@@ -45,11 +45,19 @@ jobs:
         id: cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: testing/third_party/elle/elle-cli-standalone.jar
+          # Cache the jar AND build_elle.sh's freshness stamp together. With only
+          # the jar, a cache hit restores it but build_elle.sh finds no matching
+          # .build-stamp, decides it must rebuild, and (previously) failed because
+          # the lein install was skipped on cache hit.
+          path: |
+            testing/third_party/elle/elle-cli-standalone.jar
+            testing/third_party/elle/.build-stamp
           key: ${{ steps.cache-key.outputs.value }}
 
+      # Always install lein (not just on cache miss): it's a cheap curl, and it
+      # guarantees build_elle.sh can rebuild if it ever decides the jar is stale,
+      # rather than failing with "leiningen not found".
       - name: Install Leiningen
-        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           curl -sSfL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o /usr/local/bin/lein
           chmod +x /usr/local/bin/lein
