@@ -6,3 +6,8 @@
 # for local fuzzing alike, while the rest of the project stays on 1.96 stable.
 [toolchain]
 channel = "nightly"
+# clippy so CI can run `cd fuzz && cargo clippy --all-targets` — the fuzz crate
+# is outside the main workspace, so the root clippy job never sees these
+# targets and they silently drift against the lib API (e.g. a removed
+# ClusterCommand variant). A dedicated clippy job closes that gap.
+components = ["clippy"]

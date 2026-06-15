@@ -60,6 +60,36 @@ jobs:
       - name: Clippy check
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # The fuzz crate lives outside the main workspace, so the `clippy` job above
+  # never compiles its targets — they silently drift against the lib API (a
+  # removed ClusterCommand variant went unnoticed until the sanitizer fuzz run,
+  # which is slow and path-gated). This job clippies the fuzz targets on every
+  # push/PR so drift is caught here in seconds.
+  fuzz-clippy:
+    name: Fuzz Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # dtolnay reads the repo-root toolchain file (1.96) here; rustup then
+      # auto-installs nightly + clippy when we cd into fuzz/, per
+      # fuzz/rust-toolchain.toml (cargo-fuzz requires nightly).
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # nightly
+
+      - name: Cache dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target/
+          key: ${{ runner.os }}-fuzz-clippy-${{ hashFiles('fuzz/Cargo.toml', 'Cargo.lock') }}
+
+      - name: Clippy fuzz targets
+        run: cd fuzz && cargo clippy --all-targets -- -D warnings
+
   test:
     name: Test
     runs-on: ubuntu-latest

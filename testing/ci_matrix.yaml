@@ -155,9 +155,10 @@
         },
         {
           "type": "wait_cluster",
+          "comment": "node1 was SIGKILLed; on restart it must rejoin and re-sync (possibly via pg_rewind) before its leader-view and the 2nd replica register as healthy. The sibling leader-network-partition-real case uses the same 120s budget for full health after a rejoin; 60s was too tight under CI I/O and timed out at leader_views missing=[1] / repl observed=1/2.",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 60
+          "timeout_sec": 120
         }
       ],
       "assertions": [
@@ -870,7 +871,7 @@
     {
       "id": "backup-corrupt-restore",
       "tests_md_ref": "14a. Corrupt Backup",
-      "description": "Create backup, corrupt it, and verify restore fails with a clear error status.",
+      "description": "Create a full backup on the leader, demote that node to a standby (a full restore is refused with 409 on the live leader because it overwrites the primary's data dir), corrupt the archive, and verify the restore fails with a clear 500 error.",
       "actions": [
         {
           "type": "http",
@@ -889,6 +890,18 @@
           "type": "basename",
           "source_var": "backup_path",
           "var": "backup_filename"
+        },
+        {
+          "type": "transfer_leadership",
+          "comment": "Demote node1 to a standby. A full restore overwrites the data directory, so the API refuses it with 409 on the live leader; on a standby it proceeds and fails on the corrupt archive (500), which is what this case verifies.",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 2,
+          "timeout_sec": 60
         },
         {
           "type": "cmd",
@@ -1562,7 +1575,7 @@
         {
           "type": "cmd",
           "comment": "disconnect node1 from the raft overlay \u2014 process stays alive but cannot reach peers",
-          "cmd": "docker network disconnect pgbattery_raft_net pgbattery-node1-1"
+          "cmd": "docker network disconnect \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\""
         },
         {
           "type": "wait_cluster",
@@ -1574,7 +1587,7 @@
         {
           "type": "cmd",
           "comment": "restore connectivity so node1 can rejoin as follower",
-          "cmd": "docker network connect pgbattery_raft_net pgbattery-node1-1"
+          "cmd": "docker network connect \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\""
         },
         {
           "type": "cmd",

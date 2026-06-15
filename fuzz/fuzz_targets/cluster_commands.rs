@@ -17,7 +17,7 @@ use pgbattery::governor::state_machine::{ClusterCommand, ClusterState, NodeInfo,
 /// Decode up to 64 commands from raw fuzzer bytes.
 ///
 /// Each command is encoded as:
-///   byte[0] % 5  → command type (0=Add, 1=Remove, 2=Update, 3=SetLeader, 4=UpdateLsn)
+///   byte[0] % 5  → command type (0=Add, 1=Remove, 2=Update, 3=SetSyncMode, 4=UpdateLsn)
 ///   byte[1]      → node_id (1-4)
 ///   bytes[2..10] → u64 payload (lsn / addr disambiguation)
 fn decode_commands(data: &[u8]) -> Vec<ClusterCommand> {
@@ -58,9 +58,8 @@ fn decode_commands(data: &[u8]) -> Vec<ClusterCommand> {
                     NodeRole::Follower
                 },
             },
-            3 => ClusterCommand::SetLeader {
-                id: node_id,
-                addr: pg_addr,
+            3 => ClusterCommand::SetSyncMode {
+                active: payload % 2 == 0,
             },
             _ => ClusterCommand::UpdateLsn {
                 node_id,

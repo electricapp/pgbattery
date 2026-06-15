@@ -3,6 +3,8 @@ name: Elle Consistency Check
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
   schedule:
     # Nightly 03:00 UTC — full 7-attack matrix.
     - cron: "0 3 * * *"
@@ -74,8 +76,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # PR runs only kill (~ 90 s). Nightly + manual run full matrix.
-      ATTACKS: ${{ github.event_name == 'pull_request' && 'kill' || (github.event.inputs.attacks || '') }}
+      # PR + push to main run only the `kill` smoke (~90 s). The nightly
+      # schedule and manual dispatch run the full attack matrix.
+      ATTACKS: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 'kill' || (github.event.inputs.attacks || '') }}
       COMPOSE_PROJECT_NAME: pgbha_elle_${{ github.run_id }}_${{ github.run_attempt }}
       PGBATTERY_MANAGEMENT_API_TOKEN: ci-elle-token-${{ github.run_id }}
     steps:

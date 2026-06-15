@@ -19,7 +19,7 @@
 
 **Patroni + etcd + HAProxy = 847 config lines. pgbattery = 1 binary (~14 MB).**
 
-MongoDB-style failover for PostgreSQL. Idle connections migrate in <100 ms; in-flight writes resume on the new leader within a few seconds — no client reconnect.
+MongoDB-style failover for PostgreSQL. Idle connections migrate to the new leader in <100 ms with no client reconnect. A COMMIT caught mid-failover is resolved as committed-or-error; other in-flight statements get a retryable error.
 
 ![pgbattery failover demo: SIGKILL the leader, the session keeps writing on the new leader without reconnecting](docs/assets/failover-demo.gif)
 
@@ -90,7 +90,7 @@ cargo run --release -- doctor --discover localhost:9081   # pre-deploy health ga
 
 pgbattery is a single binary for PostgreSQL HA: leader election, fencing, commit verification, backups, metrics, and TLS, without etcd or a separate load balancer.
 
-Idle connections migrate transparently (<100 ms blip in the local 3-node cluster), in-flight writes resume on the new leader within a few seconds, and the gateway can answer uncertain COMMIT outcomes by probing the new leader. It also includes a CLI, REST API, Prometheus metrics, `pg_basebackup`/`pg_dump` automation, and a built-in upgrade workflow. Safety work includes a TLA+ election spec, chaos tooling, LSN-aware promotions, and lease-based fencing for stale primaries.
+Idle connections migrate transparently to the new leader (<100 ms blip in the local 3-node cluster) with no client reconnect. A COMMIT caught mid-failover is resolved as committed-or-error by probing the new leader; other in-flight statements get a retryable error (SQLSTATE 08006). It also includes a CLI, REST API, Prometheus metrics, `pg_basebackup`/`pg_dump` automation, and a built-in upgrade workflow. Safety work includes a TLA+ election spec, chaos tooling, LSN-aware promotions, and lease-based fencing for stale primaries.
 
 ## Architecture
 
@@ -215,7 +215,7 @@ brew install uv                                       # or: pipx install uv
 
 ### What Works
 
-- Leader failure: idle connections see a <100 ms blip; in-flight writes resume on the new leader within a few seconds
+- Leader failure: idle connections see a <100 ms blip and keep their connection; a COMMIT in flight is resolved as committed-or-error, other in-flight statements get a retryable error
 - Network partition: multi-layer fencing prevents split-brain
 - Connection migration: idle transactions survive failover
 - Data integrity: synchronous replication, LSN-aware elections, and timeline verification

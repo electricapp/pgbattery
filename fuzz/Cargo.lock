@@ -455,6 +455,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a7a9bfdb35811f9e59832f0f05975114d2251b415fb534108e6f34060fd772"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -471,6 +480,16 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clap_mangen"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d82842b45bf9f6a3be090dd860095ac30728042c08e0d6261ca7259b5d850f07"
+dependencies = [
+ "clap",
+ "roff",
+]
 
 [[package]]
 name = "cmake"
@@ -1562,6 +1581,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1765,14 +1790,18 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "clap_complete",
+ "clap_mangen",
  "dashmap",
  "figment",
- "flate2",
  "metrics",
  "metrics-exporter-prometheus",
+ "minisign-verify",
  "openraft",
  "parking_lot",
  "pg_query",
+ "pgbattery-core",
+ "pgbattery-supervisor",
  "postcard",
  "redb",
  "reqwest",
@@ -1781,14 +1810,23 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "terminal_size",
- "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
- "walkdir",
+]
+
+[[package]]
+name = "pgbattery-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "figment",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1797,6 +1835,20 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "pgbattery",
+]
+
+[[package]]
+name = "pgbattery-supervisor"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flate2",
+ "metrics",
+ "pgbattery-core",
+ "tar",
+ "tokio",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -2271,7 +2323,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "tower-http",
+ "tower-http 0.6.8",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -2321,6 +2373,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "roff"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
 name = "rust_decimal"
@@ -3041,6 +3099,24 @@ dependencies = [
  "iri-string",
  "pin-project-lite",
  "tower",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "percent-encoding",
+ "pin-project-lite",
+ "tokio",
  "tower-layer",
  "tower-service",
 ]

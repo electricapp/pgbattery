@@ -33,6 +33,10 @@ DESCRIPTION:
    PostgreSQL cluster: automatic failover, synchronous replication, and a TCP
    gateway that always routes clients to the current leader.
 
+   On failover, idle client connections migrate to the new leader with no
+   reconnect; a COMMIT in flight is resolved as committed-or-error, and other
+   in-flight statements return a retryable error.
+
    Run `pgbattery <command> --help` for details on any command.
 
 COMMANDS:
