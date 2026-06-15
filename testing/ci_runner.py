@@ -794,6 +794,7 @@ class CIRunner:
         require_replication_health: bool = False,
         min_healthy_replicas: int = 1,
         live_nodes: int | None = None,
+        stable_for_sec: float = 0.0,
     ) -> None:
         """Poll until the cluster reaches the expected topology or timeout.
 
@@ -834,6 +835,14 @@ class CIRunner:
         allowed_missing_views = expected_nodes - live
         deadline = time.time() + timeout_sec
         last_error = "cluster did not converge"
+        # When stable_for_sec > 0, the full success condition must hold across
+        # consecutive polls for that long before we return — this asserts the
+        # cluster has *settled* on one leader, not merely flickered through the
+        # target state for a single poll. Critical after a disruption that
+        # provokes a brief, legitimate re-election (e.g. a partitioned former
+        # leader rejoining): a one-shot observation can catch the momentary
+        # leaders==1 and return right before the re-election drops it to 0.
+        stable_since: float | None = None
         while time.time() < deadline:
             try:
                 nodes = self._get_cluster_nodes()
@@ -955,15 +964,22 @@ class CIRunner:
                             f"async={async_count}/0 "
                             f"healthy={healthy_count}/{min_healthy_replicas}"
                         )
-                if (
+                converged = (
                     topology_ok
                     and leader_changed
                     and leader_eq_ok
                     and voters_ok
                     and views_ok
                     and repl_ok
-                ):
-                    return
+                )
+                if converged:
+                    if stable_since is None:
+                        stable_since = time.time()
+                    if stable_for_sec <= 0 or (time.time() - stable_since) >= stable_for_sec:
+                        return
+                else:
+                    # Any regression resets the stability window.
+                    stable_since = None
                 last_error = (
                     f"observed nodes={node_count}, leaders={leader_count}, voters={voter_count}, "
                     f"expected nodes={expected_nodes}, leaders={expected_leaders}"
@@ -983,6 +999,11 @@ class CIRunner:
                 if require_replication_health:
                     last_error += views_detail
                     last_error += repl_detail
+                if converged and stable_for_sec > 0 and stable_since is not None:
+                    last_error += (
+                        f", converged but awaiting stability "
+                        f"({time.time() - stable_since:.0f}/{stable_for_sec:.0f}s held)"
+                    )
             except RunnerError as exc:
                 # Illegal-state errors are permanent — don't swallow them into
                 # the polling loop. Transient HTTP/metric errors are retried.
@@ -1556,6 +1577,7 @@ class CIRunner:
                 # transfer leadership to a not-yet-replicated follower.
                 min_healthy = int(step.get("min_healthy_replicas", 1))
                 live_nodes = int(step["live_nodes"]) if "live_nodes" in step else None
+                stable_for = float(step.get("stable_for_sec", 0))
                 self._wait_for_cluster(
                     expected_nodes=expected_nodes,
                     expected_leaders=expected_leaders,
@@ -1565,6 +1587,7 @@ class CIRunner:
                     require_replication_health=require_repl,
                     min_healthy_replicas=min_healthy,
                     live_nodes=live_nodes,
+                    stable_for_sec=stable_for,
                 )
                 elapsed = time.time() - started
                 max_converge_sec = step.get("max_converge_sec")

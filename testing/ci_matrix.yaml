@@ -893,15 +893,19 @@
           "var": "backup_filename"
         },
         {
+          "type": "record_leader",
+          "var": "leader_before_restore"
+        },
+        {
           "type": "transfer_leadership",
-          "comment": "Demote node1 to a standby. A full restore overwrites the data directory, so the API refuses it with 409 on the live leader; on a standby it proceeds and fails on the corrupt archive (500), which is what this case verifies.",
+          "comment": "Demote node1 (the localhost:9081 target of the restore below) off leadership. A full restore overwrites the data directory, so the API refuses it with 409 on the live leader; on a standby it proceeds and fails on the corrupt archive (500), which is what this case verifies. We only need node1 to stop being leader — the exact new leader doesn't matter, so we assert leader_not below rather than leader_equals (a transfer request is best-effort; a re-election can legitimately land leadership on node3 instead of the requested node2, which previously made this flaky).",
           "target_node_id": 2
         },
         {
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "leader_equals": 2,
+          "leader_not_var": "leader_before_restore",
           "timeout_sec": 60
         },
         {
@@ -1599,11 +1603,12 @@
         },
         {
           "type": "wait_cluster",
-          "comment": "Demand full replication health (2 healthy followers) before yielding to the next case, otherwise its first transfer can hit the catch-up gate on a still-booting node1.",
+          "comment": "Demand full replication health (2 healthy followers) AND require it to hold for stable_for_sec before returning. When the partitioned former leader (node1) rejoins it can briefly force one re-election (it campaigned with a bumped term while isolated), so the cluster flickers 1->0->1 leaders for ~an election timeout. A one-shot wait could catch the momentary leaders==1 and return right before the dip, then the cluster_topology assertion below would see leaders=0. Requiring 10s of continuous convergence proves the re-election has settled — a brief re-election is normal Raft liveness (never 2 leaders == no split-brain), a persistent one still fails here.",
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120,
-          "min_healthy_replicas": 2
+          "min_healthy_replicas": 2,
+          "stable_for_sec": 10
         },
         {
           "type": "sleep",
