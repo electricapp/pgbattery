@@ -270,9 +270,10 @@
         },
         {
           "type": "wait_cluster",
+          "comment": "A simultaneous restart of all 3 nodes reconverges in ~5s locally, but under CI's slower/parallel load the full re-elect + re-sync can exceed 60s (observed node2's API slow to return). 120s absorbs that variance; the operation itself converges (verified locally), this is purely a CI timing budget.",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 60
+          "timeout_sec": 120
         }
       ],
       "assertions": [
