@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.4
-FROM rust:1.95 AS builder
+FROM rust:1.96 AS builder
 WORKDIR /app
 
 # Build profile: "release" (default) or "dev" for fast iteration
