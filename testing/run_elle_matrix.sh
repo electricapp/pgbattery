@@ -21,8 +21,24 @@ set -eu
 # Ensure the Elle uberjar exists (build it on first run, or whenever the
 # shim source has changed). The script is idempotent and a no-op when
 # everything is already built.
+#
+# ELLE_SKIP_BUILD=1: trust an already-present uberjar and skip build_elle.sh.
+# CI splits build (build-elle-jar job, has lein+JDK) from run (matrix job, only
+# downloads the jar artifact). The matrix job has no lein, and build_elle.sh's
+# freshness stamp isn't part of the artifact, so calling it there would try to
+# rebuild and fail with "leiningen not found". The downloaded jar is
+# authoritative; just verify it's present.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-"$SCRIPT_DIR/build_elle.sh"
+JAR_PATH="$SCRIPT_DIR/third_party/elle/elle-cli-standalone.jar"
+if [ "${ELLE_SKIP_BUILD:-0}" = "1" ]; then
+  if [ ! -f "$JAR_PATH" ]; then
+    echo "[ERR] ELLE_SKIP_BUILD=1 but uberjar is missing: $JAR_PATH" >&2
+    exit 2
+  fi
+  echo "[OK] ELLE_SKIP_BUILD=1 — using prebuilt uberjar at $JAR_PATH"
+else
+  "$SCRIPT_DIR/build_elle.sh"
+fi
 
 ALL_ATTACKS=(
   kill
