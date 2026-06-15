@@ -80,8 +80,8 @@ tokio = { version = "1", features = ["full", "tracing"] }
 clap = { version = "4", features = ["derive", "env"] }
 # Pinned to the clap 4.6 family already in the lockfile (org policy: no deps
 # newer than 7 days). Used for `pgbattery completions` and `pgbattery man`.
-clap_complete = "=4.6.0"
-clap_mangen = "=0.2.24"
+clap_complete = "=4.6.5"
+clap_mangen = "=0.3.0"
 
 # Protocol Parsing
 bytes = "1"
@@ -120,14 +120,14 @@ dashmap = "6"
 sha2 = "0.11"
 # Verify-only ed25519/minisign signatures on self-upgrade artifacts. Pinned to
 # an established release (org policy: no deps newer than 7 days).
-minisign-verify = "=0.2.1"
+minisign-verify = "=0.2.5"
 
 # HTTP client (for status command and management API)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 axum = "0.8"
 # Body-size limit + per-request timeout for the management API (DoS hardening).
 # Pinned to ~0.6.x; already transitively present via axum-0.8 → reqwest.
-tower-http = { version = "0.6", features = ["limit", "timeout"] }
+tower-http = { version = "0.7", features = ["limit", "timeout"] }
 tower = "0.5"
 
 # Terminal
