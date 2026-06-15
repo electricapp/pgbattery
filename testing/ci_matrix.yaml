@@ -1579,7 +1579,9 @@
         },
         {
           "type": "wait_cluster",
+          "comment": "node1 is severed from the overlay network, so only 2 nodes are live. Declare live_nodes=2 so the convergence oracle allows node1's leader-view to be absent and expects a single replica; without it the check waits forever for the partitioned node's view and a 2nd healthy replica.",
           "nodes": 3,
+          "live_nodes": 2,
           "leaders": 1,
           "leader_not_var": "leader_before",
           "timeout_sec": 60

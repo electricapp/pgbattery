@@ -60,7 +60,7 @@ jobs:
 
       - name: Smoke test
         run: |
-          java -jar testing/third_party/elle/elle-cli-standalone.jar \
+          java -Djava.awt.headless=true -jar testing/third_party/elle/elle-cli-standalone.jar \
             rw-register testing/elle_shim/smoke_history.json
 
       - name: Upload uberjar

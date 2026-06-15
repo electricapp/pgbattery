@@ -78,15 +78,15 @@ fuzz_target!(|data: &[u8]| {
         state.apply(cmd);
     }
 
-    // Invariant 1: at most one node in the map has role=Leader.
-    let leader_count = state
-        .nodes
-        .values()
-        .filter(|n| n.role == NodeRole::Leader)
-        .count();
-    assert!(leader_count <= 1, "multiple leaders in nodes map");
+    // NOTE: per-node `role` is descriptive metadata that `apply` sets verbatim
+    // from UpdateNode — it does NOT enforce a single role=Leader across nodes,
+    // and no production code counts role=Leader (the authoritative, structurally
+    // single leader is `leader_id`). So we deliberately do not assert "at most
+    // one role=Leader": arbitrary UpdateNode sequences can legitimately set
+    // several, and doing so is not a split-brain. (This assertion was a remnant
+    // of the removed SetLeader command, which used to demote the others.)
 
-    // Invariant 2: leader_id points to a known node (or is None).
+    // Invariant 1: leader_id points to a known node (or is None).
     if let Some(lid) = state.leader_id {
         assert!(
             state.nodes.contains_key(&lid),

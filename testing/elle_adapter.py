@@ -142,6 +142,10 @@ def check_with_elle(
     cmd = [
         "java",
         f"-Xmx{JVM_HEAP_MAX}",
+        # Elle transitively loads rhizome.viz (graph rendering), whose class
+        # initializer touches AWT and throws HeadlessException on a headless
+        # runner. We never render graphs, so force headless mode.
+        "-Djava.awt.headless=true",
         "-jar",
         str(jar),
         model,
