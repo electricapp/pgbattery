@@ -530,7 +530,9 @@ impl RaftRpcClient {
         req: AppendEntriesRequest<TypeConfig>,
     ) -> Result<AppendEntriesResponse<NodeId>> {
         let body = postcard::to_allocvec(&req)?;
-        let response = self.request(conn, addr, RpcType::AppendEntries, &body).await?;
+        let response = self
+            .request(conn, addr, RpcType::AppendEntries, &body)
+            .await?;
         let resp: AppendEntriesResponse<NodeId> = postcard::from_bytes(&response)?;
         Ok(resp)
     }
@@ -562,7 +564,9 @@ impl RaftRpcClient {
         req: InstallSnapshotRequest<TypeConfig>,
     ) -> Result<InstallSnapshotResponse<NodeId>> {
         let body = postcard::to_allocvec(&req)?;
-        let response = self.request(conn, addr, RpcType::InstallSnapshot, &body).await?;
+        let response = self
+            .request(conn, addr, RpcType::InstallSnapshot, &body)
+            .await?;
         let resp: InstallSnapshotResponse<NodeId> = postcard::from_bytes(&response)?;
         Ok(resp)
     }
@@ -629,16 +633,14 @@ impl RaftRpcClient {
                 )));
             }
             let server_name = ServerName::IpAddress(peer_ip.into());
-            let tls_stream = match tokio::time::timeout(
-                RPC_IO_TIMEOUT,
-                connector.connect(server_name, stream),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => return Err(Error::Tls(format!("TLS handshake failed: {e}"))),
-                Err(_) => return Err(Error::ConnectionTimeout(addr)),
-            };
+            let tls_stream =
+                match tokio::time::timeout(RPC_IO_TIMEOUT, connector.connect(server_name, stream))
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => return Err(Error::Tls(format!("TLS handshake failed: {e}"))),
+                    Err(_) => return Err(Error::ConnectionTimeout(addr)),
+                };
             PeerStream::Tls(Box::new(tls_stream))
         } else {
             PeerStream::Plain(stream)

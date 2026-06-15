@@ -208,15 +208,16 @@ impl Gateway {
             // Spawn handler task
             tokio::spawn(async move {
                 // Handle SSL negotiation on raw socket first
-                let (client, preread) =
-                    match negotiate_ssl(socket, &tls_config, conn_id, &state).await {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            tracing::debug!(conn_id = conn_id, error = %e, "SSL negotiation failed");
-                            registry.unregister(conn_id);
-                            return;
-                        }
-                    };
+                let (client, preread) = match negotiate_ssl(socket, &tls_config, conn_id, &state)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::debug!(conn_id = conn_id, error = %e, "SSL negotiation failed");
+                        registry.unregister(conn_id);
+                        return;
+                    }
+                };
 
                 let result = ConnectionHandler::new(
                     conn_id,

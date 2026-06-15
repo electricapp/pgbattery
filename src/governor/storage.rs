@@ -563,7 +563,7 @@ impl RedbLogStorage {
     ///
     /// A successful return guarantees that on restart, either `data`, `meta`,
     /// and `data_sha256` are *all* observed, or none of them. A SHA-256 of
-    /// the data is written alongside so [`load_snapshot_verified`] can refuse
+    /// the data is written alongside so [`Self::load_snapshot_verified`] can refuse
     /// to deserialize a torn or corrupted payload — postcard would otherwise
     /// happily attempt to decode garbage and either panic-via-Result or
     /// produce a nonsense `ClusterState`.
@@ -955,7 +955,10 @@ mod tests {
 
         let result = RedbLogStorage::new(&path);
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(
+            msg.contains("corrupted"),
+            "expected corruption error: {msg}"
+        );
         assert!(msg.contains("re-join"), "error must be actionable: {msg}");
         assert!(path.exists(), "corrupt file must be preserved in place");
         assert_eq!(
@@ -1028,7 +1031,10 @@ mod tests {
 
         // Build path: applied state untouched.
         storage.save_snapshot(&meta, data).unwrap();
-        assert_eq!(storage.load_last_applied().unwrap().last_applied_index, None);
+        assert_eq!(
+            storage.load_last_applied().unwrap().last_applied_index,
+            None
+        );
         assert!(storage.load_applied_membership().unwrap().is_none());
 
         // Install path: applied state moves with the snapshot.

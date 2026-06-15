@@ -95,8 +95,8 @@ ENVIRONMENT:
   PGBATTERY_MANAGEMENT_API_TOKEN        Management API token (prefer --token-file)
   NO_COLOR / TERM=dumb                  Disable colored output
 
-DOCS:   https://github.com/nbarbier-265/postgresha
-ISSUES: https://github.com/nbarbier-265/postgresha/issues";
+DOCS:   https://github.com/electricapp/pgbattery
+ISSUES: https://github.com/electricapp/pgbattery/issues";
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {

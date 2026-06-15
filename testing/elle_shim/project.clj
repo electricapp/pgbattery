@@ -17,7 +17,10 @@
   ;; `testing/third_party/elle/elle-cli-standalone.jar` from this dir.
   ;; This means `lein uberjar` is enough — no separate mv step.
   :uberjar-name "../../third_party/elle/elle-cli-standalone.jar"
-  :jvm-opts ["-Xmx2g"]
+  ;; -Djava.awt.headless=true: Elle's viz namespace (pulled in transitively by
+  ;; elle.txn) touches java.awt at AOT-compile time. On a headless CI runner
+  ;; that throws HeadlessException and fails `lein uberjar`, so force headless.
+  :jvm-opts ["-Xmx2g" "-Djava.awt.headless=true"]
   ;; Full AOT. Partial AOT breaks at runtime because our compiled shim
   ;; emits static references to `cheshire/core$loading__6789__auto____NNN`
   ;; with non-deterministic gensym IDs that don't match cheshire's

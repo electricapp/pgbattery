@@ -426,7 +426,10 @@ mod tests {
         );
         // Base gives openraft's own timers (which fire within 1-2 timeouts) a
         // chance before the watchdog forces anything.
-        assert!(base >= 2, "base must give openraft's own election timers a chance");
+        assert!(
+            base >= 2,
+            "base must give openraft's own election timers a chance"
+        );
     }
 
     #[test]

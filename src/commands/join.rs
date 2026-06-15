@@ -55,9 +55,8 @@ fn read_node_id_marker(raft_dir: &Path) -> Result<Option<u64>> {
 fn write_node_id_marker(raft_dir: &Path, node_id: u64) -> Result<()> {
     use std::io::Write as _;
 
-    std::fs::create_dir_all(raft_dir).map_err(|e| {
-        anyhow::anyhow!("Failed to create raft dir {}: {e}", raft_dir.display())
-    })?;
+    std::fs::create_dir_all(raft_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create raft dir {}: {e}", raft_dir.display()))?;
     let path = raft_dir.join(NODE_ID_MARKER_FILE);
     let tmp_path = raft_dir.join(format!(".{NODE_ID_MARKER_FILE}.tmp.{}", std::process::id()));
     let write = || -> Result<()> {
@@ -363,7 +362,10 @@ mod tests {
     #[test]
     fn marker_format_parse_roundtrip() {
         for id in [1, 2, 42, u64::MAX] {
-            assert_eq!(parse_node_id_marker(&format_node_id_marker(id)).unwrap(), id);
+            assert_eq!(
+                parse_node_id_marker(&format_node_id_marker(id)).unwrap(),
+                id
+            );
         }
     }
 

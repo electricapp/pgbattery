@@ -1,0 +1,10 @@
+# Mirrors deny.toml's [advisories].ignore so `cargo audit` and the CI
+# rustsec/audit-check action agree. Both are unmaintained-only advisories
+# (no vulnerability, no fix available) on a transitive/wrapper crate.
+[advisories]
+ignore = [
+    # atomic-polyfill: transitive via postcard -> heapless, no upgrade available.
+    "RUSTSEC-2023-0089",
+    # rustls-pemfile: unmaintained wrapper; migration to rustls-pki-types planned.
+    "RUSTSEC-2025-0134",
+]

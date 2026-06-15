@@ -1354,7 +1354,8 @@ impl ConnectionHandler {
                 .map_err(|e| Error::Protocol(format!("parse analysis task failed: {e}")))?
         };
         let stmt_name = stmt_name.to_owned();
-        self.extended_commit_tracker.record_parse(stmt_name, is_commit);
+        self.extended_commit_tracker
+            .record_parse(stmt_name, is_commit);
         Ok(())
     }
 

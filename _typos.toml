@@ -3,3 +3,18 @@ extend-exclude = [
     # Base64-encoded TLS test certificates trigger false positives
     "src/governor/tls.rs",
 ]
+
+[default]
+# Minisign public keys are base64 and contain letter pairs typos misreads
+# (e.g. "Iz" -> "Is"). Skip the example/release key wherever it appears
+# (docs/RELEASING.md, src/commands/upgrade.rs).
+extend-ignore-identifiers-re = [
+    "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+]
+
+[default.extend-words]
+# Domain terms and accepted spellings, not typos:
+rto = "rto"                 # Recovery Time Objective (paired with RPO)
+mis = "mis"                 # "mis-timed" — valid hyphenated prefix
+unparseable = "unparseable" # accepted variant, used consistently in the tree
+writeable = "writeable"     # accepted variant

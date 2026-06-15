@@ -995,8 +995,8 @@ impl App {
         // writable simultaneously. No sleep — the lease is the time-based
         // truth source, and the reconcile loop re-attempts promotion within
         // its 2 s cadence.
-        let lease_ms = u64::try_from(crate::governor::DEFAULT_LEASE_DURATION.as_millis())
-            .unwrap_or(u64::MAX);
+        let lease_ms =
+            u64::try_from(crate::governor::DEFAULT_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX);
         if let Some(elapsed_ms) =
             promotion_lease_holddown(failover_started_ms, unix_now_ms(), lease_ms)
         {

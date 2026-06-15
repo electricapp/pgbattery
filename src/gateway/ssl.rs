@@ -219,8 +219,7 @@ mod tests {
 
     #[test]
     fn test_tls_config_terminate_requires_cert_path() {
-        let err = TlsConfig::new(SslModeConfig::Terminate, None, None)
-            .expect_err("expected error");
+        let err = TlsConfig::new(SslModeConfig::Terminate, None, None).expect_err("expected error");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("Certificate path required"),

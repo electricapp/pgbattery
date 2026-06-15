@@ -849,9 +849,9 @@ impl BackupManager {
 
         match rollback {
             Ok(()) => restore_err,
-            Err(rollback_err) => {
-                Error::Postgres(format!("Full restore failed: {restore_err}; {rollback_err}"))
-            }
+            Err(rollback_err) => Error::Postgres(format!(
+                "Full restore failed: {restore_err}; {rollback_err}"
+            )),
         }
     }
 
@@ -1008,14 +1008,10 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
 /// (best-effort) so the artifact and its directory entry survive a crash.
 fn sync_file_and_dir(path: &Path) -> Result<()> {
     let file = std::fs::File::open(path).map_err(|e| {
-        Error::Postgres(format!(
-            "Failed to open {} for fsync: {e}",
-            path.display()
-        ))
+        Error::Postgres(format!("Failed to open {} for fsync: {e}", path.display()))
     })?;
-    file.sync_all().map_err(|e| {
-        Error::Postgres(format!("Failed to fsync backup {}: {e}", path.display()))
-    })?;
+    file.sync_all()
+        .map_err(|e| Error::Postgres(format!("Failed to fsync backup {}: {e}", path.display())))?;
     if let Some(parent) = path.parent()
         && let Err(e) = fsync_dir(parent)
     {
@@ -1195,12 +1191,14 @@ fn validate_full_backup_bundle(backup_path: &Path, compressed: bool) -> Result<(
 /// The only tar members `pg_basebackup -Ft` produces for a cluster without
 /// non-default tablespaces.
 fn is_expected_bundle_member(path: &Path) -> bool {
-    path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-        matches!(
-            name,
-            "base.tar" | "base.tar.gz" | "pg_wal.tar" | "pg_wal.tar.gz"
-        )
-    })
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "base.tar" | "base.tar.gz" | "pg_wal.tar" | "pg_wal.tar.gz"
+            )
+        })
 }
 
 /// Recover from a full restore that died between staging the old data
@@ -1760,7 +1758,10 @@ fn fsync_restored_tree(path: &Path) -> Result<()> {
         let file = std::fs::File::open(path)
             .map_err(|e| Error::Postgres(format!("Failed to open {}: {e}", path.display())))?;
         file.sync_all().map_err(|e| {
-            Error::Postgres(format!("Failed to fsync restored file {}: {e}", path.display()))
+            Error::Postgres(format!(
+                "Failed to fsync restored file {}: {e}",
+                path.display()
+            ))
         })?;
     }
 
@@ -2085,9 +2086,8 @@ mod tests {
 
     #[test]
     fn test_select_rotation_victims_is_per_type() {
-        let info = |name: &str| {
-            BackupManager::parse_backup_filename(name, Path::new(name)).unwrap()
-        };
+        let info =
+            |name: &str| BackupManager::parse_backup_filename(name, Path::new(name)).unwrap();
         // Newest-first, dumps newer than every full: type-blind retention of
         // 2 would delete both fulls.
         let backups = vec![
@@ -2105,10 +2105,7 @@ mod tests {
     #[test]
     fn test_rotate_backups_in_keeps_retention_per_type() {
         let dir = tempdir().unwrap();
-        for name in [
-            "full_backup_20240101_000000",
-            "full_backup_20240102_000000",
-        ] {
+        for name in ["full_backup_20240101_000000", "full_backup_20240102_000000"] {
             std::fs::create_dir_all(dir.path().join(name)).unwrap();
         }
         for name in [

@@ -35,12 +35,16 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      # cargo-fuzz requires nightly for the libFuzzer instrumentation. We
-      # pin a specific nightly snapshot so this job is reproducible without
-      # tracking the rolling nightly. Bump deliberately when fuzzing infra
-      # changes; the project's runtime toolchain remains 1.95 stable.
+      # cargo-fuzz needs a nightly toolchain for the libFuzzer + sanitizer
+      # instrumentation (-Zsanitizer=address). The repo-root rust-toolchain.toml
+      # pins 1.96 stable and, because rustup resolves the nearest toolchain file
+      # to the cwd, would otherwise win inside fuzz/ and make cargo reject the
+      # -Z flags. fuzz/rust-toolchain.toml selects nightly there; this step
+      # pre-installs it. The project's runtime toolchain stays 1.96 stable.
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # nightly
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry + fuzz target dir
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5

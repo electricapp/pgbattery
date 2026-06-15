@@ -22,6 +22,16 @@ concurrency:
   group: ha-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
 
+env:
+  # Every HA suite brings up the docker-compose cluster, whose compose file
+  # hard-requires PGBATTERY_MANAGEMENT_API_TOKEN (the `:?` guard aborts compose
+  # in <1s if it is unset). A fixed CI value is fine — it only gates the
+  # management API inside the ephemeral per-run cluster, and ci_runner.py reads
+  # the same env var for its own authenticated calls. (elle.yml and
+  # correctness-lite.yml already set this; ha-ci.yml was the workflow that
+  # missed it, which is why all 8 HA jobs failed at compose bring-up.)
+  PGBATTERY_MANAGEMENT_API_TOKEN: ci-ha-token
+
 jobs:
   lint-test-harness:
     name: Lint Test Harness

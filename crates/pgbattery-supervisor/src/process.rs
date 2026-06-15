@@ -1518,7 +1518,9 @@ host all all ::/0 {auth_method}
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                return Err(Error::Promotion(format!("Failed to run pg_ctl promote: {e}")));
+                return Err(Error::Promotion(format!(
+                    "Failed to run pg_ctl promote: {e}"
+                )));
             }
             Err(_) => {
                 metrics::counter!("pgbattery_pg_ctl_promote_timeouts").increment(1);
@@ -2410,7 +2412,9 @@ host all all ::/0 {auth_method}
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                return Err(Error::Postgres(format!("Failed to set read-only mode: {e}")));
+                return Err(Error::Postgres(format!(
+                    "Failed to set read-only mode: {e}"
+                )));
             }
             Err(_) => {
                 return Err(Error::Postgres(format!(
@@ -3531,7 +3535,8 @@ mod tests {
             "pg_rewind exceeded 300s budget".to_string()
         )));
         assert!(!rewind_failure_left_target_untouched(&Error::Postgres(
-            "pg_rewind failed: pg_rewind: error: could not write file \"global/pg_control\"".to_string()
+            "pg_rewind failed: pg_rewind: error: could not write file \"global/pg_control\""
+                .to_string()
         )));
     }
 

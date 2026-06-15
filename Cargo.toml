@@ -11,9 +11,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 license = "AGPL-3.0-only"
-repository = "https://github.com/nbarbier-265/postgresha"
+repository = "https://github.com/electricapp/pgbattery"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -113,7 +113,6 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
 # Utilities
-thiserror = "2"
 anyhow = "1"
 parking_lot = "0.12"
 dashmap = "6"
@@ -128,16 +127,12 @@ axum = "0.8"
 # Body-size limit + per-request timeout for the management API (DoS hardening).
 # Pinned to ~0.6.x; already transitively present via axum-0.8 → reqwest.
 tower-http = { version = "0.7", features = ["limit", "timeout"] }
-tower = "0.5"
 
 # Terminal
 terminal_size = "0.4"
 
 # Backup
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-flate2 = "1"
-tar = "0.4"
-walkdir = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

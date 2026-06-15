@@ -555,7 +555,10 @@ impl Governor {
         // openraft 0.9's RaftMetrics carries no separate committed log id, so
         // report `last_applied` — entries apply only after commit, so it is
         // the closest monotonic proxy for the commit index.
-        #[allow(clippy::cast_precision_loss, reason = "raft index fits in f64 mantissa")]
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "raft index fits in f64 mantissa"
+        )]
         metrics::gauge!("pgbattery_raft_commit_index")
             .set(metrics.last_applied.map_or(0, |l| l.index) as f64);
         metrics::gauge!("pgbattery_raft_is_leader").set(if leader_id == Some(self.node_id) {
@@ -736,10 +739,9 @@ impl Governor {
     /// `(BASE + rank * STAGGER) * election_timeout`. Pure so the stagger
     /// ordering can be unit-tested without a live cluster.
     fn leaderless_threshold(rank: u32, election_timeout_ms: u64) -> std::time::Duration {
-        let timeouts = crate::config::constants::LEADERLESS_RECOVERY_BASE_TIMEOUTS
-            .saturating_add(rank.saturating_mul(
-                crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS,
-            ));
+        let timeouts = crate::config::constants::LEADERLESS_RECOVERY_BASE_TIMEOUTS.saturating_add(
+            rank.saturating_mul(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS),
+        );
         std::time::Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
     }
 
@@ -1020,8 +1022,7 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
                 terms = ?log_entries.iter().map(|e| e.term).collect::<Vec<_>>(),
                 "Appending log entries to storage"
             );
-            if let Err(e) =
-                storage_io(&self.storage, move |s| s.append_entries(&log_entries)).await
+            if let Err(e) = storage_io(&self.storage, move |s| s.append_entries(&log_entries)).await
             {
                 // Storage failed. openraft's `RaftLogStorage::append` contract:
                 // the implementation MUST call `callback.log_io_completed(...)`
@@ -1167,9 +1168,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         let mut last_applied_log_id: Option<LogId<NodeId>> = None;
         // Mirror of the redb `last_applied` record (see `applied_end` docs);
         // reading it here saves a redb read transaction per applied batch.
-        let applied_end = self
-            .applied_end
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let applied_end = self.applied_end.load(std::sync::atomic::Ordering::Relaxed);
 
         for entry in entries {
             if Self::is_duplicate_entry(&entry, applied_end) {
@@ -1524,9 +1523,11 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
         // Persist data + metadata atomically so a crash mid-build cannot
         // leave storage with metadata pointing at unwritten data.
         let snapshot_data = data.clone();
-        storage_io(&self.storage, move |s| s.save_snapshot(&meta, &snapshot_data))
-            .await
-            .map_err(|e| storage_write_err(&e))?;
+        storage_io(&self.storage, move |s| {
+            s.save_snapshot(&meta, &snapshot_data)
+        })
+        .await
+        .map_err(|e| storage_write_err(&e))?;
 
         tracing::info!(?last_log_id, "Built snapshot");
 
@@ -1737,9 +1738,7 @@ where
 /// `LogId` recorded by a `LastAppliedState`, when anything has been applied.
 fn last_applied_log_id(s: &LastAppliedState) -> Option<LogId<NodeId>> {
     match (s.last_applied_term, s.last_applied_index) {
-        (Some(term), Some(index)) => {
-            Some(make_log_id(term, s.last_applied_leader_node_id, index))
-        }
+        (Some(term), Some(index)) => Some(make_log_id(term, s.last_applied_leader_node_id, index)),
         _ => None,
     }
 }
@@ -1812,9 +1811,7 @@ type MembershipNodes = Vec<(NodeId, String)>;
 
 /// Split a stored membership's node list into `(voters, learners)` by config
 /// membership.
-fn split_membership_nodes(
-    local: &LocalStoredMembership,
-) -> (MembershipNodes, MembershipNodes) {
+fn split_membership_nodes(local: &LocalStoredMembership) -> (MembershipNodes, MembershipNodes) {
     let voter_ids: std::collections::HashSet<NodeId> = local
         .configs
         .iter()

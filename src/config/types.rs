@@ -270,7 +270,7 @@ impl Config {
     ///
     /// # Errors
     /// Returns an error if the config file is malformed or fails validation
-    /// (see [`Config::validate`]).
+    /// (see `Config::validate`).
     pub fn load() -> Result<Self> {
         let mut config: Self = Figment::new()
             .merge(Toml::file("pgbattery.toml"))
@@ -307,7 +307,7 @@ impl Config {
     ///
     /// `node_id = 0` is the join-time auto-assign sentinel. It is a valid
     /// value to *load* (a fresh `pgbattery join` starts from it before the
-    /// cluster assigns the real id), so [`Config::validate`] accepts it — but
+    /// cluster assigns the real id), so `Config::validate` accepts it — but
     /// a node that runs consensus with id 0 poisons the cluster: tooling
     /// treats 0 as "unset" (`cluster remove --self` refuses it; join's
     /// resume path wipes Raft state when the id is not in membership).
@@ -574,7 +574,7 @@ impl Config {
     /// Get the management API bind address (explicit or derived from `metrics_addr` + 1).
     ///
     /// When `mgmt_addr` is not set, we add `1` to `metrics_addr.port()`. Port
-    /// overflow (metrics on 65535) is rejected by [`Self::validate`], so by
+    /// overflow (metrics on 65535) is rejected by `Self::validate`, so by
     /// the time anyone calls this, the derivation is guaranteed to succeed.
     /// The `unwrap_or_else` is a defensive belt — if validation is ever
     /// bypassed in tests or synthetic code paths, we still produce a valid
@@ -649,7 +649,7 @@ impl Config {
     ///
     /// # Errors
     /// Returns an error if the file is missing, malformed, or fails validation
-    /// (see [`Config::validate`]).
+    /// (see `Config::validate`).
     pub fn load_from(path: &str) -> Result<Self> {
         let mut config: Self = Figment::new()
             .merge(Toml::file(path))

@@ -3,7 +3,7 @@
 ![TLA+ Verified](https://img.shields.io/badge/Verified-TLA%2B-blue)
 ![License](https://img.shields.io/badge/License-AGPLv3-green)
 ![Status](https://img.shields.io/badge/Status-Alpha-orange)
-![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange)
+![Rust](https://img.shields.io/badge/Rust-1.96%2B-orange)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey)
 
 </div>
@@ -62,8 +62,8 @@ Batteries-included HA for PostgreSQL. Single binary. No external coordination se
 Boot the 3-node demo cluster, write to it, kill the leader, and watch the session stay alive — under five minutes:
 
 ```bash
-git clone https://github.com/nbarbier-265/postgresha
-cd postgresha
+git clone https://github.com/electricapp/pgbattery
+cd pgbattery
 cp .env.example .env                                  # supplies PGBATTERY_MANAGEMENT_API_TOKEN
 docker compose up -d                                  # bring up 3-node cluster
 psql postgres://postgres@localhost:5432/postgres      # gateway always routes to the leader

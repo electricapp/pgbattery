@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::common::{
-    colors, cprintln, format_size, hints, http_client, metric_to_u64,
-    parse_prometheus_metric_line, parse_prometheus_metrics_map,
+    colors, cprintln, format_size, hints, http_client, metric_to_u64, parse_prometheus_metric_line,
+    parse_prometheus_metrics_map,
 };
 use crate::cli::OutputFormat;
 
@@ -134,8 +134,7 @@ pub async fn run_doctor(
 }
 
 fn build_report(checks: Vec<CheckResult>) -> DoctorReport {
-    let count =
-        |status: CheckStatus| checks.iter().filter(|c| c.status == status).count();
+    let count = |status: CheckStatus| checks.iter().filter(|c| c.status == status).count();
     let pass_count = count(CheckStatus::Pass);
     let warn_count = count(CheckStatus::Warn);
     let fail_count = count(CheckStatus::Fail);
@@ -813,11 +812,17 @@ mod tests {
         let probes = vec![
             probe_with_metrics(
                 "n1",
-                &[("pgbattery_raft_is_leader", 1.0), ("pgbattery_raft_term", 7.0)],
+                &[
+                    ("pgbattery_raft_is_leader", 1.0),
+                    ("pgbattery_raft_term", 7.0),
+                ],
             ),
             probe_with_metrics(
                 "n2",
-                &[("pgbattery_raft_is_leader", 1.0), ("pgbattery_raft_term", 7.0)],
+                &[
+                    ("pgbattery_raft_is_leader", 1.0),
+                    ("pgbattery_raft_term", 7.0),
+                ],
             ),
         ];
         let checks = check_cluster_health(&probes);
@@ -831,11 +836,17 @@ mod tests {
         let probes = vec![
             probe_with_metrics(
                 "n1",
-                &[("pgbattery_raft_is_leader", 1.0), ("pgbattery_raft_term", 7.0)],
+                &[
+                    ("pgbattery_raft_is_leader", 1.0),
+                    ("pgbattery_raft_term", 7.0),
+                ],
             ),
             probe_with_metrics(
                 "n2",
-                &[("pgbattery_raft_is_leader", 1.0), ("pgbattery_raft_term", 8.0)],
+                &[
+                    ("pgbattery_raft_is_leader", 1.0),
+                    ("pgbattery_raft_term", 8.0),
+                ],
             ),
         ];
         let checks = check_cluster_health(&probes);

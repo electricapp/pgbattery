@@ -42,7 +42,9 @@ pub async fn run_init(params: InitParams) -> Result<()> {
     // would bootstrap a cluster whose leader id reads as "unset" to every
     // tool (`cluster remove --self`, join's resume path).
     if node_id == 0 {
-        anyhow::bail!("--node-id 0 is reserved (join-time auto-assign sentinel); node IDs start at 1");
+        anyhow::bail!(
+            "--node-id 0 is reserved (join-time auto-assign sentinel); node IDs start at 1"
+        );
     }
 
     let output_path = Path::new(&output);
@@ -179,7 +181,10 @@ pub(super) fn write_config_atomic(path: &Path, contents: &str, force: bool) -> R
         file.sync_all()
             .map_err(|e| anyhow::anyhow!("Failed to fsync config: {e}"))?;
         std::fs::rename(&tmp_path, path).map_err(|e| {
-            anyhow::anyhow!("Failed to move config into place at {}: {e}", path.display())
+            anyhow::anyhow!(
+                "Failed to move config into place at {}: {e}",
+                path.display()
+            )
         })?;
         super::common::fsync_dir(dir).ok();
         Ok(())

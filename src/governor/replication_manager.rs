@@ -656,7 +656,10 @@ impl ReplicationManager {
     /// "we set the GUC" does not yet mean "a standby is sync". Evaluated once
     /// per reconcile tick, so verification retries naturally without stalling
     /// the loop during a slow transition.
-    fn sync_state_confirmed(repl_stats: &[ReplicationStat], expected_sync_names: &[String]) -> bool {
+    fn sync_state_confirmed(
+        repl_stats: &[ReplicationStat],
+        expected_sync_names: &[String],
+    ) -> bool {
         repl_stats
             .iter()
             .filter(|s| s.sync_state.is_sync())
@@ -1120,7 +1123,8 @@ mod tests {
     #[test]
     fn test_single_node_has_empty_sync_list() {
         for in_grace in [false, true] {
-            let (plan, fallback) = ReplicationManager::plan_sync_replication(&[], 0, true, in_grace);
+            let (plan, fallback) =
+                ReplicationManager::plan_sync_replication(&[], 0, true, in_grace);
             assert!(plan.is_empty());
             assert!(!fallback, "no standby exists whose ack we are giving up");
         }

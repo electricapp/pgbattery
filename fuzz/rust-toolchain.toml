@@ -1,0 +1,8 @@
+# Fuzzing requires a nightly toolchain: cargo-fuzz builds with
+# -Zsanitizer=address, which stable rustc rejects. This file overrides the
+# repo-root rust-toolchain.toml (1.96 stable) for everything under fuzz/,
+# because rustup resolves the nearest toolchain file to the current directory.
+# Keeping it here means `cd fuzz && cargo fuzz run` selects nightly in CI and
+# for local fuzzing alike, while the rest of the project stays on 1.96 stable.
+[toolchain]
+channel = "nightly"
