@@ -1,0 +1,25 @@
+[package]
+name = "pgbattery-supervisor"
+description = "PostgreSQL process supervision for pgbattery: start/stop/promote/demote, idempotent. No knowledge of Raft or the gateway."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pgbattery-core = { path = "../pgbattery-core" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+metrics = "0.24"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+flate2 = "1"
+tar = "0.4"
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

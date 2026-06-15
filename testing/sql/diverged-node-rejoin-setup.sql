@@ -1,0 +1,2 @@
+CREATE TABLE IF NOT EXISTS ci_rejoin(seq INT PRIMARY KEY);
+TRUNCATE ci_rejoin;

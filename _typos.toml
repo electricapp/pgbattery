@@ -1,0 +1,5 @@
+[files]
+extend-exclude = [
+    # Base64-encoded TLS test certificates trigger false positives
+    "src/governor/tls.rs",
+]

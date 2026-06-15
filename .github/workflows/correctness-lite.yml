@@ -1,0 +1,54 @@
+name: Correctness Lite
+
+on:
+  schedule:
+    - cron: "30 3 * * 0"  # Weekly, Sunday 3:30 AM UTC
+  workflow_dispatch:
+
+jobs:
+  correctness-lite:
+    name: Correctness Lite (durability + split-brain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_correctness_${{ github.run_id }}_${{ github.run_attempt }}
+      PGBATTERY_MANAGEMENT_API_TOKEN: test-token-ci
+      ARTIFACT_DIR: testing/artifacts/correctness-lite
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Build and start cluster
+        run: docker compose up -d --build
+
+      - name: Wait for cluster to bootstrap
+        run: |
+          echo "Waiting for cluster to be ready..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:9081/api/v1/cluster/leader > /dev/null 2>&1; then
+              echo "Cluster ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run Correctness Lite
+        run: ./testing/correctness_lite.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: correctness-lite-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/correctness-lite
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup docker compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans || true

@@ -1,0 +1,31 @@
+[package]
+name = "pgbattery-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pgbattery]
+path = ".."
+
+# Keep this crate as its own workspace so it does not conflict with the
+# parent package's compilation profile (cargo-fuzz needs opt-level = 3).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_lsn"
+path = "fuzz_targets/parse_lsn.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cluster_commands"
+path = "fuzz_targets/cluster_commands.rs"
+test = false
+doc = false

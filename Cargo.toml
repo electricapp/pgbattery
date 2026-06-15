@@ -1,0 +1,168 @@
+[workspace]
+members = [
+    ".",
+    "crates/pgbattery-core",
+    "crates/pgbattery-supervisor",
+]
+
+# Shared package metadata — single source of truth for every workspace
+# crate. Each crate's [package] inherits via `*.workspace = true`, so a
+# bump to (e.g.) rust-version 1.96 happens in one place.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+repository = "https://github.com/nbarbier-265/postgresha"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+# Extra rustc lints — crank it up.
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+meta_variable_misuse = "warn"
+unit_bindings = "warn"
+redundant_lifetimes = "warn"
+unused_import_braces = "warn"
+let_underscore_drop = "warn"
+non_ascii_idents = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Denies: correctness + no-panic discipline.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+mem_forget = "deny"
+# Cherry-picked restriction lints.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+unwrap_in_result = "warn"
+lossy_float_literal = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+verbose_file_reads = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+allow_attributes_without_reason = "warn"
+# Directly contradicts the (more valuable) rustc `unreachable_pub` lint, which
+# wants `pub(crate)` exactly where this wants `pub`. Not an escape hatch — the
+# two cannot both be satisfied, and we keep `unreachable_pub`.
+redundant_pub_crate = "allow"
+
+[package]
+name = "pgbattery"
+description = "PostgreSQL High-Availability Single Binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace crates (compile-time boundaries; see docs/STATE_MACHINE.md)
+pgbattery-core = { path = "crates/pgbattery-core" }
+pgbattery-supervisor = { path = "crates/pgbattery-supervisor" }
+
+# Async Runtime
+tokio = { version = "1", features = ["full", "tracing"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+# Pinned to the clap 4.6 family already in the lockfile (org policy: no deps
+# newer than 7 days). Used for `pgbattery completions` and `pgbattery man`.
+clap_complete = "=4.6.0"
+clap_mangen = "=0.2.24"
+
+# Protocol Parsing
+bytes = "1"
+pg_query = "6"
+
+# Consensus
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+
+# Storage (Pure Rust, ACID)
+redb = "4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1.1", features = ["alloc"] }
+
+# TLS (for SSL termination mode)
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# Utilities
+thiserror = "2"
+anyhow = "1"
+parking_lot = "0.12"
+dashmap = "6"
+sha2 = "0.11"
+# Verify-only ed25519/minisign signatures on self-upgrade artifacts. Pinned to
+# an established release (org policy: no deps newer than 7 days).
+minisign-verify = "=0.2.1"
+
+# HTTP client (for status command and management API)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+axum = "0.8"
+# Body-size limit + per-request timeout for the management API (DoS hardening).
+# Pinned to ~0.6.x; already transitively present via axum-0.8 → reqwest.
+tower-http = { version = "0.6", features = ["limit", "timeout"] }
+tower = "0.5"
+
+# Terminal
+terminal_size = "0.4"
+
+# Backup
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+flate2 = "1"
+tar = "0.4"
+walkdir = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "gateway"
+harness = false
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+# panic = "abort"  # Disabled: need catch_unwind for Redb corruption recovery
+
+[profile.release.build-override]
+opt-level = 3
+
+# Flamegraph / profiling: release optimisations + debuginfo for symbol resolution.
+# Usage: cargo flamegraph --profile profiling --bin pgbattery
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

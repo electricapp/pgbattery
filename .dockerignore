@@ -1,0 +1,29 @@
+target/
+tla/
+.git/
+.github/
+*.log
+pgbattery.long-type-*.txt
+testing/artifacts/
+testing/two_sync_capture.txt
+testing/two_sync_metrics_capture.txt
+
+# Build artifacts that bloat the build context
+README.pdf
+*.pdf
+
+# Python/dev tooling caches (testing/ uses uv)
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# IDE / editor / OS
+.idea/
+.vscode/
+.DS_Store
+.claude/
+
+# Demo assets aren't needed inside the container
+demo/
+docs/assets/

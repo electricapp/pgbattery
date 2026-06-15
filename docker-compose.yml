@@ -1,0 +1,155 @@
+# `name:` pins the Compose project name so container/network names are
+# `pgbattery-*` regardless of the on-disk folder. CI overrides this via
+# `COMPOSE_PROJECT_NAME` for per-run isolation.
+name: pgbattery
+
+services:
+  node1:
+    build: .
+    hostname: node1
+    # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
+    # — rapid failover triggering pg_rewind loops that each exit non-zero —
+    # never exhausts a finite restart budget and leaves the container dead.
+    # See BUGS.md history: the 5-retry cap caused permanent node loss on
+    # any chaos sequence that exceeded the budget. Verified by ci case
+    # `restart-budget-sustained-pg-death`.
+    restart: unless-stopped
+    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/node1.toml:/app/pgbattery.toml:ro
+      - node1_state:/var/lib/postgresql
+    ports:
+      - "5432:5432"   # Client connections
+      - "9091:9090"   # Metrics
+      - "9081:9091"   # Management API
+    environment:
+      # Use the in-binary default (info,openraft=warn,openraft::replication=error)
+      # — uncomment to crank up: RUST_LOG=info,pgbattery=debug
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.28.0.11
+
+  node2:
+    build: .
+    hostname: node2
+    # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
+    # — rapid failover triggering pg_rewind loops that each exit non-zero —
+    # never exhausts a finite restart budget and leaves the container dead.
+    # See BUGS.md history: the 5-retry cap caused permanent node loss on
+    # any chaos sequence that exceeded the budget. Verified by ci case
+    # `restart-budget-sustained-pg-death`.
+    restart: unless-stopped
+    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 2 --voter"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/node2.toml:/app/pgbattery.toml:ro
+      - node2_state:/var/lib/postgresql
+    ports:
+      - "5433:5432"
+      - "9092:9090"
+      - "9082:9091"   # Management API
+    environment:
+      # Use the in-binary default (info,openraft=warn,openraft::replication=error)
+      # — uncomment to crank up: RUST_LOG=info,pgbattery=debug
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.28.0.12
+
+  node3:
+    build: .
+    hostname: node3
+    # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
+    # — rapid failover triggering pg_rewind loops that each exit non-zero —
+    # never exhausts a finite restart budget and leaves the container dead.
+    # See BUGS.md history: the 5-retry cap caused permanent node loss on
+    # any chaos sequence that exceeded the budget. Verified by ci case
+    # `restart-budget-sustained-pg-death`.
+    restart: unless-stopped
+    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 3 --voter"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/node3.toml:/app/pgbattery.toml:ro
+      - node3_state:/var/lib/postgresql
+    ports:
+      - "5434:5432"
+      - "9093:9090"
+      - "9083:9091"   # Management API
+    environment:
+      # Use the in-binary default (info,openraft=warn,openraft::replication=error)
+      # — uncomment to crank up: RUST_LOG=info,pgbattery=debug
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.28.0.13
+
+  # Witness node — learner that joins the cluster for 2+1 topology tests.
+  # Only started when the "witness" profile is active (not part of default cluster).
+  witness:
+    build: .
+    hostname: witness
+    restart: "no"
+    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 4"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/node4.toml:/app/pgbattery.toml:ro
+      - witness_state:/var/lib/postgresql
+    ports:
+      - "5435:5432"
+      - "9095:9090"
+      - "9085:9091"   # Management API
+    environment:
+      # Use the in-binary default (info,openraft=warn,openraft::replication=error)
+      # — uncomment to crank up: RUST_LOG=info,pgbattery=debug
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.28.0.14
+    profiles: [witness]
+
+  # Chaos Monkey service (uncomment to enable)
+  # chaos:
+  #   image: gaiaadm/pumba
+  #   command: >
+  #     --interval 10s
+  #     --random
+  #     netem
+  #     --duration 5s
+  #     --delay 100ms
+  #     --loss 20
+  #     "re2:node.*"
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   networks:
+  #     - raft_net
+
+networks:
+  raft_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  node1_state:
+  node2_state:
+  node3_state:
+  witness_state:

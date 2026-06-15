@@ -1,0 +1,137 @@
+name: Elle Consistency Check
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly 03:00 UTC — full 7-attack matrix.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      attacks:
+        description: "Space-separated list of attacks (default: all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: elle-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
+  build-elle-jar:
+    name: Build Elle uberjar
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      jar-cache-key: ${{ steps.cache-key.outputs.value }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up OpenJDK 21
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Compute cache key
+        id: cache-key
+        run: |
+          KEY="elle-uberjar-${{ hashFiles('testing/elle_shim/project.clj', 'testing/elle_shim/src/**/*.clj') }}"
+          echo "value=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Cache uberjar
+        id: cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: testing/third_party/elle/elle-cli-standalone.jar
+          key: ${{ steps.cache-key.outputs.value }}
+
+      - name: Install Leiningen
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o /usr/local/bin/lein
+          chmod +x /usr/local/bin/lein
+          lein --version
+
+      - name: Build uberjar
+        run: ./testing/build_elle.sh
+
+      - name: Smoke test
+        run: |
+          java -jar testing/third_party/elle/elle-cli-standalone.jar \
+            rw-register testing/elle_shim/smoke_history.json
+
+      - name: Upload uberjar
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: elle-uberjar
+          path: testing/third_party/elle/elle-cli-standalone.jar
+          retention-days: 14
+
+  elle-matrix:
+    name: Elle × Attack Matrix
+    needs: build-elle-jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # PR runs only kill (~ 90 s). Nightly + manual run full matrix.
+      ATTACKS: ${{ github.event_name == 'pull_request' && 'kill' || (github.event.inputs.attacks || '') }}
+      COMPOSE_PROJECT_NAME: pgbha_elle_${{ github.run_id }}_${{ github.run_attempt }}
+      PGBATTERY_MANAGEMENT_API_TOKEN: ci-elle-token-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up OpenJDK 21
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download uberjar
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: elle-uberjar
+          path: testing/third_party/elle/
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Bring up pgbattery cluster
+        run: |
+          docker compose up -d --wait
+          # Give Raft a few seconds to elect.
+          sleep 5
+
+      - name: Run Elle matrix
+        run: |
+          if [ -n "$ATTACKS" ]; then
+            ./testing/run_elle_matrix.sh $ATTACKS
+          else
+            ./testing/run_elle_matrix.sh
+          fi
+
+      - name: Upload elle artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: elle-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/elle-*/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload elle summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: elle-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/elle-summary.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Tear down cluster
+        if: always()
+        run: docker compose down -v --remove-orphans || true

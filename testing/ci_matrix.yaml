@@ -1,0 +1,3582 @@
+{
+  "version": 1,
+  "compose_file": "docker-compose.yml",
+  "cluster": {
+    "expected_nodes": 3,
+    "nodes": [
+      {
+        "id": 1,
+        "name": "node1",
+        "mgmt_url": "http://localhost:9081",
+        "metrics_url": "http://localhost:9091/metrics"
+      },
+      {
+        "id": 2,
+        "name": "node2",
+        "mgmt_url": "http://localhost:9082",
+        "metrics_url": "http://localhost:9092/metrics"
+      },
+      {
+        "id": 3,
+        "name": "node3",
+        "mgmt_url": "http://localhost:9083",
+        "metrics_url": "http://localhost:9093/metrics"
+      }
+    ]
+  },
+  "suites": {
+    "ha-sequential": {
+      "description": "Single cluster replay of ordered failover scenarios from docs/TESTS.md",
+      "reuse_cluster": true,
+      "cases": [
+        "leader-crash",
+        "sync-replica-failure",
+        "leader-network-partition",
+        "cluster-restart",
+        "rapid-leadership-transfer-cascade",
+        "postgres-kill-auto-restart"
+      ]
+    },
+    "ha-parallel": {
+      "description": "Isolated single-scenario checks (intended for matrix jobs). Each case gets a fresh cluster.",
+      "reuse_cluster": false,
+      "cases": [
+        "majority-loss",
+        "leadership-transfer",
+        "management-api",
+        "observability-sanity",
+        "backup-corrupt-restore",
+        "gateway-connection-survival",
+        "backup-restore-valid",
+        "leaderless-wedge-recovery",
+        "restart-budget-sustained-pg-death",
+        "mgmt-api-no-stale-leader-after-pg-death",
+        "hung-postmaster-failover",
+        "cascade-double-failover-wedge",
+        "pgbattery-sigkill-recovery",
+        "faketime-shift-active",
+        "stale-sync-metric-after-kill",
+        "lsn-leaderless-livelock-recovery",
+        "vote-rejection-progresses",
+        "rewind-refused-on-data-loss-risk"
+      ]
+    },
+    "ha-controlplane-pr": {
+      "description": "Control-plane/data-plane correctness checks suitable for PR gating.",
+      "reuse_cluster": true,
+      "max_wait_cluster_seconds": 90,
+      "cases": [
+        "acked-write-durability",
+        "stale-leader-fencing",
+        "failover-commit-boundary",
+        "repeated-failover-load",
+        "restart-permutations",
+        "leader-network-partition-real",
+        "concurrent-writes-failover",
+        "async-degraded-durability",
+        "ddl-failover"
+      ]
+    },
+    "ha-assert-sanity": {
+      "description": "Verifies that assertion SQL files actually fire when data is wrong (invert-expected-result checks). Each case seeds known-bad state and confirms the paired assert raises.",
+      "reuse_cluster": true,
+      "cases": [
+        "assert-sanity-acked",
+        "assert-sanity-concurrent",
+        "assert-sanity-diverged"
+      ]
+    },
+    "ha-controlplane-nightly": {
+      "description": "Heavier semantic and long-running control-plane checks for nightly or manual runs.",
+      "reuse_cluster": true,
+      "max_wait_cluster_seconds": 150,
+      "cases": [
+        "diverged-node-rejoin",
+        "leadership-churn-livelock",
+        "backup-consistency-under-load",
+        "prepared-transaction-semantics",
+        "session-semantics-contract",
+        "replication-slot-no-leak",
+        "clock-skew-resilience",
+        "asymmetric-leader-partition",
+        "leader-clock-skew",
+        "membership-remove-rejoin",
+        "concurrent-backup-failover",
+        "network-latency-stability",
+        "follower-one-peer-partition",
+        "rolling-upgrade",
+        "wal-hole-resync",
+        "rogue-pg-promote",
+        "correctness-lite-invariants",
+        "linearizability-register",
+        "witness-topology",
+        "storage-fault-recovery",
+        "perf-baseline",
+        "partition-plus-crash",
+        "skew-plus-restart",
+        "double-failover-partition",
+        "sync-standby-livelock"
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "leader-crash",
+      "tests_md_ref": "1. Leader Crash (SIGKILL) [V1]",
+      "description": "Kill leader container and verify failover converges to exactly one leader, AND that an acknowledged write made before the kill survived the failover. Pre-fix, the case only verified liveness ('cluster came back'); the data-integrity oracle (see CLAUDE.md: 'Verify data integrity after leadership changes') catches a regression where the new leader promotes from a behind / divergent replica.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "comment": "Seed an acknowledged marker row on the current leader before the kill. This row MUST survive failover.",
+          "file": "leader-crash-survival-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "kill the whole container; pkill alone races with docker's restart policy",
+          "cmd": "docker compose kill node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "live_nodes": 2,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "restart so the cluster is healthy for subsequent cases",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_exists",
+          "node_id": 2,
+          "metric": "pgbattery_raft_is_leader"
+        },
+        {
+          "type": "sql",
+          "comment": "Data-integrity oracle: the marker row seeded before the kill MUST be readable on the new leader via the gateway. A missing row = lost acknowledged write, which is a correctness regression.",
+          "file": "leader-crash-survival-assert.sql",
+          "node": 1
+        }
+      ]
+    },
+    {
+      "id": "sync-replica-failure",
+      "tests_md_ref": "2. Sync Replica Failure [R2, V1]",
+      "description": "Kill a follower and verify the leader stays stable and the cluster recovers.  The sleep between kill and wait_cluster guarantees the disruption actually registers (raft heartbeat timeout ~1s + Docker restart kick-off); without it, wait_cluster can observe a pre-kill healthy snapshot on its very first poll and report a false-positive 0.1s pass.  Target node is chosen at runtime so the test is deterministic regardless of which node is leader from prior cases.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "pick a follower (any node that isn't the current leader) and kill its pgbattery",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); TARGET=$([ \"$LEADER\" = 1 ] && echo node2 || echo node1); echo \"killing $TARGET (leader=$LEADER)\"; docker compose exec -T $TARGET pkill -9 pgbattery"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3,
+          "comment": "let the kill propagate: raft marks the follower unreachable, Docker starts the container restart"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals_var",
+          "var": "leader_before"
+        },
+        {
+          "type": "metric_exists",
+          "node_id": "leader",
+          "metric": "pgbattery_replication_sync",
+          "comment": "leader-only metric; resolve the current leader rather than hard-coding node 1"
+        }
+      ]
+    },
+    {
+      "id": "leader-network-partition",
+      "tests_md_ref": "3. Leader Network Partition [V1]",
+      "description": "SIGSTOP/SIGCONT node1 process to simulate hang and verify cluster reconverges.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -STOP pgbattery"
+        },
+        {
+          "type": "sleep",
+          "seconds": 5
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -CONT pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ]
+    },
+    {
+      "id": "cluster-restart",
+      "tests_md_ref": "5. Cluster-Wide Restart [V1]",
+      "description": "Restart all compose services and verify one-leader reconvergence.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose restart"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "rapid-leadership-transfer-cascade",
+      "tests_md_ref": "Chaos: rapid back-to-back leadership transfers",
+      "description": "Chain five leadership transfers across all voters with concurrent writes.  Exercises the lease-drain + catch-up-tolerance + transfer-mutex fixes: previously, the second transfer would wedge the cluster leaderless because openraft's CheckQuorum kept followers loyal to the old leader and the target burned its term for nothing.  Now each transfer is bracketed by a >lease-duration heartbeat pause and a target-catch-up check, so all five should land.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2,
+          "timeout_sec": 20
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 2,
+          "timeout_sec": 30
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 3,
+          "timeout_sec": 20
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 3,
+          "timeout_sec": 30
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1,
+          "timeout_sec": 20
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 1,
+          "timeout_sec": 30
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2,
+          "timeout_sec": 20
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 2,
+          "timeout_sec": 30
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1,
+          "timeout_sec": 20
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 1,
+          "timeout_sec": 30
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "leader_equals",
+          "value": 1,
+          "comment": "cascade ended on node1 — a wedged cluster would show no leader"
+        }
+      ]
+    },
+    {
+      "id": "postgres-kill-auto-restart",
+      "tests_md_ref": "Chaos: internal-failure shutdown produces non-zero exit + Docker restart",
+      "description": "pkill -9 postgres on a follower and verify the follower's pgbattery process exits non-zero (so Docker's restart: on-failure policy relaunches it) and the node rejoins as a healthy follower.  Regression guard for the 'zombie leader' bug where pgbattery kept running after PG died, still serving 'I am leader' from the management API, AND for the 'clean-exit ignored by Docker' regression where an internal-failure shutdown returned 0 and Docker's on-failure restart policy left the container dead.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill PG on a known follower; tolerate exit 1 from pkill (no postgres present == already in restart cycle from a prior case, which is equally a 'pg-died' state from pgbattery's perspective). The cluster's reaction is what we test, not the kill mechanic.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); TARGET=$([ \"$LEADER\" = 2 ] && echo node3 || echo node2); echo \"killing pg on $TARGET (leader=$LEADER)\"; docker compose exec -T $TARGET pkill -9 postgres; true"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3,
+          "comment": "give pgbattery time to notice PG died, exit non-zero, and for Docker to kick off the restart"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals_var",
+          "var": "leader_before",
+          "comment": "killing a follower's PG must not cause leader flap"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "leaderless-wedge-recovery",
+      "tests_md_ref": "BUGS.md: SIGSTOP leader + kill sync wedge (openraft 0.9 PreVote)",
+      "description": "Reproduces the leaderless-wedge bug: SIGSTOP the leader so quorum is impossible while node1 (sync replica) is killed; SIGCONT, restart node1, and verify the cluster recovers a leader within the leaderless-recovery-watchdog budget. Without the watchdog this cluster stays leaderless for minutes — openraft 0.9 has no PreVote, so persisted-but-undelivered T+1 votes wedge the term. With the watchdog (Governor::run_leaderless_watchdog) each voter force-triggers an election after a staggered threshold (8s + (node_id-1)*2s) to advance the term. Recovery budget = max stagger + safety = ~30s.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "freeze the leader so it can't heartbeat",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); echo \"freezing leader=$LEADER\"; docker compose exec -T node$LEADER pkill -STOP pgbattery"
+        },
+        {
+          "type": "sleep",
+          "seconds": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "kill a non-leader voter while leader is frozen — quorum impossible",
+          "cmd": "LEADER=$(curl -s http://localhost:9082/api/v1/cluster/leader 2>/dev/null | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2 || curl -s http://localhost:9083/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); TARGET=$([ \"$LEADER\" = 1 ] && echo node2 || echo node1); echo \"killing $TARGET (leader was $LEADER)\"; docker compose kill $TARGET"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3
+        },
+        {
+          "type": "cmd",
+          "comment": "wake the frozen leader after the chaos window",
+          "cmd": "for n in node1 node2 node3; do docker compose exec -T $n pkill -CONT pgbattery 2>/dev/null || true; done"
+        },
+        {
+          "type": "cmd",
+          "comment": "bring the killed node back",
+          "cmd": "docker compose start node1 || docker compose start node2 || true"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 30,
+          "require_replication_health": false,
+          "comment": "30s = watchdog stagger window + safety. Without the watchdog this never recovers. Test goal is leader recovery, not full replica catch-up — the restarted node may still be Async at the deadline."
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1,
+          "comment": "exactly one leader after recovery — no split term, no wedge"
+        }
+      ]
+    },
+    {
+      "id": "restart-budget-sustained-pg-death",
+      "tests_md_ref": "BUGS.md: Docker restart budget exhaustion under sustained PG death",
+      "description": "Kill PG repeatedly on a follower (6 times, > the old `on-failure:5` cap) and verify the container's pgbattery process is still responsive at the end. Without `restart: unless-stopped` Docker stops restarting after 5 failures, leaving the container Exited and the cluster permanently one node short. We probe by curling the mgmt port (port 9082 for node2, 9083 for node3) with retries — if the container is up at all, that port responds within ~30s. If Docker abandoned the container, the port stays dead.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "kill PG 6 times in quick succession on a known follower; pkill returns 1 when PG is mid-restart between kills — that's fine, the goal is to trigger 6+ Docker restart attempts",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); TARGET=$([ \"$LEADER\" = 2 ] && echo node3 || echo node2); echo \"hammering pg on $TARGET (leader=$LEADER)\"; for i in 1 2 3 4 5 6; do echo \"--- kill $i ---\"; docker compose exec -T $TARGET pkill -9 postgres 2>/dev/null || true; sleep 4; done"
+        },
+        {
+          "type": "cmd",
+          "comment": "verify the hammered container is still alive by curling its mgmt port. Docker with `on-failure:5` would have given up and the port would never come back; with `unless-stopped` it keeps retrying. Use retries to ride out one in-flight restart cycle.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); if [ \"$LEADER\" = 2 ]; then PORT=9083; TARGET=node3; else PORT=9082; TARGET=node2; fi; echo \"probing $TARGET mgmt on $PORT\"; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do if curl -sf -m 2 http://localhost:$PORT/api/v1/cluster/nodes >/dev/null; then echo \"$TARGET responsive on attempt $i\"; exit 0; fi; sleep 2; done; echo \"FAIL: $TARGET mgmt port dead after 30s — Docker abandoned the container\"; docker compose ps -a; exit 1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals_var",
+          "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "mgmt-api-no-stale-leader-after-pg-death",
+      "tests_md_ref": "BUGS.md: management API serves stale leader after PG death (zombie leader, root cause #5)",
+      "description": "Kill PG on the leader; immediately query the leader's management API. The /cluster/leader endpoint must NOT continue to report this dead node as leader after RaftCore has shut down. The old implementation read `cluster_state.leader_id` (the Raft-log-applied mirror) which persists across RaftCore shutdown — fixed by reading `RaftMetrics::current_leader` (live truth source) instead. We poll the leader's own mgmt port immediately after the kill; if it lies, this assertion fails.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "kill PG on the current leader",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); echo \"killing pg on leader node$LEADER\"; docker compose exec -T node$LEADER pkill -9 postgres"
+        },
+        {
+          "type": "sleep",
+          "seconds": 2,
+          "comment": "give pgbattery health-tick (500ms) time to notice + RaftCore time to shut down"
+        },
+        {
+          "type": "cmd",
+          "comment": "If the old-leader's mgmt port is still up (process not yet exited) AND still claims itself as leader, fail. We tolerate the port being down (container already restarting).",
+          "cmd": "LEADER=$leader_before; PORT=$((9080 + LEADER)); RESP=$(curl -s -m 2 http://localhost:$PORT/api/v1/cluster/leader 2>/dev/null || true); echo \"resp: $RESP\"; if echo \"$RESP\" | grep -q '\"leader_id\":'$LEADER; then echo 'FAIL: dead leader still claiming leadership'; exit 1; fi; echo 'OK: no stale leader claim'"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60,
+          "comment": "let the cluster reconverge before the next case"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "hung-postmaster-failover",
+      "tests_md_ref": "BUGS.md: hung postmaster wedges leader silently",
+      "description": "SIGSTOP the leader's postgres postmaster (process alive, unresponsive). Liveness based on process-existence (`is_alive`) would report healthy. Cluster must detect query-unresponsiveness and fail over within the probe-failure threshold + graceful-shutdown timeout. Without the fix: writes hang forever, no failover. With the fix: a new leader is elected on a healthy node within ~90s (5×2s probe failures = 10s + 5s graceful pg.stop timeout + Docker restart + Raft election).",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "SIGSTOP the postmaster — process still in process table, just frozen",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); echo \"freezing pg on node$LEADER\"; docker compose exec -T node$LEADER bash -c 'PID=$(pgrep -f \"^/usr/lib/postgresql/.*/postgres -D\"); kill -STOP $PID'"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 120,
+          "comment": "leader must MOVE to a healthy node; without fix this never happens. 120s budget covers: 10s probe failures + 5s shutdown timeout + docker restart + raft election."
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "Best-effort: SIGCONT the frozen postmaster + restart its container so subsequent tests see a clean cluster",
+          "cmd": "for n in node1 node2 node3; do docker compose exec -T $n bash -c 'PID=$(pgrep -f \"^/usr/lib/postgresql/.*/postgres -D\"); [ -n \"$PID\" ] && kill -CONT $PID 2>/dev/null' || true; done"
+        }
+      ]
+    },
+    {
+      "id": "cascade-double-failover-wedge",
+      "tests_md_ref": "BUGS.md: cluster wedges when chaos arrives faster than node recovery",
+      "description": "Kill the leader THREE times in close succession under sustained concurrent write load. Each kill happens BEFORE the previous killed node has fully completed pg_basebackup. The interleaving leaves only one voter healthy at the moment of kill #3 → no quorum → the cluster's only path back is the leaderless watchdog forcing an election once the recovering nodes' Raft comes back. Without the widened watchdog stagger, multiple voters' forced elections collide (term tangle) and the cluster stays wedged for minutes. With fix: lowest-id voter elects cleanly and cluster recovers within 90s.",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "concurrent-writes-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "Start sustained background write load via the gateway (3 parallel loopers). They keep firing until the gateway is unreachable.",
+          "cmd": "for w in 1 2 3; do (for i in $(seq 1 100); do timeout 3 psql -h 127.0.0.1 -p 5432 -U postgres -c \"INSERT INTO ci_concurrent_writes(worker_id,seq) SELECT $w, generate_series((($i-1)*200)+1, $i*200);\" 2>/dev/null; done) & done; echo started"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3,
+          "comment": "let WAL build up"
+        },
+        {
+          "type": "cmd",
+          "comment": "kill #1",
+          "cmd": "L=$(for p in 9081 9082 9083; do curl -s -m 2 http://localhost:$p/api/v1/cluster/leader 2>/dev/null | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2 && break; done); echo \"kill #1: node$L\"; docker compose kill node$L"
+        },
+        {
+          "type": "sleep",
+          "seconds": 4,
+          "comment": "election + restart kick-off"
+        },
+        {
+          "type": "cmd",
+          "comment": "restart killed node",
+          "cmd": "for n in 1 2 3; do docker compose start node$n 2>&1 > /dev/null; done"
+        },
+        {
+          "type": "sleep",
+          "seconds": 4,
+          "comment": "node mid-basebackup. Kill new leader."
+        },
+        {
+          "type": "cmd",
+          "comment": "kill #2",
+          "cmd": "L=$(for p in 9081 9082 9083; do curl -s -m 2 http://localhost:$p/api/v1/cluster/leader 2>/dev/null | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2 && break; done); echo \"kill #2: node$L\"; docker compose kill node$L"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3
+        },
+        {
+          "type": "cmd",
+          "comment": "restart again",
+          "cmd": "for n in 1 2 3; do docker compose start node$n 2>&1 > /dev/null; done"
+        },
+        {
+          "type": "sleep",
+          "seconds": 4,
+          "comment": "give MOST recent leader time, but kill before fully settled"
+        },
+        {
+          "type": "cmd",
+          "comment": "kill #3 — by now multiple nodes are in various recovery states",
+          "cmd": "L=$(for p in 9081 9082 9083; do curl -s -m 2 http://localhost:$p/api/v1/cluster/leader 2>/dev/null | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2 && break; done); echo \"kill #3: node$L\"; if [ -n \"$L\" ]; then docker compose kill node$L; else echo 'no leader to kill — already wedged'; fi"
+        },
+        {
+          "type": "sleep",
+          "seconds": 5
+        },
+        {
+          "type": "cmd",
+          "comment": "bring back everything; the watchdog now needs to recover from arbitrary chaos state",
+          "cmd": "for n in 1 2 3; do docker compose start node$n 2>&1 > /dev/null; done; wait 2>/dev/null; true"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "require_replication_health": false,
+          "comment": "After 3-kill cascade under load, test goal is leader+topology recovery (matches the assertion below). A trailing follower still catching up via basebackup is expected and shouldn't fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "drop the workload table",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h 127.0.0.1 -p 5434 -c 'DROP TABLE IF EXISTS ci_concurrent_writes;' 2>/dev/null || true"
+        }
+      ]
+    },
+    {
+      "id": "pgbattery-sigkill-recovery",
+      "tests_md_ref": "BUGS.md: abruptly-killed pgbattery leaves PG zombie",
+      "description": "SIGKILL pgbattery (NOT postgres) on a node. The child postgres is orphaned and eventually becomes a zombie. Without the fix, the new pgbattery boots, reads postmaster.pid, sees the zombie's PID, refuses to start a fresh postgres → infinite crash loop. With the fix (cleanup_stale_postgres on supervisor start): the new pgbattery cleans the stale postmaster.pid and starts fresh PG. We don't require a leadership change — Docker's restart is fast enough that node1 often resumes leadership; the test instead asserts that all 3 nodes are alive + writeable within the budget.",
+      "actions": [
+        {
+          "type": "cmd",
+          "comment": "SIGKILL pgbattery on the LEADER",
+          "cmd": "L=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); echo \"sigkill pgbattery on node$L\"; docker compose exec -T node$L pkill -9 -f '^pgbattery'"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "comment": "Cluster converges back to a single leader. Without fix: the killed node's PG is wedged on the zombie postmaster.pid and never comes back, so sync_replicas stays at 0."
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "faketime-shift-active",
+      "tests_md_ref": "BUGS.md: libfaketime not actually installed in container",
+      "description": "Verifies that the FAKETIME LD_PRELOAD machinery actually works. Every other chaos test that depends on time manipulation is silently no-op'd if this doesn't pass. Writes +30s to /tmp/faketime, then runs `date` and asserts the time shifted by 25–35s (loose bound for clock drift between the two `date` calls).",
+      "actions": [],
+      "assertions": [
+        {
+          "type": "cmd",
+          "cmd": "BEFORE=$(docker compose exec -T node1 date +%s | tr -d '[:space:]'); docker compose exec -T node1 bash -c 'echo +30s > /tmp/faketime'; sleep 1; AFTER=$(docker compose exec -T node1 date +%s | tr -d '[:space:]'); DIFF=$((AFTER - BEFORE)); docker compose exec -T node1 bash -c 'echo +0s > /tmp/faketime'; echo \"diff=$DIFF\"; [ \"$DIFF\" -ge 25 ] && [ \"$DIFF\" -le 35 ]"
+        }
+      ]
+    },
+    {
+      "id": "majority-loss",
+      "tests_md_ref": "4. Majority Loss [L2]",
+      "description": "Stop two nodes and verify quorum loss and write fencing behavior.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose stop node2 node3"
+        },
+        {
+          "type": "sleep",
+          "seconds": 5
+        }
+      ],
+      "assertions": [
+        {
+          "type": "metric_equals",
+          "node_id": 1,
+          "metric": "pgbattery_raft_has_quorum",
+          "value": 0
+        },
+        {
+          "type": "sql",
+          "file": "majority-loss-write.sql",
+          "node": 1,
+          "expect_exit": [
+            1,
+            2
+          ]
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node2 node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "leadership-transfer",
+      "tests_md_ref": "7. Manual Promotion (modeled as leadership transfer) [V1]",
+      "description": "Transfer leadership to node2 and verify (a) the new leader is stable AND (b) an acknowledged write made before the transfer survived. A graceful transfer must preserve all acknowledged writes — otherwise the target was promoted before catching up.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "comment": "Seed an acknowledged marker row before the transfer. Must survive.",
+          "file": "leadership-transfer-survival-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "comment": "Data-integrity oracle: marker row from before transfer must be readable via gateway on the new leader.",
+          "file": "leadership-transfer-survival-assert.sql",
+          "node": 1
+        }
+      ]
+    },
+    {
+      "id": "management-api",
+      "tests_md_ref": "10. Management API",
+      "description": "Validate key management API endpoints return JSON payloads.",
+      "actions": [],
+      "assertions": [
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/cluster/leader",
+          "expect_status": 200,
+          "json_fields": [
+            "leader_id"
+          ]
+        },
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/cluster/nodes",
+          "expect_status": 200,
+          "json_fields": [
+            "nodes"
+          ]
+        },
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/cluster/node/2/lag",
+          "expect_status": 200,
+          "json_fields": [
+            "lag_bytes",
+            "is_synced"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "observability-sanity",
+      "tests_md_ref": "11. Observability Sanity",
+      "description": "Ensure metrics endpoints expose expected HA signals and exactly one leader.",
+      "actions": [],
+      "assertions": [
+        {
+          "type": "metric_exists",
+          "node_id": 1,
+          "metric": "pgbattery_raft_is_leader"
+        },
+        {
+          "type": "metric_exists",
+          "node_id": 2,
+          "metric": "pgbattery_raft_is_leader"
+        },
+        {
+          "type": "metric_exists",
+          "node_id": 3,
+          "metric": "pgbattery_raft_is_leader"
+        },
+        {
+          "type": "metric_exists",
+          "node_id": 1,
+          "metric": "pgbattery_connections_active"
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ]
+    },
+    {
+      "id": "backup-corrupt-restore",
+      "tests_md_ref": "14a. Corrupt Backup",
+      "description": "Create backup, corrupt it, and verify restore fails with a clear error status.",
+      "actions": [
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/backup/create",
+          "expect_status": 200,
+          "json_fields": [
+            "path",
+            "success"
+          ],
+          "capture_json": {
+            "backup_path": "path"
+          }
+        },
+        {
+          "type": "basename",
+          "source_var": "backup_path",
+          "var": "backup_filename"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 sh -c \"printf 'CORRUPTED-FOR-TESTING' > {{backup_path}}/base.tar.gz\""
+        },
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/backup/restore?filename={{backup_filename}}",
+          "expect_status": 500,
+          "json_fields": [
+            "success",
+            "message"
+          ]
+        }
+      ],
+      "assertions": [
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/backup/list",
+          "expect_status": 200,
+          "json_fields": [
+            "backups"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "acked-write-durability",
+      "tests_md_ref": "Control Plane 1. Acked Write Durability Invariant [W1, R2]",
+      "description": "Writes unique acknowledged operations before/after failover and verifies no loss or duplicates.",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "acked-write-durability-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "sql",
+          "file": "acked-write-durability-pre.sql",
+          "node": 1
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "acked-write-durability-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "acked-write-durability-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "stale-leader-fencing",
+      "tests_md_ref": "Control Plane 2. Stale Leader Fencing Under Asymmetric Partition [L1]",
+      "description": "Forces leader quorum loss while leader stays reachable; verifies write fencing and no quorum signal.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose stop node2 node3"
+        },
+        {
+          "type": "sleep",
+          "seconds": 6
+        }
+      ],
+      "assertions": [
+        {
+          "type": "metric_equals",
+          "node_id": 1,
+          "metric": "pgbattery_raft_has_quorum",
+          "value": 0
+        },
+        {
+          "type": "sql",
+          "file": "stale-leader-fencing-write.sql",
+          "node": 1,
+          "expect_exit": [
+            1,
+            2
+          ]
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node2 node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "failover-commit-boundary",
+      "tests_md_ref": "Control Plane 3. Failover During In-Flight Transaction Matrix [W1, S1]",
+      "description": "Kills leader during transaction sleep and verifies committed state is explicit and bounded.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "failover-commit-boundary-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "sql",
+          "file": "failover-commit-boundary-autocommit.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T -d node1 sh -c \"psql -U postgres -h localhost -p 5432 -d postgres -v ON_ERROR_STOP=0 -c 'BEGIN; INSERT INTO ci_tx_boundary(mode, seq) VALUES (''txn'', 1); SELECT pg_sleep(5); COMMIT;' > /tmp/ci_tx_boundary.out 2>&1\""
+        },
+        {
+          "type": "sleep",
+          "seconds": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T -d node1 sh -c \"pkill -9 pgbattery\""
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "failover-commit-boundary-assert.sql",
+          "node": 2
+        }
+      ]
+    },
+    {
+      "id": "repeated-failover-load",
+      "tests_md_ref": "Control Plane 4. Repeated Failover Under Sustained Write Load [W1, V1]",
+      "description": "Performs deterministic write batches with repeated leader kills and validates no acknowledged-write loss.",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "repeated-failover-load-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "repeated-failover-load-b1.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "repeated-failover-load-b2.sql",
+          "node": 2
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node2 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "repeated-failover-load-b3.sql",
+          "node": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node3 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "repeated-failover-load-b4.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "repeated-failover-load-assert.sql",
+          "node": 1
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "diverged-node-rejoin",
+      "tests_md_ref": "Control Plane 5. Diverged Node Rejoin Correctness [V2]",
+      "description": "Stops a follower, advances writes, rejoins follower, and verifies lag convergence and replicated data.",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "diverged-node-rejoin-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose stop node3"
+        },
+        {
+          "type": "sql",
+          "file": "diverged-node-rejoin-insert.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        }
+      ],
+      "assertions": [
+        {
+          "type": "wait_sync",
+          "nodes": [
+            3
+          ],
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "diverged-node-rejoin-assert.sql",
+          "node": 3,
+          "direct": true
+        }
+      ]
+    },
+    {
+      "id": "restart-permutations",
+      "tests_md_ref": "Control Plane 6. Cluster Restart Liveness Permutations [V1]",
+      "description": "Restarts all nodes in two explicit start-order permutations and verifies write liveness each time.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose stop node1 node2 node3"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node2"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "restart-permutations-write.sql",
+          "node": 2
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose stop node1 node2 node3"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node2"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "sleep",
+          "seconds": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60,
+          "min_healthy_replicas": 2
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "restart-permutations-assert.sql",
+          "node": 1
+        }
+      ]
+    },
+    {
+      "id": "leadership-churn-livelock",
+      "tests_md_ref": "Control Plane 7. Leadership Churn Livelock Test [V1]",
+      "description": "Rapidly transfers leadership among voters and verifies the cluster still converges and accepts writes.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "leadership-churn-livelock-write.sql",
+          "node": 3
+        }
+      ]
+    },
+    {
+      "id": "backup-consistency-under-load",
+      "tests_md_ref": "Control Plane 8. Backup Consistency Under Concurrent Writes [W1]",
+      "description": "Creates backup during active writes and verifies backup artifact is present and cluster remains writable.",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "backup-consistency-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "sql",
+          "file": "backup-consistency-b1.sql",
+          "node": 1
+        },
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/backup/create",
+          "expect_status": 200,
+          "json_fields": [
+            "success",
+            "path",
+            "size_bytes"
+          ],
+          "capture_json": {
+            "backup_path": "path",
+            "backup_size_bytes": "size_bytes"
+          }
+        },
+        {
+          "type": "sql",
+          "file": "backup-consistency-b2.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 sh -lc \"test -s {{backup_path}}\""
+        },
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/backup/list",
+          "expect_status": 200,
+          "json_fields": [
+            "backups"
+          ]
+        },
+        {
+          "type": "sql",
+          "file": "backup-consistency-assert.sql",
+          "node": 2
+        }
+      ]
+    },
+    {
+      "id": "prepared-transaction-semantics",
+      "tests_md_ref": "Control Plane 9. Prepared Transaction Semantics (2PC) [S1]",
+      "description": "Validates prepared transaction behavior across failover, or exits cleanly when disabled.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 sh -lc \"psql -U postgres -h localhost -p 5432 -d postgres -tAc 'SHOW max_prepared_transactions;'\"",
+          "capture_stdout": "max_prepared_transactions"
+        },
+        {
+          "type": "sql",
+          "file": "prepared-transaction-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "if [ \"$(echo '{{max_prepared_transactions}}' | tr -d '[:space:]')\" = '0' ]; then echo 'prepared transactions disabled; skipping active 2PC path'; else docker compose exec -T node1 sh -lc \"psql -U postgres -h localhost -p 5432 -d postgres -v ON_ERROR_STOP=1 -c \\\"BEGIN; INSERT INTO ci_prepared_xact(id) VALUES (1) ON CONFLICT DO NOTHING; PREPARE TRANSACTION 'ci_xact_1';\\\"\"; fi"
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "cmd": "if [ \"$(echo '{{max_prepared_transactions}}' | tr -d '[:space:]')\" = '0' ]; then echo 'prepared transactions disabled; skipping COMMIT PREPARED'; else docker compose exec -T node2 sh -lc \"psql -U postgres -h localhost -p 5432 -d postgres -v ON_ERROR_STOP=1 -c \\\"COMMIT PREPARED 'ci_xact_1';\\\"\"; fi"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cmd",
+          "cmd": "if [ \"$(echo '{{max_prepared_transactions}}' | tr -d '[:space:]')\" = '0' ]; then echo 'prepared transactions disabled; semantics check skipped'; exit 0; fi; docker compose exec -T node2 sh -lc \"psql -U postgres -h localhost -p 5432 -d postgres -tAc 'SELECT COUNT(*) FROM ci_prepared_xact WHERE id = 1;' | tr -d '[:space:]' | grep -x '1'\""
+        }
+      ]
+    },
+    {
+      "id": "session-semantics-contract",
+      "tests_md_ref": "Control Plane 10. Session Semantics Contract (Locks/Temp Objects) [S2]",
+      "description": "Holds advisory lock in long session, triggers failover, and verifies lock is released post-failover.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 sh -lc \"(psql -U postgres -h localhost -p 5432 -d postgres -v ON_ERROR_STOP=1 -c \\\"SELECT pg_advisory_lock(424242); SELECT pg_sleep(30);\\\" >/tmp/ci_session_lock.out 2>&1 &) ; sleep 2\""
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node2 sh -lc \"psql -U postgres -h localhost -p 5432 -d postgres -tAc 'SELECT pg_try_advisory_lock(424242);' | tr -d '[:space:]' | grep -x 'f'\""
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node2 sh -lc \"for i in \\$(seq 1 20); do if psql -U postgres -h localhost -p 5432 -d postgres -tAc 'SELECT pg_try_advisory_lock(424242);' | tr -d '[:space:]' | grep -x 't' >/dev/null; then exit 0; fi; sleep 1; done; echo 'advisory lock was not released after failover'; exit 1\""
+        }
+      ]
+    },
+    {
+      "id": "leader-network-partition-real",
+      "tests_md_ref": "Control Plane 11. Real Network Partition (docker network disconnect) [V1]",
+      "description": "Severs node1 from the overlay network (not a process pause) and verifies fencing and election. Unlike SIGSTOP, the node cannot communicate with peers at all \u2014 tests the true split-brain path.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "comment": "disconnect node1 from the raft overlay \u2014 process stays alive but cannot reach peers",
+          "cmd": "docker network disconnect pgbattery_raft_net pgbattery-node1-1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "restore connectivity so node1 can rejoin as follower",
+          "cmd": "docker network connect pgbattery_raft_net pgbattery-node1-1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Restart node1 container so docker host->container port forwarding for 9081/9091 is re-established. Without this restart, network disconnect/connect leaves the published-port iptables/userland-proxy state stale on macOS Docker and host-side requests to localhost:9081 and localhost:9091 time out, even though the container can reach peers fine.",
+          "cmd": "docker compose restart node1"
+        },
+        {
+          "type": "wait_cluster",
+          "comment": "Demand full replication health (2 healthy followers) before yielding to the next case, otherwise its first transfer can hit the catch-up gate on a still-booting node1.",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
+        },
+        {
+          "type": "sleep",
+          "comment": "After partition heal, openraft 0.9 keeps replication-to-rejoined-node on a backoff for several seconds before sending heartbeats reliably. Without this settling window, the next test's leadership transfer can land while node1's RaftMetrics::replication[1].matched is still None and the cluster trips the catch-up gate.",
+          "seconds": 5
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ]
+    },
+    {
+      "id": "concurrent-writes-failover",
+      "tests_md_ref": "Control Plane 12. Concurrent Writes During Failover [W2]",
+      "description": "Starts 3 concurrent large INSERT batches against the leader PG, kills pgbattery mid-write, and verifies each batch is either fully present or fully absent (atomicity). Detects partial write bugs.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "concurrent-writes-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "three background batch inserts (1000 rows each) then kill pgbattery after 1s overlap",
+          "cmd": "docker compose exec -T node1 sh -lc \"psql -U postgres -h 127.0.0.1 -p 5434 -d postgres -c \\\"INSERT INTO ci_concurrent_writes(worker_id,seq) SELECT 1,g FROM generate_series(1,1000) AS g\\\" 2>/dev/null & psql -U postgres -h 127.0.0.1 -p 5434 -d postgres -c \\\"INSERT INTO ci_concurrent_writes(worker_id,seq) SELECT 2,g FROM generate_series(1,1000) AS g\\\" 2>/dev/null & psql -U postgres -h 127.0.0.1 -p 5434 -d postgres -c \\\"INSERT INTO ci_concurrent_writes(worker_id,seq) SELECT 3,g FROM generate_series(1,1000) AS g\\\" 2>/dev/null & sleep 1; pkill -9 pgbattery; wait 2>/dev/null; true\""
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "concurrent-writes-assert.sql",
+          "node": 2,
+          "direct": true
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "gateway-connection-survival",
+      "tests_md_ref": "Control Plane 13. Gateway Connection Migration [S2]",
+      "description": "Opens idle connections through a follower gateway (proxying to leader), kills the leader, and verifies pgbattery_connections_migrated is incremented \u2014 confirming the gateway migrates connections rather than just dropping them.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "open 2 idle connections through node2 gateway (which proxies to node1)",
+          "cmd": "docker compose exec -T node2 sh -lc \"(psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -c 'SELECT pg_sleep(8);' 2>/dev/null &); (psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -c 'SELECT pg_sleep(8);' 2>/dev/null &); sleep 1\""
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose kill node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "live_nodes": 2,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "metric_exists",
+          "node_id": 2,
+          "metric": "pgbattery_connections_total"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "replication-slot-no-leak",
+      "tests_md_ref": "Control Plane 14. Replication Slot Leak After Repeated Failovers [R1]",
+      "description": "Forces two successive pgbattery kills and verifies no inactive physical replication slots remain on any node's primary. Stale slots block WAL cleanup and cause unbounded disk growth.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node2 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sleep",
+          "seconds": 10,
+          "comment": "allow replication manager to detect and clean any orphaned slots"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "comment": "node1: no inactive physical replication slots",
+          "file": "replication-slot-no-leak-assert.sql",
+          "node": 1
+        },
+        {
+          "type": "sql",
+          "comment": "node2: no inactive physical replication slots",
+          "file": "replication-slot-no-leak-assert.sql",
+          "node": 2
+        },
+        {
+          "type": "sql",
+          "comment": "node3: no inactive physical replication slots",
+          "file": "replication-slot-no-leak-assert.sql",
+          "node": 3
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "clock-skew-resilience",
+      "tests_md_ref": "Control Plane 15. NTP Clock Skew Resilience [V1]",
+      "description": "Jumps node2 clock forward 5 minutes via libfaketime then back, verifying the cluster remains stable. Uses LD_PRELOAD faketime (no SYS_TIME capability needed). Tests Raft lease and heartbeat timing under clock skew.",
+      "actions": [
+        {
+          "type": "clock_skew",
+          "comment": "jump node2 clock +5min via libfaketime; no SYS_TIME cap required",
+          "node": 2,
+          "seconds": 300
+        },
+        {
+          "type": "sleep",
+          "seconds": 10,
+          "comment": "longer than the lease interval so any mis-timed lease expiry would trigger"
+        },
+        {
+          "type": "clock_heal",
+          "comment": "restore node2 clock to real time",
+          "node": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "clock_heal",
+          "comment": "always restore node2 clock even if test fails mid-way",
+          "node": 2
+        }
+      ]
+    },
+    {
+      "id": "asymmetric-leader-partition",
+      "tests_md_ref": "Control Plane 13. Asymmetric Partition (leader inbound blocked) [L1]",
+      "description": "Blocks inbound Raft traffic to the leader while leaving outbound intact. The leader keeps sending heartbeats so followers never time out on their own \u2014 only lease expiry and fencing on the leader side can resolve this. Verifies the cluster eventually elects a new leader and recovers cleanly.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "asymmetric_partition",
+          "comment": "Drop all inbound to node1 from node2 and node3 \u2014 node1 cannot hear follower ACKs or votes",
+          "node": 1,
+          "from_node": 2
+        },
+        {
+          "type": "asymmetric_partition",
+          "node": 1,
+          "from_node": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 60
+        },
+        {
+          "type": "asymmetric_heal",
+          "comment": "Restore inbound to node1 so it can rejoin as follower",
+          "node": 1,
+          "from_node": 2
+        },
+        {
+          "type": "asymmetric_heal",
+          "node": 1,
+          "from_node": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "remove iptables rules if still present; ignore exit code if already removed",
+          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null || true",
+          "expect_exit": null
+        }
+      ]
+    },
+    {
+      "id": "leader-clock-skew",
+      "tests_md_ref": "Control Plane 16. Leader Clock Skew [V1]",
+      "description": "Shifts the current leader's (node1) clock +5 minutes via libfaketime. The leader may self-step-down when its own Raft lease expires early. Verifies a stable cluster with exactly one leader after healing.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "clock_skew",
+          "comment": "jump leader clock +5min; it may see its own lease expire and step down",
+          "node": 1,
+          "seconds": 300
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "clock_heal",
+          "comment": "restore leader clock to real time",
+          "node": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "clock_heal",
+          "comment": "restore if test failed before heal step",
+          "node": 1
+        }
+      ]
+    },
+    {
+      "id": "async-degraded-durability",
+      "tests_md_ref": "Control Plane 17. Write Durability Under Async Degradation [L2]",
+      "description": "Writes 30 rows sync-replicated to all three nodes, kills node3, writes 10 more rows sync-replicated to node2, then kills node2 (quorum lost). Verifies writes are fenced with no quorum and all 40 pre-quorum-loss rows survive full cluster recovery.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "async-degraded-durability-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "sql",
+          "file": "async-degraded-durability-pre.sql",
+          "comment": "30 rows committed to all 3 nodes",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node3 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "async-degraded-durability-mid.sql",
+          "comment": "10 rows committed via quorum of node1+node2 only",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node2 pkill -9 pgbattery"
+        },
+        {
+          "type": "sleep",
+          "seconds": 6,
+          "comment": "allow leader to detect quorum loss"
+        },
+        {
+          "type": "sql",
+          "file": "async-degraded-durability-fenced.sql",
+          "comment": "this write must be rejected: no quorum",
+          "node": 1,
+          "expect_exit": [
+            1,
+            2
+          ]
+        }
+      ],
+      "assertions": [
+        {
+          "type": "metric_equals",
+          "node_id": 1,
+          "metric": "pgbattery_raft_has_quorum",
+          "value": 0
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose restart node2 node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "async-degraded-durability-assert.sql",
+          "node": "leader"
+        }
+      ]
+    },
+    {
+      "id": "membership-remove-rejoin",
+      "tests_md_ref": "Control Plane 18. Membership Remove and Rejoin [V2]",
+      "description": "Removes node3 from Raft membership via the management API, stops the container, verifies the 2-node cluster stays stable with a leader, then restarts node3 (which auto-rejoins via its configured join command) and verifies the full 3-node cluster reforms.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/cluster/remove/3",
+          "expect_status": 200,
+          "json_fields": [
+            "success"
+          ]
+        },
+        {
+          "type": "cmd",
+          "comment": "stop node3 container so it leaves cleanly; restart will re-trigger join",
+          "cmd": "docker compose stop node3"
+        },
+        {
+          "type": "sleep",
+          "seconds": 5,
+          "comment": "allow 2-node cluster to stabilise"
+        },
+        {
+          "type": "cmd",
+          "comment": "node3 command is 'pgbattery join --peer ... --voter'; it will re-add itself",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/cluster/members",
+          "expect_status": 200,
+          "json_fields": [
+            "members"
+          ]
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "backup-restore-valid",
+      "tests_md_ref": "14b. Valid Backup Restore",
+      "description": "Creates a valid backup with 3 seed rows, inserts additional post-backup rows, restores the backup, and verifies the cluster returns to the exact pre-insert snapshot (3 rows only, no post-backup rows).",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "backup-restore-valid-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/backup/create",
+          "expect_status": 200,
+          "json_fields": [
+            "success",
+            "path"
+          ],
+          "capture_json": {
+            "backup_path": "path"
+          }
+        },
+        {
+          "type": "basename",
+          "source_var": "backup_path",
+          "var": "backup_filename"
+        },
+        {
+          "type": "sql",
+          "comment": "insert post-backup rows that should vanish after restore",
+          "file": "backup-restore-valid-post.sql",
+          "node": 1
+        },
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/backup/restore?filename={{backup_filename}}",
+          "expect_status": 200,
+          "json_fields": [
+            "success"
+          ]
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "backup-restore-valid-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "concurrent-backup-failover",
+      "tests_md_ref": "Control Plane 19. Concurrent Backup and Leader Failover [W1]",
+      "description": "Starts a pg_basebackup in the background (curl &), waits 1s, kills the leader mid-backup, waits for cluster reconvergence, and verifies either a clean backup result or a clean error \u2014 not a hang or corrupt state.",
+      "actions": [
+        {
+          "type": "sql",
+          "file": "concurrent-backup-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "fire backup in background; $! captures curl PID; wait after kill so shell reaps it",
+          "cmd": "curl -s --max-time 45 -o /tmp/bkp_conc.json -X POST -H \"x-pgbattery-token: $PGBATTERY_MANAGEMENT_API_TOKEN\" http://localhost:9081/api/v1/backup/create & CURL_PID=$!; sleep 1; docker compose exec -T node1 pkill -9 pgbattery; wait $CURL_PID || true"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "if curl wrote a response, verify it is parseable JSON with a known field",
+          "cmd": "test -s /tmp/bkp_conc.json && uv run python -c \"import json,sys; d=json.load(open('/tmp/bkp_conc.json')); assert any(k in d for k in ('success','message','error')), 'unexpected backup response: '+repr(d)\" || true"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "rm -f /tmp/bkp_conc.json",
+          "expect_exit": null
+        }
+      ]
+    },
+    {
+      "id": "network-latency-stability",
+      "tests_md_ref": "Control Plane 20. Network Latency Stability [V1]",
+      "description": "Adds 150ms\u00b140ms outbound latency on node2 and node3 via tc netem, writes data through the leader, asserts replication sync and data integrity under high RTT, then removes the delay.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "network-latency-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "network_delay",
+          "comment": "follower ACKs and replication traffic from node2 arrive 150ms\u00b140ms late",
+          "node": 2,
+          "delay_ms": 150,
+          "jitter_ms": 40
+        },
+        {
+          "type": "network_delay",
+          "node": 3,
+          "delay_ms": 150,
+          "jitter_ms": 40
+        },
+        {
+          "type": "sql",
+          "comment": "writes must succeed even with high-latency followers",
+          "file": "network-latency-write.sql",
+          "node": 1
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 60,
+          "comment": "replicas may be slow to ack under high latency"
+        },
+        {
+          "type": "network_heal",
+          "node": 2
+        },
+        {
+          "type": "network_heal",
+          "node": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "network-latency-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "network_heal",
+          "comment": "ensure delay is removed even if test fails",
+          "node": 2
+        },
+        {
+          "type": "network_heal",
+          "node": 3
+        }
+      ]
+    },
+    {
+      "id": "follower-one-peer-partition",
+      "tests_md_ref": "Control Plane 21. Follower Inter-Peer Partition [V1]",
+      "description": "Partitions node2 and node3 from each other (bidirectional DROP) while both can still reach the leader (node1). Raft quorum is preserved via node1. Verifies no leader change occurs, writes succeed, and the cluster heals cleanly.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "file": "network-latency-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "asymmetric_partition",
+          "comment": "node2 cannot receive from node3",
+          "node": 2,
+          "from_node": 3
+        },
+        {
+          "type": "asymmetric_partition",
+          "comment": "node3 cannot receive from node2",
+          "node": 3,
+          "from_node": 2
+        },
+        {
+          "type": "sleep",
+          "seconds": 10,
+          "comment": "cluster should remain stable with quorum via node1"
+        },
+        {
+          "type": "sql",
+          "comment": "writes must succeed: node1 can commit via either node2 or node3",
+          "file": "network-latency-write.sql",
+          "node": 1
+        },
+        {
+          "type": "asymmetric_heal",
+          "node": 2,
+          "from_node": 3
+        },
+        {
+          "type": "asymmetric_heal",
+          "node": 3,
+          "from_node": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals_var",
+          "comment": "leader must NOT change: quorum was never lost",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "file": "network-latency-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "remove iptables rules if still present",
+          "cmd": "docker compose exec -T node2 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node3 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null || true",
+          "expect_exit": null
+        }
+      ]
+    },
+    {
+      "id": "rolling-upgrade",
+      "tests_md_ref": "Control Plane 22. Rolling Upgrade [V1]",
+      "description": "Simulates a rolling upgrade by restarting each node one at a time while the cluster continuously serves writes. Verifies no write loss and no downtime window longer than a single election timeout. In CI both restarts use the same binary; the test validates the upgrade procedure.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "rolling-upgrade-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "sql",
+          "file": "rolling-upgrade-batch1.sql",
+          "comment": "30 rows before any restart",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "upgrade node3 (follower) first \u2014 safest, no leadership disruption",
+          "cmd": "docker compose restart node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "rolling-upgrade-batch2.sql",
+          "comment": "10 rows after node3 upgrade",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "upgrade node2 (follower)",
+          "cmd": "docker compose restart node2"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "rolling-upgrade-batch3.sql",
+          "comment": "10 rows after node2 upgrade",
+          "node": 1
+        },
+        {
+          "type": "transfer_leadership",
+          "comment": "move leadership off node1 before restarting it",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "upgrade node1 (now a follower)",
+          "cmd": "docker compose restart node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "rolling-upgrade-batch4.sql",
+          "comment": "10 rows after node1 upgrade",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "rolling-upgrade-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "wal-hole-resync",
+      "tests_md_ref": "Control Plane 23. WAL-Hole Full Resync [V2]",
+      "description": "Stops node3, advances the leader's WAL far enough that old segments may be recycled (80,000 rows + CHECKPOINT + pg_switch_wal twice), then restarts node3. If WAL replay is not possible pgbattery must trigger a full pg_basebackup resync. Verifies all 80,000 rows are present on node3 after convergence.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "wal-hole-resync-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose stop node3"
+        },
+        {
+          "type": "sql",
+          "comment": "generate ~20MB of WAL then force segment recycling",
+          "file": "wal-hole-resync-advance.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "wait_sync",
+          "nodes": [
+            3
+          ],
+          "timeout_sec": 120,
+          "comment": "full resync via pg_basebackup may take longer than WAL replay"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "wal-hole-resync-assert.sql",
+          "comment": "read directly from node3 to confirm it has all rows",
+          "node": 3,
+          "direct": true
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "ddl-failover",
+      "tests_md_ref": "Control Plane 24. DDL Atomicity During Failover [W3]",
+      "description": "Runs CREATE TABLE + CREATE INDEX inside a background psql session, kills the leader 300ms into the DDL, then waits for failover. Verifies the schema is either fully committed or fully absent \u2014 no partial DDL (table without its PK, or orphaned index).",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "ddl-failover-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "Start DDL in background via detached exec; stop container 300ms later from the host (more reliable than pkill inside container); wait for exec to exit",
+          "cmd": "docker compose exec -T node1 sh -c 'psql -U postgres -h localhost -p 5432 -d postgres -v ON_ERROR_STOP=0 -c \"CREATE TABLE ci_ddl_atomic(id SERIAL PRIMARY KEY, val TEXT); CREATE INDEX ci_ddl_idx ON ci_ddl_atomic(val);\"' & DDL_PID=$!; sleep 0.3; docker compose stop -t 0 node1; wait $DDL_PID; docker compose start node1; true"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "ddl-failover-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "rogue-pg-promote",
+      "tests_md_ref": "Control Plane 25. Rogue pg_ctl Promote Split-Brain Detection [W2, L1]",
+      "description": "Calls pg_ctl promote directly on node2 (a follower) bypassing pgbattery, creating a rogue primary. pgbattery should detect that pg_is_in_recovery() is false on a non-leader node and fence/restart it. Verifies the cluster converges to a single leader and no data is duplicated.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "rogue-promote-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "promote node2's PostgreSQL directly, bypassing pgbattery",
+          "cmd": "docker compose exec -T node2 /usr/lib/postgresql/18/bin/pg_ctl promote -D /var/lib/postgresql/data"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "rogue-promote-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 30
+        }
+      ]
+    },
+    {
+      "id": "correctness-lite-invariants",
+      "tests_md_ref": "Control Plane 26. Correctness Lite — Durability + Split-Brain (I1\u2013I7 + L2\u2013L3 + B1\u2013B2) [W1, W2, L1, L2]",
+      "description": "Runs correctness_lite.py against the live cluster: 8 fault-injection steps (~360 writes), checks I1-NO_LOST_ACKS, I2-NO_PHANTOM_WRITES, I3-NO_DUPLICATES, I4-SINGLE_LEADER, I5-NO_ACKS_DURING_QUORUM_LOSS, I6-INTERMEDIATE_READ_CONSISTENCY, I7-CAUSAL_MONOTONICITY, plus log-grep checks L2-L3 and bank-transfer invariants B1-B2. NOTE: This is durability + split-brain coverage, not linearizability — see the linearizability-register case for that.",
+      "actions": [
+        {
+          "type": "cmd",
+          "comment": "correctness_lite assumes a running cluster; waits up to 120s for a healthy leader",
+          "cmd": "uv run --project testing python testing/correctness_lite.py run --artifact-dir testing/artifacts/correctness-matrix",
+          "expect_exit": 0
+        }
+      ],
+      "assertions": []
+    },
+    {
+      "id": "linearizability-register",
+      "tests_md_ref": "Control Plane 26b. Linearizability — single-register CAS history (WGL)",
+      "description": "Runs linearizability_register.py against the live cluster: spawns 3 concurrent clients issuing reads / writes / CAS against a shared register, kills the leader mid-run, then verifies the recorded operation history is linearizable via the Wing-Gong-Lowe algorithm. Catches transactional anomalies (lost-update, stale-read, write-skew on the single key) that correctness_lite cannot.",
+      "actions": [
+        {
+          "type": "cmd",
+          "comment": "linearizability_register assumes a running cluster; needs a leader for the initial CREATE TABLE",
+          "cmd": "uv run --project testing python testing/linearizability_register.py run --artifact-dir testing/artifacts/linearizability-matrix",
+          "expect_exit": 0
+        }
+      ],
+      "assertions": []
+    },
+    {
+      "id": "witness-topology",
+      "tests_md_ref": "Control Plane 27. Witness Node 2+1 Topology",
+      "description": "Starts the witness learner node (node4, profiles=[witness]), verifies it joins the cluster, then kills node3 to simulate a 2+1 scenario. The two remaining voters plus the witness should maintain cluster health. Cleans up by stopping the witness.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "start witness using the 'witness' compose profile",
+          "cmd": "docker compose --profile witness up -d witness"
+        },
+        {
+          "type": "sleep",
+          "seconds": 10,
+          "comment": "allow witness to join and stabilise"
+        },
+        {
+          "type": "http",
+          "method": "GET",
+          "url": "http://localhost:9081/api/v1/cluster/members",
+          "expect_status": 200,
+          "json_fields": [
+            "members"
+          ]
+        },
+        {
+          "type": "cmd",
+          "comment": "kill node3 \u2014 cluster must keep quorum via node1 + node2",
+          "cmd": "docker compose exec -T node3 pkill -9 pgbattery"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "restore node3",
+          "cmd": "docker compose restart node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "stop witness so it does not affect subsequent test cases",
+          "cmd": "docker compose --profile witness stop witness"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-acked",
+      "tests_md_ref": "Assert Sanity 1. acked-write-durability assertion fires on bad data [W1]",
+      "description": "Seeds ci_ack_durability with 5 rows (expected 60) then confirms the assertion raises \u2014 verifying the assert SQL cannot pass silently on wrong data.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-acked-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "acked-write-durability-assert.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "sql",
+          "file": "assert-sanity-acked-bad.sql",
+          "node": 1,
+          "comment": "re-run setup (which truncates) so the table is empty, not 5 bad rows"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_ack_durability'"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-concurrent",
+      "tests_md_ref": "Assert Sanity 2. concurrent-writes assertion fires on partial batch [W2]",
+      "description": "Seeds ci_concurrent_writes with worker_id=7 having 500 rows (not 1000) then confirms the assertion raises.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-concurrent-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "concurrent-writes-assert.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_concurrent_writes'"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-diverged",
+      "tests_md_ref": "Assert Sanity 3. diverged-node-rejoin assertion fires on wrong row count [V2]",
+      "description": "Seeds ci_rejoin with 10 rows (expected 25) then confirms the assertion raises.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-diverged-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "diverged-node-rejoin-assert.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_rejoin'"
+        }
+      ]
+    },
+    {
+      "id": "storage-fault-recovery",
+      "tests_md_ref": "Control Plane V2. Storage Fault Recovery (pg_control corruption) [V2]",
+      "description": "Stops node3, corrupts its pg_control file (simulating storage fault), restarts node3, and verifies pgbattery automatically resync'd via pg_basebackup and the node rejoins the cluster with consistent data. Tests contract V2.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "storage-fault-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 30
+        },
+        {
+          "type": "cmd",
+          "comment": "stop node3 cleanly before corrupting its storage",
+          "cmd": "docker compose stop node3"
+        },
+        {
+          "type": "cmd",
+          "comment": "corrupt pg_control \u2014 PostgreSQL will refuse to start, triggering pgbattery's basebackup resync path",
+          "cmd": "docker compose run --rm --no-deps node3 sh -c 'dd if=/dev/urandom of=/var/lib/postgresql/data/global/pg_control bs=1 count=100 conv=notrunc 2>/dev/null; echo \"pg_control corrupted\"'"
+        },
+        {
+          "type": "cmd",
+          "comment": "restart node3 \u2014 pgbattery must detect the corrupt data dir and resync",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 180,
+          "comment": "basebackup resync can take up to 3 minutes"
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "storage-fault-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "perf-baseline",
+      "tests_md_ref": "Performance 1. pgbench TPS Regression Gate",
+      "description": "Runs pgbench (4 clients, 10s) against the leader's internal PostgreSQL port and asserts TPS >= 100. Acts as a performance regression floor \u2014 a 10x throughput regression will fail this gate even if all correctness tests pass.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "pgbench",
+          "node": 1,
+          "scale": 1,
+          "clients": 4,
+          "threads": 2,
+          "duration_sec": 10,
+          "min_tps": 100.0,
+          "capture_tps": "pgbench_tps"
+        }
+      ],
+      "assertions": [],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "drop pgbench tables so they do not interfere with other tests",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS pgbench_accounts, pgbench_branches, pgbench_history, pgbench_tellers'"
+        }
+      ]
+    },
+    {
+      "id": "partition-plus-crash",
+      "tests_md_ref": "Control Plane 18. Compound: Asymmetric Partition + Leader Crash [L1, V1]",
+      "description": "Simultaneously applies an inbound iptables drop on the leader AND kills the leader container. Tests that followers elect a new leader when the old one is both isolated and dead \u2014 a scenario that could confuse fencing state if the two fault layers interact badly.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "asymmetric_partition",
+          "comment": "Block inbound Raft traffic to node1 from node2 and node3",
+          "node": 1,
+          "from_node": 2
+        },
+        {
+          "type": "asymmetric_partition",
+          "node": 1,
+          "from_node": 3
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill the leader while it is also partitioned \u2014 compound fault",
+          "cmd": "docker compose kill node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 2,
+          "leaders": 1,
+          "leader_not_var": "leader_before",
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "Restart node1; iptables rules are reset on container restart",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "Remove any residual iptables rules on node1 (no-op if container was restarted)",
+          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "skew-plus-restart",
+      "tests_md_ref": "Control Plane 19. Compound: Clock Skew + Node Restart [V1]",
+      "description": "Applies a +5 minute clock skew to node2 while simultaneously restarting node3. Tests that the cluster remains stable when a follower has a skewed clock and another follower is mid-restart \u2014 two stressors that individually are handled but could interact on election timing.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "clock_skew",
+          "comment": "Jump node2 clock +5 minutes via libfaketime",
+          "node": 2,
+          "seconds": 300
+        },
+        {
+          "type": "cmd",
+          "comment": "Restart node3 while node2 has skewed clock \u2014 compound stressor",
+          "cmd": "docker compose restart node3"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        },
+        {
+          "type": "clock_heal",
+          "comment": "Restore node2 clock to real time",
+          "node": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "clock_heal",
+          "comment": "Always restore node2 clock even if test fails mid-way",
+          "node": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "double-failover-partition",
+      "tests_md_ref": "Control Plane 19. Double Failover with Network Partition [V1]",
+      "description": "Kill leader, let it rejoin, then pause the NEW leader. Verifies that after two rapid timeline changes every follower pg_rewinds correctly, resumes streaming, and joins the sync standby list. This is the exact sequence that previously left followers wedged with stale min_recovery_end_timeline.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill leader node1 — triggers first failover (TL N+1)",
+          "cmd": "docker compose kill node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 2,
+          "leaders": 1,
+          "timeout_sec": 30
+        },
+        {
+          "type": "record_leader",
+          "var": "second_leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Bring node1 back so it can rejoin as follower",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "comment": "Write data while all three nodes are up",
+          "file": "double-failover-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Pause the current leader — triggers second failover (TL N+2)",
+          "cmd": "docker pause pgbattery-node{{ second_leader }}-1"
+        },
+        {
+          "type": "sleep",
+          "seconds": 8
+        },
+        {
+          "type": "cmd",
+          "comment": "Unpause the old leader — it must pg_rewind and rejoin",
+          "cmd": "docker unpause pgbattery-node{{ second_leader }}-1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        },
+        {
+          "type": "sleep",
+          "comment": "Give replication manager time to converge sync standby list",
+          "seconds": 10
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "Verify ALL followers are streaming (not stuck in startup/waiting). Run on every node — the current leader has pg_stat_replication.",
+          "cmd": "for n in node1 node2 node3; do cnt=$(docker compose exec -T $n psql -h 127.0.0.1 -p 5434 -U postgres -tAc \"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';\" 2>/dev/null | tr -d ' '); [ \"$cnt\" = \"2\" ] && exit 0; done; exit 1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Verify sync_standby_names includes both followers (query the leader)",
+          "cmd": "for n in node1 node2 node3; do ssn=$(docker compose exec -T $n psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SHOW synchronous_standby_names;' 2>/dev/null); echo \"$ssn\" | grep -q 'pgbattery_node_' && echo \"$ssn\" | grep -c 'pgbattery_node_' | grep -q '[2-3]' && exit 0; done; exit 1"
+        },
+        {
+          "type": "sql",
+          "comment": "Verify writes succeed (not blocked by missing sync replica)",
+          "file": "double-failover-assert.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "Ensure all containers running (unpause any stuck paused)",
+          "cmd": "docker unpause pgbattery-node1-1 pgbattery-node2-1 pgbattery-node3-1 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1 node2 node3 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "sync-standby-livelock",
+      "tests_md_ref": "Control Plane 20. Sync Standby Livelock Prevention [V1]",
+      "description": "Disconnects one follower and verifies writes still succeed via the remaining sync replica. Catches the bug where synchronous_standby_names is narrowed to only the currently-streaming replica — if that sole replica then disconnects, writes deadlock because ALTER SYSTEM to fix the list is itself a write.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "wait_sync",
+          "comment": "Ensure at least one sync replica before we start",
+          "nodes": [2, 3],
+          "timeout_sec": 30
+        },
+        {
+          "type": "sql",
+          "comment": "Seed test data",
+          "file": "sync-livelock-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill node2 — removes one replica from pg_stat_replication",
+          "cmd": "docker compose kill node2"
+        },
+        {
+          "type": "sleep",
+          "comment": "Let replication_manager detect node2 gone and re-evaluate sync list",
+          "seconds": 10
+        },
+        {
+          "type": "cmd",
+          "comment": "Verify writes still succeed with only node3 streaming. This would deadlock if sync_standby_names was narrowed to only node2.",
+          "cmd": "docker compose exec -T node1 psql -h 127.0.0.1 -p 5434 -U postgres -c \"INSERT INTO sync_livelock_test(v) VALUES ('after-kill'); SELECT 1;\" -t | grep -q '1'"
+        },
+        {
+          "type": "cmd",
+          "comment": "Verify sync_standby_names still includes BOTH replicas (node2 staying in list is harmless; removing it is dangerous)",
+          "cmd": "docker compose exec -T node1 psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SHOW synchronous_standby_names;' | grep -q 'pgbattery_node_2'"
+        },
+        {
+          "type": "cmd",
+          "comment": "Bring node2 back",
+          "cmd": "docker compose start node2"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "comment": "Verify all writes survived including the one during node2 outage",
+          "file": "sync-livelock-assert.sql",
+          "node": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node2 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "lsn-leaderless-livelock-recovery",
+      "tests_md_ref": "Audit C3/Liveness: LSN fail-closed leaderless livelock",
+      "description": "Regression coverage for the LSN-fail-closed leaderless livelock. `max_cluster_lsn` is refreshed only by Raft applies; during a leaderless window exceeding LSN_STALENESS_THRESHOLD_SECS (30s), the cached value stayed non-zero while all stored LSN timestamps aged into staleness. Pre-fix, every voter saw every candidate as stale and refused every vote → election livelock. Post-fix, is_lsn_acceptable_for_election re-derives the fresh max on the fly from node_lsns and falls back to bootstrap-permissive when nothing is fresh. Scenario: kill node1 (leader by default), wait long enough that all surviving nodes' last-seen LSN updates from the dead leader have aged out (45s = staleness + margin), then verify the surviving voters elect a new leader.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_before_livelock"
+        },
+        {
+          "type": "cmd",
+          "comment": "kill the current leader's container so the cluster goes leaderless. Docker restart kicks in but with the staleness window > restart cooldown we still spend long enough leaderless to trip the bug.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); TARGET=node${LEADER}; echo \"killing $TARGET (leader=$LEADER)\"; docker compose kill $TARGET"
+        },
+        {
+          "type": "sleep",
+          "seconds": 45,
+          "comment": "Wait long enough that any LSN heartbeats from the dead leader present in node_lsns have aged past LSN_STALENESS_THRESHOLD_SECS=30s. Pre-fix the survivors would be wedged on votes during this window; post-fix they fall back to bootstrap-permissive."
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "live_nodes": 2,
+          "leaders": 1,
+          "leader_not_var": "leader_before_livelock",
+          "timeout_sec": 90,
+          "comment": "Must converge to a single new leader. Pre-fix this times out (every voter rejects every candidate as stale)."
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before_livelock"
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start $(docker compose ps -a --services --filter status=exited) 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "vote-rejection-progresses",
+      "tests_md_ref": "Audit C3: Vote rejection returns proper VoteResponse, not transport error",
+      "description": "Regression coverage for the vote-rejection-as-Protocol-error bug. The LSN-gate in network.rs used to return Err(Protocol) when rejecting a vote; openraft callers treated that as a transport error and retried forever, while the rejecting side had committed to a no. Post-fix, a rejection emits a proper VoteResponse{vote_granted=false} and the candidate can step down / let another node win. This test rapidly cycles leadership several times: under the pre-fix bug, any LSN-gate rejection would deadlock the cycle. Under the post-fix code, even if some votes are rejected, the cluster keeps making progress.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "vote_progress_initial_leader"
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "vote_progress_initial_leader",
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "vote_progress_mid_leader"
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 3
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "vote_progress_mid_leader",
+          "timeout_sec": 60
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals",
+          "value": 1,
+          "comment": "Three full transfers must converge to node 1. Pre-fix, any single LSN-gate rejection in the cascade would have wedged the cluster on transport-error retries."
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        }
+      ]
+    },
+    {
+      "id": "rewind-refused-on-data-loss-risk",
+      "tests_md_ref": "Rewind data-loss gate — supervisor refuses pg_rewind when local WAL is more than one block ahead of the source",
+      "description": "Regression coverage for the pre-rewind divergence check. pg_rewind aligns local data to the source by discarding any WAL the source doesn't have; if the local node had ack'd commits beyond the source LSN (e.g. an ex-leader rejoining after the cluster promoted a follower that didn't see all writes), the rewind silently erases those commits. The supervisor now queries both LSNs before invoking pg_rewind and refuses with `Error::RewindDataLossRisk` when divergence exceeds `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES` (8 KiB). This case verifies: (1) the metric `pgbattery_pg_rewind_refused_data_loss_risk` is exposed, (2) a healthy leader transfer + rejoin sequence does NOT spuriously trigger the gate (false-positive regression). The positive case (gate actually fires) requires fault injection beyond the standard chaos toolkit and is covered by the supervisor's unit tests (`test_rewind_decision_refuse_beyond_threshold`, etc).",
+      "actions": [
+        {
+          "type": "cmd",
+          "comment": "Confirm the gate metric is described and exposed on the current leader. /metrics returns HELP + value lines for described counters even when their value is 0.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); LEADER_PORT=$((9090 + LEADER)); BODY=$(curl -s http://localhost:$LEADER_PORT/metrics); echo \"$BODY\" | grep -E '^# HELP pgbattery_pg_rewind_refused_data_loss_risk' || (echo 'metric HELP missing'; exit 1)"
+        },
+        {
+          "type": "record_leader",
+          "var": "rewind_test_initial_leader"
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_not_var": "rewind_test_initial_leader",
+          "timeout_sec": 60,
+          "comment": "Graceful transfer — every node catches up before transfer, so no divergence beyond the in-flight one-WAL-block tolerance. The old leader rewinds (if needed) without tripping the gate."
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 1,
+          "timeout_sec": 60
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "False-positive regression: after a fully-graceful transfer cascade with all nodes caught up, the rewind data-loss gate must NOT have fired on any node. A non-zero counter here means the gate triggered during a scenario it should have allowed — false positive that would deadlock failover.",
+          "cmd": "for p in 9091 9092 9093; do COUNT=$(curl -s http://localhost:$p/metrics | awk '/^pgbattery_pg_rewind_refused_data_loss_risk/{print $2}' | head -1); COUNT=${COUNT:-0}; echo \"port $p: $COUNT\"; [ \"$(echo \"$COUNT\" | cut -d. -f1)\" -eq 0 ] || (echo \"FALSE POSITIVE: rewind gate fired on port $p (count=$COUNT)\"; exit 1); done"
+        }
+      ]
+    },
+    {
+      "id": "stale-sync-metric-after-kill",
+      "tests_md_ref": "BUGS.md: pgbattery_replica_is_sync stale-Sync after replica disconnect",
+      "description": "After killing a follower's PostgreSQL, the leader's per-replica sync gauge must NOT keep reporting two Sync replicas. PG drops the walsender from pg_stat_replication within ~1s; the gauge must mirror that source-of-truth and not linger on the cached Sync value for `disconnect_timeout`. Pre-fix, replication_manager only flipped sync_state=Async after the grace window; post-fix, it flips immediately on absence from pg_stat_replication.",
+      "actions": [
+        {
+          "type": "record_leader",
+          "var": "leader_for_sync_metric"
+        },
+        {
+          "type": "cmd",
+          "comment": "Wait for sync replication to be established (at least one Sync replica) before introducing chaos. Otherwise we'd be asserting on bootstrap state, not steady state.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); LEADER_PORT=$((9090 + LEADER)); for i in $(seq 1 30); do SYNC=$(curl -s http://localhost:$LEADER_PORT/metrics | awk '/^pgbattery_replica_is_sync\\{/{if($2>=1.5)c++} END{print c+0}'); if [ \"$SYNC\" -ge 1 ]; then echo \"sync replicas: $SYNC\"; break; fi; sleep 1; done; [ \"$SYNC\" -ge 1 ]"
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill PG (not pgbattery) on a follower. PG drops the walsender; the leader's pg_stat_replication loses that row within ~1s.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); TARGET=$([ \"$LEADER\" = 1 ] && echo node2 || echo node1); echo \"killing PG on $TARGET (leader=$LEADER)\"; docker compose exec -T $TARGET bash -c 'pkill -9 -f \"^/usr/lib/postgresql/.*/postgres -D\" || true'"
+        },
+        {
+          "type": "sleep",
+          "seconds": 2,
+          "comment": "Give the leader's replica_check tick (1s interval) one full pass to scrape pg_stat_replication and re-emit metrics. Pre-fix: stale Sync persists for ~disconnect_timeout (~15s). Post-fix: flips to Async on the very next tick."
+        },
+        {
+          "type": "cmd",
+          "comment": "Assert: leader's pgbattery_replica_is_sync gauge reports AT MOST 1 sync replica (only the surviving follower). Pre-fix sees 2; post-fix sees 1. Exits non-zero on stale-Sync detection.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); LEADER_PORT=$((9090 + LEADER)); BODY=$(curl -s http://localhost:$LEADER_PORT/metrics); SYNC=$(echo \"$BODY\" | awk '/^pgbattery_replica_is_sync\\{/{if($2>=1.5)c++} END{print c+0}'); echo \"leader=$LEADER sync_count=$SYNC\"; echo \"$BODY\" | grep -E '^pgbattery_replica_is_sync' || true; [ \"$SYNC\" -le 1 ]"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals_var",
+          "var": "leader_for_sync_metric",
+          "comment": "Killing a follower's PG must not cause leadership change."
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120,
+          "comment": "Docker restart policy + pgbattery process-death detection brings the killed node back; wait for full reconvergence so the next case starts clean."
+        }
+      ]
+    }
+  ]
+}

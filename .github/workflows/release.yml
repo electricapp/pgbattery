@@ -1,0 +1,104 @@
+name: Release
+
+# Scaffold: on a `vX.Y.Z` tag, build the binary matrix, sign each artifact with
+# minisign, and upload binary + .sha256 + .minisig to the GitHub release.
+#
+# Requires repository secret MINISIGN_SECRET_KEY (contents of a password-less
+# minisign secret key — see docs/RELEASING.md). Until that secret exists and the
+# public key is embedded in src/commands/upgrade.rs, releases are unsigned and
+# `pgbattery upgrade` falls back to checksum + HTTPS.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create or reuse the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
+          # `latest` marker consumed by `pgbattery upgrade` (GET <base>/latest).
+          printf '%s\n' "$VERSION" > latest
+          gh release upload "$GITHUB_REF_NAME" latest --clobber
+
+  build:
+    name: Build & sign (${{ matrix.os_name }}-${{ matrix.arch }})
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os_name: linux
+            arch: x86_64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            os_name: macos
+            arch: x86_64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            os_name: macos
+            arch: aarch64
+          # TODO: aarch64-unknown-linux-gnu needs a cross toolchain (cross/zig).
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --bin pgbattery --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/pgbattery" \
+             "dist/pgbattery-${{ matrix.os_name }}-${{ matrix.arch }}"
+
+      - name: Install minisign
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y minisign
+          else
+            brew install minisign
+          fi
+
+      - name: Sign artifact
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set — see docs/RELEASING.md"
+            exit 1
+          fi
+          scripts/sign-release.sh dist/
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSET="pgbattery-${{ matrix.os_name }}-${{ matrix.arch }}"
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/$ASSET" "dist/$ASSET.sha256" "dist/$ASSET.minisig" --clobber

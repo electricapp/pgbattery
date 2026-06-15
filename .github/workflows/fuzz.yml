@@ -1,0 +1,79 @@
+name: Fuzz
+
+# Per-PR smoke runs (30s/target) catch regressions in parsers and command
+# decoding. The weekly schedule runs longer (5min/target) to surface deeper
+# bugs that the smoke runs miss.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/governor/state_machine.rs"
+      - "src/governor/storage.rs"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  push:
+    branches: [main]
+  schedule:
+    # Sunday 04:00 UTC — runs after correctness-lite (03:30) so a flaky
+    # cluster doesn't crowd CI.
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_lsn, cluster_commands]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # cargo-fuzz requires nightly for the libFuzzer instrumentation. We
+      # pin a specific nightly snapshot so this job is reproducible without
+      # tracking the rolling nightly. Bump deliberately when fuzzing infra
+      # changes; the project's runtime toolchain remains 1.95 stable.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # nightly
+
+      - name: Cache cargo registry + fuzz target dir
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target/
+          key: fuzz-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml', 'fuzz/fuzz_targets/${{ matrix.target }}.rs') }}
+          restore-keys: |
+            fuzz-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzzer
+        env:
+          # Schedule = nightly = 5 min/target; everything else = 30 s.
+          FUZZ_DURATION: ${{ github.event_name == 'schedule' && '300' || '30' }}
+        run: |
+          set -euo pipefail
+          cd fuzz
+          cargo fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${FUZZ_DURATION} \
+            -timeout=10
+
+      - name: Upload crashing inputs (if any)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30

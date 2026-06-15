@@ -1,0 +1,216 @@
+name: HA CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_controlplane_nightly:
+        description: "Also run the heavy ha-controlplane-nightly suite"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "15 4 * * *"
+
+# A new push to a PR/branch cancels the in-progress run so reviewers wait
+# only on the latest commit. main + scheduled runs are exempt so we don't
+# lose nightly signal or post-merge confirmation.
+concurrency:
+  group: ha-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
+  lint-test-harness:
+    name: Lint Test Harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+      - name: Ruff format check
+        run: uv run --project testing ruff format --check testing/
+
+      - name: Ruff lint check
+        run: uv run --project testing ruff check testing/
+
+      - name: Mypy strict
+        run: uv run --project testing mypy testing/ --strict
+
+      - name: Lint matrix, SQL, and Python scripts
+        run: uv run --python 3.14 --script testing/lint_matrix.py
+
+  ha-sequential:
+    needs: lint-test-harness
+    name: HA Sequential
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 60
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_seq_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Run deterministic sequential HA suite
+        run: ./testing/ci_runner.py --suite ha-sequential --artifact-dir testing/artifacts/ha-sequential
+
+      - name: Upload sequential HA artifacts (failure only)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ha-sequential-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/ha-sequential
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup docker compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+  ha-parallel:
+    name: HA Parallel (${{ matrix.case }})
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - majority-loss
+          - leadership-transfer
+          - management-api
+          - observability-sanity
+          - backup-corrupt-restore
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_${{ matrix.case }}_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Run deterministic parallel HA case
+        run: ./testing/ci_runner.py --suite ha-parallel --case ${{ matrix.case }} --artifact-dir testing/artifacts/ha-parallel-${{ matrix.case }}
+
+      - name: Upload parallel HA artifacts (failure only)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ha-parallel-${{ matrix.case }}-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/ha-parallel-${{ matrix.case }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup docker compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+  ha-controlplane-pr:
+    name: HA Control Plane PR
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 120
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_cppr_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Run control-plane PR suite
+        run: ./testing/ci_runner.py --suite ha-controlplane-pr --artifact-dir testing/artifacts/ha-controlplane-pr
+
+      - name: Upload control-plane PR artifacts (failure only)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ha-controlplane-pr-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/ha-controlplane-pr
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup docker compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+  ha-assert-sanity:
+    name: Assert Sanity (invert-expected-result)
+    needs: lint-test-harness
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_assertsanity_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Run assert-sanity suite (verifies assertions can fail)
+        run: ./testing/ci_runner.py --suite ha-assert-sanity --artifact-dir testing/artifacts/ha-assert-sanity
+
+      - name: Upload assert-sanity artifacts (failure only)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ha-assert-sanity-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/ha-assert-sanity
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup docker compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+  ha-controlplane-nightly:
+    name: HA Control Plane Nightly
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_controlplane_nightly == 'true')
+    timeout-minutes: 180
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_cpnightly_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Run control-plane nightly suite
+        run: ./testing/ci_runner.py --suite ha-controlplane-nightly --artifact-dir testing/artifacts/ha-controlplane-nightly
+
+      - name: Upload control-plane nightly artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ha-controlplane-nightly-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/ha-controlplane-nightly
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup docker compose resources
+        if: always()
+        run: docker compose down -v --remove-orphans || true

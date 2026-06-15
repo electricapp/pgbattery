@@ -1,0 +1,27 @@
+{
+  "baseline_tps": 1084.599132,
+  "baseline_latency_ms": 3.688,
+  "heartbeat_max_gap_ms": 67.60874995961785,
+  "heartbeat_p99_gap_ms": 67.28616682812572,
+  "heartbeat_recovery_ms": 2501.7879579681903,
+  "leader_before": 3,
+  "leader_after": 3,
+  "cluster_recovery_s": 2.663028165930882,
+  "docker_stats": [
+    {
+      "container": "pgbattery-node3-1",
+      "cpu": "5.22%",
+      "mem": "158.9MiB / 7.653GiB"
+    },
+    {
+      "container": "pgbattery-node1-1",
+      "cpu": "4.06%",
+      "mem": "144.8MiB / 7.653GiB"
+    },
+    {
+      "container": "pgbattery-node2-1",
+      "cpu": "3.23%",
+      "mem": "115.8MiB / 7.653GiB"
+    }
+  ]
+}

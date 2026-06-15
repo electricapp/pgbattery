@@ -1,0 +1,44 @@
+# Build artifacts
+/target/
+/tla/states/
+README.pdf
+*.pdf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+*.bin
+tla/*_TTrace_*.bin
+tla/*_TTrace_*.tla
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/
+
+# Debug/diagnostic files
+*.long-type-*.txt
+/testing/artifacts/
+/testing/two_sync_capture.txt
+/testing/two_sync_metrics_capture.txt
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Environment
+.env
+.env.local
+
+# Elle build outputs
+testing/third_party/elle/*.jar
+testing/elle_shim/target/
+testing/elle_shim/.cpcache/
+testing/elle_shim/pom.xml
+testing/third_party/elle/.build-stamp

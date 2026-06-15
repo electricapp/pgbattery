@@ -1,0 +1,18 @@
+[package]
+name = "pgbattery-core"
+description = "pgbattery shared types (errors, config primitives, basic constants). No IO. No tokio. No openraft."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+postcard = { version = "1.1", features = ["alloc"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+
+[lints]
+workspace = true

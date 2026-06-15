@@ -1,0 +1,33 @@
+node_id = 1
+listen_addr = "0.0.0.0:5432"
+raft_addr = "0.0.0.0:5433"
+metrics_addr = "0.0.0.0:9090"
+pg_bin_dir = "/usr/lib/postgresql/18/bin"
+pg_data_dir = "/var/lib/postgresql/data"
+pg_internal_port = 5434
+pg_auth_mode = "trust"
+
+# Advertise addresses (what other nodes use to reach this node)
+advertise_raft_addr = "172.28.0.11:5433"
+advertise_mgmt_addr = "172.28.0.11:9091"
+
+election_timeout_ms = 1000
+heartbeat_interval_ms = 250
+
+[[peers]]
+id = 2
+raft_addr = "172.28.0.12:5433"
+pg_addr = "172.28.0.12:5434"
+
+[[peers]]
+id = 3
+raft_addr = "172.28.0.13:5433"
+pg_addr = "172.28.0.13:5434"
+
+# Backup configuration
+[backup]
+enabled = true
+backup_dir = "/var/lib/postgresql/backups"
+retention_count = 3
+backup_type = "dump"  # "full" or "dump"
+compress = true
