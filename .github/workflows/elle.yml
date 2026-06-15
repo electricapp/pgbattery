@@ -105,8 +105,20 @@ jobs:
 
       - name: Bring up pgbattery cluster
         run: |
-          docker compose up -d --wait
-          # Give Raft a few seconds to elect.
+          docker compose up -d --build
+          # The cluster self-heals through join/election restarts, so a node can
+          # be transiently unhealthy during bring-up — `--wait` treats that as
+          # fatal (it flagged node2 unhealthy seconds in). Poll the leader
+          # endpoint instead, matching correctness-lite; the management API
+          # answers 200 once a leader is elected.
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:9081/api/v1/cluster/leader >/dev/null 2>&1; then
+              echo "cluster ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          # Brief settle so all followers have applied the first cluster-state update.
           sleep 5
 
       - name: Run Elle matrix

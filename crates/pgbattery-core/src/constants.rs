@@ -49,13 +49,22 @@ pub const PG_CONTROLDATA_TIMEOUT_MS: u64 = 5_000;
 /// Maximum local-WAL-ahead-of-source divergence the supervisor will
 /// silently discard via `pg_rewind`.
 ///
-/// One `PostgreSQL` WAL block (8 KiB). Beyond this we refuse the rewind
-/// with `Error::RewindDataLossRisk`: rewinding would erase WAL that the
-/// cluster may still need, and we'd rather leave the node out of the
-/// cluster than commit silently to data loss. The small in-flight window
-/// (leader wrote a WAL block but the new source hadn't streamed it yet)
-/// is the only legitimate case where local > source by a small amount;
-/// anything larger means the local node had ack'd writes the new source
-/// never received, which is exactly the silent-data-loss scenario this
-/// gate exists to surface.
-pub const PG_REWIND_DIVERGENCE_THRESHOLD_BYTES: u64 = 8_192;
+/// One `PostgreSQL` WAL segment (16 MiB). A crashed primary (e.g. the leader
+/// `SIGKILLed` mid-write) is almost always ahead of the freshly-elected leader
+/// by some *uncommitted* WAL — the in-flight transaction plus checkpoint /
+/// autovacuum / FPI background records — which routinely exceeds a single
+/// 8 KiB block. With pgbattery's synchronous replication and LSN-aware
+/// election the new leader already holds every acknowledged commit, so that
+/// "extra" WAL on the old primary is unacked and safe for `pg_rewind` to
+/// discard. The previous one-block threshold refused it, so a crashed leader
+/// could never auto-rejoin — it crash-looped on the fence gate (deposed
+/// primary, lease expired, PG stopped after the refused rewind → "FAILED TO
+/// FENCE" → shutdown → restart → repeat).
+///
+/// Beyond a full segment the node ran independently long enough to be a
+/// genuine divergence concern, so we still refuse with
+/// `Error::RewindDataLossRisk` and leave it out of the cluster for operator
+/// inspection rather than risk discarding ack'd writes (the async-failover
+/// edge case the gate exists to surface). Lower this if your data-safety
+/// posture favours manual intervention over automatic rejoin under load.
+pub const PG_REWIND_DIVERGENCE_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;

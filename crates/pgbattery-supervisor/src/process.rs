@@ -3296,6 +3296,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_rewind_decision_failover_inflight_window_within_tolerance() {
+        // A crashed primary is routinely some KB-to-MB ahead of the
+        // freshly-elected leader (uncommitted/background WAL). With the
+        // one-WAL-segment threshold that divergence is accepted so the node
+        // can auto-rejoin — regression for the 8 KiB threshold that refused
+        // it and left the deposed leader crash-looping on the fence gate.
+        let decision = rewind_divergence_decision(
+            100_000_000 + 256 * 1024,
+            100_000_000,
+            PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+        );
+        assert_eq!(
+            decision,
+            RewindDecision::WithinTolerance {
+                divergence_bytes: 256 * 1024
+            }
+        );
+    }
+
+    #[test]
+    fn test_rewind_decision_refuse_beyond_segment() {
+        // More than a full WAL segment ahead: genuine independent divergence,
+        // still refused for operator inspection.
+        let decision = rewind_divergence_decision(
+            100_000_000 + PG_REWIND_DIVERGENCE_THRESHOLD_BYTES + 1,
+            100_000_000,
+            PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+        );
+        assert!(matches!(decision, RewindDecision::Refuse { .. }));
+    }
+
     // ── upsert_managed_block ──────────────────────────────────────────────
 
     #[test]

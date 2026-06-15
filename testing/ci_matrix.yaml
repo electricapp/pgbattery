@@ -155,10 +155,10 @@
         },
         {
           "type": "wait_cluster",
-          "comment": "node1 was SIGKILLed; on restart it must rejoin and re-sync (possibly via pg_rewind) before its leader-view and the 2nd replica register as healthy. The sibling leader-network-partition-real case uses the same 120s budget for full health after a rejoin; 60s was too tight under CI I/O and timed out at leader_views missing=[1] / repl observed=1/2.",
+          "comment": "After restart node1 demotes, pg_rewinds to the new leader's timeline, and rejoins as a healthy replica. With the rewind divergence gate raised to one WAL segment (PG_REWIND_DIVERGENCE_THRESHOLD_BYTES) the deposed leader no longer gets stuck refusing the rewind, so this converges in seconds — 60s is ample.",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 60
         }
       ],
       "assertions": [
