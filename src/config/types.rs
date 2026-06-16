@@ -133,6 +133,11 @@ pub struct Config {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_ms: u64,
 
+    /// Max concurrent client connections; excess are dropped until a slot
+    /// frees, bounding memory/fd use under a connection storm.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
     /// Time a replica may be missing from `pg_stat_replication` before it is
     /// demoted from `synchronous_standby_names` (async). Lower values
     /// shrink the failover RPO window but make transient network blips
@@ -178,6 +183,10 @@ const fn default_connection_timeout() -> u64 {
 
 const fn default_idle_timeout() -> u64 {
     crate::config::constants::DEFAULT_IDLE_TIMEOUT_MS
+}
+
+const fn default_max_connections() -> usize {
+    crate::config::constants::DEFAULT_MAX_GATEWAY_CONNECTIONS
 }
 
 const fn default_replica_disconnect_timeout() -> u64 {
@@ -334,7 +343,7 @@ impl Config {
         // (>1h) past every realistic deadline almost certainly indicate
         // a units-confusion typo (e.g. someone wrote 5_000_000 thinking
         // microseconds).
-        const ONE_HOUR_MS: u64 = 60 * 60 * 1000;
+        const ONE_HOUR_MS: u64 = 60 * 60 * 1_000;
         for (name, value) in [
             ("election_timeout_ms", self.election_timeout_ms),
             ("heartbeat_interval_ms", self.heartbeat_interval_ms),
@@ -378,6 +387,11 @@ impl Config {
                 self.heartbeat_interval_ms,
                 crate::config::constants::METRICS_WATCHDOG_TIMEOUT_MS
             );
+        }
+
+        // A zero cap would reject every connection, bricking the gateway.
+        if self.max_connections == 0 {
+            anyhow::bail!("max_connections must be > 0");
         }
         Ok(())
     }
@@ -681,6 +695,7 @@ impl Config {
             ssl_key_path: self.ssl_key_path.clone(),
             connection_timeout_ms: self.connection_timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
+            max_connections: self.max_connections,
         }
     }
 

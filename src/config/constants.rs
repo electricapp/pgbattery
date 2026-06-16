@@ -30,8 +30,15 @@ pub const GATEWAY_BUFFER_SIZE: usize = 65536;
 /// Maximum gateway buffer size (16MB) - prevents OOM from malicious large queries
 pub const MAX_GATEWAY_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
+/// Default cap on concurrent client connections.
+///
+/// Each holds two buffers and two file descriptors, so an unbounded accept
+/// loop can exhaust memory or descriptors. Excess connections are dropped
+/// until a slot frees; tunable via `max_connections`.
+pub const DEFAULT_MAX_GATEWAY_CONNECTIONS: usize = 5_000;
+
 /// Default connection timeout in milliseconds
-pub const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 5000;
+pub const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 5_000;
 
 /// Default idle timeout in milliseconds
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 300_000; // 5 minutes
@@ -43,7 +50,7 @@ pub const MAX_REPLICATION_LAG_BYTES: u64 = 16 * 1024 * 1024; // 16 MB
 pub const MAX_REPLICATION_LAG_SECONDS: f64 = 5.0;
 
 /// Interval for checking replica health
-pub const REPLICA_CHECK_INTERVAL_MS: u64 = 1000;
+pub const REPLICA_CHECK_INTERVAL_MS: u64 = 1_000;
 
 /// Default timeout (ms) before a missing replica is dropped from
 /// `synchronous_standby_names`.
@@ -62,7 +69,7 @@ pub const REPLICA_DISCONNECT_TIMEOUT_MS: u64 = 30_000;
 /// election timer churn to be uncommon in healthy clusters; the
 /// leaderless-watchdog (`LEADERLESS_RECOVERY_BASE_TIMEOUTS`) is the real
 /// recovery floor.
-pub const DEFAULT_ELECTION_TIMEOUT_MS: u64 = 1000;
+pub const DEFAULT_ELECTION_TIMEOUT_MS: u64 = 1_000;
 
 /// Default Raft heartbeat interval in milliseconds.
 ///
@@ -78,7 +85,7 @@ pub const FENCE_WAIT_TIMEOUT_SECS: u64 = 30;
 pub const FENCE_WAIT_NO_LEADER_TIMEOUT_SECS: u64 = 5;
 
 /// Sync wait timeout in milliseconds
-pub const SYNC_WAIT_TIMEOUT_MS: u64 = 5000;
+pub const SYNC_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 /// Sync check interval in milliseconds
 pub const SYNC_CHECK_INTERVAL_MS: u64 = 100;
@@ -90,7 +97,7 @@ pub const BOOTSTRAP_TIMEOUT_SECS: u64 = 300; // 5 minutes
 pub const BOOTSTRAP_PROBE_INTERVAL_MS: u64 = 500;
 
 /// Quorum detection threshold in milliseconds
-pub const QUORUM_TIMEOUT_MS: u64 = 1000;
+pub const QUORUM_TIMEOUT_MS: u64 = 1_000;
 
 // ---------------------------------------------------------------------------
 // Leaderless-recovery watchdog.
@@ -145,7 +152,7 @@ pub const LEADERLESS_RECOVERY_COOLDOWN_TIMEOUTS: u32 = 15;
 /// watchdog escalates. A watchdog that fires after the lease would create a
 /// window where the leader has self-fenced but the lease still looks valid to
 /// racing readers.
-pub const METRICS_WATCHDOG_TIMEOUT_MS: u64 = 1500;
+pub const METRICS_WATCHDOG_TIMEOUT_MS: u64 = 1_500;
 
 /// Maximum Raft message size (64MB)
 pub const MAX_RAFT_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
@@ -230,7 +237,7 @@ pub const REPLICATION_SLOT_ENSURE_INTERVAL_SECS: u64 = 30;
 pub const PG_REWIND_MAX_RETRIES: u32 = 10;
 
 /// Delay between `pg_rewind` retry attempts in milliseconds.
-pub const PG_REWIND_RETRY_DELAY_MS: u64 = 1000;
+pub const PG_REWIND_RETRY_DELAY_MS: u64 = 1_000;
 
 /// Extra wait on top of the leader lease before triggering an election on a
 /// transfer target.

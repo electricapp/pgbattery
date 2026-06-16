@@ -395,7 +395,15 @@ impl ConnectionHandler {
     pub async fn run(mut self) -> Result<()> {
         // SSL negotiation already handled before ConnectionHandler creation
         // Read startup message (or detect cancel request)
-        let startup = match self.read_startup_or_cancel().await? {
+        // Bound the startup/cancel read: post-handshake a client could stall
+        // before sending startup, pinning a slot before the proxy loop's idle
+        // timeout applies.
+        let startup_timeout = Duration::from_millis(self.config.connection_timeout_ms);
+        let Ok(initial) = timeout(startup_timeout, self.read_startup_or_cancel()).await else {
+            metrics::counter!("pgbattery_gateway_startup_timeouts").increment(1);
+            return Err(Error::ConnectionTimeout(UNKNOWN_SOCKET_ADDR));
+        };
+        let startup = match initial? {
             StartupOrCancel::Startup(msg) => msg,
             StartupOrCancel::Cancel(cancel_msg) => {
                 // Handle cancel request by forwarding to backend
@@ -430,9 +438,8 @@ impl ConnectionHandler {
         let leader = self.get_leader()?;
         let mut backend = self.connect_to_backend(leader).await?;
 
-        // Forward startup message to backend
-        backend.write_all(&startup).await?;
-        backend.flush().await?;
+        // Bounded so a backend that accepts but never drains can't pin us.
+        write_all_within_deadline(&mut backend, &startup, self.id).await?;
 
         // Run the proxy loop, cleanup on exit
         let result = self.proxy_loop(&mut backend).await;
@@ -988,8 +995,7 @@ impl ConnectionHandler {
         // parsing of the new backend's stream.
         backend_buf.clear();
         if let Some(startup) = self.startup_params.clone() {
-            backend.write_all(&startup).await?;
-            backend.flush().await?;
+            write_all_within_deadline(backend, &startup, self.id).await?;
             self.wait_for_ready(backend, backend_buf).await?;
         }
         // Order mirrors `handle_leader_change`: LISTEN, then prepared
@@ -1858,8 +1864,7 @@ impl ConnectionHandler {
 
                 // Re-send startup message
                 if let Some(startup) = self.startup_params.clone() {
-                    backend.write_all(&startup).await?;
-                    backend.flush().await?;
+                    write_all_within_deadline(backend, &startup, self.id).await?;
 
                     // Wait for AuthenticationOk and ReadyForQuery. `wait_for_ready`
                     // intercepts the BackendKeyData frame and registers the new
@@ -2070,8 +2075,7 @@ impl ConnectionHandler {
 
         let count = queries.len();
         for msg in queries {
-            backend.write_all(&msg).await?;
-            backend.flush().await?;
+            write_all_within_deadline(backend, &msg, self.id).await?;
             // Wait for ReadyForQuery
             self.wait_for_ready(backend, backend_buf).await?;
         }
@@ -2108,9 +2112,8 @@ impl ConnectionHandler {
         let stmt_count = prepared.len();
         let sync = session_replay::build_sync();
         for (name, parse_bytes) in &prepared {
-            backend.write_all(parse_bytes).await?;
-            backend.write_all(&sync).await?;
-            backend.flush().await?;
+            write_all_within_deadline(backend, parse_bytes, self.id).await?;
+            write_all_within_deadline(backend, &sync, self.id).await?;
             if let Err(e) = self.wait_for_ready(backend, backend_buf).await {
                 tracing::warn!(
                     conn_id = self.id,

@@ -1460,7 +1460,7 @@ host all all ::/0 {auth_method}
             .arg(&conninfo)
             .kill_on_drop(true)
             .output();
-        let output = tokio::time::timeout(Duration::from_millis(1500), fut)
+        let output = tokio::time::timeout(Duration::from_millis(1_500), fut)
             .await
             .map_err(|_| Error::Postgres("WAL receiver timeline probe timed out".to_string()))?
             .map_err(|e| Error::Postgres(format!("Failed to query wal receiver: {e}")))?;
@@ -1885,7 +1885,7 @@ host all all ::/0 {auth_method}
             .arg(&conninfo)
             .kill_on_drop(true)
             .output();
-        let output = tokio::time::timeout(Duration::from_millis(1500), fut)
+        let output = tokio::time::timeout(Duration::from_millis(1_500), fut)
             .await
             .ok()?
             .ok()?;
@@ -2026,7 +2026,7 @@ host all all ::/0 {auth_method}
             .arg(&conninfo)
             .kill_on_drop(true)
             .output();
-        let output = tokio::time::timeout(Duration::from_millis(1500), fut)
+        let output = tokio::time::timeout(Duration::from_millis(1_500), fut)
             .await
             .ok()?
             .ok()?;

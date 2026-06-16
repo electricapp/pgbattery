@@ -9,10 +9,10 @@
 pub const PG_REWIND_MAX_RETRIES: u32 = 10;
 
 /// Delay between `pg_rewind` retry attempts in milliseconds.
-pub const PG_REWIND_RETRY_DELAY_MS: u64 = 1000;
+pub const PG_REWIND_RETRY_DELAY_MS: u64 = 1_000;
 
 /// Sync wait timeout in milliseconds.
-pub const SYNC_WAIT_TIMEOUT_MS: u64 = 5000;
+pub const SYNC_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 /// Sync check interval in milliseconds.
 pub const SYNC_CHECK_INTERVAL_MS: u64 = 100;

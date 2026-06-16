@@ -42,7 +42,7 @@ use serde::Serialize;
 use std::time::Duration as StdDuration;
 use tower_http::timeout::TimeoutLayer;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::watch;
 use tracing::info;
 
@@ -90,6 +90,13 @@ pub struct ManagementApiState {
     /// across the snapshot and the `change_membership` call makes the computed
     /// set reflect all prior committed changes.
     pub membership_lock: tokio::sync::Mutex<()>,
+    /// Serializes backup create/restore: two restores (or a restore racing a
+    /// create) on the same PGDATA corrupt it, and the supervisor lock doesn't
+    /// cover dump restores or create. `try_lock` fast-fails the second request.
+    pub backup_lock: tokio::sync::Mutex<()>,
+    /// Fixed 1s-window count of auth *failures*, to throttle brute force.
+    /// Valid tokens bypass it, so a legitimate caller is never limited.
+    pub auth_failures: Mutex<(std::time::Instant, u64)>,
 }
 
 impl std::fmt::Debug for ManagementApiState {
@@ -190,9 +197,29 @@ async fn require_management_token(
         return next.run(request).await;
     }
 
-    // Count auth failures so ops can alert on brute-force attempts. Rate
-    // limiting proper is delegated to the reverse proxy (see module doc).
     metrics::counter!("pgbattery_management_api_auth_failures").increment(1);
+
+    // Throttle brute force: cap auth failures per 1s window. Valid tokens
+    // return above, so this never limits a legitimate caller.
+    let now = std::time::Instant::now();
+    let over_limit = {
+        let mut window = state.auth_failures.lock();
+        if now.duration_since(window.0) >= StdDuration::from_secs(1) {
+            *window = (now, 0);
+        }
+        window.1 = window.1.saturating_add(1);
+        window.1 > crate::config::constants::MGMT_API_RATE_LIMIT_RPS
+    };
+    if over_limit {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(AuthErrorResponse {
+                success: false,
+                message: "Too many failed authentication attempts; slow down".to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::UNAUTHORIZED,

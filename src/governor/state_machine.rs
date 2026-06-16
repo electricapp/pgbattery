@@ -328,6 +328,25 @@ impl ClusterState {
     /// - sync inactive: 16 MB, matching the published async RPO.
     #[must_use]
     pub fn is_lsn_acceptable_for_election(&self, candidate_id: NodeId) -> (bool, &'static str) {
+        // Election gate: permissive when the candidate has no LSN report yet
+        // (initial-join window) — Raft log-matching is the final safety net.
+        self.evaluate_lsn_acceptable(candidate_id, true)
+    }
+
+    /// Stricter sibling of [`Self::is_lsn_acceptable_for_election`] for the
+    /// promote-to-voter / transfer paths: a candidate with no fresh LSN report
+    /// is rejected (fail-closed), since we can't prove it's caught up. The
+    /// "no fresh data anywhere" bootstrap case stays permissive.
+    #[must_use]
+    pub fn is_lsn_acceptable_for_promotion(&self, candidate_id: NodeId) -> (bool, &'static str) {
+        self.evaluate_lsn_acceptable(candidate_id, false)
+    }
+
+    fn evaluate_lsn_acceptable(
+        &self,
+        candidate_id: NodeId,
+        missing_candidate_ok: bool,
+    ) -> (bool, &'static str) {
         let catchup_threshold_bytes = self.lsn_catchup_threshold_bytes();
         let now = unix_now_secs();
         let staleness = crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
@@ -353,7 +372,15 @@ impl ClusterState {
         // Bootstrap: cluster has fresh data from someone, but the candidate
         // has never reported an LSN. Typically initial-join window.
         let Some(&(candidate_lsn, candidate_ts)) = self.node_lsns.get(&candidate_id) else {
-            return (true, "bootstrap: no LSN data for candidate");
+            if missing_candidate_ok {
+                return (true, "bootstrap: no LSN data for candidate");
+            }
+            // Cluster has fresh data but none for the candidate — can't verify
+            // catch-up, so fail closed.
+            return (
+                false,
+                "no fresh LSN report for candidate; refusing promotion (fail-closed)",
+            );
         };
 
         // Cluster has fresh data from some peer, but the candidate's own

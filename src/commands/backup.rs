@@ -81,7 +81,7 @@ pub async fn run_backup_create(
     // (BACKUP_SUBPROCESS_BUDGET), and full backups add a pg_verifybackup
     // pass plus fsync. A shorter client timeout abandons an operation that
     // is still running server-side and invites a concurrent retry.
-    let client = http_client(7200)?;
+    let client = http_client(7_200)?;
     let token = management_api_token(config_path.as_deref());
 
     let resp = with_spinner(
@@ -284,7 +284,7 @@ pub async fn run_backup_restore(
     // (BACKUP_SUBPROCESS_BUDGET) plus decompression and fsync passes. A
     // shorter client timeout abandons an operation that is still running
     // server-side and invites a concurrent retry.
-    let client = http_client(7200)?;
+    let client = http_client(7_200)?;
     let token = management_api_token(config_path.as_deref());
 
     let resp = with_spinner(

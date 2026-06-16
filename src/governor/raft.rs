@@ -336,16 +336,8 @@ impl Governor {
         let tracking_election = runtime.leader_lost_at.is_some();
         if runtime.prev_leader_id.is_some() && leader_id.is_none() && !tracking_election {
             // Leader just disappeared — start the election timer.
-            let now = Instant::now();
-            runtime.leader_lost_at = Some(now);
-            let now_unix_ms = u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX);
-            self.state.write().failover_started_at_unix_ms = Some(now_unix_ms);
+            runtime.leader_lost_at = Some(Instant::now());
+            self.state.write().failover_started_at_unix_ms = Some(Self::unix_now_ms());
         } else if leader_id.is_some() && tracking_election {
             // A new leader appeared while we were tracking an election.
             if let Some(lost_at) = runtime.leader_lost_at.take() {
@@ -360,6 +352,21 @@ impl Governor {
         }
 
         let is_leader = leader_id == Some(self.node_id);
+
+        // The watch can coalesce Leader(other) → None → Leader(self), dropping
+        // the leader→none edge that stamps `failover_started_at_unix_ms` and
+        // skipping the promotion hold-down (split-brain risk). Re-stamp on the
+        // leader-acquisition edge of a real failover; `now` is later than the
+        // missed edge, so we only ever wait longer (the safe direction).
+        if Self::should_anchor_coalesced_failover(
+            runtime.prev_leader_id,
+            is_leader,
+            self.node_id,
+            self.state.read().failover_started_at_unix_ms.is_some(),
+        ) {
+            self.state.write().failover_started_at_unix_ms = Some(Self::unix_now_ms());
+        }
+
         let has_quorum = Self::has_quorum(metrics, is_leader);
         let quorum_ack_age = Self::quorum_ack_age(metrics, is_leader);
         // Expire lease BEFORE activating fence: the per-message lease check in
@@ -450,6 +457,38 @@ impl Governor {
             None => true,
             Some(p) => p != should_fence,
         }
+    }
+
+    /// Whether becoming leader must re-anchor the promotion hold-down because
+    /// the metrics watch may have coalesced away the leader→none edge. True
+    /// only for a real failover (a different prior leader, not yet anchored);
+    /// false for bootstrap, steady-state, or when not leader. Pure fn so the
+    /// coalescing cases are unit-testable.
+    const fn should_anchor_coalesced_failover(
+        prev_leader_id: Option<NodeId>,
+        is_leader: bool,
+        self_id: NodeId,
+        failover_already_anchored: bool,
+    ) -> bool {
+        if !is_leader || failover_already_anchored {
+            return false;
+        }
+        match prev_leader_id {
+            Some(prev) => prev != self_id,
+            None => false,
+        }
+    }
+
+    /// Wall-clock Unix milliseconds, saturating on clock anomalies. Callers use
+    /// `saturating_sub`, so extremes fail toward "no time elapsed" (defer).
+    fn unix_now_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     fn update_fencing_state(
@@ -874,11 +913,11 @@ impl RaftLogReader<TypeConfig> for LogStorageAdapter {
     ) -> std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
         let start = match range.start_bound() {
             std::ops::Bound::Included(&n) => n,
-            std::ops::Bound::Excluded(&n) => n + 1,
+            std::ops::Bound::Excluded(&n) => n.saturating_add(1),
             std::ops::Bound::Unbounded => 0,
         };
         let end = match range.end_bound() {
-            std::ops::Bound::Included(&n) => n + 1,
+            std::ops::Bound::Included(&n) => n.saturating_add(1),
             std::ops::Bound::Excluded(&n) => n,
             std::ops::Bound::Unbounded => u64::MAX,
         };
@@ -2132,6 +2171,66 @@ mod tests {
         assert!(!Governor::fence_gate_needs_apply(Some(false), false));
         assert!(Governor::fence_gate_needs_apply(Some(true), false));
         assert!(Governor::fence_gate_needs_apply(Some(false), true));
+    }
+
+    // ---- Coalesced-failover hold-down anchor ----
+
+    #[test]
+    fn coalesced_failover_anchors_holddown_on_direct_leader_takeover() {
+        // The watch collapsed Leader(7) → None → Leader(self=3): we observe a
+        // direct prior-leader→self transition with no anchor set yet. The
+        // hold-down MUST be (re)anchored so promotion waits out the deposed
+        // leader's lease.
+        assert!(Governor::should_anchor_coalesced_failover(
+            Some(7), // prev leader was a different node
+            true,    // we are now leader
+            3,       // self
+            false,   // no anchor set (the leader→none edge was coalesced away)
+        ));
+    }
+
+    #[test]
+    fn coalesced_failover_does_not_anchor_on_fresh_bootstrap() {
+        // No prior leader ever observed → genuine fresh-cluster bootstrap →
+        // promote immediately, no hold-down.
+        assert!(!Governor::should_anchor_coalesced_failover(
+            None, true, 3, false
+        ));
+    }
+
+    #[test]
+    fn coalesced_failover_does_not_anchor_in_steady_state() {
+        // We were already the leader (prev == self): a heartbeat tick, not a
+        // failover. Must not reset the anchor.
+        assert!(!Governor::should_anchor_coalesced_failover(
+            Some(3),
+            true,
+            3,
+            false
+        ));
+    }
+
+    #[test]
+    fn coalesced_failover_does_not_anchor_when_already_set() {
+        // The normal (non-coalesced) path already stamped the anchor on the
+        // leader→none edge — don't clobber it with a later instant.
+        assert!(!Governor::should_anchor_coalesced_failover(
+            Some(7),
+            true,
+            3,
+            true
+        ));
+    }
+
+    #[test]
+    fn coalesced_failover_does_not_anchor_when_not_leader() {
+        // Leadership went elsewhere — we aren't promoting, so nothing to anchor.
+        assert!(!Governor::should_anchor_coalesced_failover(
+            Some(7),
+            false,
+            3,
+            false
+        ));
     }
 
     // ---- Snapshot membership fidelity ----

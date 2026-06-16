@@ -126,12 +126,21 @@ impl RaftRpcServer {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        let tls_status = if tls_config.is_some() {
-            "TLS enabled"
+        if tls_config.is_some() {
+            tracing::info!(%addr, tls = "enabled", "Raft RPC server listening");
+        } else if addr.ip().is_loopback() {
+            tracing::info!(%addr, tls = "plaintext-loopback", "Raft RPC server listening");
         } else {
-            "plaintext"
-        };
-        tracing::info!(%addr, tls = tls_status, "Raft RPC server listening");
+            // Plaintext = unauthenticated consensus: any reachable host can
+            // forge votes/log entries and force split-brain. Trusted networks
+            // only; configure Raft mTLS otherwise.
+            tracing::warn!(
+                %addr,
+                "Raft RPC server listening PLAINTEXT on a non-loopback address — the \
+                 consensus port is UNAUTHENTICATED. Configure Raft mTLS or restrict it to a \
+                 trusted network; an attacker who can reach it can force split-brain."
+            );
+        }
 
         Ok(Self {
             listener,

@@ -1584,11 +1584,12 @@
         },
         {
           "type": "wait_cluster",
-          "comment": "node1 is severed from the overlay network, so only 2 nodes are live. Declare live_nodes=2 so the convergence oracle allows node1's leader-view to be absent and expects a single replica; without it the check waits forever for the partitioned node's view and a 2nd healthy replica.",
+          "comment": "Verify the partition triggered a failover: node1 is severed, so a new leader must be elected among the 2 reachable nodes. We do NOT assert replication health here — that is impossible to satisfy mid-partition: the new leader keeps the severed node1 in pg_stat_replication (as a lagging/async standby) until wal_sender_timeout (~60s) elapses, so a strict '0 async replicas / exactly 1 healthy replica' check races that timeout and flakes. require_replication_health=false checks only topology + that leadership moved off node1; the post-heal wait below re-asserts full health once node1 rejoins.",
           "nodes": 3,
           "live_nodes": 2,
           "leaders": 1,
           "leader_not_var": "leader_before",
+          "require_replication_health": false,
           "timeout_sec": 60
         },
         {

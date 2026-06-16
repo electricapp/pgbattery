@@ -494,7 +494,7 @@ fn validate_promote_membership(
     let (lsn_ok, lsn_reason) = state
         .cluster_state
         .read()
-        .is_lsn_acceptable_for_election(node_id);
+        .is_lsn_acceptable_for_promotion(node_id);
     if !lsn_ok {
         warn!(
             node_id = node_id,
@@ -891,6 +891,15 @@ pub(super) async fn trigger_elect(
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
         }
+    } else {
+        // No PostgreSQL here (witness): electing it would route clients to a
+        // node with no database. Refuse so a misdirected trigger/transfer fails
+        // cleanly instead of electing a primary-less leader.
+        warn!(
+            node_id = state.node_id,
+            "Refusing election trigger: node runs no PostgreSQL (witness) — cannot serve as primary"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     match state.raft.trigger().elect().await {
         Ok(()) => StatusCode::OK.into_response(),
@@ -1076,6 +1085,11 @@ pub(super) async fn transfer_leadership(
         );
     };
 
+    // Serialize with membership mutations too: a concurrent `remove` could drop
+    // the target mid-transfer. Acquired after transfer_lock (the sole ordering;
+    // remove/promote/join take membership_lock alone), so no deadlock.
+    let _membership_guard = state.membership_lock.lock().await;
+
     // Single watch borrow; `membership_config` is an `Arc`, so no full
     // `RaftMetrics` clone.
     let (current_leader, membership_config) = {
@@ -1106,6 +1120,32 @@ pub(super) async fn transfer_leadership(
     // ready when its matched index equals ours.
     if let Err(response) = wait_for_target_catchup(&state, target_node_id).await {
         return response;
+    }
+
+    // Raft-log catch-up doesn't imply PG WAL replay. Gate on the target's PG
+    // LSN too (fail-closed) so we can't promote a data-behind standby.
+    {
+        let (lsn_ok, lsn_reason) = state
+            .cluster_state
+            .read()
+            .is_lsn_acceptable_for_promotion(target_node_id);
+        if !lsn_ok {
+            warn!(
+                target_node_id,
+                reason = lsn_reason,
+                "Refusing leadership transfer: target behind on PG WAL"
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(TransferResponse {
+                    success: false,
+                    message: format!(
+                        "Target node {target_node_id} is behind on WAL ({lsn_reason}); retry after replication converges"
+                    ),
+                    new_leader_id: Some(state.node_id),
+                }),
+            );
+        }
     }
 
     // openraft (CheckQuorum) won't let a follower vote for a new candidate
@@ -1174,6 +1214,18 @@ pub(super) async fn transfer_leadership(
     // Poll until leadership changes.
     let new_leader = poll_for_leader_change(&state.raft, state.node_id).await;
 
+    transfer_outcome_response(&state, target_node_id, new_leader)
+}
+
+/// Build the transfer response from the post-election leader observation.
+/// `success` means leadership actually reached the requested target; a race
+/// where a third node grabbed the term reports the real leader instead of a
+/// false `success`, so callers can reconcile.
+fn transfer_outcome_response(
+    state: &ManagementApiState,
+    target_node_id: NodeId,
+    new_leader: Option<NodeId>,
+) -> (StatusCode, Json<TransferResponse>) {
     new_leader.map_or_else(
         || {
             let current = state.raft.metrics().borrow().current_leader;
@@ -1187,13 +1239,6 @@ pub(super) async fn transfer_leadership(
             )
         },
         |new_leader| {
-            // `success` reflects "did leadership transfer to the requested target",
-            // not just "did *some* leader emerge". A target that wins-then-crashes
-            // before our poll snapshot is captured (or any race where a third node
-            // grabs the term) returns a new leader != target_node_id; a client
-            // that retried based on `success: true` would never notice the target
-            // was bypassed. `new_leader_id` always reflects reality so callers can
-            // reconcile if needed.
             let transferred_to_target = new_leader == target_node_id;
             (
                 StatusCode::OK,

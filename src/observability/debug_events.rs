@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum number of events to retain.
-const MAX_EVENTS: usize = 1000;
+const MAX_EVENTS: usize = 1_000;
 
 /// A debug event representing a state transition.
 #[derive(Debug, Clone, Serialize)]

@@ -42,6 +42,8 @@ expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
 mem_forget = "deny"
+# Readability: require digit-group separators on long numeric literals (5_000, not 5000).
+unreadable_literal = "deny"
 # Cherry-picked restriction lints.
 todo = "warn"
 unimplemented = "warn"

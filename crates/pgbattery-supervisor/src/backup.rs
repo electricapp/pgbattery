@@ -1602,6 +1602,22 @@ fn copy_directory_contents(source_dir: &Path, target_dir: &Path) -> Result<()> {
                 ))
             })?;
 
+            // Reject symlinks escaping PGDATA (absolute or `..`): recreated,
+            // they'd point PG outside the restore. pgbattery backups carry none
+            // (tablespaces refused at creation), so this only blocks a planted
+            // backup dir — the guard the tar path gets from `unpack_in`.
+            if link_target.is_absolute()
+                || link_target
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(Error::Postgres(format!(
+                    "Refusing to restore symlink {} -> {}: target escapes the data directory",
+                    src_path.display(),
+                    link_target.display()
+                )));
+            }
+
             #[cfg(unix)]
             std::os::unix::fs::symlink(&link_target, &dst_path).map_err(|e| {
                 Error::Postgres(format!(

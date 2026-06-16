@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::config::SslModeConfig;
 use crate::config::constants::METRICS_SYNC_INTERVAL_MS;
@@ -55,6 +55,9 @@ pub struct GatewayConfig {
 
     /// Idle timeout in milliseconds
     pub idle_timeout_ms: u64,
+
+    /// Max concurrent client connections; excess are dropped until a slot frees.
+    pub max_connections: usize,
 }
 
 /// The Gateway - `PostgreSQL`-aware TCP proxy.
@@ -62,6 +65,8 @@ pub struct Gateway {
     config: GatewayConfig,
     tls_config: Arc<TlsConfig>,
     registry: Arc<ConnectionRegistry>,
+    /// Caps concurrent client connections at `config.max_connections`.
+    conn_limit: Arc<Semaphore>,
     leader_rx: watch::Receiver<Option<SocketAddr>>,
     fence_rx: watch::Receiver<FenceState>,
     lease: crate::governor::SharedLeaseState,
@@ -107,10 +112,13 @@ impl Gateway {
             config.ssl_key_path.as_deref(),
         )?);
 
+        let conn_limit = Arc::new(Semaphore::new(config.max_connections));
+
         Ok(Self {
             config,
             tls_config,
             registry,
+            conn_limit,
             leader_rx,
             fence_rx,
             lease,
@@ -182,71 +190,105 @@ impl Gateway {
                 tracing::debug!(peer = %peer_addr, error = %e, "set_nodelay failed");
             }
 
-            // Fast connection ID generation - no crypto overhead
-            let conn_id = self.registry.next_id();
+            // Bound concurrent connections: the owned permit rides in the
+            // handler task and frees on exit. At capacity, drop the socket
+            // rather than spawn unbounded tasks/buffers.
+            let Ok(permit) = self.conn_limit.clone().try_acquire_owned() else {
+                metrics::counter!("pgbattery_gateway_connections_rejected_at_capacity")
+                    .increment(1);
+                tracing::warn!(
+                    peer = %peer_addr,
+                    max_connections = self.config.max_connections,
+                    "Gateway at connection capacity; dropping new connection"
+                );
+                drop(socket);
+                continue;
+            };
 
-            tracing::debug!(
-                conn_id = conn_id,
-                peer = %peer_addr,
-                "Accepted new client connection"
-            );
-
-            metrics::counter!("pgbattery_connections_total").increment(1);
-
-            // Create connection state
-            let state = Arc::new(RwLock::new(ConnectionState::new(conn_id)));
-            self.registry.register(state.clone());
-
-            // Clone what we need for the handler task
-            let registry = self.registry.clone();
-            let leader_rx = self.leader_rx.clone();
-            let fence_rx = self.fence_rx.clone();
-            let config = self.config.clone();
-            let tls_config = self.tls_config.clone();
-            let lease = self.lease.clone();
-
-            // Spawn handler task
-            tokio::spawn(async move {
-                // Handle SSL negotiation on raw socket first
-                let (client, preread) = match negotiate_ssl(socket, &tls_config, conn_id, &state)
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        tracing::debug!(conn_id = conn_id, error = %e, "SSL negotiation failed");
-                        registry.unregister(conn_id);
-                        return;
-                    }
-                };
-
-                let result = ConnectionHandler::new(
-                    conn_id,
-                    client,
-                    state.clone(),
-                    leader_rx,
-                    fence_rx,
-                    config,
-                    registry.clone(),
-                    lease,
-                    preread,
-                )
-                .run()
-                .await;
-
-                match &result {
-                    Ok(()) => {
-                        tracing::debug!(conn_id = conn_id, "Connection closed normally");
-                    }
-                    Err(e) => {
-                        tracing::debug!(conn_id = conn_id, error = %e, "Connection closed");
-                    }
-                }
-
-                registry.unregister(conn_id);
-            });
+            self.dispatch_connection(socket, peer_addr, permit);
         }
 
         Ok(())
+    }
+
+    /// Register an accepted connection and spawn its handler task. The
+    /// semaphore `permit` rides in the task, freeing the slot when it ends.
+    fn dispatch_connection(
+        &self,
+        socket: TcpStream,
+        peer_addr: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let conn_id = self.registry.next_id();
+        tracing::debug!(conn_id = conn_id, peer = %peer_addr, "Accepted new client connection");
+        metrics::counter!("pgbattery_connections_total").increment(1);
+
+        let state = Arc::new(RwLock::new(ConnectionState::new(conn_id)));
+        self.registry.register(state.clone());
+
+        // Clone what we need for the handler task.
+        let registry = self.registry.clone();
+        let leader_rx = self.leader_rx.clone();
+        let fence_rx = self.fence_rx.clone();
+        let config = self.config.clone();
+        let tls_config = self.tls_config.clone();
+        let lease = self.lease.clone();
+
+        tokio::spawn(async move {
+            // Hold the connection-cap permit for the task's lifetime.
+            let _permit = permit;
+
+            // Bound SSL negotiation by connection_timeout_ms: a client that
+            // connects and sends nothing can't pin a slot (the proxy loop's
+            // idle timeout only starts after startup).
+            let negotiated = tokio::time::timeout(
+                Duration::from_millis(config.connection_timeout_ms),
+                negotiate_ssl(socket, &tls_config, conn_id, &state),
+            )
+            .await;
+            let (client, preread) = match negotiated {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    tracing::debug!(conn_id = conn_id, error = %e, "SSL negotiation failed");
+                    registry.unregister(conn_id);
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        conn_id = conn_id,
+                        "SSL/startup negotiation timed out before any data"
+                    );
+                    metrics::counter!("pgbattery_gateway_startup_timeouts").increment(1);
+                    registry.unregister(conn_id);
+                    return;
+                }
+            };
+
+            let result = ConnectionHandler::new(
+                conn_id,
+                client,
+                state.clone(),
+                leader_rx,
+                fence_rx,
+                config,
+                registry.clone(),
+                lease,
+                preread,
+            )
+            .run()
+            .await;
+
+            match &result {
+                Ok(()) => {
+                    tracing::debug!(conn_id = conn_id, "Connection closed normally");
+                }
+                Err(e) => {
+                    tracing::debug!(conn_id = conn_id, error = %e, "Connection closed");
+                }
+            }
+
+            registry.unregister(conn_id);
+        });
     }
 }
 
@@ -364,6 +406,7 @@ mod tests {
             ssl_key_path: None,
             connection_timeout_ms: 5000,
             idle_timeout_ms: 300_000,
+            max_connections: 5000,
         };
 
         assert_eq!(config.connection_timeout_ms, 5000);
@@ -379,6 +422,7 @@ mod tests {
             ssl_key_path: None,
             connection_timeout_ms: 5000,
             idle_timeout_ms: 300_000,
+            max_connections: 5000,
         };
         let (_leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);
         let (_fence_tx, fence_rx) = watch::channel(FenceState::unfenced());

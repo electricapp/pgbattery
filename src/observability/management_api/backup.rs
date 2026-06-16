@@ -85,6 +85,21 @@ pub(super) async fn create_backup(
 ) -> impl IntoResponse {
     info!(node_id = state.node_id, backup_type = ?query.backup_type, "Processing backup create request");
 
+    // Serialize against any other backup/restore; fast-fail if one is running.
+    let Ok(_backup_guard) = state.backup_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(BackupCreateResponse {
+                success: false,
+                message: "Another backup or restore operation is already in progress".to_string(),
+                path: None,
+                size_bytes: None,
+                backup_type: None,
+                compressed: None,
+            }),
+        );
+    };
+
     let backup_type = query.backup_type.unwrap_or(crate::config::BackupType::Full);
 
     // Check if backup manager is available
@@ -360,6 +375,18 @@ pub(super) async fn restore_backup(
         "Processing backup restore request"
     );
 
+    // Serialize against any other backup/restore; fast-fail if one is running.
+    // (The supervisor lock below doesn't cover the dump path.)
+    let Ok(_backup_guard) = state.backup_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(BackupRestoreResponse {
+                success: false,
+                message: "Another backup or restore operation is already in progress".to_string(),
+            }),
+        );
+    };
+
     let (backup_manager, is_full) =
         match resolve_restore(&state, &query.filename, query.allow_primary) {
             Ok(ready) => ready,
@@ -377,72 +404,32 @@ pub(super) async fn restore_backup(
     // restarts pgbattery in bootstrap mode, which spins up a brand-new
     // Raft cluster and orphans the followers. Keeping the lock held
     // blocks the health tick for the duration of the restore window.
-    let restore_result = if let Some(supervisor) = maybe_supervisor {
-        let mut pg = supervisor.lock().await;
-        if let Err(e) = pg.stop().await {
-            error!(error = %e, "Failed to stop PostgreSQL before restore");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(BackupRestoreResponse {
-                    success: false,
-                    message: format!("Failed to stop PostgreSQL before restore: {e}"),
-                }),
-            );
-        }
+    if let Some(supervisor) = maybe_supervisor {
+        // Full restore overwrites PGDATA, so it runs with PG stopped under the
+        // supervisor lock — held across stop → restore → start so the 500ms
+        // health tick can't see `is_alive()==false`, assume a crash, and shut
+        // us down (which would re-bootstrap a fresh Raft cluster).
+        execute_full_restore(&state, supervisor, &backup_manager, &query).await
+    } else {
+        // Dump restore — PG keeps running; no lock needed across the call.
         let result = backup_manager
             .restore_backup(&query.filename, query.database.as_deref())
             .await;
-        // pg_basebackup output carries no standby.signal, so the restored dir
-        // would boot as a writable primary on its own timeline (full restores
-        // are refused on the leader above). Write the signal first so the node
-        // comes up as a standby and rejoins through the normal leader-follow
-        // path instead of diverging. Only on success: a failed restore rolls
-        // back to the pre-restore tree, whose role must not be rewritten here.
-        if result.is_ok()
-            && let Err(e) = pg.ensure_standby_signal().await
-        {
-            error!(error = %e, "Failed to write standby.signal after restore");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(BackupRestoreResponse {
-                    success: false,
-                    message: format!("Restore succeeded but writing standby.signal failed: {e}"),
-                }),
-            );
-        }
-        if let Err(start_err) = pg.start().await {
-            error!(error = %start_err, "Failed to restart PostgreSQL after restore");
-            let msg = match &result {
-                Ok(()) => {
-                    format!("Restore succeeded but PostgreSQL failed to restart: {start_err}")
-                }
-                Err(e) => {
-                    format!("Restore failed ({e}) and PostgreSQL failed to restart: {start_err}")
-                }
-            };
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(BackupRestoreResponse {
-                    success: false,
-                    message: msg,
-                }),
-            );
-        }
-        drop(pg);
-        result
-    } else {
-        // Dump restore — PG keeps running; no lock needed across the call.
-        backup_manager
-            .restore_backup(&query.filename, query.database.as_deref())
-            .await
-    };
+        restore_response(&query.filename, result)
+    }
+}
 
-    match restore_result {
+/// Build the HTTP response for a completed restore.
+fn restore_response(
+    filename: &str,
+    result: Result<(), impl std::fmt::Display>,
+) -> (StatusCode, Json<BackupRestoreResponse>) {
+    match result {
         Ok(()) => (
             StatusCode::OK,
             Json(BackupRestoreResponse {
                 success: true,
-                message: format!("Backup '{}' restored successfully", query.filename),
+                message: format!("Backup '{filename}' restored successfully"),
             }),
         ),
         Err(e) => {
@@ -456,6 +443,76 @@ pub(super) async fn restore_backup(
             )
         }
     }
+}
+
+/// Full (physical) restore: stop PG, clobber PGDATA, mark standby, restart —
+/// all under the supervisor lock, after re-checking non-leadership.
+async fn execute_full_restore(
+    state: &ManagementApiState,
+    supervisor: &Arc<tokio::sync::Mutex<crate::supervisor::Supervisor>>,
+    backup_manager: &crate::supervisor::BackupManager,
+    query: &BackupRestoreQuery,
+) -> (StatusCode, Json<BackupRestoreResponse>) {
+    let fail = |message: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(BackupRestoreResponse {
+                success: false,
+                message,
+            }),
+        )
+    };
+
+    let mut pg = supervisor.lock().await;
+    // Re-check under the lock: `resolve_restore`'s leader check was a snapshot
+    // and we may have won an election since. Wiping PGDATA under a node that
+    // just became primary would destroy committed data.
+    if state.raft.metrics().borrow().current_leader == Some(state.node_id) {
+        tracing::warn!(
+            node_id = state.node_id,
+            filename = %query.filename,
+            "Aborting full restore: node became leader after the request was accepted"
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(BackupRestoreResponse {
+                success: false,
+                message: "Node became the leader after the restore was accepted; \
+                          aborting to avoid overwriting the live primary's data directory."
+                    .to_string(),
+            }),
+        );
+    }
+    if let Err(e) = pg.stop().await {
+        error!(error = %e, "Failed to stop PostgreSQL before restore");
+        return fail(format!("Failed to stop PostgreSQL before restore: {e}"));
+    }
+    let result = backup_manager
+        .restore_backup(&query.filename, query.database.as_deref())
+        .await;
+    // pg_basebackup output carries no standby.signal, so the restored dir would
+    // boot as a writable primary on its own timeline. Write the signal first so
+    // the node comes up as a standby and rejoins via the normal leader-follow
+    // path. Only on success: a failed restore rolls back to the pre-restore
+    // tree, whose role must not be rewritten.
+    if result.is_ok()
+        && let Err(e) = pg.ensure_standby_signal().await
+    {
+        error!(error = %e, "Failed to write standby.signal after restore");
+        return fail(format!(
+            "Restore succeeded but writing standby.signal failed: {e}"
+        ));
+    }
+    if let Err(start_err) = pg.start().await {
+        error!(error = %start_err, "Failed to restart PostgreSQL after restore");
+        let msg = match &result {
+            Ok(()) => format!("Restore succeeded but PostgreSQL failed to restart: {start_err}"),
+            Err(e) => format!("Restore failed ({e}) and PostgreSQL failed to restart: {start_err}"),
+        };
+        return fail(msg);
+    }
+    drop(pg);
+    restore_response(&query.filename, result)
 }
 
 #[cfg(test)]

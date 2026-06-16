@@ -89,14 +89,29 @@ impl JoinRequest {
     }
 
     /// Convert to [`AdvertisedAddresses`].
+    ///
+    /// Returns `None` for unparseable addresses, or for an unspecified IP
+    /// (`0.0.0.0`/`::`) or port 0 — never valid as an advertised peer, so a
+    /// join carrying one is rejected rather than registered as a bogus member.
     #[must_use]
     pub fn to_advertised(&self) -> Option<AdvertisedAddresses> {
-        Some(AdvertisedAddresses {
+        let addrs = AdvertisedAddresses {
             pg_addr: self.pg_addr.parse().ok()?,
             raft_addr: self.raft_addr.parse().ok()?,
             mgmt_addr: self.mgmt_addr.parse().ok()?,
             metrics_addr: self.metrics_addr.parse().ok()?,
-        })
+        };
+        for addr in [
+            addrs.pg_addr,
+            addrs.raft_addr,
+            addrs.mgmt_addr,
+            addrs.metrics_addr,
+        ] {
+            if addr.ip().is_unspecified() || addr.port() == 0 {
+                return None;
+            }
+        }
+        Some(addrs)
     }
 }
 

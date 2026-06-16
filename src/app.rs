@@ -514,6 +514,8 @@ impl App {
             debug_events: crate::observability::debug_events::DebugEventBuffer::new(),
             transfer_lock: tokio::sync::Mutex::new(()),
             membership_lock: tokio::sync::Mutex::new(()),
+            backup_lock: tokio::sync::Mutex::new(()),
+            auth_failures: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
         });
         // Also clone the token into an owned String copy for the CLI-style
         // HTTP client used by the auto-promotion path, below.
@@ -1017,7 +1019,7 @@ impl App {
                         clippy::cast_precision_loss,
                         reason = "elapsed millis since startup fits in f64 mantissa"
                     )]
-                    let total_secs = elapsed_ms as f64 / 1000.0;
+                    let total_secs = elapsed_ms as f64 / 1_000.0;
                     metrics::histogram!("pgbattery_failover_total_seconds").record(total_secs);
                     tracing::info!(total_secs, "Failover total duration recorded");
                     cluster_state.write().failover_started_at_unix_ms = None;
