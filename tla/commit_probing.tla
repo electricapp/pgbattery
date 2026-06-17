@@ -2,8 +2,7 @@
 (*
  * TLA+ Specification for Commit Probing (In-Doubt Transaction Recovery)
  *
- * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
- * tla/README.md.
+ * Machine-checked: `make -C tla check` (CI: .github/workflows/tla.yml).
  *
  * Models the gateway's ability to recover transaction status after leader
  * failure during COMMIT. This is the "in-doubt transaction" problem.

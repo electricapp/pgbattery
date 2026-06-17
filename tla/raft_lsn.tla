@@ -2,8 +2,7 @@
 (*
  * TLA+ Specification for Raft with LSN-Aware Elections
  *
- * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
- * tla/README.md before relying on the THEOREMs at the foot of this file.
+ * Machine-checked: `make -C tla check` (CI: .github/workflows/tla.yml).
  *
  * This spec extends standard Raft voting to include PostgreSQL LSN (Log Sequence
  * Number) as an additional constraint on vote acceptance. This is the "Kukushkin
@@ -62,18 +61,26 @@
  *      accepts a candidate with no LSN report, is_lsn_acceptable_for_promotion
  *      rejects it when the cluster has fresh data.
  *
- * WHAT THIS PROVES: LSN-aware voting cannot elect a leader a voter considered
- *   too far behind, and the threshold never deadlocks elections.
- * WHAT THIS DOESN'T PROVE: LSN reporting is timely/accurate; the staleness and
- *   fail-closed-promotion paths above; that the dual threshold is well-chosen.
+ * WHAT THIS PROVES: ElectionSafety (at most one leader) and that the LSN gate
+ *   never deadlocks elections (NoLSNDeadlock / SomeNodeCanWin).
+ * WHAT TLC ACTIVELY DISPROVES: that the elected leader has an acceptable or
+ *   non-behind LSN. The gate is ADVISORY — the self-vote is not LSN-checked, so
+ *   a candidate behind on LSN self-votes and can still reach quorum via an
+ *   under-informed voter. LeaderHasAcceptableLSN and LeaderLSNNotBelowVoters are
+ *   defined below as the aspiration but are NOT in the cfg: TLC finds a
+ *   counterexample to each. Leader freshness rests on Raft log-matching
+ *   (LogIsUpToDate, abstracted to TRUE here), not on the LSN gate.
+ * ALSO NOT MODELED: LSN reporting timeliness; the staleness window and the
+ *   fail-closed-promotion path above; whether the dual threshold is well-chosen.
  *
  * === IMPLEMENTATION vs SPEC NOTE ===
  *
- * The spec models LSN voting as MANDATORY (blocking) - a candidate with
- * unacceptable LSN cannot become leader. The implementation matches:
- * governor/network.rs rejects the vote RPC with an error when the candidate's
- * LSN is too far behind the known cluster max. The spec and implementation
- * are aligned.
+ * A VOTER rejects a candidate whose LSN is too far behind the voter's known max
+ * (governor/network.rs rejects the vote RPC). But this is per-voter and
+ * advisory: a candidate self-votes without an LSN check and needs only the rest
+ * of a quorum, so an under-informed voter can still carry a behind candidate to
+ * leadership. The implementation says as much — the gate is "advisory; Raft
+ * log-matching provides the final safety guarantee" (state_machine.rs).
  *
  * Authors: pgbattery team
  * Date: 2024
@@ -379,12 +386,11 @@ ElectionSafety ==
         (state[n] = "Leader" /\ state[m] = "Leader") => n = m
 
 (*
- * LeaderCompleteness: A leader's LSN was acceptable to its voters
- * (The LSN safety property we want to verify)
- *
- * Note: We only check against nodes that VOTED for the leader.
- * Nodes that didn't participate (e.g., partitioned) don't affect this.
- * This matches Raft's quorum-based safety model.
+ * LeaderHasAcceptableLSN: aspiration that every voter found the leader's LSN
+ * acceptable. NOT checked — TLC disproves it. The self-vote skips the LSN check
+ * (StartElection sets votesGranted[n] = {n} unconditionally), so a candidate
+ * behind its own maxKnownLSN reaches quorum via one under-informed voter. The
+ * gate is advisory; this stays as documentation of what it does NOT guarantee.
  *)
 LeaderHasAcceptableLSN ==
     leader /= None =>
@@ -394,9 +400,10 @@ LeaderHasAcceptableLSN ==
             IsLSNAcceptable(leader, voter)
 
 (*
- * StrongerLSNSafety: No leader can have LSN below any voter's actual LSN
- * This is what we REALLY want - the leader should have data at least as
- * fresh as any node that voted for it.
+ * LeaderLSNNotBelowVoters: the leader's actual LSN within threshold of every
+ * voter's actual LSN. Also NOT checked — TLC disproves it too, on a path where
+ * a behind candidate self-votes, gains an under-informed vote, and ReplicateLSN
+ * then advances a voter past the leader. Same advisory caveat as above.
  *)
 LeaderLSNNotBelowVoters ==
     leader /= None =>

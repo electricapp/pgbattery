@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 /tla/states/
+/tla/.tools/
 README.pdf
 *.pdf
 

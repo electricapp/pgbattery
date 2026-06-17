@@ -1,0 +1,30 @@
+name: TLA+
+
+# Machine-checks the formal specs in tla/. Reproducible: the model checker
+# (tla2tools.jar) is pinned by version + SHA-256 in tla/Makefile, and CI runs
+# the very same `make -C tla check` you run locally.
+
+on:
+  push:
+    paths:
+      - "tla/**"
+      - ".github/workflows/tla.yml"
+  pull_request:
+    paths:
+      - "tla/**"
+      - ".github/workflows/tla.yml"
+  workflow_dispatch:
+
+jobs:
+  tlc:
+    name: Model-check TLA+ specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Model-check all specs (downloads + verifies pinned TLC jar)
+        run: make -C tla check

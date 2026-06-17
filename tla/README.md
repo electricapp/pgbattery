@@ -1,92 +1,83 @@
 # TLA+ Specifications
 
-Formal models of pgbattery's core safety properties.
+Formal models of pgbattery's core safety properties, **machine-checked** with TLC.
 
-> **Validation status.** These specs are **not run in CI** and are **not
-> machine-checked in this repository** — TLC is not installed here. Each spec's
-> invariants were verified by hand against its actions (a proof sketch). Run TLC
-> (below) before relying on any `THEOREM`/`INVARIANT`. Treat the `.tla` files as
-> the source of truth for _what is claimed_; only a TLC run establishes that the
-> claims _hold_.
-
-## Specs
-
-| Spec                        | What it checks                                                              |
-| --------------------------- | -------------------------------------------------------------------------- |
-| `lease_fencing.tla`         | At most one node holds **write authority** across leadership transfer      |
-| `raft_lsn.tla`              | LSN-aware voting never elects a leader a voter deemed too far behind        |
-| `commit_probing.tla`        | In-doubt COMMIT probing is correct; acknowledged commits survive failover  |
-| `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions      |
+> **Validation.** `make check` (below) runs all four specs through TLC and fails
+> on any violation. The model checker (`tla2tools.jar`) is pinned by version +
+> SHA-256 in the `Makefile`, so every run — local or CI — uses an identical,
+> verified binary. CI runs the same target: `.github/workflows/tla.yml`.
 
 ## Run
 
 ```bash
-# Install TLC (one-time)
-brew install --cask tla-plus-toolbox
-
-# Run each model (artifacts go into artifacts/)
 cd tla/
-tlc lease_fencing.tla         -config lease_fencing.cfg         -metadir artifacts
-tlc raft_lsn.tla              -config raft_lsn.cfg              -metadir artifacts
-tlc commit_probing.tla        -config commit_probing.cfg        -metadir artifacts
-tlc timeline_verification.tla -config timeline_verification.cfg -metadir artifacts
+make check                      # download (pinned) + check ALL specs
+make check-lease_fencing        # one spec, full TLC output
+make tools                      # just fetch + verify the jar
+make clean                      # remove downloaded jar + TLC state
 ```
 
-## Properties checked (by `.cfg`)
+Requires a JDK ≥ 11. The `Makefile` auto-detects a working `java`, else Homebrew
+`openjdk@21`. On macOS install it with **`brew install openjdk@21`** (a formula —
+no `sudo`; the `--cask`/Toolbox needs root and isn't required).
 
-**`lease_fencing.tla`**
+## What each spec checks
 
-- `AtMostOneWriteAuthority` — at most one node has a valid lease **and** a
-  writable PG at any instant. Non-vacuous: leadership transfers in the model, so
-  a deposed leader and a new leader coexist; the promotion hold-down plus the
-  quorum-ack-anchored lease keep their write windows disjoint. Set `HoldDown = 0`
-  in the cfg and TLC produces the two-writer (split-brain) counterexample.
-- `SelfFenceOnQuorumLoss` — a leader that stops getting quorum acks loses write
-  authority within `QuorumTimeout` of its last ack.
-- Scope note: the hold-down is modeled anchored at the election instant. The
-  implementation anchors at the new leader's _local_ leader-loss observation,
-  which coincides only for fast failover. The partial-partition case and its
-  sync-replication backstop are documented in the spec header.
+| Spec                        | Verified property                                                          |
+| --------------------------- | -------------------------------------------------------------------------- |
+| `lease_fencing.tla`         | At most one node holds **write authority** across leadership transfer      |
+| `raft_lsn.tla`              | Election safety + the LSN gate never deadlocks elections                   |
+| `commit_probing.tla`        | In-doubt COMMIT probing is correct; acknowledged commits survive failover  |
+| `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions     |
 
-**`raft_lsn.tla`**
+## Properties (checked by each `.cfg`)
 
-- `ElectionSafety` — at most one leader.
-- `LeaderHasAcceptableLSN` / `LeaderLSNNotBelowVoters` — every node that voted
-  for the leader found its LSN acceptable (the LSN-safety property).
-- `NoLSNDeadlock` / `SomeNodeCanWin` — the LSN gate never wedges elections.
-- Scope note: a single abstract threshold stands in for the code's dual
-  sync/async threshold; the staleness window and the election-vs-promotion
-  fail-open/closed split are documented, not modeled (no clock in this spec).
+**`lease_fencing.tla`** — passes (14,974 distinct states)
 
-**`commit_probing.tla`**
+- `AtMostOneWriteAuthority` — at most one node has a valid lease **and** writable
+  PG at any instant. **Non-vacuous**: leadership transfers in the model, so a
+  deposed and a new leader coexist; only the promotion hold-down plus the
+  quorum-ack-anchored lease keep their write windows apart. Removing
+  `ASSUME HoldDown >= LeaseDuration` and setting `HoldDown = 0` makes TLC produce
+  the two-writer (split-brain) counterexample — confirming the invariant has teeth.
+- `SelfFenceOnQuorumLoss` — a leader that stops getting acks loses write authority
+  within `QuorumTimeout` of its last ack.
+- Time is modeled **relatively** (bounded countdowns advanced by one global tick),
+  not as an absolute clock, so the state space stays small and finite.
+- Scope: the hold-down is modeled at the election instant; the implementation
+  anchors at the new leader's local leader-loss observation, which coincides only
+  for fast failover. The partial-partition case and its sync-replication backstop
+  are documented in the spec header.
 
-- `ProbeCommittedImpliesVisible` / `ProbeAbortedImpliesNotWritten` — the probe
-  never reports a false commit or a false abort.
-- `AckedSuccessIsDurable` — any success the client saw (normal or synthetic)
-  denotes a transaction still visible on the current leader after failover (RPO=0).
+**`raft_lsn.tla`** — passes (33,957 distinct states)
 
-**`timeline_verification.tla`**
+- `ElectionSafety` (≤1 leader), `NoLSNDeadlock` / `SomeNodeCanWin` (the LSN gate
+  never wedges elections), `TypeOK`.
+- **TLC actively DISPROVES** `LeaderHasAcceptableLSN` and `LeaderLSNNotBelowVoters`
+  (defined in the spec, deliberately not in the cfg): a candidate self-votes past
+  the gate — the self-vote is not LSN-checked — and reaches quorum via an
+  under-informed voter, so a node can lead while behind on LSN. The LSN gate is
+  **advisory**; Raft log-matching (abstracted here) is the real safety net, exactly
+  as the implementation comments state.
 
-- `TypeOK` + `TimelineMonotonic` — timelines stay in bounds and a promotion only
-  ever advances a node's timeline.
-- Does **not** claim "no two primaries share a timeline" — that is false in the
-  partition model. Single-primary safety lives in `lease_fencing.tla` (Raft); the
-  `pg_rewind` data-loss gate is covered by Rust unit tests for
-  `rewind_divergence_decision`.
+**`commit_probing.tla`** — passes (47,932 distinct states)
+
+- `ProbeCommittedImpliesVisible` / `ProbeAbortedImpliesNotWritten` — no false commit
+  or false abort.
+- `AckedSuccessIsDurable` — any success the client saw (normal or synthetic) is
+  still visible on the current leader after failover (RPO=0).
+
+**`timeline_verification.tla`** — passes (3,208 distinct states)
+
+- `TypeOK` + `TimelineMonotonic` — timelines stay bounded and a promotion only ever
+  advances a node's timeline.
+- Does **not** claim "no two primaries share a timeline" — false in the partition
+  model. Single-primary safety lives in `lease_fencing.tla` (Raft); the `pg_rewind`
+  data-loss gate is covered by Rust unit tests for `rewind_divergence_decision`.
 
 ## Code mapping
 
-Each spec's header maps its TLA+ variables and actions to the Rust that
-implements them, by file and function (not line number, which rots). Example
-from `lease_fencing.tla`:
-
-```
-LeaseIsValid(n)          →  governor/lease.rs            is_valid()
-renew(quorum_ack_age)    →  governor/lease.rs            renew()  (anchor = last ack + duration)
-BelievesHasQuorum (1s)   →  governor/raft.rs             millis_since_quorum_ack < QUORUM_TIMEOUT_MS
-HoldDown gate            →  app.rs                       promotion_lease_holddown()
-```
-
-The supervisor lives in the `crates/pgbattery-supervisor/` workspace crate
-(`crates/pgbattery-supervisor/src/process.rs`), not `src/supervisor/` (which is
-a re-export shim).
+Each spec's header maps its TLA+ variables and actions to the Rust that implements
+them, by file and function (not line number, which rots). The supervisor lives in
+the `crates/pgbattery-supervisor/` workspace crate
+(`crates/pgbattery-supervisor/src/process.rs`), not `src/supervisor/` (a re-export shim).

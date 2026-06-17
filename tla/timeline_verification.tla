@@ -2,8 +2,7 @@
 (*
  * TLA+ Specification for Timeline Transitions
  *
- * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
- * tla/README.md.
+ * Machine-checked: `make -C tla check` (CI: .github/workflows/tla.yml).
  *
  * Models PostgreSQL timeline transitions during promotion and partition. The
  * implementation deliberately does NOT block promotion on timeline divergence
