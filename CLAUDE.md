@@ -19,17 +19,29 @@ This is a distributed database system. If you observe inconsistent state (split-
 
 ## Architecture
 
+Cargo **workspace** with three members (`Cargo.toml` `[workspace]`): the root
+binary crate (`.`) plus two leaf crates with a strict compile-time boundary —
+neither leaf depends on the root, so they cannot pull in Raft/gateway/etc.
+
 ```
-src/
-  cli.rs, main.rs, app.rs    — entrypoint, CLI parsing
+src/                           — root crate (the `pgbattery` binary)
+  cli.rs, main.rs, app.rs      — entrypoint, CLI parsing, orchestration
   cluster/                     — Raft consensus, membership, replication management
   governor/                    — leader/follower state machines, failover logic
   gateway/                     — TCP proxy that routes clients to current leader
-  supervisor/                  — PostgreSQL process management (start/stop/promote)
+  supervisor/mod.rs            — RE-EXPORT SHIM only; impl lives in the crate below
   observability/               — Prometheus metrics + management HTTP API
   config/                      — TOML config parsing
   commands/                    — backup/restore
+
+crates/
+  pgbattery-core/src/          — shared primitives: clock, constants, error, types
+  pgbattery-supervisor/src/    — REAL PostgreSQL process mgmt (process.rs, backup.rs)
+                                 e.g. verify_promotion_safe(), promote/demote, pg_rewind
 ```
+
+Note: `crate::supervisor::*` paths still resolve via the shim, but the source is
+under `crates/pgbattery-supervisor/src/` — grep there, not `src/supervisor/`.
 
 ## Docker Compose (3-node cluster)
 

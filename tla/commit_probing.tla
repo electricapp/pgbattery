@@ -2,6 +2,9 @@
 (*
  * TLA+ Specification for Commit Probing (In-Doubt Transaction Recovery)
  *
+ * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
+ * tla/README.md.
+ *
  * Models the gateway's ability to recover transaction status after leader
  * failure during COMMIT. This is the "in-doubt transaction" problem.
  *
@@ -19,7 +22,7 @@
  *   commitSent[c]       → gateway/handlers/mod.rs: after Query("COMMIT") forwarded
  *   walWritten[txid]    → PostgreSQL: transaction in WAL
  *   replicated[txid]    → PostgreSQL: replicated to sync replica
- *   probeResult[c]      → gateway/handlers/mod.rs: probe_transaction_status()
+ *   probeResult[c]      → gateway/handlers/mod.rs: probe_txid_status()
  *
  * CODE REFERENCES:
  *   gateway/handlers/mod.rs - Commit detection, txid capture, probe logic, synthetic responses
@@ -299,6 +302,23 @@ ReplicatedImpliesProbeFindsIt ==
     \A c \in Connections :
         (txidCaptured[c] /= 0 /\ replicated[txidCaptured[c]] /\ probeResult[c] /= "none" /\ leader /= None)
         => (probeResult[c] = "committed" \/ IsVisibleOn(txidCaptured[c], leader))
+
+(*
+ * RPO=0 end-to-end: any acknowledged success the client saw — normal-path
+ * (sync commit confirmed before the crash) or synthetic "committed" — denotes a
+ * transaction still visible on the current leader, across failover. Normal-path
+ * responses require replicated[txid] (ReceiveCommitResponse), and a new leader
+ * must carry every replicated txn (ElectNewLeader); synthetic "committed"
+ * requires visibility directly (ProbeCommittedImpliesVisible). This is the
+ * no-lost-acknowledged-commit guarantee.
+ *)
+AckedSuccessIsDurable ==
+    \A c \in Connections :
+        (   responseReceived[c]
+         /\ txidCaptured[c] /= 0
+         /\ probeResult[c] \in {"none", "committed"}
+         /\ leader /= None )
+        => IsVisibleOn(txidCaptured[c], leader)
 
 \* ============================================================================
 \* WHAT THIS PROVES

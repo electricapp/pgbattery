@@ -1,110 +1,139 @@
 -------------------------------- MODULE lease_fencing --------------------------------
 (*
- * TLA+ Specification for Lease-Based Split-Brain Prevention (v2)
+ * TLA+ Specification for Lease-Based Split-Brain Prevention
  *
- * ENHANCEMENT OVER v1: Models quorum detection timing explicitly.
+ * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
+ * tla/README.md; the invariants below are hand-verified against the actions,
+ * which is a proof sketch, not a proof.
  *
- * v1 assumed instant quorum detection. Reality uses millis_since_quorum_ack
- * with a 1000ms threshold. This spec models that timing to prove the
- * threshold is sufficient for safety.
+ * === WHY THIS MODELS LEADERSHIP TRANSFER ===
  *
- * Models the triple-layer defense mechanism in pgbattery:
- * - Layer 1: Process coupling (tini)
- * - Layer 2: Gateway lease checking
- * - Layer 3: Supervisor enforcement loop
+ * Split-brain is only expressible if two nodes can believe they lead at once.
+ * A model with a single, write-once leader makes `AtMostOneWriteAuthority` hold
+ * VACUOUSLY — the dangerous state (a deposed leader still holding a stale lease
+ * while a new leader is elected) is unreachable. So this spec models leadership
+ * TRANSFER across terms: a stale (deposed) leader and a freshly-elected leader
+ * coexist in the state space, and only the hold-down plus lease anchoring keep
+ * their write windows apart. The property is non-vacuous — set HoldDown = 0 in
+ * the cfg and TLC finds the two-writer counterexample.
  *
- * === KEY ADDITION: Quorum Detection Timing ===
+ * === THE TWO MECHANISMS THIS SPEC MODELS ===
  *
- * CODE: governor/raft.rs
+ *   1. Lease anchored at the last quorum ack.
+ *      CODE: governor/lease.rs renew():
+ *            expires_at = (now - quorum_ack_age) + duration
+ *      => a leader's authority ends at  last_quorum_ack + LeaseDuration, NOT
+ *         at  now + LeaseDuration.  A deposed leader cannot ack again (only the
+ *         current Raft leader receives quorum acks), so its expiry is frozen.
  *
- *   let millis = metrics.millis_since_quorum_ack.unwrap_or(u64::MAX);
- *   let has_quorum = if voter_count == 1 {
- *       true  // Single voter always has quorum
- *   } else {
- *       millis < 1000  // Quorum if heard from majority within 1s
- *   };
+ *   2. Promotion hold-down.
+ *      CODE: app.rs promotion_lease_holddown(); governor/raft.rs
+ *            failover_started_at_unix_ms; docs/STATE_MACHINE.md §2.
+ *      => a leader elected via failover refuses to make PG writable until one
+ *         full LeaseDuration has elapsed since the leader->none edge it observed.
  *
- * This spec models:
- *   - lastQuorumAck[n] = time of last successful quorum ack
- *   - QuorumTimeout = 10 (represents 1000ms in time units)
- *   - Quorum detected as lost when: time - lastQuorumAck[n] > QuorumTimeout
+ * === MODELING NOTE 1: write AUTHORITY, not lease validity, is the safety property ===
  *
- * Authors: pgbattery team
- * Date: 2025
+ * Two VALID leases can briefly coexist (the new leader renews its lease as soon
+ * as it has quorum, while the deposed leader's lease has not yet expired). That
+ * is harmless because the deposed leader is the only one WRITABLE during that
+ * window and the new leader is still in hold-down. So the invariant is about
+ * WRITE AUTHORITY (valid lease AND PG writable), matching the code: the lease
+ * is intent; the hold-down gates the actual promotion. Treating <=1 *valid
+ * lease* as the safety property would be wrong — the system does not provide it
+ * (two leases overlap transiently); only <=1 *write authority* holds.
+ *
+ * === MODELING NOTE 2: the hold-down anchor (important limitation) ===
+ *
+ * This spec anchors the hold-down at the ELECTION instant and enforces that a
+ * deposed leader cannot ack after it loses the term (only the current
+ * `raftLeader` runs ReceiveQuorumAck). Hence  A_old <= E_new  holds by
+ * construction, and the hold-down (>= LeaseDuration) closes the window.
+ *
+ * The IMPLEMENTATION anchors at the new leader's FIRST LOCAL leader->none
+ * observation `obs`, and does NOT re-stamp at the election edge unless the edge
+ * was coalesced away (raft.rs should_anchor_coalesced_failover). For FAST
+ * failover  obs ≈ E  and this model is faithful. For SLOW / PARTIAL-PARTITION
+ * failover  obs  can precede the deposed leader's last quorum ack by more than
+ * (LeaseDuration - QuorumTimeout); the hold-down is then already satisfied at
+ * election and provides NO protection. In that regime split-brain freedom rests
+ * on (a) `SelfFenceOnQuorumLoss` below — the deposed leader self-fences within
+ * QuorumTimeout of its last real ack — and (b) synchronous replication blocking
+ * un-acknowledged commits during that <= QuorumTimeout window.
+ * THIS SPEC DOES NOT MODEL PARTIAL-QUORUM DYNAMICS — the analysis is in this header.
+ *
+ * Single global clock: clock skew between nodes is out of scope (the code uses
+ * wall-clock Instants; the ordering argument is about event ordering, which a
+ * single monotonic `time` captures).
+ *
+ * Authors: pgbattery team   Date: 2026
  *)
 
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
-    Nodes,                  \* Set of node IDs {1, 2, 3}
-    LeaseDuration,          \* Lease duration in time units (e.g., 20 = 2 seconds)
-    QuorumTimeout,          \* Quorum detection timeout (e.g., 10 = 1 second)
-    EnforcementInterval,    \* Lease enforcement check interval (e.g., 1 = 100ms)
-    MaxTime                 \* Maximum time to explore (bounds state space)
+    Nodes,            \* e.g. {1, 2, 3}
+    LeaseDuration,    \* DEFAULT_LEASE_DURATION (e.g. 20 == 2s)
+    QuorumTimeout,    \* QUORUM_TIMEOUT_MS     (e.g. 10 == 1s); must be < LeaseDuration
+    HoldDown,         \* promotion hold-down   (== LeaseDuration in the code)
+    MaxTerm,          \* bound on elections (state-space bound)
+    MaxTime           \* bound on the clock  (state-space bound)
+
+\* Key timing relationships the implementation depends on.
+ASSUME QuorumTimeout < LeaseDuration
+ASSUME HoldDown >= LeaseDuration
 
 VARIABLES
-    (* Raft state *)
-    raftLeader,             \* Current Raft leader (node ID or None)
-    lastQuorumAck,          \* lastQuorumAck[n] = time of last quorum ack for node n
+    raftTerm,           \* global monotonic Raft term; 0 == no leader yet
+    raftLeader,         \* node that is leader at raftTerm (or None)
+    lastQuorumAck,      \* lastQuorumAck[n]: time of n's last majority ack
+    leaseExpiresAt,     \* leaseExpiresAt[n]
+    leaseIsLeader,      \* leaseIsLeader[n]: lease state thinks n is leader
+    holdDownUntil,      \* holdDownUntil[n]: n must not enable writes before this time
+    pgWritable,         \* pgWritable[n]: PostgreSQL on n accepts writes
+    canReachMajority,   \* canReachMajority[n]
+    time
 
-    (* Lease state - Layers 2 & 3 *)
-    leaseExpiresAt,         \* leaseExpiresAt[n] = when node n's lease expires (time)
-    leaseIsLeader,          \* leaseIsLeader[n] = does lease state think n is leader?
+vars == <<raftTerm, raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
+          holdDownUntil, pgWritable, canReachMajority, time>>
 
-    (* PostgreSQL state *)
-    pgWritable,             \* pgWritable[n] = is PostgreSQL accepting writes?
-    pgAlive,                \* pgAlive[n] = is PostgreSQL process running?
-
-    (* Process state - Layer 1 *)
-    pgBatteryAlive,         \* pgBatteryAlive[n] = is pgbattery process running?
-
-    (* Gateway state - Layer 2 *)
-    gatewayAcceptsWrites,   \* gatewayAcceptsWrites[n] = gateway forwarding writes?
-
-    (* Network partition state *)
-    canReachMajority,       \* canReachMajority[n] = can node n reach majority of cluster?
-
-    (* Clock *)
-    time                    \* Global clock (monotonic time)
-
-vars == <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-          pgWritable, pgAlive, pgBatteryAlive, gatewayAcceptsWrites,
-          canReachMajority, time>>
-
-\* ============================================================================
-\* HELPERS
-\* ============================================================================
-
-Quorum == (Cardinality(Nodes) \div 2) + 1
 None == 0
 
-\* Derived: Does node believe it has quorum based on timing?
-\* CODE: governor/raft.rs
-BelievesHasQuorum(n) ==
-    time - lastQuorumAck[n] < QuorumTimeout
+\* CODE: governor/raft.rs — has_quorum := millis_since_quorum_ack < QUORUM_TIMEOUT_MS
+BelievesHasQuorum(n) == time - lastQuorumAck[n] < QuorumTimeout
 
-\* Lease validity check - includes quorum check
-\* CODE: governor/lease.rs, governor/raft.rs
-\* A lease is only valid if the node ALSO believes it has quorum
+\* Lease validity.  CODE: governor/lease.rs is_valid() == is_leader && now < expires_at,
+\* with quorum loss folded in via update_from_raft's immediate-expiry branch
+\* (modeled here as the BelievesHasQuorum conjunct so a stale leader self-fences).
 LeaseIsValid(n) ==
     /\ leaseIsLeader[n]
     /\ time < leaseExpiresAt[n]
     /\ BelievesHasQuorum(n)
 
-\* ============================================================================
-\* INITIAL STATE
-\* ============================================================================
+\* Effective write authority: a node may serve writes only with a valid lease
+\* AND a writable PG. (Gateway per-message lease check + supervisor enable.)
+HasWriteAuthority(n) == LeaseIsValid(n) /\ pgWritable[n]
+
+TypeOK ==
+    /\ raftTerm \in 0..MaxTerm
+    /\ raftLeader \in Nodes \cup {None}
+    /\ lastQuorumAck \in [Nodes -> 0..MaxTime]
+    /\ leaseExpiresAt \in [Nodes -> 0..(MaxTime + LeaseDuration)]
+    /\ leaseIsLeader \in [Nodes -> BOOLEAN]
+    /\ holdDownUntil \in [Nodes -> 0..(MaxTime + HoldDown)]
+    /\ pgWritable \in [Nodes -> BOOLEAN]
+    /\ canReachMajority \in [Nodes -> BOOLEAN]
+    /\ time \in 0..MaxTime
 
 Init ==
+    /\ raftTerm = 0
     /\ raftLeader = None
-    /\ lastQuorumAck = [n \in Nodes |-> 0]  \* No acks yet
-    /\ leaseExpiresAt = [n \in Nodes |-> 0]  \* All expired
+    /\ lastQuorumAck = [n \in Nodes |-> 0]
+    /\ leaseExpiresAt = [n \in Nodes |-> 0]
     /\ leaseIsLeader = [n \in Nodes |-> FALSE]
+    /\ holdDownUntil = [n \in Nodes |-> 0]
     /\ pgWritable = [n \in Nodes |-> FALSE]
-    /\ pgAlive = [n \in Nodes |-> TRUE]
-    /\ pgBatteryAlive = [n \in Nodes |-> TRUE]
-    /\ gatewayAcceptsWrites = [n \in Nodes |-> FALSE]
-    /\ canReachMajority = [n \in Nodes |-> TRUE]  \* Initially connected
+    /\ canReachMajority = [n \in Nodes |-> TRUE]
     /\ time = 0
 
 \* ============================================================================
@@ -112,272 +141,177 @@ Init ==
 \* ============================================================================
 
 (*
- * Raft elects a leader - simplified, focus is on lease timing
+ * Bootstrap election: the very first leader. No prior leader => no hold-down.
+ * CODE: node1 bootstraps; promotion_lease_holddown returns "promote now" when
+ * failover_started_at_unix_ms is None.
  *)
-RaftElectLeader(n) ==
-    /\ raftLeader = None
-    /\ pgBatteryAlive[n]
+ElectBootstrapLeader(n) ==
+    /\ raftTerm = 0
     /\ canReachMajority[n]
+    /\ raftTerm' = 1
     /\ raftLeader' = n
     /\ lastQuorumAck' = [lastQuorumAck EXCEPT ![n] = time]
-    /\ UNCHANGED <<leaseExpiresAt, leaseIsLeader, pgWritable, pgAlive,
-                   pgBatteryAlive, gatewayAcceptsWrites, canReachMajority, time>>
+    /\ holdDownUntil' = [holdDownUntil EXCEPT ![n] = 0]   \* no hold-down on bootstrap
+    /\ UNCHANGED <<leaseExpiresAt, leaseIsLeader, pgWritable, canReachMajority, time>>
 
 (*
- * Leader receives heartbeat ack from majority - updates quorum timestamp
- * CODE: governor/raft.rs (metrics.millis_since_quorum_ack)
- *
- * This is the KEY action for quorum timing.
- * In reality, OpenRaft tracks this via heartbeat responses.
+ * Failover election at a higher term. A previous leader exists and is left
+ * INTACT — it is now STALE and must self-fence (quorum timeout) / expire (lease)
+ * on its own. The new leader starts fresh: not writable, no lease, hold-down
+ * anchored at "now".  See MODELING NOTE 2 for why "now" (election) rather than
+ * the implementation's earlier local observation.
+ * CODE: governor/raft.rs stamps failover_started_at_unix_ms on the leader->none
+ * edge; app.rs gates promote() on that + LeaseDuration.
+ *)
+ElectFailoverLeader(n) ==
+    /\ raftTerm >= 1
+    /\ raftTerm < MaxTerm
+    /\ raftLeader # n                 \* a real transfer
+    /\ canReachMajority[n]
+    /\ raftTerm' = raftTerm + 1
+    /\ raftLeader' = n
+    /\ lastQuorumAck' = [lastQuorumAck EXCEPT ![n] = time]
+    /\ holdDownUntil' = [holdDownUntil EXCEPT ![n] = time + HoldDown]
+    /\ leaseIsLeader' = [leaseIsLeader EXCEPT ![n] = FALSE]  \* must re-renew
+    /\ leaseExpiresAt' = [leaseExpiresAt EXCEPT ![n] = time] \* expired (time < time is FALSE)
+    /\ pgWritable' = [pgWritable EXCEPT ![n] = FALSE]        \* came up as a standby
+    /\ UNCHANGED <<canReachMajority, time>>
+
+(*
+ * Leader receives a heartbeat ack from a majority. ONLY the current Raft leader
+ * can do this — a deposed leader at a lower term cannot get quorum acks, so its
+ * lastQuorumAck is frozen at deposition (this enforces A_old <= E_new).
+ * CODE: governor/raft.rs (metrics.millis_since_quorum_ack).
  *)
 ReceiveQuorumAck(n) ==
     /\ raftLeader = n
-    /\ pgBatteryAlive[n]
-    /\ canReachMajority[n]  \* Can only get acks if network connected
-    /\ lastQuorumAck' = [lastQuorumAck EXCEPT ![n] = time]
-    /\ UNCHANGED <<raftLeader, leaseExpiresAt, leaseIsLeader, pgWritable,
-                   pgAlive, pgBatteryAlive, gatewayAcceptsWrites, canReachMajority, time>>
-
-(*
- * Governor updates lease based on Raft state
- * CODE: governor/lease.rs (update_from_raft)
- *
- * CRITICAL: Only renews lease if BelievesHasQuorum(n) is true
- * This is where the 1000ms threshold matters!
- *)
-UpdateLease(n) ==
-    /\ pgBatteryAlive[n]
-    /\ raftLeader = n
-    /\ BelievesHasQuorum(n)  \* <-- THE TIMING CHECK
-    /\ leaseExpiresAt' = [leaseExpiresAt EXCEPT ![n] = time + LeaseDuration]
-    /\ leaseIsLeader' = [leaseIsLeader EXCEPT ![n] = TRUE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, pgWritable, pgAlive,
-                   pgBatteryAlive, gatewayAcceptsWrites, canReachMajority, time>>
-
-(*
- * Quorum loss detected via timing - lease expires immediately
- * CODE: governor/lease.rs (immediate expiry on quorum loss)
- *
- * This happens when: time - lastQuorumAck[n] >= QuorumTimeout
- * The node realizes it hasn't heard from majority in 1 second.
- *)
-DetectQuorumLoss(n) ==
-    /\ pgBatteryAlive[n]
-    /\ leaseIsLeader[n]
-    /\ ~BelievesHasQuorum(n)  \* Timeout exceeded!
-    /\ leaseExpiresAt' = [leaseExpiresAt EXCEPT ![n] = time - 1]  \* Immediate expiry
-    /\ leaseIsLeader' = [leaseIsLeader EXCEPT ![n] = FALSE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, pgWritable, pgAlive,
-                   pgBatteryAlive, gatewayAcceptsWrites, canReachMajority, time>>
-
-(*
- * Network partition - node can no longer reach majority
- * Models: docker pause, network failure, etc.
- *)
-NetworkPartition(n) ==
     /\ canReachMajority[n]
-    /\ canReachMajority' = [canReachMajority EXCEPT ![n] = FALSE]
-    \* Note: lastQuorumAck NOT updated - this is how partition is detected
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgWritable, pgAlive, pgBatteryAlive, gatewayAcceptsWrites, time>>
+    /\ lastQuorumAck' = [lastQuorumAck EXCEPT ![n] = time]
+    /\ UNCHANGED <<raftTerm, raftLeader, leaseExpiresAt, leaseIsLeader,
+                   holdDownUntil, pgWritable, canReachMajority, time>>
 
 (*
- * Network heals - node can reach majority again
+ * Governor renews the lease, anchored at the last quorum ack (NOT at now).
+ * CODE: governor/lease.rs renew(): expires_at = (now - quorum_ack_age) + duration,
+ * which equals lastQuorumAck + LeaseDuration.
  *)
-NetworkHeal(n) ==
-    /\ ~canReachMajority[n]
-    /\ canReachMajority' = [canReachMajority EXCEPT ![n] = TRUE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgWritable, pgAlive, pgBatteryAlive, gatewayAcceptsWrites, time>>
+RenewLease(n) ==
+    /\ raftLeader = n
+    /\ BelievesHasQuorum(n)
+    /\ leaseIsLeader' = [leaseIsLeader EXCEPT ![n] = TRUE]
+    /\ leaseExpiresAt' = [leaseExpiresAt EXCEPT ![n] = lastQuorumAck[n] + LeaseDuration]
+    /\ UNCHANGED <<raftTerm, raftLeader, lastQuorumAck, holdDownUntil,
+                   pgWritable, canReachMajority, time>>
 
 (*
- * Layer 2: Gateway opens writes when lease is valid
- * CODE: gateway/handlers/mod.rs — lease checked per-message
- *
- * Previously modeled as a static constraint (GatewayLeaseInSync), which meant
- * gatewayAcceptsWrites was never set to TRUE and NoWritesWithoutLease held vacuously.
- * Now modeled as an explicit action so TLC actually explores write-enabled states.
- *)
-GatewayEnableWrites(n) ==
-    /\ pgBatteryAlive[n]
-    /\ LeaseIsValid(n)
-    /\ ~gatewayAcceptsWrites[n]
-    /\ gatewayAcceptsWrites' = [gatewayAcceptsWrites EXCEPT ![n] = TRUE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgWritable, pgAlive, pgBatteryAlive, canReachMajority, time>>
-
-(*
- * Layer 2: Gateway closes writes when lease expires
- *)
-GatewayDisableWrites(n) ==
-    /\ ~LeaseIsValid(n)
-    /\ gatewayAcceptsWrites[n]
-    /\ gatewayAcceptsWrites' = [gatewayAcceptsWrites EXCEPT ![n] = FALSE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgWritable, pgAlive, pgBatteryAlive, canReachMajority, time>>
-
-(*
- * Layer 3: Supervisor enables PG writes when lease is valid
- * CODE: supervisor/process.rs set_readonly(false) — called when node becomes leader
+ * Supervisor enables PG writes — gated by BOTH a valid lease AND the hold-down.
+ * CODE: app.rs promote_local_postgres after promotion_lease_holddown passes;
+ * crates/pgbattery-supervisor/src/process.rs set_readonly(false).
  *)
 EnablePgWrites(n) ==
-    /\ pgBatteryAlive[n]
+    /\ raftLeader = n
     /\ LeaseIsValid(n)
-    /\ pgAlive[n]
+    /\ time >= holdDownUntil[n]      \* THE HOLD-DOWN GATE
     /\ ~pgWritable[n]
     /\ pgWritable' = [pgWritable EXCEPT ![n] = TRUE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgAlive, pgBatteryAlive, gatewayAcceptsWrites, canReachMajority, time>>
+    /\ UNCHANGED <<raftTerm, raftLeader, lastQuorumAck, leaseExpiresAt,
+                   leaseIsLeader, holdDownUntil, canReachMajority, time>>
 
 (*
- * Layer 3: Enforcement loop forces readonly
- * CODE: app.rs — enforcement loop runs every 500ms
+ * Enforcement / gateway forces read-only once the lease is invalid.
+ * CODE: app.rs lease_enforcement_tick (100ms) + gateway per-message lease check.
  *)
-EnforcementFence(n) ==
-    /\ pgBatteryAlive[n]
+Fence(n) ==
     /\ ~LeaseIsValid(n)
     /\ pgWritable[n]
     /\ pgWritable' = [pgWritable EXCEPT ![n] = FALSE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgAlive, pgBatteryAlive, gatewayAcceptsWrites, canReachMajority, time>>
+    /\ UNCHANGED <<raftTerm, raftLeader, lastQuorumAck, leaseExpiresAt,
+                   leaseIsLeader, holdDownUntil, canReachMajority, time>>
 
-(*
- * Layer 1: Process coupling - pgbattery dies, PostgreSQL dies too
- *)
-KillPgBattery(n) ==
-    /\ pgBatteryAlive[n]
-    /\ pgBatteryAlive' = [pgBatteryAlive EXCEPT ![n] = FALSE]
-    /\ pgAlive' = [pgAlive EXCEPT ![n] = FALSE]
-    /\ pgWritable' = [pgWritable EXCEPT ![n] = FALSE]
-    /\ gatewayAcceptsWrites' = [gatewayAcceptsWrites EXCEPT ![n] = FALSE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   canReachMajority, time>>
+NetworkPartition(n) ==
+    /\ canReachMajority[n]
+    /\ canReachMajority' = [canReachMajority EXCEPT ![n] = FALSE]
+    /\ UNCHANGED <<raftTerm, raftLeader, lastQuorumAck, leaseExpiresAt,
+                   leaseIsLeader, holdDownUntil, pgWritable, time>>
 
-(*
- * Strict fate sharing - pgbattery exits when PostgreSQL dies
- *)
-PostgreSQLDies(n) ==
-    /\ pgAlive[n]
-    /\ pgAlive' = [pgAlive EXCEPT ![n] = FALSE]
-    /\ pgBatteryAlive' = [pgBatteryAlive EXCEPT ![n] = FALSE]
-    /\ pgWritable' = [pgWritable EXCEPT ![n] = FALSE]
-    /\ gatewayAcceptsWrites' = [gatewayAcceptsWrites EXCEPT ![n] = FALSE]
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   canReachMajority, time>>
+NetworkHeal(n) ==
+    /\ ~canReachMajority[n]
+    /\ canReachMajority' = [canReachMajority EXCEPT ![n] = TRUE]
+    /\ UNCHANGED <<raftTerm, raftLeader, lastQuorumAck, leaseExpiresAt,
+                   leaseIsLeader, holdDownUntil, pgWritable, time>>
 
-(*
- * Time advances
- *)
 Tick ==
     /\ time < MaxTime
     /\ time' = time + 1
-    /\ UNCHANGED <<raftLeader, lastQuorumAck, leaseExpiresAt, leaseIsLeader,
-                   pgWritable, pgAlive, pgBatteryAlive, gatewayAcceptsWrites,
-                   canReachMajority>>
+    /\ UNCHANGED <<raftTerm, raftLeader, lastQuorumAck, leaseExpiresAt,
+                   leaseIsLeader, holdDownUntil, pgWritable, canReachMajority>>
 
-\* ============================================================================
-\* SPECIFICATION
-\* ============================================================================
+\* Stutter at the time bound so TLC does not report an artificial deadlock.
+Terminating ==
+    /\ time = MaxTime
+    /\ UNCHANGED vars
 
 Next ==
-    \/ \E n \in Nodes : RaftElectLeader(n)
+    \/ \E n \in Nodes : ElectBootstrapLeader(n)
+    \/ \E n \in Nodes : ElectFailoverLeader(n)
     \/ \E n \in Nodes : ReceiveQuorumAck(n)
-    \/ \E n \in Nodes : UpdateLease(n)
-    \/ \E n \in Nodes : DetectQuorumLoss(n)
+    \/ \E n \in Nodes : RenewLease(n)
+    \/ \E n \in Nodes : EnablePgWrites(n)
+    \/ \E n \in Nodes : Fence(n)
     \/ \E n \in Nodes : NetworkPartition(n)
     \/ \E n \in Nodes : NetworkHeal(n)
-    \/ \E n \in Nodes : GatewayEnableWrites(n)
-    \/ \E n \in Nodes : GatewayDisableWrites(n)
-    \/ \E n \in Nodes : EnablePgWrites(n)
-    \/ \E n \in Nodes : EnforcementFence(n)
-    \/ \E n \in Nodes : KillPgBattery(n)
-    \/ \E n \in Nodes : PostgreSQLDies(n)
     \/ Tick
-
-StateConstraint ==
-    \E n \in Nodes : pgBatteryAlive[n]
+    \/ Terminating
 
 Spec == Init /\ [][Next]_vars
 
+StateConstraint ==
+    /\ time <= MaxTime
+    /\ raftTerm <= MaxTerm
+
 \* ============================================================================
-\* INVARIANTS (Safety Properties)
+\* SAFETY INVARIANTS
 \* ============================================================================
 
 (*
- * CRITICAL: At most one node can accept writes at any time
+ * THE safety property: at most one node holds write authority at any instant.
+ * NON-VACUOUS — leadership transfers, so two leaders coexist in the state space;
+ * only the hold-down (>= LeaseDuration) plus lease anchoring keep their write
+ * windows apart.  Hand proof: a failover leader N becomes writable no earlier
+ * than  E_N + HoldDown >= E_N + LeaseDuration.  The deposed leader O cannot ack
+ * after E_N (ReceiveQuorumAck requires raftLeader = O), so
+ * leaseExpiresAt[O] = A_O + LeaseDuration  with  A_O <= E_N.  Hence O's lease has
+ * expired by the time N can write.  Set HoldDown = 0 to see TLC break this.
  *)
-AtMostOneWritableNode ==
-    Cardinality({n \in Nodes :
-        /\ pgWritable[n]
-        /\ gatewayAcceptsWrites[n]
-    }) <= 1
+AtMostOneWriteAuthority ==
+    Cardinality({n \in Nodes : HasWriteAuthority(n)}) <= 1
 
 (*
- * No writes without valid lease
+ * A leader that stops receiving quorum acks loses write authority within
+ * QuorumTimeout of its last ack — even before its lease would naturally expire.
+ * This is the bound that protects the partial-partition case (MODELING NOTE 2),
+ * where the hold-down does not. Also a regression guard: if the BelievesHasQuorum
+ * conjunct were ever dropped from LeaseIsValid, this would be violable.
+ * CODE: governor/raft.rs has_quorum == false => lease immediate-expiry.
  *)
-NoWritesWithoutLease ==
+SelfFenceOnQuorumLoss ==
     \A n \in Nodes :
-        gatewayAcceptsWrites[n] => LeaseIsValid(n)
+        (time - lastQuorumAck[n] >= QuorumTimeout) => ~LeaseIsValid(n)
 
 (*
- * KEY TIMING INVARIANT: Partitioned node's lease expires before new election
- *
- * If a node is partitioned (can't reach majority), its lease MUST expire
- * before any other node could become leader with a valid lease.
- *
- * This proves QuorumTimeout < LeaseDuration is sufficient for safety.
+ * Writability implies the node currently believes itself the lease leader.
+ * (EnablePgWrites requires LeaseIsValid -> leaseIsLeader; only an election of n
+ * clears leaseIsLeader[n], and it clears pgWritable[n] in the same step.)
  *)
-PartitionedNodeLeaseMustExpire ==
-    \A n \in Nodes :
-        (~canReachMajority[n] /\ time - lastQuorumAck[n] >= QuorumTimeout)
-        => ~LeaseIsValid(n)
+WritableImpliesLeaseLeader ==
+    \A n \in Nodes : pgWritable[n] => leaseIsLeader[n]
 
-(*
- * Quorum timeout must be less than lease duration for safety
- * This is the KEY relationship this spec verifies!
- *
- * If QuorumTimeout >= LeaseDuration, a partitioned node might still
- * have a valid lease when a new leader is elected.
- *)
-ASSUME QuorumTimeout < LeaseDuration
+\* ============================================================================
+\* THEOREMS (checked by TLC against the cfg)
+\* ============================================================================
 
-(*
- * After partition, lease expires within QuorumTimeout time units
- *)
-LeaseExpiresAfterPartition ==
-    \A n \in Nodes :
-        \* If partitioned and enough time has passed
-        (~canReachMajority[n] /\ time > lastQuorumAck[n] + QuorumTimeout)
-        \* Then lease must be invalid
-        => ~LeaseIsValid(n)
-
-(*
- * No split-brain: Can't have two valid leases simultaneously
- *)
-NoSplitBrain ==
-    Cardinality({n \in Nodes : LeaseIsValid(n)}) <= 1
+THEOREM TypeSafety       == Spec => []TypeOK
+THEOREM NoSplitBrain     == Spec => []AtMostOneWriteAuthority
+THEOREM QuorumSelfFence  == Spec => []SelfFenceOnQuorumLoss
 
 ================================================================================
-
-(*
- * Model Checking Configuration (lease_fencing_v2.cfg)
- *
- * CONSTANTS
- *   Nodes = {1, 2, 3}
- *   LeaseDuration = 20      \* 2 seconds
- *   QuorumTimeout = 10      \* 1 second (must be < LeaseDuration!)
- *   EnforcementInterval = 1 \* 100ms
- *   MaxTime = 50
- *
- * INVARIANTS
- *   AtMostOneWritableNode
- *   NoWritesWithoutLease
- *   PartitionedNodeLeaseMustExpire
- *   LeaseExpiresAfterPartition
- *   NoSplitBrain
- *
- * This proves:
- *   - The 1000ms quorum timeout is safe given 2s lease duration
- *   - Partitioned nodes self-fence before new leader can accept writes
- *   - No split-brain possible under the timing model
- *)

@@ -2,6 +2,9 @@
 (*
  * TLA+ Specification for Raft with LSN-Aware Elections
  *
+ * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
+ * tla/README.md before relying on the THEOREMs at the foot of this file.
+ *
  * This spec extends standard Raft voting to include PostgreSQL LSN (Log Sequence
  * Number) as an additional constraint on vote acceptance. This is the "Kukushkin
  * Safety" feature that prevents electing a leader with stale data.
@@ -40,18 +43,29 @@
  *    Justification: Both propagate max LSN to voters
  *    CODE: state_machine.rs (update max_cluster_lsn)
  *
- * 3. LSN LAG THRESHOLD:
- *    Spec: LSNLagThreshold constant (e.g., 16777216 = 16MB)
- *    Reality: MAX_REPLICATION_LAG_BYTES = 16 * 1024 * 1024
- *    Match: EXACT (constants.rs)
+ * 3. LSN LAG THRESHOLD (single, abstracted):
+ *    Spec: one LSNLagThreshold constant.
+ *    Reality: state_machine.rs lsn_catchup_threshold_bytes() picks a DUAL
+ *      threshold by replication mode — tight SYNC_LAG_THRESHOLD_BYTES (1 MB,
+ *      also the fail-safe default for unknown mode) vs loose
+ *      MAX_REPLICATION_LAG_BYTES (16 MB) only when async is positively known.
+ *    Run this model twice — a tight and a loose LSNLagThreshold — to cover
+ *      both; the single constant abstracts whichever mode is active.
  *
- * 4. VOTING LOGIC:
- *    Spec: candidateLSN + threshold >= voterMaxLSN
- *    Reality: (max - candidate) <= threshold (algebraically equivalent)
- *    Match: EXACT (state_machine.rs)
+ * 4. VOTING LOGIC (core comparison only):
+ *    Spec: candidateLSN + threshold >= voterMaxLSN  (i.e. max - candidate <=
+ *      threshold), matching the "too far behind" branch of evaluate_lsn_acceptable.
+ *    Abstracted away (no clock in this spec, so documented not checked):
+ *      the staleness window (LSN_STALENESS_THRESHOLD_SECS = 30 s) that recomputes
+ *      a *fresh* max and rejects a candidate whose own LSN heartbeat is stale;
+ *      and the fail-open vs fail-closed split — is_lsn_acceptable_for_election
+ *      accepts a candidate with no LSN report, is_lsn_acceptable_for_promotion
+ *      rejects it when the cluster has fresh data.
  *
- * WHAT THIS PROVES: LSN-aware voting prevents stale leader election
- * WHAT THIS DOESN'T PROVE: LSN reporting is timely/accurate
+ * WHAT THIS PROVES: LSN-aware voting cannot elect a leader a voter considered
+ *   too far behind, and the threshold never deadlocks elections.
+ * WHAT THIS DOESN'T PROVE: LSN reporting is timely/accurate; the staleness and
+ *   fail-closed-promotion paths above; that the dual threshold is well-chosen.
  *
  * === IMPLEMENTATION vs SPEC NOTE ===
  *

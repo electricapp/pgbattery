@@ -2063,7 +2063,7 @@ mod tests {
 
     // ---- CheckQuorum: the no-term-inflation property ----
     //
-    // openraft has no pre-vote (by design, in every version), so the only
+    // openraft 0.9 has no pre-vote, so the only
     // thing stopping an isolated leader/candidate from inflating its term
     // while partitioned is CheckQuorum: when `has_quorum_decision` returns
     // false the governor calls `runtime_config().elect(false)`, disabling

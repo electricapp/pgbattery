@@ -114,11 +114,16 @@ pub const QUORUM_TIMEOUT_MS: u64 = 1_000;
 // The watchdog forces an election (`raft.trigger().elect()`) when a voter has
 // seen `RaftMetrics::current_leader == None` for too long — breaking the
 // openraft-0.9 deadlock where a term holds a persisted-but-undelivered vote
-// that nobody can supersede (openraft has no pre-vote, by design, in any
-// version). Recovery is ordered by **voter rank**: the lowest-id voter in the
-// current membership fires first, and each successive rank fires one stagger
-// window later, so the lowest *reachable* voter effectively drives recovery
-// (a dead lower-id voter simply never fires and the next live rank takes over).
+// that nobody can supersede (openraft 0.9 ships no pre-vote). Recovery is
+// ordered by **voter rank**: the lowest-id voter in the current membership
+// fires first, and each successive rank fires one stagger window later, so the
+// lowest *reachable* voter effectively drives recovery (a dead lower-id voter
+// simply never fires and the next live rank takes over).
+//
+// TODO(prevote): openraft added PreVote on `main` (unreleased as of 2026-06).
+// Adopt it once it ships in a release and revisit this watchdog and the
+// CheckQuorum `elect(false)` gate in `raft.rs` — PreVote removes the
+// persisted-vote deadlock and the term inflation both exist to work around.
 // ---------------------------------------------------------------------------
 
 /// Base leaderless duration, in election timeouts, before the lowest-rank

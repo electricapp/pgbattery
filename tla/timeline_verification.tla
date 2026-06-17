@@ -1,11 +1,16 @@
 ---------------------------- MODULE timeline_verification ----------------------------
 (*
- * TLA+ Specification for Timeline Divergence Detection
+ * TLA+ Specification for Timeline Transitions
  *
- * Models PostgreSQL timeline verification to prevent split-brain scenarios
- * where two nodes diverge on different timelines.
+ * NOT machine-checked in this repo (no TLC in CI). Run it with the command in
+ * tla/README.md.
  *
- * Based on: supervisor/process.rs verify_promotion_safe()
+ * Models PostgreSQL timeline transitions during promotion and partition. The
+ * implementation deliberately does NOT block promotion on timeline divergence
+ * (pg_rewind reconciles it), so this spec checks the transition invariants that
+ * DO hold, not a divergence-blocking property.
+ *
+ * Based on: crates/pgbattery-supervisor/src/process.rs verify_promotion_safe()
  *
  * Key Safety Property:
  *   A node cannot promote to primary if its timeline has diverged from
@@ -19,9 +24,13 @@
  *   inRecovery[n]         → SELECT pg_is_in_recovery()
  *   isPrimary[n]          → NOT in_recovery
  *
- * Safety Check:
- *   TLA: receiverTimeline > localTimeline → BLOCK promotion
- *   Code: supervisor/process.rs → return Err("Split-brain detected")
+ * Safety Check (observability, NOT a hard block — see note at end of header):
+ *   TLA: receiverTimeline > localTimeline → logged, promotion proceeds
+ *   Code: crates/pgbattery-supervisor/src/process.rs verify_promotion_safe()
+ *         returns Err ONLY on operational failure (pg_controldata timeout /
+ *         missing TimeLineID / parse error), which aborts promotion. Timeline
+ *         divergence itself does NOT return Err and does NOT block — pg_rewind
+ *         plus Raft authority handle it.
  *
  * SIMPLIFICATIONS:
  *
@@ -29,22 +38,22 @@
  *    Spec: Instant read of timelineID
  *    Reality: Shell out to pg_controldata + parsing
  *    Gap: Could hang on NFS stale handles (no timeout originally)
- *    Fix: Added 10s timeout wrapper in supervisor/process.rs
- *    CODE: supervisor/process.rs
+ *    Fix: Added 10s timeout wrapper in crates/pgbattery-supervisor/src/process.rs
+ *    CODE: crates/pgbattery-supervisor/src/process.rs
  *
  * 2. WAL RECEIVER QUERY:
  *    Spec: Instant read of walReceiverTimeline
  *    Reality: SQL query SELECT * FROM pg_wal_receiver_status()
  *    Gap: Could hang if PostgreSQL deadlocked
  *    Mitigation: PostgreSQL query timeout (statement_timeout)
- *    CODE: supervisor/process.rs
+ *    CODE: crates/pgbattery-supervisor/src/process.rs
  *
  * 3. PROMOTION ATOMICITY:
  *    Spec: Promotion is single atomic action
  *    Reality: verify → promote → wait_for_promotion (multi-step)
  *    Gap: Could crash between verify and promote
  *    Mitigation: Timeline verified on EVERY ExistingPrimary startup
- *    CODE: supervisor/process.rs
+ *    CODE: crates/pgbattery-supervisor/src/process.rs
  *
  * 4. TIMELINE INCREMENT:
  *    Spec: timeline++ on promotion
@@ -67,7 +76,7 @@
  *   while receiving WAL from a higher timeline. This is EXPECTED and SAFE.
  *   Blocking would prevent recovery from ever completing.
  *
- * CODE: supervisor/process.rs
+ * CODE: crates/pgbattery-supervisor/src/process.rs
  *   if receiver_info > timeline_id {
  *       tracing::info!("Timeline difference detected (expected after pg_rewind)");
  *       // Does NOT block - proceeds with promotion
@@ -78,11 +87,15 @@
  *   2. Raft is authoritative for leadership decisions
  *   3. Synchronous replication prevents data loss
  *
- * WHAT THIS SPEC MODELS: Timeline state transitions during partitions
- * WHAT THIS SPEC DOES NOT PROVE: Strong safety invariants (removed due to above)
+ * WHAT THIS SPEC CHECKS: timelines stay in bounds (TypeOK) and never decrease
+ *   (TimelineMonotonic) — a promotion only ever advances a node's timeline.
+ * WHAT IT DOES NOT CLAIM: "no two primaries share a timeline" (false in the
+ *   partition model — Raft provides single-primary, not the timeline number;
+ *   see lease_fencing.tla) and the pg_rewind data-loss gate (pure logic,
+ *   covered by the Rust unit tests for rewind_divergence_decision).
  *
  * Authors: pgbattery team
- * Date: 2025
+ * Date: 2026
  *)
 
 EXTENDS Naturals, FiniteSets
@@ -152,6 +165,7 @@ AttemptPromotion(n) ==
 VerifyTimelineSafety(n) ==
     /\ promotionAttempted[n]
     /\ inRecovery[n]  \* Must still be standby (not yet promoted)
+    /\ timelineID[n] < MaxTimeline  \* bound so TypeOK holds and is checkable
     /\ LET localTimeline == timelineID[n]
            receiverTimeline == walReceiverTimeline[n]
        IN
@@ -179,6 +193,7 @@ NetworkPartitionDiverge(n1, n2) ==
     /\ inRecovery[n2]
     /\ walReceiverTimeline[n2] = timelineID[n1]  \* n2 was following n1
     /\ walReceiverTimeline[n2] <= timelineID[n2]  \* Timeline safety check
+    /\ timelineID[n2] < MaxTimeline  \* bound so TypeOK holds and is checkable
     /\ inRecovery' = [inRecovery EXCEPT ![n2] = FALSE]  \* n2 promoted in partition
     /\ isPrimary' = [isPrimary EXCEPT ![n2] = TRUE]
     /\ timelineID' = [timelineID EXCEPT ![n2] = timelineID[n2] + 1]
@@ -224,11 +239,21 @@ StateConstraint ==
     /\ \A n \in Nodes : timelineID[n] <= MaxTimeline
 
 \* ============================================================================
-\* INVARIANTS
+\* PROPERTIES
 \* ============================================================================
 
-(* At most one primary per timeline.
- * After promotion, timelineID increments, ensuring uniqueness. *)
+(* A node's PostgreSQL timeline never decreases — every promotion (normal or
+ * in-partition) strictly increments it, and nothing lowers it. This is the
+ * real, checkable guarantee of the timeline model. *)
+TimelineMonotonic ==
+    [][ \A n \in Nodes : timelineID'[n] >= timelineID[n] ]_vars
+
+(* NOT an invariant — kept to document why timeline numbers do NOT provide
+ * single-primary safety. Two nodes promoting in separate partitions can reach
+ * the same timeline number on different forks, so this predicate is FALSE in
+ * the partition model and is left unchecked. Single-primary safety is Raft's
+ * (see lease_fencing.tla); the pg_rewind data-loss gate is pure logic covered
+ * by the Rust unit tests for rewind_divergence_decision. *)
 NoDualPrimariesSameTimeline ==
     ~\E n1, n2 \in Nodes :
         /\ n1 /= n2
