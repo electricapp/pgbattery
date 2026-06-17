@@ -5,7 +5,7 @@ and, when a signing key is configured, a **minisign signature** (authenticity).
 This document is the publisher-side half: how to generate the key, sign
 artifacts, and lay them out so the upgrade client can verify them.
 
-> **Status:** signing is *scaffolded but not yet active*. Until a key is embedded
+> **Status:** signing is _scaffolded but not yet active_. Until a key is embedded
 > (step 2), `upgrade` falls back to checksum + HTTPS and prints a warning that
 > authenticity is unverified. Once the key is embedded, every upgrade requires a
 > valid signature.
@@ -48,7 +48,7 @@ const RELEASE_PUBLIC_KEY: Option<&str> = Some("RWQf6LRCGA9i53mlYecO4IzT51TGPpvWu
 
 Rebuild and ship. From then on, clients require a valid `.minisig` for every upgrade.
 
-Operators who want to enforce authenticity *before* a key is embedded can pass
+Operators who want to enforce authenticity _before_ a key is embedded can pass
 `--public-key pgbattery.pub` or set `PGBATTERY_RELEASE_PUBLIC_KEY` to the base64
 key line.
 
@@ -56,9 +56,9 @@ key line.
 
 Add repository secrets:
 
-| Secret                 | Value                                            |
-| ---------------------- | ------------------------------------------------ |
-| `MINISIGN_SECRET_KEY`  | full contents of `pgbattery.key`                 |
+| Secret                | Value                            |
+| --------------------- | -------------------------------- |
+| `MINISIGN_SECRET_KEY` | full contents of `pgbattery.key` |
 
 (A password-less key needs no `MINISIGN_PASSWORD`. If you used a password, add it
 as a secret and feed it to `minisign` on stdin.)

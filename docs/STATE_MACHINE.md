@@ -10,23 +10,23 @@ Canonical reference for every state machine in pgbattery: states, transitions, a
 
 Every state transition is driven by a **definitive source of truth** — never by a timer, sleep, or polling-as-substitute-for-event.
 
-| Concern                                 | Definitive source of truth                                                     |
-| --------------------------------------- | ------------------------------------------------------------------------------ |
-| Who is Raft leader                      | `openraft::RaftMetrics::current_leader` (via `metrics_watch`)                  |
-| Whether _we_ are Raft leader            | `RaftMetrics::current_leader == Some(self.node_id)`                            |
-| Raft membership / quorum                | `RaftMetrics::membership_config`                                               |
-| Raft committed log                      | `RaftMetrics::last_applied`                                                    |
-| Whether PG is primary                   | `pg_is_in_recovery()`                                                          |
-| Whether PG is read-only                 | `SELECT setting FROM pg_settings WHERE name = 'default_transaction_read_only'` |
-| Which leader PG is configured to follow | `SELECT setting FROM pg_settings WHERE name = 'primary_conninfo'`              |
-| PG sync replication state               | `pg_stat_replication.sync_state`                                               |
-| `synchronous_standby_names`             | `SHOW synchronous_standby_names`                                               |
-| Standby intent on disk                  | presence of `standby.signal`                                                   |
+| Concern                                 | Definitive source of truth                                                                                                                                  |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Who is Raft leader                      | `openraft::RaftMetrics::current_leader` (via `metrics_watch`)                                                                                               |
+| Whether _we_ are Raft leader            | `RaftMetrics::current_leader == Some(self.node_id)`                                                                                                         |
+| Raft membership / quorum                | `RaftMetrics::membership_config`                                                                                                                            |
+| Raft committed log                      | `RaftMetrics::last_applied`                                                                                                                                 |
+| Whether PG is primary                   | `pg_is_in_recovery()`                                                                                                                                       |
+| Whether PG is read-only                 | `SELECT setting FROM pg_settings WHERE name = 'default_transaction_read_only'`                                                                              |
+| Which leader PG is configured to follow | `SELECT setting FROM pg_settings WHERE name = 'primary_conninfo'`                                                                                           |
+| PG sync replication state               | `pg_stat_replication.sync_state`                                                                                                                            |
+| `synchronous_standby_names`             | `SHOW synchronous_standby_names`                                                                                                                            |
+| Standby intent on disk                  | presence of `standby.signal`                                                                                                                                |
 | Current WAL position                    | `pg_current_wal_lsn()` / `pg_last_wal_replay_lsn()` (local safety gates); the reportable LSN adds `pg_last_wal_receive_lsn()` — what the node holds on disk |
-| Timeline ID                             | `pg_walfile_name(pg_current_wal_lsn())` parsed                                 |
-| PG process alive                        | `Child::try_wait()` on the postmaster                                          |
-| Lease validity                          | `is_leader && has_quorum && now < expires_at` derived from `RaftMetrics`       |
-| Maximum cluster LSN                     | Raft state machine `node_lsns` map (replicated, durable)                       |
+| Timeline ID                             | `pg_walfile_name(pg_current_wal_lsn())` parsed                                                                                                              |
+| PG process alive                        | `Child::try_wait()` on the postmaster                                                                                                                       |
+| Lease validity                          | `is_leader && has_quorum && now < expires_at` derived from `RaftMetrics`                                                                                    |
+| Maximum cluster LSN                     | Raft state machine `node_lsns` map (replicated, durable)                                                                                                    |
 
 ### Discipline
 

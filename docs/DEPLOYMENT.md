@@ -126,4 +126,3 @@ scrape_configs:
   annotations:
     description: "Replica lag exceeds 16MB."
 ```
-

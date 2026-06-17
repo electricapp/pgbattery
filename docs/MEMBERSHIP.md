@@ -1,6 +1,6 @@
 # Membership Cheatsheet
 
-Three relevant operations: **bootstrap**, **join/promote**, and **remove**. 
+Three relevant operations: **bootstrap**, **join/promote**, and **remove**.
 
 ## Terms
 

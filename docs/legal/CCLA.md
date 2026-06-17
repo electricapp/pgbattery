@@ -117,10 +117,10 @@ contributing within the scope of their employment for the Corporation.
 |           |                 |       |
 |           |                 |       |
 
-**Corporation:** _______________________________________________
+**Corporation:** **********************\_\_\_**********************
 
-**Authorized signatory (name & title):** ________________________
+**Authorized signatory (name & title):** **********\_\_\_\_**********
 
-**Signature:** ______________________  **Date:** ________________
+**Signature:** **********\_\_********** **Date:** ******\_\_\_\_******
 
-**Point of contact (name & email):** ____________________________
+**Point of contact (name & email):** ************\_\_\_\_************

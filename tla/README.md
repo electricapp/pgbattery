@@ -23,12 +23,12 @@ no `sudo`; the `--cask`/Toolbox needs root and isn't required).
 
 ## What each spec checks
 
-| Spec                        | Verified property                                                          |
-| --------------------------- | -------------------------------------------------------------------------- |
-| `lease_fencing.tla`         | At most one node holds **write authority** across leadership transfer      |
-| `raft_lsn.tla`              | Election safety + the LSN gate never deadlocks elections                   |
-| `commit_probing.tla`        | In-doubt COMMIT probing is correct; acknowledged commits survive failover  |
-| `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions     |
+| Spec                        | Verified property                                                         |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `lease_fencing.tla`         | At most one node holds **write authority** across leadership transfer     |
+| `raft_lsn.tla`              | Election safety + the LSN gate never deadlocks elections                  |
+| `commit_probing.tla`        | In-doubt COMMIT probing is correct; acknowledged commits survive failover |
+| `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions    |
 
 ## Properties (checked by each `.cfg`)
 
