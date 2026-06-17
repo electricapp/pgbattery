@@ -1,0 +1,12 @@
+# Build output and dependencies
+target/
+node_modules/
+
+# Vendored / generated — not ours to format
+testing/third_party/
+tla/.tools/
+testing/.venv/
+
+# Legal CLA templates: signature-blank runs (***___***) make prettier
+# non-idempotent (each --write grows the run), so it can never be "clean".
+docs/legal/

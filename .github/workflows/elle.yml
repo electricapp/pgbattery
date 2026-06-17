@@ -3,8 +3,12 @@ name: Elle Consistency Check
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   schedule:
     # Nightly 03:00 UTC — full 7-attack matrix.
     - cron: "0 3 * * *"

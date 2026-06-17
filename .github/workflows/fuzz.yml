@@ -13,6 +13,8 @@ on:
       - ".github/workflows/fuzz.yml"
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   schedule:
     # Sunday 04:00 UTC — runs after correctness-lite (03:30) so a flaky
     # cluster doesn't crowd CI.

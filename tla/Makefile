@@ -15,8 +15,8 @@
 
 SHELL := bash
 
-TLA_VERSION    := 1.7.4
-TLA_JAR_SHA256 := 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+TLA_VERSION    := 1.8.0
+TLA_JAR_SHA256 := 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
 TLA_JAR_URL    := https://github.com/tlaplus/tlaplus/releases/download/v$(TLA_VERSION)/tla2tools.jar
 
 TOOLS_DIR := .tools
