@@ -162,6 +162,7 @@ pub async fn run_upgrade(
     let binary_name = platform_binary_name();
     let download_url = format!("{base_url}/v{target}/{binary_name}");
     let checksum_url = format!("{download_url}.sha256");
+    let bundle_url = format!("{download_url}.bundle");
     let signature_url = format!("{download_url}.sig");
     let certificate_url = format!("{download_url}.pem");
 
@@ -174,6 +175,7 @@ pub async fn run_upgrade(
     let backup_path = download_verify_replace(
         &download_url,
         &checksum_url,
+        &bundle_url,
         &signature_url,
         &certificate_url,
         verifier.as_ref(),
@@ -242,9 +244,15 @@ fn check_write_permissions(exe_path: &Path) -> Result<()> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "download/verify/replace threads the binary + each verification asset URL through one \
+              call site; bundling them into a struct would only move the argument list elsewhere"
+)]
 async fn download_verify_replace(
     binary_url: &str,
     checksum_url: &str,
+    bundle_url: &str,
     signature_url: &str,
     certificate_url: &str,
     verifier: Option<&CosignVerifier>,
@@ -288,24 +296,18 @@ async fn download_verify_replace(
 
     // Verify the Sigstore cosign keyless signature when verification is enabled.
     // The checksum only proves the bytes match the (also-downloaded) .sha256;
-    // the signature + Fulcio certificate prove the bytes were signed in this
-    // repository's release workflow via GitHub Actions OIDC.
+    // cosign proves the bytes were signed in this repository's release workflow
+    // via GitHub Actions OIDC.
     if let Some(verifier) = verifier {
-        info!("Fetching signature + certificate");
-        let signature = fetch_text(&client, signature_url, "signature").await?;
-        let certificate = fetch_text(&client, certificate_url, "certificate").await?;
-
-        info!("Verifying cosign keyless signature");
-        verifier
-            .verify_blob(&bytes, signature.trim(), &certificate)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Signature verification FAILED: {e:#}. The binary is not a trusted \
-                     pgbattery release — refusing to install."
-                )
-            })?;
-        info!("Signature verified (Sigstore cosign keyless)");
+        verify_release_signature(
+            &client,
+            verifier,
+            &bytes,
+            bundle_url,
+            signature_url,
+            certificate_url,
+        )
+        .await?;
     }
 
     // Write to temp file
@@ -407,6 +409,84 @@ async fn fetch_text(client: &reqwest::Client, url: &str, what: &str) -> Result<S
     }
 
     Ok(resp.text().await?)
+}
+
+/// Verify the downloaded binary against the cosign keyless trust policy.
+///
+/// Prefers the **Sigstore bundle** (`<binary>.bundle`): it carries the
+/// signature, the Fulcio certificate, AND the Rekor transparency-log inclusion
+/// proof, so verification additionally confirms the signing event was recorded
+/// in the public log. Falls back to the detached `.sig`/`.pem` (signature +
+/// chain + identity, minus Rekor) only when no bundle is published — older
+/// releases, or a publisher that opted out. Either way an unverifiable binary is
+/// refused.
+async fn verify_release_signature(
+    client: &reqwest::Client,
+    verifier: &CosignVerifier,
+    bytes: &[u8],
+    bundle_url: &str,
+    signature_url: &str,
+    certificate_url: &str,
+) -> Result<()> {
+    info!("Fetching Sigstore bundle (Rekor inclusion proof)");
+    if let Some(bundle_json) = fetch_optional_text(client, bundle_url, "bundle").await? {
+        info!("Verifying cosign keyless signature + Rekor transparency-log inclusion");
+        verifier
+            .verify_bundle(bytes, bundle_json.trim())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Signature/Rekor verification FAILED: {e:#}. The binary is not a trusted \
+                     pgbattery release — refusing to install."
+                )
+            })?;
+        info!("Verified (Sigstore cosign keyless + Rekor transparency log)");
+        return Ok(());
+    }
+
+    warn!(
+        "No Sigstore bundle ({bundle_url}); falling back to detached .sig/.pem \
+         (Rekor transparency-log inclusion is NOT verified for this release)."
+    );
+    let signature = fetch_text(client, signature_url, "signature").await?;
+    let certificate = fetch_text(client, certificate_url, "certificate").await?;
+
+    info!("Verifying cosign keyless signature (detached, no Rekor)");
+    verifier
+        .verify_blob(bytes, signature.trim(), &certificate)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Signature verification FAILED: {e:#}. The binary is not a trusted \
+                 pgbattery release — refusing to install."
+            )
+        })?;
+    info!("Signature verified (Sigstore cosign keyless, detached)");
+    Ok(())
+}
+
+/// Fetch a small text asset that is *optional*: a 404 (or other 4xx "not
+/// found") yields `Ok(None)` so the caller can fall back, while a network error
+/// is still a hard failure. Used for the `.bundle` (Rekor) asset, which older
+/// releases may not publish.
+async fn fetch_optional_text(
+    client: &reqwest::Client,
+    url: &str,
+    what: &str,
+) -> Result<Option<String>> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch {what}: {e}"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("Failed to fetch {what} ({}): {}", resp.status(), url);
+    }
+    Ok(Some(resp.text().await?))
 }
 
 async fn fetch_checksum(client: &reqwest::Client, url: &str) -> Result<String> {

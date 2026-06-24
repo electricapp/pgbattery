@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Sign pgbattery release artifacts with Sigstore **cosign keyless**: writes a
-# .sha256, a .sig (signature), and a .pem (Fulcio certificate) next to every
+# .sha256, a .bundle (Sigstore bundle: signature + cert + Rekor inclusion
+# proof), a .sig (signature), and a .pem (Fulcio certificate) next to every
 # `pgbattery-*` binary in the given directory.
 #
 # In CI this is done inline by .github/workflows/release.yml (GitHub Actions
@@ -41,11 +42,14 @@ shopt -s nullglob
 signed=0
 for f in "$DIR"/pgbattery-*; do
   case "$f" in
-    *.sha256 | *.sig | *.pem) continue ;;
+    *.sha256 | *.bundle | *.sig | *.pem) continue ;;
   esac
   echo "signing $f"
   sha256 "$f" > "$f.sha256"
+  # Emit BOTH a Sigstore bundle (signature + cert + Rekor inclusion proof, the
+  # primary artifact the client verifies) and the detached sig/cert fallback.
   cosign sign-blob --yes \
+    --bundle "$f.bundle" \
     --output-signature "$f.sig" \
     --output-certificate "$f.pem" \
     "$f"
@@ -68,4 +72,4 @@ if [[ "$signed" -eq 0 ]]; then
   echo "error: no pgbattery-* artifacts found in $DIR" >&2
   exit 1
 fi
-echo "signed $signed artifact(s) (.sha256 + .sig + .pem)"
+echo "signed $signed artifact(s) (.sha256 + .bundle + .sig + .pem)"
