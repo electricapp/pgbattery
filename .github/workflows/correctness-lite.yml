@@ -5,17 +5,28 @@ on:
     - cron: "30 3 * * 0"  # Weekly, Sunday 3:30 AM UTC
   workflow_dispatch:
 
+# Deny-all by default; each job re-grants only the scopes it needs.
+permissions: {}
+
+concurrency:
+  group: correctness-lite-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   correctness-lite:
     name: Correctness Lite (durability + split-brain)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     env:
       COMPOSE_PROJECT_NAME: pgbha_correctness_${{ github.run_id }}_${{ github.run_attempt }}
       PGBATTERY_MANAGEMENT_API_TOKEN: test-token-ci
       ARTIFACT_DIR: testing/artifacts/correctness-lite
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true

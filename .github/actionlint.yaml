@@ -1,0 +1,11 @@
+# Tell actionlint about runner labels its built-in list doesn't include.
+#
+# `macos-13` is GitHub's last Intel (x86_64) macOS hosted image and is still
+# available; release.yml's `x86_64-apple-darwin` build matrix needs it. As of
+# actionlint v1.7.12 the built-in known-labels list was trimmed to macos-14+
+# (the image is slated for eventual deprecation), so actionlint reports it as an
+# unknown label. Declaring it here keeps the lint green without changing the
+# runner. Remove this entry once the build drops the Intel macOS target.
+self-hosted-runner:
+  labels:
+    - macos-13
