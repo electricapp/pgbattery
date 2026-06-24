@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Rust dependencies
+  # Rust dependencies (Cargo.toml / Cargo.lock).
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -12,7 +12,7 @@ updates:
       - "dependencies"
       - "rust"
     groups:
-      production-dependencies:
+      cargo:
         patterns:
           - "*"
         update-types:
@@ -20,7 +20,8 @@ updates:
           - "minor"
           - "major"
 
-  # GitHub Actions
+  # GitHub Actions workflows — Dependabot bumps both the SHA pin and the
+  # trailing version comment.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -30,13 +31,13 @@ updates:
     open-pull-requests-limit: 99
     labels:
       - "dependencies"
-      - "ci"
+      - "actions"
     groups:
       actions:
         patterns:
           - "*"
 
-  # Docker
+  # Docker base image(s) for the container build.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
@@ -47,3 +48,7 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+    groups:
+      docker:
+        patterns:
+          - "*"

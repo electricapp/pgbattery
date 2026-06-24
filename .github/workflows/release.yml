@@ -13,8 +13,13 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+# Deny-all by default; each job re-grants only the scopes it needs. The release
+# jobs need `contents: write` to create the release and upload assets via gh.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,8 +29,12 @@ jobs:
     name: Create release
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Create or reuse the GitHub release
         env:
@@ -43,6 +52,8 @@ jobs:
     needs: create-release
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -62,10 +73,13 @@ jobs:
           # TODO: aarch64-unknown-linux-gnu needs a cross toolchain (cross/zig).
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.96
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
+          toolchain: "1.96"
           targets: ${{ matrix.target }}
 
       - name: Build

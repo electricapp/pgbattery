@@ -18,13 +18,10 @@ on:
   pull_request_target:
     types: [opened, closed, synchronize]
 
-# Least privilege for the default GITHUB_TOKEN. Signature storage uses the
+# Deny-all by default; the single job below re-grants the scopes the CLA
+# assistant needs for the default GITHUB_TOKEN. Signature storage uses the
 # separate PERSONAL_ACCESS_TOKEN secret (see below).
-permissions:
-  actions: write
-  contents: write
-  pull-requests: write
-  statuses: write
+permissions: {}
 
 concurrency:
   group: cla-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -35,6 +32,13 @@ jobs:
     name: Check / record CLA signature
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Least privilege for the default GITHUB_TOKEN — the CLA assistant comments
+    # on the PR, sets a commit status, and records signatures.
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+      statuses: write
     # Only act on the sign/recheck comment, or on PR lifecycle events.
     if: >-
       (github.event.issue.pull_request &&
