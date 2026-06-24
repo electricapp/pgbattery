@@ -307,7 +307,7 @@ impl ClusterState {
 
     /// Staleness-filtered maximum LSN across the cluster, recomputed on the fly.
     ///
-    /// Same rule as [`Self::recalculate_max_cluster_lsn`] but pure (no
+    /// Same rule as `Self::recalculate_max_cluster_lsn` but pure (no
     /// mutation, no skew logging): excludes entries older than the staleness
     /// window and caps future-skewed timestamps at age 0. Safety gates re-derive
     /// through this rather than reading the stored `max_cluster_lsn` field, which
