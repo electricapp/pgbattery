@@ -133,8 +133,16 @@ async fn resolve_node_or_id(
                 }
                 anyhow::bail!("{}", hints::node_not_found(node_id));
             }
-            // Assume it's a host:port address
-            Ok(s)
+            // Otherwise it must be a host:port address. Validate the shape now
+            // so a typo like "localhost" (missing port) fails with a clear
+            // message instead of a confusing transport error at request time.
+            match s.rsplit_once(':') {
+                Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => Ok(s),
+                _ => anyhow::bail!(
+                    "Invalid node argument {s:?}: expected a numeric node ID or a host:port \
+                     address (e.g. 127.0.0.1:9081)"
+                ),
+            }
         }
         None => config
             .map(|c| c.get_mgmt_addr().to_string())

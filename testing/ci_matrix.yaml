@@ -74,7 +74,8 @@
         "leader-network-partition-real",
         "concurrent-writes-failover",
         "async-degraded-durability",
-        "ddl-failover"
+        "ddl-failover",
+        "lsn-over-report-rejected"
       ]
     },
     "ha-assert-sanity": {
@@ -3599,6 +3600,27 @@
           "comment": "Docker restart policy + pgbattery process-death detection brings the killed node back; wait for full reconvergence so the next case starts clean."
         }
       ]
+    },
+    {
+      "id": "lsn-over-report-rejected",
+      "tests_md_ref": "Management API: report-lsn over-report guard rejects impossible follower LSNs",
+      "description": "A forged or buggy follower LSN report far beyond any possible write position must be rejected by the leader before it reaches replicated state. An accepted over-report would inflate max_cluster_lsn and make every legitimate election candidate look 'too far behind', wedging failover. The leader rejects with HTTP 400 — either because the value exceeds its current write position, or (when the write position is momentarily unverifiable) via the implausible-advance clamp — and increments pgbattery_lsn_report_rejected_*. Followers would return 421 (misdirected); only the leader applies the guard.",
+      "actions": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cmd",
+          "comment": "POST an impossible LSN (u64::MAX) for a known node to the current leader's management API; assert it is rejected with 400 and that a rejection counter incremented on the leader.",
+          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); MGMT=$((9080 + LEADER)); MET=$((9090 + LEADER)); CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H \"x-pgbattery-token: $PGBATTERY_MANAGEMENT_API_TOKEN\" -H 'Content-Type: application/json' -d '{\"node_id\":2,\"lsn_bytes\":18446744073709551615}' http://localhost:$MGMT/api/v1/cluster/report-lsn); echo \"leader=$LEADER code=$CODE\"; [ \"$CODE\" = \"400\" ] || { echo \"FAIL: expected 400 for impossible LSN, got $CODE\"; exit 1; }; REJ=$(curl -s http://localhost:$MET/metrics | awk '/^pgbattery_lsn_report_rejected_/{s+=$2} END{print s+0}'); REJ_INT=$(echo $REJ | cut -d. -f1); echo \"rejected_total=$REJ\"; [ \"$REJ_INT\" -ge 1 ] || { echo \"FAIL: rejection counter did not increment\"; exit 1; }; echo PASS"
+        }
+      ],
+      "cleanup": []
     }
   ]
 }

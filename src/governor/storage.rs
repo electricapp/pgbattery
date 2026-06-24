@@ -286,15 +286,36 @@ impl RedbLogStorage {
         Ok(())
     }
 
+    /// Pin a write transaction to `Immediate` durability (fsync before the
+    /// commit returns), logging + counting if redb refuses to honor it.
+    ///
+    /// Every Raft-state write — append, vote, truncate, purge, snapshot,
+    /// last-applied, membership — goes through this so durability never
+    /// silently depends on the redb default. Truncate especially is a Raft
+    /// safety operation: a conflicting log suffix must be durably gone before
+    /// the leader's replacement entries are accepted, or a crash could
+    /// resurrect them and diverge the log. See `append_entries` for why redb 4
+    /// cannot actually reduce below `Immediate` today (defence in depth).
+    fn pin_immediate(write_txn: &mut redb::WriteTransaction) {
+        if let Err(e) = write_txn.set_durability(redb::Durability::Immediate) {
+            tracing::error!(
+                error = %e,
+                "Failed to pin redb durability to Immediate — Raft state durability may be degraded"
+            );
+            metrics::counter!("pgbattery_raft_storage_durability_pin_failures").increment(1);
+        }
+    }
+
     /// Delete log entries from the given index onwards.
     ///
     /// # Errors
     /// Returns an error if the underlying redb transaction fails.
     pub fn delete_from(&self, from_index: u64) -> Result<()> {
-        let write_txn = self
+        let mut write_txn = self
             .db
             .begin_write()
             .map_err(|e| Error::Storage(format!("Failed to begin write: {e}")))?;
+        Self::pin_immediate(&mut write_txn);
 
         {
             let mut table = write_txn
@@ -340,10 +361,11 @@ impl RedbLogStorage {
     /// # Errors
     /// Returns an error if the underlying redb transaction fails.
     pub fn delete_up_to(&self, purge: &PurgedLogId) -> Result<()> {
-        let write_txn = self
+        let mut write_txn = self
             .db
             .begin_write()
             .map_err(|e| Error::Storage(format!("Failed to begin write: {e}")))?;
+        Self::pin_immediate(&mut write_txn);
 
         let purged_count = {
             let mut table = write_txn
@@ -591,10 +613,11 @@ impl RedbLogStorage {
     }
 
     fn write_snapshot(&self, meta: &SnapshotMeta, data: &[u8], update_applied: bool) -> Result<()> {
-        let write_txn = self
+        let mut write_txn = self
             .db
             .begin_write()
             .map_err(|e| Error::Storage(format!("Failed to begin write: {e}")))?;
+        Self::pin_immediate(&mut write_txn);
 
         let digest = Sha256::digest(data);
 
@@ -768,10 +791,11 @@ impl RedbLogStorage {
         membership: &LocalStoredMembership,
         state: &LastAppliedState,
     ) -> Result<()> {
-        let write_txn = self
+        let mut write_txn = self
             .db
             .begin_write()
             .map_err(|e| Error::Storage(format!("Failed to begin write: {e}")))?;
+        Self::pin_immediate(&mut write_txn);
 
         {
             let mut table = write_txn
@@ -824,10 +848,11 @@ impl RedbLogStorage {
     /// # Errors
     /// Returns an error if the write transaction, serialization, or commit fails.
     pub fn save_last_applied(&self, state: &LastAppliedState) -> Result<()> {
-        let write_txn = self
+        let mut write_txn = self
             .db
             .begin_write()
             .map_err(|e| Error::Storage(format!("Failed to begin write: {e}")))?;
+        Self::pin_immediate(&mut write_txn);
 
         {
             let mut table = write_txn

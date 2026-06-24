@@ -21,9 +21,24 @@ pub type NodeId = u64;
 /// `Debug` on a parent struct — redacts the secret instead of leaking
 /// it. Deserializes transparently from a plain string, so existing
 /// config files continue to parse unchanged.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct RedactedSecret(String);
+
+// Serialize is implemented by hand to emit a redaction marker rather than the
+// secret. A derived (transparent) Serialize would round-trip the cleartext, so
+// any struct that ever serializes a field of this type — a config dump, a debug
+// API response, a snapshot — would leak the token. Deserialize stays
+// transparent so config files parse unchanged; the real value is reachable only
+// through `as_str()`.
+impl Serialize for RedactedSecret {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("<redacted>")
+    }
+}
 
 impl RedactedSecret {
     #[must_use]
@@ -154,4 +169,34 @@ const fn default_retention_count() -> u32 {
 
 const fn default_compress() -> bool {
     true
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test code asserts on known-good values and panics are the failure signal"
+)]
+mod tests {
+    use super::*;
+
+    /// The secret must never be serialized in cleartext: a transparent derive
+    /// would round-trip the inner string, leaking it through any struct that
+    /// serializes this field. Serialization must emit only the redaction marker.
+    #[test]
+    fn redacted_secret_serializes_redacted_not_cleartext() {
+        let secret = RedactedSecret::new("super-secret-token".to_string());
+        let bytes = postcard::to_allocvec(&secret).unwrap();
+        assert!(
+            bytes
+                .windows(b"<redacted>".len())
+                .any(|w| w == b"<redacted>"),
+            "serialized form should contain the redaction marker"
+        );
+        assert!(
+            !bytes
+                .windows(b"super-secret-token".len())
+                .any(|w| w == b"super-secret-token"),
+            "serialized form must not contain the cleartext secret"
+        );
+    }
 }

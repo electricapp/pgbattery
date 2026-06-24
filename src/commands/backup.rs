@@ -257,6 +257,18 @@ pub async fn run_backup_restore(
         message: String,
     }
 
+    // Client-side defense in depth: the server canonicalizes within its backup
+    // directory, but the CLI should never send a name that isn't a bare
+    // basename. This also stops a name like `../dump_x` from spoofing the
+    // `dump_` prefix heuristic that selects the destructive allow_primary path.
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        anyhow::bail!("Invalid backup filename {filename:?}: must be a bare filename, not a path");
+    }
+
     let node_addr = resolve_node_addr(node, config_path.as_deref()).await?;
 
     // Dump restores replay SQL into the running primary, so the server only

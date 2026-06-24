@@ -81,11 +81,17 @@ pub struct ClusterState {
     /// Used as advisory input for leader election decisions.
     pub max_cluster_lsn: u64,
 
-    /// Wall-clock Unix-milliseconds at which this node last observed the
+    /// Wall-clock Unix-milliseconds at which *this node* last observed the
     /// cluster losing its leader. `None` outside of an active failover.
-    /// Set by the governor; cleared by the app after promotion completes.
-    /// Stored as Unix time (not `Instant`) so it survives snapshot install.
-    #[serde(default)]
+    ///
+    /// Local projection, not replicated state: written by the governor on the
+    /// locally-observed leader→none edge and cleared by the app after promotion.
+    /// `serde(skip)` keeps it out of snapshots — like `leader_id`/`leader_addr`
+    /// — so an installed snapshot can't inject *another* node's wall clock and
+    /// shorten this node's promotion hold-down across clock skew. A node that
+    /// installs a snapshot mid-failover re-stamps it from its own clock on the
+    /// next leader→none edge it observes.
+    #[serde(skip)]
     pub failover_started_at_unix_ms: Option<u64>,
 
     /// Whether the leader currently has `synchronous_standby_names` set to a
@@ -299,6 +305,35 @@ impl ClusterState {
         self.max_cluster_lsn = fresh_max;
     }
 
+    /// Staleness-filtered maximum LSN across the cluster, recomputed on the fly.
+    ///
+    /// Same rule as `Self::recalculate_max_cluster_lsn` but pure (no
+    /// mutation, no skew logging): excludes entries older than the staleness
+    /// window and caps future-skewed timestamps at age 0. Safety gates re-derive
+    /// through this rather than reading the stored `max_cluster_lsn` field, which
+    /// is only refreshed on a Raft apply: during a leaderless window past the
+    /// staleness threshold the stored value stays frozen at the pre-outage max
+    /// while every timestamp has aged out, whereas this falls back to 0
+    /// (bootstrap-permissive) — and the promote path stays consistent with the
+    /// election gate, which already re-derives.
+    #[must_use]
+    pub fn fresh_max_lsn(&self) -> u64 {
+        let now = unix_now_secs();
+        self.node_lsns
+            .values()
+            .filter(|(_, ts)| {
+                let age = if *ts > now {
+                    0
+                } else {
+                    now.saturating_sub(*ts)
+                };
+                age < crate::config::constants::LSN_STALENESS_THRESHOLD_SECS
+            })
+            .map(|(lsn, _)| *lsn)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Check if a candidate's LSN is acceptable for leader election.
     ///
     /// Returns `(acceptable, reason)`. Rejects when:
@@ -454,6 +489,35 @@ mod tests {
             role: NodeRole::Follower,
             last_seen: 0,
         }));
+    }
+
+    /// `fresh_max_lsn` re-derives the cluster max from only non-stale entries,
+    /// so a peer whose LSN report has aged out is excluded even while the stored
+    /// `max_cluster_lsn` (frozen at the last Raft apply) still reflects it. The
+    /// promotion gate reads through this so a frozen stale max can't wedge it.
+    #[test]
+    fn test_fresh_max_lsn_excludes_stale_entries() {
+        use crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
+        let mut state = ClusterState::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        add_test_node(&mut state, 1);
+        add_test_node(&mut state, 2);
+        // Node 2 holds the higher LSN but its report is stale; node 1 is fresh.
+        state.node_lsns.insert(1, (100_000, now));
+        state
+            .node_lsns
+            .insert(2, (900_000, now - LSN_STALENESS_THRESHOLD_SECS - 1));
+        // Model a stored max frozen before node 2 aged out.
+        state.max_cluster_lsn = 900_000;
+
+        // fresh_max_lsn ignores the stale node-2 entry and returns node 1's LSN,
+        // while the stored cache still holds the frozen, now-stale value — which
+        // is exactly why the promotion gate re-derives instead of reading it.
+        assert_eq!(state.fresh_max_lsn(), 100_000);
+        assert_eq!(state.max_cluster_lsn, 900_000);
     }
 
     #[test]

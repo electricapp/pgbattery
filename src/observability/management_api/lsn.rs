@@ -125,7 +125,14 @@ pub(super) async fn get_node_lag(
     // behind. Fail closed: report the lag for display but never is_synced=true
     // when the leader position is unknown (a join readiness gate consumes this).
     let (lag_bytes, is_synced) = known_leader_lsn.map_or_else(
-        || (max_cluster_lsn.saturating_sub(node_lsn), false),
+        || {
+            // The leader hasn't durably reported its own LSN. is_synced is
+            // forced false (a join-readiness gate consumes this), which silently
+            // blocks auto-promotion of every new node — surface it so the root
+            // cause (leader LSN-report failing) is visible, not a mystery.
+            metrics::counter!("pgbattery_node_lag_leader_lsn_unknown").increment(1);
+            (max_cluster_lsn.saturating_sub(node_lsn), false)
+        },
         |leader_lsn| {
             let lag = leader_lsn.saturating_sub(node_lsn);
             (lag, lag < SYNC_LAG_THRESHOLD_BYTES)
@@ -185,29 +192,57 @@ pub(super) async fn report_lsn(
     // an over-report before it reaches replicated state: a bogus high value
     // (buggy node, bit-flip, or a token-holder) would inflate `max_cluster_lsn`
     // and reject election candidates as "too far behind" — a failover wedge.
-    // Best-effort: if the bound is unknowable (PG slow/contended, or still in
-    // recovery right after our own election), skip it rather than drop a
-    // legit report.
-    if let Some(leader_write_lsn) = leader_current_write_lsn(&state).await
-        && req.lsn_bytes > leader_write_lsn
-    {
-        tracing::warn!(
-            node_id = req.node_id,
-            reported = req.lsn_bytes,
-            leader_write_lsn,
-            "Rejecting LSN report ahead of leader's write position (impossible — bug or tampering)"
-        );
-        metrics::counter!("pgbattery_lsn_report_rejected_ahead_of_leader").increment(1);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ReportLsnResponse {
-                success: false,
-                message: format!(
-                    "Reported LSN {} exceeds leader write position {leader_write_lsn}",
-                    req.lsn_bytes
-                ),
-            }),
-        );
+    match leader_current_write_lsn(&state).await {
+        Some(leader_write_lsn) if req.lsn_bytes > leader_write_lsn => {
+            tracing::warn!(
+                node_id = req.node_id,
+                reported = req.lsn_bytes,
+                leader_write_lsn,
+                "Rejecting LSN report ahead of leader's write position (impossible — bug or tampering)"
+            );
+            metrics::counter!("pgbattery_lsn_report_rejected_ahead_of_leader").increment(1);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ReportLsnResponse {
+                    success: false,
+                    message: format!(
+                        "Reported LSN {} exceeds leader write position {leader_write_lsn}",
+                        req.lsn_bytes
+                    ),
+                }),
+            );
+        }
+        Some(_) => {}
+        None => {
+            // The exact bound is unknowable (leader PG slow/contended, or still
+            // in recovery right after our own election). Don't skip the check
+            // entirely — a bit-flipped or buggy report could otherwise inflate
+            // `max_cluster_lsn` to an astronomical value and wedge every future
+            // election until it ages out. Fall back to rejecting values
+            // implausibly far above the cluster's known fresh max; a legit
+            // report can never be gigabytes ahead of every other node.
+            const MAX_UNVERIFIED_LSN_ADVANCE_BYTES: u64 = 4_294_967_296; // 4 GiB
+            let fresh_max = state.cluster_state.read().fresh_max_lsn();
+            if req.lsn_bytes > fresh_max.saturating_add(MAX_UNVERIFIED_LSN_ADVANCE_BYTES) {
+                tracing::warn!(
+                    node_id = req.node_id,
+                    reported = req.lsn_bytes,
+                    fresh_max,
+                    "Rejecting LSN report implausibly far ahead of cluster max while leader write position is unverifiable"
+                );
+                metrics::counter!("pgbattery_lsn_report_rejected_implausible").increment(1);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ReportLsnResponse {
+                        success: false,
+                        message: format!(
+                            "Reported LSN {} implausibly far ahead of cluster max {fresh_max}",
+                            req.lsn_bytes
+                        ),
+                    }),
+                );
+            }
+        }
     }
 
     // Commit the LSN update to Raft.

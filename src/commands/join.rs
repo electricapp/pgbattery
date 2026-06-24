@@ -216,6 +216,18 @@ pub async fn run_join(
     }
 
     // Fresh-join path: fetch cluster info to discover peers and node_id.
+    //
+    // join trusts the peer address: it pulls the node id, peer list, and leader
+    // from `peer` over the (assumed-trusted) management network and then runs
+    // pg_basebackup, which overwrites this node's PostgreSQL data directory.
+    // There is no cluster-identity handshake, so pointing --peer at the wrong
+    // host enrolls this node into the wrong cluster and destroys its data.
+    warn!(
+        peer = %peer,
+        "join will enroll this node into the cluster reached at this peer address and \
+         overwrite the local PostgreSQL data directory via pg_basebackup; ensure the peer \
+         is a trusted member of the intended cluster"
+    );
     let client = http_client(30)?;
     info!(peer = %peer, "Fetching cluster information");
     let join_info = fetch_join_info(&client, &peer).await?;

@@ -369,6 +369,13 @@ async fn process_request(
                 // safety-critical path. `None` is the honest, safe fallback
                 // ("voter's log position unknown"); the `vote` field still
                 // does the work of conveying our term.
+                //
+                // Caveat: `RaftMetrics` is an eventually-consistent projection
+                // that can lag our durably-persisted vote by a core-loop tick,
+                // so the term echoed here may be slightly stale. That only
+                // prolongs an election round — a rejection never binds the
+                // voter and this path can never *grant* a vote — so it is a
+                // liveness footnote, not a safety hazard.
                 let metrics_snapshot = raft.metrics().borrow().clone();
                 let resp = VoteResponse::<NodeId> {
                     vote: metrics_snapshot.vote,
@@ -432,10 +439,24 @@ impl PeerConnection {
     /// never be reused.
     async fn exchange(mut self, rpc_type: RpcType, body: &[u8]) -> Result<(Self, Vec<u8>)> {
         let request_buf = frame_request(rpc_type, body)?;
+        // Each request type has exactly one valid response type; validating it
+        // catches a desynced stream before postcard decodes the wrong frame.
+        let expected = match rpc_type {
+            RpcType::AppendEntries => RpcType::AppendEntriesResponse,
+            RpcType::Vote => RpcType::VoteResponse,
+            RpcType::InstallSnapshot => RpcType::InstallSnapshotResponse,
+            other => {
+                return Err(Error::Protocol(format!(
+                    "not a request RPC type: {other:?}"
+                )));
+            }
+        };
         let addr = self.addr;
         let response = match &mut self.stream {
-            PeerStream::Plain(stream) => exchange_on(stream, &request_buf, addr).await?,
-            PeerStream::Tls(stream) => exchange_on(stream.as_mut(), &request_buf, addr).await?,
+            PeerStream::Plain(stream) => exchange_on(stream, &request_buf, addr, expected).await?,
+            PeerStream::Tls(stream) => {
+                exchange_on(stream.as_mut(), &request_buf, addr, expected).await?
+            }
         };
         Ok((self, response))
     }
@@ -454,7 +475,12 @@ fn frame_request(rpc_type: RpcType, body: &[u8]) -> Result<BytesMut> {
 }
 
 /// Write a framed request and read the framed response over a stream.
-async fn exchange_on<S>(stream: &mut S, request_buf: &BytesMut, addr: SocketAddr) -> Result<Vec<u8>>
+async fn exchange_on<S>(
+    stream: &mut S,
+    request_buf: &BytesMut,
+    addr: SocketAddr,
+    expected: RpcType,
+) -> Result<Vec<u8>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -475,11 +501,20 @@ where
     let len = u32::from_be_bytes(len_buf) as usize;
     let body_len = validate_rpc_frame_len(len, "response")?;
 
-    // Read response type
+    // Read response type and validate it against what this request expects.
+    // postcard is positional/untagged, so a desynced stream could otherwise be
+    // decoded as a structurally-valid-but-wrong message (e.g. a fabricated
+    // VoteResponse) — a safety hazard on the election path.
     let mut type_buf = [0u8; 1];
     tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut type_buf))
         .await
         .map_err(|_| Error::ConnectionTimeout(addr))??;
+    let resp_type = RpcType::try_from(type_buf[0])?;
+    if resp_type != expected {
+        return Err(Error::Protocol(format!(
+            "RPC response type mismatch from {addr}: expected {expected:?}, got {resp_type:?}"
+        )));
+    }
 
     // Read response body
     let mut response_body = BytesMut::with_capacity(body_len);

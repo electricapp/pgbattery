@@ -128,46 +128,54 @@ pub async fn run_status(
     watch: Option<u64>,
     config_path: Option<String>,
 ) -> Result<()> {
-    // Parse initial node addresses with optional node IDs
-    let discovered_nodes: Vec<DiscoveredNode> = if let Some(n) = nodes {
-        // Explicit --nodes provided - use as-is (no node IDs known)
-        n.split(',')
-            .map(|s| DiscoveredNode {
-                node_id: None,
-                metrics_addr: s.trim().to_string(),
-            })
-            .collect()
-    } else if let Some(mgmt_addr) = discover {
-        // Explicit --discover provided
-        discover_nodes(&mgmt_addr).await?
-    } else {
-        // Load config and try to auto-discover from cluster API
-        let config = match &config_path {
-            Some(path) => crate::config::Config::load_from(path)?,
-            None => crate::config::Config::load()
-                .map_err(|_| anyhow::anyhow!("No --nodes or --discover specified and couldn't load config file. Use --discover <mgmt-addr> to auto-discover nodes."))?,
-        };
+    // Parse initial node addresses with optional node IDs. `rediscover_addr` is
+    // the mgmt address to re-query on each --watch tick so membership changes
+    // (joins/removals) show up live; it is `None` for an explicit --nodes list,
+    // which is a static set the operator pinned.
+    let (mut discovered_nodes, rediscover_addr): (Vec<DiscoveredNode>, Option<String>) =
+        if let Some(n) = nodes {
+            // Explicit --nodes provided - use as-is (no node IDs known)
+            let list = n
+                .split(',')
+                .map(|s| DiscoveredNode {
+                    node_id: None,
+                    metrics_addr: s.trim().to_string(),
+                })
+                .collect();
+            (list, None)
+        } else if let Some(mgmt_addr) = discover {
+            // Explicit --discover provided
+            let list = discover_nodes(&mgmt_addr).await?;
+            (list, Some(mgmt_addr))
+        } else {
+            // Load config and try to auto-discover from cluster API
+            let config = match &config_path {
+                Some(path) => crate::config::Config::load_from(path)?,
+                None => crate::config::Config::load()
+                    .map_err(|_| anyhow::anyhow!("No --nodes or --discover specified and couldn't load config file. Use --discover <mgmt-addr> to auto-discover nodes."))?,
+            };
 
-        // Try auto-discovery first (gets accurate addresses and node IDs after joins/removals)
-        let mgmt_addr = config.get_mgmt_addr().to_string();
-        match discover_nodes(&mgmt_addr).await {
-            Ok(nodes) if !nodes.is_empty() => nodes,
-            _ => {
-                // Fall back to static config addresses with config node IDs
-                let mut nodes = vec![DiscoveredNode {
-                    node_id: Some(config.node_id),
-                    metrics_addr: config.metrics_addr.to_string(),
-                }];
-                for peer in &config.peers {
-                    nodes.push(DiscoveredNode {
-                        node_id: Some(peer.id),
-                        metrics_addr: peer.get_metrics_addr().to_string(),
-                    });
+            // Try auto-discovery first (gets accurate addresses and node IDs after joins/removals)
+            let mgmt_addr = config.get_mgmt_addr().to_string();
+            let list = match discover_nodes(&mgmt_addr).await {
+                Ok(nodes) if !nodes.is_empty() => nodes,
+                _ => {
+                    // Fall back to static config addresses with config node IDs
+                    let mut nodes = vec![DiscoveredNode {
+                        node_id: Some(config.node_id),
+                        metrics_addr: config.metrics_addr.to_string(),
+                    }];
+                    for peer in &config.peers {
+                        nodes.push(DiscoveredNode {
+                            node_id: Some(peer.id),
+                            metrics_addr: peer.get_metrics_addr().to_string(),
+                        });
+                    }
+                    nodes
                 }
-                nodes
-            }
-        }
-    };
+            };
+            (list, Some(mgmt_addr))
+        };
 
     loop {
         let current_nodes = discovered_nodes.clone();
@@ -185,6 +193,15 @@ pub async fn run_status(
             // Clamp to ≥1s: `--watch 0` would be a zero-delay busy loop
             // hammering every node's metrics endpoint.
             tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+            // Refresh membership for the next render so a join/remove during the
+            // watch session shows up without restarting. Keep the prior list if
+            // the re-query fails or returns nothing (transient leader outage).
+            if let Some(addr) = &rediscover_addr
+                && let Ok(fresh) = discover_nodes(addr).await
+                && !fresh.is_empty()
+            {
+                discovered_nodes = fresh;
+            }
             // Clear screen for refresh — only when stdout is a real terminal,
             // so piped/redirected output isn't peppered with escape codes.
             if std::io::stdout().is_terminal() {

@@ -37,6 +37,10 @@ const RELEASE_PUBLIC_KEY_ENV: &str = "PGBATTERY_RELEASE_PUBLIC_KEY";
 /// Returns an error if the version check, download, checksum, or signature
 /// verification fails, if the release URL is insecure, or if the binary cannot
 /// be replaced (e.g. insufficient permissions).
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "each bool maps 1:1 to a clap CLI flag for the upgrade subcommand"
+)]
 pub async fn run_upgrade(
     check: bool,
     version: Option<String>,
@@ -44,6 +48,7 @@ pub async fn run_upgrade(
     yes: bool,
     allow_insecure_http: bool,
     public_key: Option<String>,
+    insecure_no_verify: bool,
 ) -> Result<()> {
     // Initialize minimal logging for CLI
     tracing_subscriber::fmt()
@@ -112,6 +117,24 @@ pub async fn run_upgrade(
          pgbattery cluster remove --self"
     );
 
+    // Require either a configured signing key or an explicit insecure opt-in
+    // before installing. Without a key the binary's authenticity cannot be
+    // cryptographically verified (only SHA-256 integrity over the transport),
+    // so refuse by default — symmetric with --allow-insecure-http.
+    if release_key.is_none() && !insecure_no_verify {
+        anyhow::bail!(
+            "No release signing key configured: the new binary's authenticity cannot be \
+             cryptographically verified (only SHA-256 integrity over the transport). \
+             Configure a key (--public-key / PGBATTERY_RELEASE_PUBLIC_KEY, see \
+             docs/RELEASING.md), or pass --insecure-no-verify to upgrade anyway."
+        );
+    }
+
+    // current_exe() resolves symlinks, so this is the real file replaced in
+    // place. For a symlinked or package-manager install the resolved (often
+    // versioned) target — not the symlink — is overwritten; the confirmation
+    // below shows that path. Upgrade through the package manager instead if that
+    // is how this node was installed.
     let exe_path = std::env::current_exe()?;
 
     // Replacing the running binary is irreversible without the backup copy;

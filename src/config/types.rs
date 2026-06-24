@@ -362,8 +362,26 @@ impl Config {
             }
         }
 
-        // Validate timeout relationships
-        if self.heartbeat_interval_ms >= self.election_timeout_ms / 2 {
+        // `replica_disconnect_timeout_ms` is the window before a lagging or
+        // silent replica is dropped from `synchronous_standby_names`. Below one
+        // replica-check interval it would drop a replica before the leader ever
+        // probes it — almost certainly a units mistake, so reject it. (Large
+        // values are a deliberate RPO/availability trade-off and left to the
+        // operator.)
+        let replica_check = crate::config::constants::REPLICA_CHECK_INTERVAL_MS;
+        if self.replica_disconnect_timeout_ms < replica_check {
+            anyhow::bail!(
+                "replica_disconnect_timeout_ms ({}) must be >= the replica check interval \
+                 ({replica_check} ms); a smaller value drops replicas before they are probed",
+                self.replica_disconnect_timeout_ms
+            );
+        }
+
+        // Validate timeout relationships. Multiply rather than divide so the
+        // bound is exact: integer division of an odd `election_timeout_ms`
+        // rounds the threshold down and can admit a heartbeat that doesn't
+        // actually fit twice within an election timeout.
+        if self.heartbeat_interval_ms.saturating_mul(2) >= self.election_timeout_ms {
             anyhow::bail!(
                 "heartbeat_interval_ms ({}) must be < election_timeout_ms ({}) / 2",
                 self.heartbeat_interval_ms,
@@ -493,6 +511,15 @@ impl Config {
         // Validate peer IDs are unique
         let mut seen_ids = std::collections::HashSet::new();
         for peer in &self.peers {
+            // 0 is the auto-assign sentinel / "unset" everywhere else (node_id
+            // validation, join, init). A peer entry with id 0 would flow into
+            // membership and address maps as a real voter that the rest of the
+            // tooling refuses to operate on — a phantom, un-removable member.
+            if peer.id == 0 {
+                anyhow::bail!(
+                    "Peer ID 0 is reserved (auto-assign sentinel) and cannot identify a peer"
+                );
+            }
             if !seen_ids.insert(peer.id) {
                 anyhow::bail!("Duplicate peer ID: {}", peer.id);
             }
@@ -780,6 +807,88 @@ mod tests {
         assert_eq!(config.peers.len(), 2);
         assert_eq!(config.peers[0].id, 2);
         assert_eq!(config.peers[1].id, 3);
+    }
+
+    /// A peer entry with the reserved sentinel id 0 must be rejected: 0 means
+    /// "unset / auto-assign" everywhere else, so a real peer carrying it becomes
+    /// a phantom voter the rest of the tooling won't operate on.
+    #[test]
+    fn test_peer_id_zero_rejected() {
+        let toml = r#"
+            node_id = 1
+            listen_addr = "0.0.0.0:5432"
+            raft_addr = "0.0.0.0:5433"
+            metrics_addr = "0.0.0.0:9090"
+            management_api_token = "test-token"
+            pg_bin_dir = "/usr/lib/postgresql/16/bin"
+            pg_data_dir = "/var/lib/postgresql/data"
+
+            [[peers]]
+            id = 0
+            raft_addr = "10.0.0.2:5433"
+            pg_addr = "10.0.0.2:5434"
+        "#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(toml.as_bytes()).unwrap();
+        let result = Config::load_from(file.path().to_str().unwrap());
+        assert!(result.is_err(), "peer id 0 must be rejected");
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(msg.contains("reserved"), "unexpected error: {msg}");
+    }
+
+    /// A `replica_disconnect_timeout_ms` below one replica-check interval would
+    /// drop a replica before the leader ever probes it — a units mistake.
+    #[test]
+    fn test_replica_disconnect_below_check_interval_rejected() {
+        let toml = r#"
+            node_id = 1
+            listen_addr = "0.0.0.0:5432"
+            raft_addr = "0.0.0.0:5433"
+            metrics_addr = "0.0.0.0:9090"
+            management_api_token = "test-token"
+            pg_bin_dir = "/usr/lib/postgresql/16/bin"
+            pg_data_dir = "/var/lib/postgresql/data"
+            replica_disconnect_timeout_ms = 500
+        "#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(toml.as_bytes()).unwrap();
+        let result = Config::load_from(file.path().to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "sub-check-interval disconnect must be rejected"
+        );
+        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("replica check interval"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// With an odd `election_timeout_ms`, a heartbeat that genuinely fits twice
+    /// must be accepted. The old `heartbeat >= election/2` integer-division
+    /// check wrongly rejected 499 against 999 (999/2 == 499); the exact
+    /// `2*heartbeat >= election` check (998 < 999) accepts it.
+    #[test]
+    fn test_heartbeat_just_under_half_odd_election_accepted() {
+        let toml = r#"
+            node_id = 1
+            listen_addr = "0.0.0.0:5432"
+            raft_addr = "0.0.0.0:5433"
+            metrics_addr = "0.0.0.0:9090"
+            management_api_token = "test-token"
+            pg_bin_dir = "/usr/lib/postgresql/16/bin"
+            pg_data_dir = "/var/lib/postgresql/data"
+            election_timeout_ms = 999
+            heartbeat_interval_ms = 499
+        "#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(toml.as_bytes()).unwrap();
+        let result = Config::load_from(file.path().to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "heartbeat that fits twice in an odd election timeout must be accepted: {:?}",
+            result.err()
+        );
     }
 
     #[test]
