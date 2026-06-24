@@ -21,6 +21,12 @@ use pgbattery_core::{Error, NodeId, PgAuthMode, Result, WalLevel};
 /// session. The full marker is `__PGBATTERY_SQL_END_<seq>__`.
 const END_MARKER_PREFIX: &str = "__PGBATTERY_SQL_END_";
 
+/// Upper bound on a single newline-terminated line read from the persistent
+/// psql session. A wedged or garbage backend streaming an unterminated line
+/// would otherwise grow `line_buf` without limit; cap it so the session errors
+/// out instead of exhausting memory.
+const MAX_SQL_LINE_BYTES: usize = 8 * 1_024 * 1_024;
+
 /// How a line read from the persistent psql session relates to the end
 /// marker for the query currently being awaited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +161,17 @@ impl LocalSqlClient {
             let consumed = chunk.len();
             self.line_buf.extend_from_slice(chunk);
             self.stdout.consume(consumed);
+            if self.line_buf.len() > MAX_SQL_LINE_BYTES {
+                // A backend streaming an unterminated line past the cap is
+                // wedged or emitting garbage; stop accumulating rather than
+                // grow the buffer unbounded.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "psql line exceeded {MAX_SQL_LINE_BYTES} bytes without a newline"
+                    ),
+                ));
+            }
         }
     }
 
@@ -434,27 +451,65 @@ const fn rewind_divergence_decision(
     }
 }
 
-/// Whether a failed `pg_rewind` run clearly happened before it modified the
-/// target data directory.
+/// Stderr marker for a `pg_rewind` failure that is pre-copy (target intact)
+/// but cannot be resolved by retrying: the source and target already share a
+/// timeline, so no amount of waiting will make them diverge.
+const REWIND_SAME_TIMELINE_MARKER: &str = "source and target cluster are on the same timeline";
+
+/// How a failed `pg_rewind` run relates to the target data directory and the
+/// retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreCopyOutcome {
+    /// Target intact, failure is transient (source not up yet, connection
+    /// refused) — worth retrying.
+    Retryable,
+    /// Target intact, but the condition is terminal (same timeline) — never
+    /// retry; surface immediately while keeping the dir known-startable.
+    Terminal,
+    /// The copy phase may have started; the target is a mix of old and new
+    /// blocks (fail closed).
+    Touched,
+}
+
+/// Classify a failed `pg_rewind` run against the target data directory.
 ///
 /// `pg_rewind` only starts writing to the target after it has connected to
 /// the source and located the divergence point; failures from the
 /// connection/validation phase leave the target intact and are recognisable
 /// from stderr. Anything unrecognised is treated as having touched the
-/// target (fail closed): a copy that died mid-flight leaves an
+/// target ([`PreCopyOutcome::Touched`]): a copy that died mid-flight leaves an
 /// unrecoverable mix of old and new blocks.
-fn pg_rewind_failure_is_pre_copy(stderr: &str) -> bool {
-    const PRE_COPY_MARKERS: &[&str] = &[
+///
+/// The same-timeline condition is pre-copy (target untouched) but terminal:
+/// retrying can never make the timelines differ, so it is classified
+/// [`PreCopyOutcome::Terminal`] to break the retry loop immediately.
+fn classify_pg_rewind_failure(stderr: &str) -> PreCopyOutcome {
+    const RETRYABLE_MARKERS: &[&str] = &[
         "could not connect",
         "connection to server",
         "fe_sendauth",
         "password authentication failed",
         "no pg_hba.conf entry",
         "target server must be shut down cleanly",
-        "source and target cluster are on the same timeline",
     ];
     let lower = stderr.to_ascii_lowercase();
-    PRE_COPY_MARKERS.iter().any(|m| lower.contains(m))
+    if lower.contains(REWIND_SAME_TIMELINE_MARKER) {
+        return PreCopyOutcome::Terminal;
+    }
+    if RETRYABLE_MARKERS.iter().any(|m| lower.contains(m)) {
+        PreCopyOutcome::Retryable
+    } else {
+        PreCopyOutcome::Touched
+    }
+}
+
+/// Whether a failed `pg_rewind` run clearly happened before it modified the
+/// target data directory (both retryable and terminal pre-copy outcomes).
+///
+/// Used by the data-safety classification, which cares only that the on-disk
+/// state is intact and startable — not whether the failure is worth retrying.
+fn pg_rewind_failure_is_pre_copy(stderr: &str) -> bool {
+    !matches!(classify_pg_rewind_failure(stderr), PreCopyOutcome::Touched)
 }
 
 /// Whether a `run_pg_rewind` failure is known to have left the target data
@@ -536,6 +591,11 @@ impl Supervisor {
                     // CRITICAL: Clear child reference after reaping zombie
                     // Otherwise next is_alive() call returns Err instead of Ok(false)
                     self.child = None;
+                    // Clear the role gauge on the running→exited transition so
+                    // monitoring does not show a stale primary/standby role
+                    // after a crash. Only on this transition: once `child` is
+                    // None, later polls take the branch below and never re-emit.
+                    metrics::gauge!("pgbattery_pg_is_primary").set(0.0);
                     Ok(false) // Dead
                 }
                 Ok(None) => Ok(true), // Alive
@@ -688,16 +748,36 @@ impl Supervisor {
             return;
         };
 
-        // Linux: /proc/<pid>/status. State line shows R/S/D (live) or Z/X
-        // (zombie/dead). Missing file = process doesn't exist at all.
+        // Liveness check, fail closed. We only clean up when we can POSITIVELY
+        // confirm the process is gone:
+        //   - /proc/<pid> missing entirely  → process does not exist
+        //   - /proc/<pid>/status State is Z/X → zombie/dead, safe to clear
+        // Anything else is indeterminate: a readable live process (don't
+        // touch it), OR /proc unreadable for reasons unrelated to death — on
+        // non-Linux, restricted containers, or `hidepid` mounts a LIVE
+        // foreign postmaster reads exactly the same as a dead one. Killing on
+        // that ambiguity would SIGKILL a healthy PG and delete its pid file,
+        // so we leave the pid file in place and let PG's own startup pid-file
+        // check surface the conflict.
+        let proc_dir_exists = fs::metadata(format!("/proc/{pid}")).await.is_ok();
         let proc_status = fs::read_to_string(format!("/proc/{pid}/status")).await.ok();
-        let needs_cleanup = proc_status.as_ref().is_none_or(|s| {
-            s.lines()
-                .find(|l| l.starts_with("State:"))
-                .is_some_and(|l| l.contains('Z') || l.contains('X'))
-        });
-        if !needs_cleanup {
-            tracing::debug!(pid, "postmaster.pid references a live process");
+        let positively_dead = if proc_dir_exists {
+            proc_status.as_ref().is_some_and(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("State:"))
+                    .is_some_and(|l| l.contains('Z') || l.contains('X'))
+            })
+        } else {
+            // The process directory is absent, so the pid no longer exists.
+            true
+        };
+        if !positively_dead {
+            tracing::warn!(
+                pid,
+                proc_readable = proc_status.is_some(),
+                "postmaster.pid references a process we cannot confirm is dead; \
+                 leaving pid file in place so PG's startup check arbitrates"
+            );
             return;
         }
 
@@ -1119,8 +1199,17 @@ host all all ::/0 {auth_method}
     /// `None` downgrades the gate to warn-and-proceed. Deliberately not
     /// `pg_controldata` — after a crash it understates the end-of-WAL
     /// position, which would make the gate pass exactly when it must not.
+    ///
+    /// Uses the received/durable position ([`Self::get_reportable_lsn`]), not
+    /// the replayed position. A synchronous standby acknowledges a commit on
+    /// WAL receive/flush, before replay, so its acked-but-unreplayed commits
+    /// live in the gap between the replay and receive positions. The gate must
+    /// refuse to discard that WAL, which means it has to see the received
+    /// position — the replayed position understates what the node holds on disk
+    /// and would let the gate under-refuse and silently drop acked commits.
+    /// This matches the promote gate's rationale on [`Self::get_reportable_lsn`].
     async fn capture_lsn_for_rewind_gate(&self) -> Option<u64> {
-        let lsn_str = match self.get_current_lsn().await {
+        let lsn_str = match self.get_reportable_lsn().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -2147,6 +2236,14 @@ host all all ::/0 {auth_method}
         // contain the inner retry budget without ever becoming the dominant
         // bound under healthy conditions.
         const PG_REWIND_BUDGET: Duration = Duration::from_mins(5);
+        // How long to wait for a SIGKILL'd pg_rewind to be reaped after the
+        // budget elapses. SIGKILL is prompt; the bounded wait only guards
+        // against a child stuck in uninterruptible I/O so we never block the
+        // supervisor mutex past the budget. A wait-timeout is best-effort —
+        // the OS reaper collects the zombie once we exit.
+        const PG_REWIND_REAP_BUDGET: Duration = Duration::from_secs(5);
+
+        let budget_deadline = Instant::now() + PG_REWIND_BUDGET;
 
         let inner = async {
             let pg_rewind = self.config.pg_bin_dir.join("pg_rewind");
@@ -2174,21 +2271,70 @@ host all all ::/0 {auth_method}
 
             // Retry up to PG_REWIND_MAX_RETRIES times with delay (new leader needs time to start)
             for attempt in 1..=PG_REWIND_MAX_RETRIES {
-                // `kill_on_drop(true)` so the outer budget timeout actually
-                // terminates pg_rewind instead of leaving it copying into
-                // the data directory while the caller moves on.
-                let output = Command::new(&pg_rewind)
+                // Spawn explicitly (rather than `Command::output()`) so the
+                // budget timeout can `start_kill()` then `wait()` the child
+                // to reap it. `kill_on_drop(true)` SIGKILLs on drop but does
+                // not await the child, leaving an orphan that could race a
+                // later `start()` on the same data dir; the explicit reap
+                // below closes that window.
+                let mut child = Command::new(&pg_rewind)
                     .arg("-D")
                     .arg(&self.config.pg_data_dir)
                     .arg("--source-server")
                     .arg(&source_connstr)
                     .arg("--progress")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
                     .kill_on_drop(true)
-                    .output()
-                    .await
+                    .spawn()
                     .map_err(|e| Error::Postgres(format!("Failed to run pg_rewind: {e}")))?;
 
-                if output.status.success() {
+                // Drain stderr concurrently with the wait, but keep the
+                // `child` handle (only borrowed by `wait`) so the timeout path
+                // can kill it. `wait_with_output` would move the child and
+                // leave nothing to reap. Draining the pipe also prevents a
+                // full pipe buffer from deadlocking pg_rewind against our wait.
+                let mut stderr_pipe = child.stderr.take();
+                let mut stderr_buf = Vec::new();
+                let collect = async {
+                    let drain_err = async {
+                        if let Some(p) = stderr_pipe.as_mut() {
+                            p.read_to_end(&mut stderr_buf).await
+                        } else {
+                            Ok(0)
+                        }
+                    };
+                    let (status, _) = tokio::join!(child.wait(), drain_err);
+                    status
+                };
+
+                // Bound this attempt by the remaining budget so the wait can
+                // reap the child rather than dropping it (and only SIGKILLing).
+                let remaining = budget_deadline.saturating_duration_since(Instant::now());
+                let status = match tokio::time::timeout(remaining, collect).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(e)) => {
+                        return Err(Error::Postgres(format!("Failed to run pg_rewind: {e}")));
+                    }
+                    Err(_) => {
+                        // Budget exceeded mid-run. Reap the child before
+                        // returning so no orphaned pg_rewind keeps writing
+                        // into the data dir and races a later start().
+                        child.start_kill().ok();
+                        tokio::time::timeout(PG_REWIND_REAP_BUDGET, child.wait())
+                            .await
+                            .ok();
+                        // "exceeded budget" is classified as target-touched by
+                        // rewind_failure_left_target_untouched — a timeout can
+                        // kill a copy mid-flight.
+                        return Err(Error::Postgres(format!(
+                            "pg_rewind exceeded {}s budget",
+                            PG_REWIND_BUDGET.as_secs()
+                        )));
+                    }
+                };
+
+                if status.success() {
                     tracing::info!("pg_rewind completed successfully");
                     // Couple standby.signal write to rewind success. pg_rewind
                     // sources from a primary that has no standby.signal, so the
@@ -2204,16 +2350,21 @@ host all all ::/0 {auth_method}
                     return Ok(());
                 }
 
-                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = String::from_utf8_lossy(&stderr_buf);
 
-                // Retry only failures from before the copy phase (source
-                // not up yet, connection refused — the "new leader needs
-                // time to start" cases). Once the copy has started, a
-                // failure leaves the target as a mix of old and new
-                // blocks; re-running pg_rewind on that is not recoverable,
-                // so surface immediately for the caller's touched-target
-                // handling.
-                if attempt < PG_REWIND_MAX_RETRIES && pg_rewind_failure_is_pre_copy(&stderr) {
+                // Retry only transient failures from before the copy phase
+                // (source not up yet, connection refused — the "new leader
+                // needs time to start" cases). A same-timeline failure is
+                // also pre-copy (target intact) but terminal: waiting will
+                // never make the timelines differ, so break immediately
+                // instead of burning the full retry budget. Once the copy
+                // has started, a failure leaves the target as a mix of old
+                // and new blocks; re-running pg_rewind on that is not
+                // recoverable, so surface immediately for the caller's
+                // touched-target handling.
+                if attempt < PG_REWIND_MAX_RETRIES
+                    && classify_pg_rewind_failure(&stderr) == PreCopyOutcome::Retryable
+                {
                     tracing::warn!(
                         attempt,
                         max_retries = PG_REWIND_MAX_RETRIES,
@@ -2224,7 +2375,11 @@ host all all ::/0 {auth_method}
                     continue;
                 }
 
-                // Non-retryable error or max attempts reached
+                // Terminal pre-copy, non-retryable error, or max attempts
+                // reached. The error string still carries the original
+                // stderr, so rewind_failure_left_target_untouched can
+                // classify the data-safety outcome (same-timeline stays
+                // untouched).
                 tracing::warn!(stderr = %stderr, "pg_rewind failed");
                 return Err(Error::Postgres(format!("pg_rewind failed: {stderr}")));
             }
@@ -3568,6 +3723,50 @@ mod tests {
         )));
         assert!(!rewind_failure_left_target_untouched(&Error::Postgres(
             "pg_rewind failed: pg_rewind: error: could not write file \"global/pg_control\""
+                .to_string()
+        )));
+    }
+
+    #[test]
+    fn test_classify_pg_rewind_failure() {
+        // Transient connection-phase failures are retryable.
+        assert_eq!(
+            classify_pg_rewind_failure(
+                "pg_rewind: error: could not connect to server: Connection refused"
+            ),
+            PreCopyOutcome::Retryable
+        );
+        assert_eq!(
+            classify_pg_rewind_failure("pg_rewind: fatal: target server must be shut down cleanly"),
+            PreCopyOutcome::Retryable
+        );
+        // Same timeline is pre-copy (target intact) but terminal: retrying can
+        // never make the timelines differ.
+        assert_eq!(
+            classify_pg_rewind_failure(
+                "pg_rewind: error: source and target cluster are on the same timeline"
+            ),
+            PreCopyOutcome::Terminal
+        );
+        // Unrecognised / mid-copy failures count as touched (fail closed).
+        assert_eq!(
+            classify_pg_rewind_failure(
+                "pg_rewind: error: could not read file \"base/1/2658\": Input/output error"
+            ),
+            PreCopyOutcome::Touched
+        );
+        assert_eq!(classify_pg_rewind_failure(""), PreCopyOutcome::Touched);
+    }
+
+    #[test]
+    fn test_same_timeline_is_pre_copy_but_untouched() {
+        // Terminal pre-copy still leaves the target intact, so the data dir
+        // is known-startable and the node can come back up.
+        assert!(pg_rewind_failure_is_pre_copy(
+            "pg_rewind: error: source and target cluster are on the same timeline"
+        ));
+        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
+            "pg_rewind failed: pg_rewind: error: source and target cluster are on the same timeline"
                 .to_string()
         )));
     }

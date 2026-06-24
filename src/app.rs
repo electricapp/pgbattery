@@ -667,6 +667,14 @@ impl App {
             // ever missed. With cache-free `ensure_follows`, a tick on a
             // stable cluster is a single cheap PG probe and a no-op.
             let mut reconcile_interval = tokio::time::interval(Duration::from_secs(2));
+            // Coalesce, don't burst. The default `Burst` behaviour fires every
+            // missed tick back-to-back the instant a long lock hold (a demote /
+            // pg_rewind) releases — re-contending the just-freed supervisor lock
+            // exactly when the node is recovering. `Skip` collapses the backlog
+            // to a single catch-up tick.
+            lsn_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            health_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // If the token can't be encoded as a header value we used to
             // silently fall back to a tokenless client, then every LSN report
             // to a peer 401'd and replication tracking went dark. Refuse to
@@ -953,17 +961,20 @@ impl App {
         };
         // Read max LSN and sync mode from a single cluster_state snapshot
         // so the threshold matches the data it's being compared against.
-        // Reading after the local LSN probe captures any heartbeats
-        // applied during the probe: max_cluster_lsn is monotonic
-        // non-decreasing, so a future-arriving update can only make this
-        // check stricter (fail-closed), never weaker.
+        // Re-derive the max via `fresh_max_lsn()` (staleness-filtered, on the
+        // fly) rather than reading the stored `max_cluster_lsn` field: the
+        // stored field only refreshes on a Raft apply, so a leaderless window
+        // past the staleness threshold leaves it frozen at a pre-outage value.
+        // Re-deriving keeps this gate consistent with the election gate (which
+        // already re-derives) and falls back to bootstrap-permissive once every
+        // peer's report has aged out.
         // `sync_active` is tri-state: `Some(false)` = known async (loose
         // threshold), `Some(true)`/`None` = sync-or-unknown (tight, fail-safe).
         // `lsn_catchup_threshold_bytes` applies that rule in one place.
         let (max_cluster_lsn, sync_active, catchup_threshold) = {
             let state = cluster_state.read();
             (
-                state.max_cluster_lsn,
+                state.fresh_max_lsn(),
                 state.sync_replication_active,
                 state.lsn_catchup_threshold_bytes(),
             )
@@ -1050,17 +1061,25 @@ impl App {
         //
         // `demote` can run a full stop → pg_rewind → start while holding the
         // supervisor lock, which the lease-enforcement loop also needs. This is
-        // safe: (1) `set_readonly(true)` below fences PG read-only *before* the
-        // long demote, so no writes can slip through while the lease loop is
-        // blocked; (2) every blocking sub-operation inside `demote` (stop,
-        // pg_rewind, wait_for_ready) is itself timeout-bounded, so the lock is
-        // held for a bounded interval, never indefinitely.
+        // safe: (1) the fence below stops PG from accepting writes *before* the
+        // long demote — `set_readonly(true)` flips the read-only default and
+        // `terminate_client_backends` severs existing sessions, so neither an
+        // already-open transaction nor a `BEGIN READ WRITE` can commit WAL that
+        // the following `pg_rewind` would silently discard; (2) every blocking
+        // sub-operation inside `demote` (stop, pg_rewind, wait_for_ready) is
+        // itself timeout-bounded, so the lock is held for a bounded interval,
+        // never indefinitely.
         let mut pg = postgres.lock().await;
         if let Err(e) = pg.set_readonly(true).await {
             metrics::counter!("pgbattery_demote_fence_failures").increment(1);
             error!(error = %e, "Failed to fence before {context} - aborting demote");
             return;
         }
+        // `set_readonly` only changes the read-only *default*; existing sessions
+        // and `BEGIN READ WRITE` bypass it. Sever client backends so an in-flight
+        // write can't outlive the fence and land in WAL that pg_rewind then
+        // destroys — the same escalation the emergency lease fence uses.
+        Self::terminate_client_backends(&pg).await;
         if let Err(e) = pg.demote(leader_addr).await {
             metrics::counter!("pgbattery_demote_apply_failures").increment(1);
             error!(error = %e, "Failed to configure standby for new leader");
@@ -1264,6 +1283,9 @@ impl App {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(LEASE_CHECK_INTERVAL);
+            // Fence loop: never burst a backlog of missed 100 ms ticks at the
+            // supervisor lock the instant a long hold releases — coalesce to one.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut fence_failures: u32 = 0;
 
             tracing::info!("Lease enforcement loop started (safety valve)");

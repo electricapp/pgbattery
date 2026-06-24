@@ -237,6 +237,12 @@ pub enum Commands {
         /// (overrides the embedded key; also: `PGBATTERY_RELEASE_PUBLIC_KEY`)
         #[arg(long, value_name = "PATH")]
         public_key: Option<String>,
+
+        /// Upgrade even when no release signing key is configured (insecure:
+        /// integrity is still checked via SHA-256, but authenticity is not
+        /// cryptographically verified). Required to upgrade until a key exists.
+        #[arg(long)]
+        insecure_no_verify: bool,
     },
 
     /// Run diagnostic checks on the cluster

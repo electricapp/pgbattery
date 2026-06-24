@@ -403,7 +403,7 @@ impl Governor {
     /// mechanism that stops an isolated leader/candidate from inflating its term
     /// while partitioned (openraft has no pre-vote, so `CheckQuorum` is the only
     /// guard against term inflation) — see the `term_does_not_inflate_*` tests.
-    const fn has_quorum_decision(
+    pub(crate) const fn has_quorum_decision(
         is_leader: bool,
         leader_known: bool,
         voter_count: usize,
@@ -981,8 +981,21 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
             return Ok(None);
         }
 
-        // Create vote and restore committed status if it was saved
-        let mut result = OpenRaftVote::new(vote.term, vote.voted_for.unwrap_or(0));
+        // Create vote and restore committed status if it was saved.
+        // `save_vote` always persists `Some(node_id)` and node 0 is a reserved
+        // sentinel that never runs, so a persisted vote with term > 0 but no
+        // `voted_for` is corruption, not a legitimate "voted for nobody" state
+        // (which is the term == 0 early-return above). Surface it loudly; the
+        // sentinel-0 fallback binds the vote to no real candidate.
+        let voted_for = vote.voted_for.unwrap_or_else(|| {
+            tracing::error!(
+                term = vote.term,
+                "Persisted vote has term > 0 but no voted_for — vote store may be corrupt"
+            );
+            metrics::counter!("pgbattery_vote_missing_voted_for").increment(1);
+            0
+        });
+        let mut result = OpenRaftVote::new(vote.term, voted_for);
         if vote.committed {
             result.commit();
         }

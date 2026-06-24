@@ -393,7 +393,7 @@ pub(super) async fn join_cluster(
     // Serialize with promote/remove so an add-learner can't interleave with a
     // concurrent absolute voter-set recompute (see
     // `ManagementApiState::membership_lock`).
-    let _membership_guard = state.membership_lock.lock().await;
+    let membership_guard = state.membership_lock.lock().await;
 
     let (addrs, resume) = match validate_join_request(&state, &req) {
         Ok(validated) => validated,
@@ -424,6 +424,14 @@ pub(super) async fn join_cluster(
             "Node added as learner"
         );
     }
+
+    // The voter-set serialization the lock exists for is complete once the
+    // learner add has been submitted; the remaining steps (node-info replicate,
+    // membership apply-wait, slot creation) are idempotent and Raft-serialized.
+    // Releasing the lock here rather than holding it across the multi-second
+    // apply-wait keeps a slow or stuck join from freezing promote/remove on the
+    // control plane.
+    drop(membership_guard);
 
     if let Err(err) = replicate_node_info(&state, &req, &addrs).await {
         error!(
@@ -1061,6 +1069,10 @@ async fn wait_for_target_catchup(
 
 /// Transfer leadership to `target_node_id` by stepping down and prompting it to
 /// call an immediate election.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cohesive handshake (validate, catch-up gate, lease drain, elect, observe); splitting hides the ordering that matters for correctness"
+)]
 pub(super) async fn transfer_leadership(
     State(state): State<Arc<ManagementApiState>>,
     Path(target_node_id): Path<u64>,
@@ -1171,6 +1183,31 @@ pub(super) async fn transfer_leadership(
         DEFAULT_LEASE_DURATION + Duration::from_millis(LEADERSHIP_TRANSFER_LEASE_SAFETY_MS),
     )
     .await;
+
+    // We deliberately stopped heartbeating for a full lease duration above. If
+    // we lost leadership during that window (a partition heal, a competing
+    // election, a concurrent step-down) triggering an election on the target
+    // now would bump a term against a cluster that may already have a fresh
+    // leader — a self-inflicted leaderless blip. Re-confirm we are still leader
+    // before committing to the handoff; the HeartbeatGuard's Drop restores
+    // heartbeats on this early return.
+    let still_leader = state.raft.metrics().borrow().current_leader;
+    if still_leader != Some(state.node_id) {
+        warn!(
+            node_id = state.node_id,
+            target_node_id,
+            ?still_leader,
+            "Aborting leadership transfer: no longer leader after lease drain"
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(TransferResponse {
+                success: false,
+                message: "No longer leader after lease drain; transfer aborted".to_string(),
+                new_leader_id: still_leader,
+            }),
+        );
+    }
 
     // Tell the target to start an election immediately.
     let elect_result =

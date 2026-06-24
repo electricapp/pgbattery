@@ -137,7 +137,19 @@ async fn main() -> Result<()> {
             yes,
             allow_insecure_http,
             public_key,
-        }) => run_upgrade(check, version, url, yes, allow_insecure_http, public_key).await,
+            insecure_no_verify,
+        }) => {
+            run_upgrade(
+                check,
+                version,
+                url,
+                yes,
+                allow_insecure_http,
+                public_key,
+                insecure_no_verify,
+            )
+            .await
+        }
         Some(Commands::Doctor {
             nodes,
             discover,

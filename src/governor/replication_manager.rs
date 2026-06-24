@@ -266,17 +266,20 @@ impl ReplicationManager {
     }
 
     /// Whether this leader still has a Raft quorum acknowledging it. A
-    /// single-voter cluster is its own quorum. Mirrors the governor's quorum
-    /// rule so the sync/async decision agrees with the fence/lease.
+    /// single-voter cluster is its own quorum. Delegates to the governor's
+    /// canonical `has_quorum_decision` so the sync/async decision can never
+    /// drift from the fence/lease rule.
     fn has_raft_quorum(&self) -> bool {
         let metrics = self.raft.metrics();
         let m = metrics.borrow();
+        let is_leader = m.current_leader == Some(self.node_id);
         let voter_count = m.membership_config.membership().voter_ids().count();
-        if voter_count <= 1 {
-            return true;
-        }
-        m.millis_since_quorum_ack
-            .is_some_and(|ms| ms < crate::config::constants::QUORUM_TIMEOUT_MS)
+        crate::governor::raft::Governor::has_quorum_decision(
+            is_leader,
+            m.current_leader.is_some(),
+            voter_count,
+            m.millis_since_quorum_ack,
+        )
     }
 
     async fn ensure_replication_slots_if_due(&mut self) {
@@ -708,6 +711,12 @@ impl ReplicationManager {
         reason = "single cohesive slot create/drop reconciliation; splitting obscures the flow"
     )]
     async fn ensure_replication_slots(&mut self) {
+        // Per-call budget so one hung slot query can't pin the supervisor lock
+        // for the Supervisor's full 30 s SQL timeout, starving the 100 ms lease
+        // fence loop that shares the same lock. On expiry the op is skipped and
+        // the next ensure tick retries.
+        const SLOT_SQL_BUDGET: Duration = Duration::from_secs(2);
+
         // Collect node IDs (excluding self) so we can drop the cluster lock
         let target_ids: Vec<NodeId> = {
             let cluster = self.cluster_state.read();
@@ -720,22 +729,32 @@ impl ReplicationManager {
         };
 
         let pg = self.postgres.lock().await;
-        let existing_slots = match pg.list_physical_replication_slots().await {
-            Ok(slots) => slots,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to list existing replication slots (will retry later)"
-                );
-                return;
-            }
-        };
+        let existing_slots =
+            match tokio::time::timeout(SLOT_SQL_BUDGET, pg.list_physical_replication_slots()).await {
+                Ok(Ok(slots)) => slots,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to list existing replication slots (will retry later)"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!("Listing replication slots exceeded budget (will retry later)");
+                    return;
+                }
+            };
 
         let (create_slots_for, drop_slots_for) =
             Self::plan_slot_reconciliation(&target_ids, &existing_slots);
 
         for node_id in create_slots_for {
-            if let Err(e) = pg.create_replication_slot(node_id).await {
+            let create_result =
+                tokio::time::timeout(SLOT_SQL_BUDGET, pg.create_replication_slot(node_id))
+                    .await
+                    .map_err(|_| "exceeded slot SQL budget".to_string())
+                    .and_then(|inner| inner.map_err(|e| e.to_string()));
+            if let Err(e) = create_result {
                 tracing::error!(
                     node_id,
                     error = %e,
@@ -751,7 +770,12 @@ impl ReplicationManager {
         let drop_attempted = !drop_slots_for.is_empty();
         for stale_node_id in drop_slots_for {
             let slot_name = format!("replica_{stale_node_id}");
-            match pg.drop_replication_slot(stale_node_id).await {
+            let drop_result =
+                tokio::time::timeout(SLOT_SQL_BUDGET, pg.drop_replication_slot(stale_node_id))
+                    .await
+                    .map_err(|_| "exceeded slot SQL budget".to_string())
+                    .and_then(|inner| inner.map_err(|e| e.to_string()));
+            match drop_result {
                 Ok(()) => {
                     self.slot_drop_failures.remove(&stale_node_id);
                     // Clear the stuck-slot gauge if we'd previously escalated.
@@ -809,6 +833,11 @@ impl ReplicationManager {
                 }
             }
         }
+
+        // The supervisor lock is no longer needed below; the failure-counter GC
+        // is pure in-memory work. Release it before that pass so the fence loop
+        // isn't blocked a moment longer than necessary.
+        drop(pg);
 
         // Garbage-collect failure counters for nodes we no longer attempt to drop
         // (e.g. the node rejoined). Only do so when we've just had a drop pass

@@ -44,6 +44,34 @@ use crate::governor::raft::FenceState;
 /// gone or hostile, so the connection is severed.
 const PROXY_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Maximum startup-packet length accepted, matching libpq's
+/// `PQ_MAX_STARTUP_PACKET_LENGTH`. The startup packet carries every connection
+/// parameter; the server itself rejects anything larger, so this is the same
+/// ceiling rather than an arbitrary gateway limit.
+const MAX_STARTUP_PACKET_LEN: usize = 10_000;
+
+/// Shared HTTP client for the commit-recovery probes (leader discovery +
+/// txid-status). Building a `reqwest::Client` sets up a connection pool and TLS
+/// config; one reused client avoids constructing it per probe during a failover
+/// storm. Both endpoints are unauthenticated plaintext GETs, so no per-call
+/// configuration is needed.
+fn commit_probe_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Release the allocation of a proxy buffer that grew to handle a large
+/// transfer once it is fully drained. `read_buf` grows a `BytesMut` toward
+/// [`MAX_GATEWAY_BUFFER_SIZE`] and never shrinks it, so without this a single
+/// large result would pin that capacity for the connection's whole life —
+/// across `max_connections` formerly-busy idle connections that adds up. Only
+/// resets when empty (a partial frame still buffered is left untouched).
+fn shrink_if_oversized(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() > GATEWAY_BUFFER_SIZE {
+        *buf = BytesMut::with_capacity(GATEWAY_BUFFER_SIZE);
+    }
+}
+
 /// Write `bytes` and flush within [`PROXY_WRITE_DEADLINE`], severing on
 /// expiry.
 async fn write_all_within_deadline<S>(stream: &mut S, bytes: &[u8], conn_id: u64) -> Result<()>
@@ -508,7 +536,7 @@ impl ConnectionHandler {
         }
 
         // It's a startup message - read the rest
-        if !(8..=10000).contains(&length) {
+        if !(8..=MAX_STARTUP_PACKET_LEN).contains(&length) {
             return Err(Error::Protocol(format!(
                 "Invalid startup message length: {length}"
             )));
@@ -837,6 +865,7 @@ impl ConnectionHandler {
 
         *last_activity = Instant::now();
         self.process_client_data(client_buf, backend).await?;
+        shrink_if_oversized(client_buf);
         Ok(false)
     }
 
@@ -868,6 +897,7 @@ impl ConnectionHandler {
 
         *last_activity = Instant::now();
         self.process_backend_data(backend_buf).await?;
+        shrink_if_oversized(backend_buf);
         Ok(())
     }
 
@@ -1391,6 +1421,19 @@ impl ConnectionHandler {
     }
 
     async fn capture_txid_for_commit(&mut self, backend: &mut TcpStream, lone_commit: bool) {
+        // The probe injects its own write to the backend; gate it on a still-
+        // valid lease so the gateway never issues backend I/O after write
+        // authority has lapsed. The per-message pre-check ran before this, but
+        // the lease can expire during the (up to 5s) probe budget, and the
+        // probe is best-effort anyway (the COMMIT proceeds without it).
+        let (is_leader, valid_until) = {
+            let lease = self.lease.read();
+            (lease.is_leader(), lease.valid_until())
+        };
+        if is_leader && Instant::now() >= valid_until {
+            tracing::debug!(conn_id = self.id, "Skipping txid capture: leader lease expired");
+            return;
+        }
         tracing::debug!(conn_id = self.id, "Detected COMMIT, capturing txid");
         match self.query_txid_current(backend).await {
             Ok(txid) => {
@@ -2119,10 +2162,23 @@ impl ConnectionHandler {
                     conn_id = self.id,
                     name = %name,
                     error = %e,
-                    "Failed to replay prepared statement on new backend"
+                    "Failed to replay prepared statement on new backend; severing session"
                 );
                 metrics::counter!("pgbattery_session_replay_failed", "kind" => "parse")
                     .increment(1);
+                // Don't continue: the client believes this statement exists, but
+                // it doesn't on the new backend, so a later Bind/Execute would get
+                // a confusing "prepared statement does not exist" mid-session.
+                // Sever (08006) so the driver re-prepares on reconnect — the same
+                // discipline applied to non-migratable sessions above.
+                self.send_failover_error_response(
+                    "pgbattery: leader changed; a prepared statement could not be re-established and the session was severed",
+                )
+                .await;
+                return Err(Error::ConnectionSevered {
+                    conn_id: self.id,
+                    reason: format!("prepared statement {name} replay failed"),
+                });
             }
         }
 
@@ -2372,15 +2428,22 @@ impl ConnectionHandler {
 
         let inner = async {
             let msg = Self::build_query_message("SELECT txid_current()");
-            backend.write_all(&msg).await?;
-            backend.flush().await?;
+            // Same deadline-bounded write the rest of the proxy uses, so a
+            // backend that stops draining mid-probe can't stall here unbounded.
+            write_all_within_deadline(backend, &msg, self.id).await?;
 
             // Read response - we expect: RowDescription, DataRow, CommandComplete, ReadyForQuery
             let mut buf = BytesMut::with_capacity(256);
             let mut txid: Option<i64> = None;
 
             loop {
-                backend.read_buf(&mut buf).await?;
+                let n = backend.read_buf(&mut buf).await?;
+                if n == 0 {
+                    // Backend closed mid-probe. Without this guard read_buf
+                    // returns Ok(0) forever and the loop spins parsing the same
+                    // incomplete buffer until the budget fires.
+                    return Err(Error::BackendDisconnected);
+                }
 
                 while buf.len() >= 5 {
                     let Some(header) = PacketHeader::parse(&buf) else {
@@ -2455,7 +2518,7 @@ impl ConnectionHandler {
         }
 
         let leader_mgmt_addr = self.discover_leader_mgmt_addr().await?;
-        let client = reqwest::Client::new();
+        let client = commit_probe_http_client();
         let url = format!("http://{leader_mgmt_addr}/api/v1/cluster/txid-status/{txid}");
         let response =
             client.get(&url).send().await.map_err(|e| {
@@ -2486,7 +2549,7 @@ impl ConnectionHandler {
         }
 
         let local_mgmt_addr = self.config.mgmt_addr;
-        let client = reqwest::Client::new();
+        let client = commit_probe_http_client();
         let url = format!("http://{local_mgmt_addr}/api/v1/cluster/leader");
         let response = client.get(&url).send().await.map_err(|e| {
             Error::Protocol(format!("Failed to query leader discovery endpoint: {e}"))
