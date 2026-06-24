@@ -119,9 +119,29 @@ anyhow = "1"
 parking_lot = "0.12"
 dashmap = "6"
 sha2 = "0.11"
-# Verify-only ed25519/minisign signatures on self-upgrade artifacts. Pinned to
-# an established release (org policy: no deps newer than 7 days).
-minisign-verify = "=0.2.5"
+
+# ── Release-artifact verification (Sigstore cosign keyless) ──
+# Verify-only: in-process verification of `cosign sign-blob` keyless signatures
+# on self-upgrade artifacts. `default-features = false` drops cosign-rs's default
+# `native-tls`/openssl; we route TLS through rustls (the rest of the binary is
+# rustls-only). `cosign` gives `Client::verify_blob` + `CertificateVerifier`;
+# `sigstore-trust-root` gives the TUF-backed Fulcio/Rekor trust root.
+sigstore = { version = "0.14", default-features = false, features = [
+    "cosign",
+    "sigstore-trust-root",
+    "rustls-tls",
+] }
+# X.509 parsing for the leaf cert's SAN identity + Sigstore OIDC-issuer
+# extension, and webpki for a time-correct Fulcio chain check (the leaf is
+# short-lived, so it is verified at its own `not_before`, not "now"). Versions
+# track sigstore-rs's own deps so the lockfile stays conflict-free.
+x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
+const-oid = { version = "0.9", default-features = false }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs"] }
+pki-types = { package = "rustls-pki-types", version = "1", default-features = false, features = ["std"] }
+base64 = "0.22"
+# Match the SAN identity (release-workflow tag URL) against the expected regex.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 # HTTP client (for status command and management API)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
