@@ -13,6 +13,8 @@ README.pdf
 *~
 
 *.bin
+# …but keep the cosign-verification test fixtures (a tiny signed test blob).
+!tests/fixtures/cosign/*.bin
 tla/*_TTrace_*.bin
 tla/*_TTrace_*.tla
 

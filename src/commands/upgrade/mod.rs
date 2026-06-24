@@ -1,13 +1,15 @@
 //! Self-upgrade command implementation.
 
 use anyhow::Result;
-use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::path::Path;
 use tracing::{info, warn};
 
 use super::common::{confirm, fsync_dir, http_client};
+
+mod cosign;
+use cosign::CosignVerifier;
 
 const DEFAULT_UPGRADE_URL: &str = "https://pgbattery.io/releases";
 
@@ -18,18 +20,6 @@ const UPDATE_AVAILABLE_EXIT_CODE: i32 = 10;
 
 /// Current version from Cargo.toml.
 pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Minisign public key embedded for verifying release artifacts.
-///
-/// `None` until the project publishes a signing key. Once set to the base64
-/// key line (`Some("RWQ…")`), every `upgrade` *requires* a valid `.minisig`
-/// signature over the downloaded binary. See `docs/RELEASING.md` for how to
-/// generate the keypair and fill this in.
-const RELEASE_PUBLIC_KEY: Option<&str> = None;
-
-/// Env var holding a minisign public key (base64 line), overriding the embedded
-/// one. Operators can pin authenticity even before a key is baked into the binary.
-const RELEASE_PUBLIC_KEY_ENV: &str = "PGBATTERY_RELEASE_PUBLIC_KEY";
 
 /// Run the upgrade command.
 ///
@@ -47,7 +37,7 @@ pub async fn run_upgrade(
     url: Option<String>,
     yes: bool,
     allow_insecure_http: bool,
-    public_key: Option<String>,
+    identity: Option<String>,
     insecure_no_verify: bool,
 ) -> Result<()> {
     // Initialize minimal logging for CLI
@@ -68,11 +58,11 @@ pub async fn run_upgrade(
     let base_url = url.unwrap_or_else(|| DEFAULT_UPGRADE_URL.to_string());
     let base_url = base_url.trim_end_matches('/');
 
-    // The upgrade replaces the running binary, so authenticity matters. We have
-    // no release-signing infrastructure yet (that needs a signing key + signed
-    // artifacts), so HTTPS is the authenticity boundary: TLS authenticates the
-    // release server, and the SHA-256 check guarantees integrity of the bytes.
-    // Refuse plain http unless the operator explicitly opts in.
+    // The upgrade replaces the running binary, so authenticity matters. By
+    // default we require a Sigstore cosign keyless signature (see below); when
+    // verification is explicitly disabled with --insecure-no-verify, HTTPS is
+    // the only authenticity boundary, so refuse plain http unless the operator
+    // also opts into that.
     if base_url.starts_with("http://") && !allow_insecure_http {
         anyhow::bail!(
             "Refusing to upgrade over plain HTTP ({base_url}): the response could be \
@@ -81,11 +71,19 @@ pub async fn run_upgrade(
         );
     }
 
-    // Resolve the release signing key up front (CLI > env > embedded) so a bad
-    // path or malformed key fails before we touch the network. When present, a
-    // valid signature becomes mandatory below; when absent we fall back to
-    // checksum + HTTPS.
-    let release_key = resolve_release_public_key(public_key.as_deref())?;
+    // Build the cosign keyless verifier up front (compiles the identity regex
+    // and reads the issuer/identity overrides) so a malformed override fails
+    // before we touch the network. The Sigstore trust root (Fulcio CA certs) is
+    // fetched lazily, only once we actually have a binary to verify.
+    //
+    // When --insecure-no-verify is set we skip building the verifier entirely:
+    // the upgrade proceeds on SHA-256 integrity + HTTPS only (see the refusal
+    // below for the security trade-off).
+    let verifier = if insecure_no_verify {
+        None
+    } else {
+        Some(CosignVerifier::from_env(identity.as_deref())?)
+    };
 
     // Fetch latest version
     let latest = fetch_latest_version(base_url).await?;
@@ -117,16 +115,17 @@ pub async fn run_upgrade(
          pgbattery cluster remove --self"
     );
 
-    // Require either a configured signing key or an explicit insecure opt-in
-    // before installing. Without a key the binary's authenticity cannot be
-    // cryptographically verified (only SHA-256 integrity over the transport),
-    // so refuse by default — symmetric with --allow-insecure-http.
-    if release_key.is_none() && !insecure_no_verify {
+    // Require either cosign keyless verification or an explicit insecure opt-in
+    // before installing. Without verification the binary's authenticity cannot
+    // be cryptographically established (only SHA-256 integrity over the
+    // transport), so refuse by default — symmetric with --allow-insecure-http.
+    if verifier.is_none() && !insecure_no_verify {
+        // Unreachable in practice (verifier is always Some unless
+        // insecure_no_verify), but kept as a defensive guard.
         anyhow::bail!(
-            "No release signing key configured: the new binary's authenticity cannot be \
-             cryptographically verified (only SHA-256 integrity over the transport). \
-             Configure a key (--public-key / PGBATTERY_RELEASE_PUBLIC_KEY, see \
-             docs/RELEASING.md), or pass --insecure-no-verify to upgrade anyway."
+            "Release signature verification is not configured: the new binary's authenticity \
+             cannot be cryptographically verified. Pass --insecure-no-verify to upgrade anyway \
+             (integrity is still checked via SHA-256 over HTTPS)."
         );
     }
 
@@ -152,9 +151,9 @@ pub async fn run_upgrade(
         return Ok(());
     }
 
-    if release_key.is_none() {
+    if verifier.is_none() {
         warn!(
-            "No release signing key configured: authenticity is not cryptographically \
+            "--insecure-no-verify: the new binary's authenticity is NOT cryptographically \
              verified (integrity still enforced via SHA-256 over HTTPS). See docs/RELEASING.md."
         );
     }
@@ -163,7 +162,8 @@ pub async fn run_upgrade(
     let binary_name = platform_binary_name();
     let download_url = format!("{base_url}/v{target}/{binary_name}");
     let checksum_url = format!("{download_url}.sha256");
-    let signature_url = format!("{download_url}.minisig");
+    let signature_url = format!("{download_url}.sig");
+    let certificate_url = format!("{download_url}.pem");
 
     info!(url = %download_url, "Downloading");
 
@@ -175,7 +175,8 @@ pub async fn run_upgrade(
         &download_url,
         &checksum_url,
         &signature_url,
-        release_key.as_ref(),
+        &certificate_url,
+        verifier.as_ref(),
         &exe_path,
     )
     .await?;
@@ -245,7 +246,8 @@ async fn download_verify_replace(
     binary_url: &str,
     checksum_url: &str,
     signature_url: &str,
-    release_key: Option<&PublicKey>,
+    certificate_url: &str,
+    verifier: Option<&CosignVerifier>,
     exe_path: &Path,
 ) -> Result<std::path::PathBuf> {
     let client = http_client(300)?; // 5 min timeout for large binary
@@ -284,21 +286,26 @@ async fn download_verify_replace(
     }
     info!("Checksum verified");
 
-    // Verify the signature when a release key is configured. The checksum only
-    // proves the bytes match the (also-downloaded) .sha256; the signature proves
-    // they were produced by the holder of the release private key.
-    if let Some(key) = release_key {
-        info!("Verifying signature");
-        let sig_text = fetch_signature(&client, signature_url).await?;
-        let signature = Signature::decode(&sig_text)
-            .map_err(|e| anyhow::anyhow!("Malformed signature file ({signature_url}): {e}"))?;
-        key.verify(&bytes, &signature, false).map_err(|e| {
-            anyhow::anyhow!(
-                "Signature verification FAILED: {e}. The binary is not signed by the \
-                 expected release key — refusing to install."
-            )
-        })?;
-        info!("Signature verified");
+    // Verify the Sigstore cosign keyless signature when verification is enabled.
+    // The checksum only proves the bytes match the (also-downloaded) .sha256;
+    // the signature + Fulcio certificate prove the bytes were signed in this
+    // repository's release workflow via GitHub Actions OIDC.
+    if let Some(verifier) = verifier {
+        info!("Fetching signature + certificate");
+        let signature = fetch_text(&client, signature_url, "signature").await?;
+        let certificate = fetch_text(&client, certificate_url, "certificate").await?;
+
+        info!("Verifying cosign keyless signature");
+        verifier
+            .verify_blob(&bytes, signature.trim(), &certificate)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Signature verification FAILED: {e:#}. The binary is not a trusted \
+                     pgbattery release — refusing to install."
+                )
+            })?;
+        info!("Signature verified (Sigstore cosign keyless)");
     }
 
     // Write to temp file
@@ -378,53 +385,21 @@ fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// Resolve the release signing key from CLI flag, env var, or the embedded
-/// constant (in that precedence). The flag value is a path to a minisign
-/// public-key file; the env var and embedded constant are the base64 key line.
-/// Returns `Ok(None)` when no key is configured anywhere.
-fn resolve_release_public_key(public_key_path: Option<&str>) -> Result<Option<PublicKey>> {
-    if let Some(path) = public_key_path {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read public key file '{path}': {e}"))?;
-        return parse_minisign_public_key(&contents).map(Some);
-    }
-    if let Ok(env_key) = std::env::var(RELEASE_PUBLIC_KEY_ENV) {
-        let trimmed = env_key.trim();
-        if !trimmed.is_empty() {
-            return parse_minisign_public_key(trimmed).map(Some);
-        }
-    }
-    RELEASE_PUBLIC_KEY.map_or_else(
-        || Ok(None),
-        |embedded| parse_minisign_public_key(embedded).map(Some),
-    )
-}
-
-/// Parse a minisign public key from either a full `.pub` file (a comment line
-/// followed by the base64 key) or a bare base64 key line.
-fn parse_minisign_public_key(input: &str) -> Result<PublicKey> {
-    // The key line is the last non-empty, non-comment line.
-    let key_line = input
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
-        .ok_or_else(|| anyhow::anyhow!("No key line found in public key input"))?;
-    PublicKey::from_base64(key_line)
-        .map_err(|e| anyhow::anyhow!("Invalid minisign public key: {e}"))
-}
-
-async fn fetch_signature(client: &reqwest::Client, url: &str) -> Result<String> {
+/// Fetch a small text asset (signature or certificate) that must exist when
+/// verification is enabled. A 404 here means the release is unsigned, which —
+/// because verification is configured — is a hard failure.
+async fn fetch_text(client: &reqwest::Client, url: &str, what: &str) -> Result<String> {
     let resp = client
         .get(url)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch signature: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to fetch {what}: {e}"))?;
 
     if !resp.status().is_success() {
         anyhow::bail!(
-            "Failed to fetch signature ({}): {}. A release signing key is configured, \
-             so an unsigned release cannot be installed. Ensure {} exists on the server.",
+            "Failed to fetch {what} ({}): {}. Cosign keyless verification is enabled, so an \
+             unsigned release cannot be installed. Ensure {} exists on the server (or pass \
+             --insecure-no-verify to skip verification).",
             resp.status(),
             url,
             url
@@ -474,29 +449,4 @@ fn compute_sha256(data: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_minisign_public_key;
-
-    // minisign's documented example public key (jedisct1/minisign README).
-    const EXAMPLE_KEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
-
-    #[test]
-    fn parses_full_pub_file_with_comment() {
-        let pubfile = format!("untrusted comment: minisign public key 1234\n{EXAMPLE_KEY}\n");
-        assert!(parse_minisign_public_key(&pubfile).is_ok());
-    }
-
-    #[test]
-    fn parses_bare_key_line() {
-        assert!(parse_minisign_public_key(EXAMPLE_KEY).is_ok());
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        assert!(parse_minisign_public_key("not a key").is_err());
-        assert!(parse_minisign_public_key("untrusted comment: only a comment\n").is_err());
-    }
 }

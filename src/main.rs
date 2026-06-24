@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
             url,
             yes,
             allow_insecure_http,
-            public_key,
+            identity,
             insecure_no_verify,
         }) => {
             run_upgrade(
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
                 url,
                 yes,
                 allow_insecure_http,
-                public_key,
+                identity,
                 insecure_no_verify,
             )
             .await

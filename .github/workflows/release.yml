@@ -1,12 +1,11 @@
 name: Release
 
-# Scaffold: on a `vX.Y.Z` tag, build the binary matrix, sign each artifact with
-# minisign, and upload binary + .sha256 + .minisig to the GitHub release.
-#
-# Requires repository secret MINISIGN_SECRET_KEY (contents of a password-less
-# minisign secret key — see docs/RELEASING.md). Until that secret exists and the
-# public key is embedded in src/commands/upgrade.rs, releases are unsigned and
-# `pgbattery upgrade` falls back to checksum + HTTPS.
+# On a `vX.Y.Z` tag, build the binary matrix, sign each artifact with Sigstore
+# **cosign keyless** (GitHub Actions OIDC → Fulcio short-lived cert; no signing
+# secret to manage), and upload binary + .sha256 + .sig + .pem to the GitHub
+# release. `pgbattery upgrade` verifies the .sig/.pem against the expected OIDC
+# issuer + release-workflow identity (see src/commands/upgrade/cosign.rs and
+# docs/RELEASING.md).
 
 on:
   push:
@@ -14,7 +13,9 @@ on:
       - 'v*'
 
 # Deny-all by default; each job re-grants only the scopes it needs. The release
-# jobs need `contents: write` to create the release and upload assets via gh.
+# jobs need `contents: write` to create the release and upload assets via gh,
+# and the build job additionally needs `id-token: write` for cosign keyless
+# (Sigstore OIDC) signing.
 permissions: {}
 
 concurrency:
@@ -53,7 +54,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: write # upload release assets via gh
+      id-token: write # cosign keyless: request the GitHub Actions OIDC token
     strategy:
       fail-fast: false
       matrix:
@@ -91,23 +93,48 @@ jobs:
           cp "target/${{ matrix.target }}/release/pgbattery" \
              "dist/pgbattery-${{ matrix.os_name }}-${{ matrix.arch }}"
 
-      - name: Install minisign
+      # Install cosign by direct download (SHA-pinned + checksum-verified), not
+      # an action, so the toolchain is reproducible and audit-pinned. Pinned to
+      # cosign v2.4.1; checksums are from that release's cosign_checksums.txt.
+      - name: Install cosign (SHA-pinned)
         run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y minisign
-          else
-            brew install minisign
-          fi
+          set -euo pipefail
+          COSIGN_VERSION="2.4.1"
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)   ASSET="cosign-linux-amd64";  SHA="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b" ;;
+            macOS-X64)   ASSET="cosign-darwin-amd64"; SHA="666032ca283da92b6f7953965688fd51200fdc891a86c19e05c98b898ea0af4e" ;;
+            macOS-ARM64) ASSET="cosign-darwin-arm64"; SHA="13343856b69f70388c4fe0b986a31dde5958e444b41be22d785d3dc5e1a9cc62" ;;
+            *) echo "::error::unsupported runner ${{ runner.os }}-${{ runner.arch }} for cosign"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/${ASSET}" -o /tmp/cosign
+          echo "${SHA}  /tmp/cosign" | shasum -a 256 -c -
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+          cosign version
 
-      - name: Sign artifact
-        env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      # Keyless signing: GitHub Actions presents its OIDC identity to Fulcio,
+      # which issues a short-lived signing certificate. No signing secret. We
+      # immediately verify the result against this repo's workflow identity so a
+      # broken signature fails the release here rather than at upgrade time.
+      - name: Sign + verify artifact (cosign keyless)
         run: |
-          if [ -z "$MINISIGN_SECRET_KEY" ]; then
-            echo "::error::MINISIGN_SECRET_KEY secret is not set — see docs/RELEASING.md"
-            exit 1
-          fi
-          scripts/sign-release.sh dist/
+          set -euo pipefail
+          ASSET="pgbattery-${{ matrix.os_name }}-${{ matrix.arch }}"
+          # SHA-256 (integrity); kept alongside the cosign material.
+          shasum -a 256 "dist/$ASSET" | awk '{print $1}' > "dist/$ASSET.sha256"
+          cosign sign-blob --yes \
+            --output-signature "dist/$ASSET.sig" \
+            --output-certificate "dist/$ASSET.pem" \
+            "dist/$ASSET"
+          cosign verify-blob \
+            --signature "dist/$ASSET.sig" \
+            --certificate "dist/$ASSET.pem" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v.*$" \
+            "dist/$ASSET"
+          echo "Signed + verified: $ASSET"
+        env:
+          COSIGN_EXPERIMENTAL: "1"
 
       - name: Upload to release
         env:
@@ -115,4 +142,7 @@ jobs:
         run: |
           ASSET="pgbattery-${{ matrix.os_name }}-${{ matrix.arch }}"
           gh release upload "$GITHUB_REF_NAME" \
-            "dist/$ASSET" "dist/$ASSET.sha256" "dist/$ASSET.minisig" --clobber
+            "dist/$ASSET" \
+            "dist/$ASSET.sha256" \
+            "dist/$ASSET.sig" \
+            "dist/$ASSET.pem" --clobber

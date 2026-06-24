@@ -233,14 +233,16 @@ pub enum Commands {
         #[arg(long)]
         allow_insecure_http: bool,
 
-        /// Minisign public-key file to verify the release signature against
-        /// (overrides the embedded key; also: `PGBATTERY_RELEASE_PUBLIC_KEY`)
-        #[arg(long, value_name = "PATH")]
-        public_key: Option<String>,
+        /// Override the expected cosign keyless **identity** (a regex matched
+        /// against the signing certificate's SAN). Defaults to this repo's
+        /// release workflow; also settable via `PGBATTERY_RELEASE_IDENTITY_REGEX`.
+        /// (Issuer override: `PGBATTERY_RELEASE_OIDC_ISSUER`.)
+        #[arg(long, value_name = "REGEX")]
+        identity: Option<String>,
 
-        /// Upgrade even when no release signing key is configured (insecure:
-        /// integrity is still checked via SHA-256, but authenticity is not
-        /// cryptographically verified). Required to upgrade until a key exists.
+        /// Skip cosign keyless signature verification entirely (insecure:
+        /// integrity is still checked via SHA-256 over HTTPS, but authenticity
+        /// is NOT cryptographically verified).
         #[arg(long)]
         insecure_no_verify: bool,
     },
