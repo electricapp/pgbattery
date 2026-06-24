@@ -322,7 +322,11 @@ impl ClusterState {
         self.node_lsns
             .values()
             .filter(|(_, ts)| {
-                let age = if *ts > now { 0 } else { now.saturating_sub(*ts) };
+                let age = if *ts > now {
+                    0
+                } else {
+                    now.saturating_sub(*ts)
+                };
                 age < crate::config::constants::LSN_STALENESS_THRESHOLD_SECS
             })
             .map(|(lsn, _)| *lsn)

@@ -167,9 +167,7 @@ impl LocalSqlClient {
                 // grow the buffer unbounded.
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "psql line exceeded {MAX_SQL_LINE_BYTES} bytes without a newline"
-                    ),
+                    format!("psql line exceeded {MAX_SQL_LINE_BYTES} bytes without a newline"),
                 ));
             }
         }
@@ -347,7 +345,7 @@ pub struct TimelineInfo {
 ///
 /// Holds no role/state cache. The authoritative source for PG role is
 /// `pg_is_in_recovery()` via [`Self::is_in_recovery`]; for "who are we
-/// following", `SHOW primary_conninfo` via [`Self::is_following`]. See
+/// following", `SHOW primary_conninfo` via `Self::is_following`. See
 /// `docs/STATE_MACHINE.md` for the full discipline.
 pub struct Supervisor {
     config: SupervisorConfig,
@@ -2813,7 +2811,7 @@ host all all ::/0 {auth_method}
     /// replication manager's per-tick reconciliation) can retry on its next
     /// pass. Swallowing errors here would silently leak the slot — a pinned
     /// slot keeps WAL forever, eventually filling disk. The caller treats
-    /// transient failures as warnings via [`SLOT_DROP_FAILURE_ESCALATION`].
+    /// transient failures as warnings via `SLOT_DROP_FAILURE_ESCALATION`.
     ///
     /// # Errors
     /// Returns an error if the slot name is invalid or the existence check or

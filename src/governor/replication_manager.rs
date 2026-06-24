@@ -730,7 +730,8 @@ impl ReplicationManager {
 
         let pg = self.postgres.lock().await;
         let existing_slots =
-            match tokio::time::timeout(SLOT_SQL_BUDGET, pg.list_physical_replication_slots()).await {
+            match tokio::time::timeout(SLOT_SQL_BUDGET, pg.list_physical_replication_slots()).await
+            {
                 Ok(Ok(slots)) => slots,
                 Ok(Err(e)) => {
                     tracing::warn!(

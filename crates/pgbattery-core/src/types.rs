@@ -187,7 +187,9 @@ mod tests {
         let secret = RedactedSecret::new("super-secret-token".to_string());
         let bytes = postcard::to_allocvec(&secret).unwrap();
         assert!(
-            bytes.windows(b"<redacted>".len()).any(|w| w == b"<redacted>"),
+            bytes
+                .windows(b"<redacted>".len())
+                .any(|w| w == b"<redacted>"),
             "serialized form should contain the redaction marker"
         );
         assert!(

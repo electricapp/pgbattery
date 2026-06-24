@@ -853,9 +853,15 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(toml.as_bytes()).unwrap();
         let result = Config::load_from(file.path().to_str().unwrap());
-        assert!(result.is_err(), "sub-check-interval disconnect must be rejected");
+        assert!(
+            result.is_err(),
+            "sub-check-interval disconnect must be rejected"
+        );
         let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(msg.contains("replica check interval"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("replica check interval"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// With an odd `election_timeout_ms`, a heartbeat that genuinely fits twice

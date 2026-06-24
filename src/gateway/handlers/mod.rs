@@ -1431,7 +1431,10 @@ impl ConnectionHandler {
             (lease.is_leader(), lease.valid_until())
         };
         if is_leader && Instant::now() >= valid_until {
-            tracing::debug!(conn_id = self.id, "Skipping txid capture: leader lease expired");
+            tracing::debug!(
+                conn_id = self.id,
+                "Skipping txid capture: leader lease expired"
+            );
             return;
         }
         tracing::debug!(conn_id = self.id, "Detected COMMIT, capturing txid");
