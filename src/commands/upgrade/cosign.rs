@@ -332,6 +332,12 @@ fn extract_san_identity(leaf: &X509Certificate) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test assertions on fixtures; unwrap/expect pinpoint the failing case"
+    )]
+
     use super::*;
 
     #[test]
@@ -344,8 +350,7 @@ mod tests {
     fn default_identity_regex_matches_release_workflow_tag() {
         let v = CosignVerifier::new(DEFAULT_OIDC_ISSUER, DEFAULT_IDENTITY_REGEX).unwrap();
         // The SAN a real GitHub Actions release-workflow run on a v* tag carries.
-        let good =
-            "https://github.com/electricapp/pgbattery/.github/workflows/release.yml@refs/tags/v1.2.3";
+        let good = "https://github.com/electricapp/pgbattery/.github/workflows/release.yml@refs/tags/v1.2.3";
         assert!(v.identity_regex.is_match(good), "should match {good}");
         let good_pre = "https://github.com/electricapp/pgbattery/.github/workflows/release.yml@refs/tags/v1.2.3-rc.1";
         assert!(v.identity_regex.is_match(good_pre));
@@ -427,7 +432,12 @@ mod tests {
 
     /// Load the full fixture set (blob, signature, leaf cert, roots). Returns
     /// `None` (test skips) if any piece is missing.
-    fn full_fixture() -> Option<(Vec<u8>, String, String, Vec<pki_types::CertificateDer<'static>>)> {
+    fn full_fixture() -> Option<(
+        Vec<u8>,
+        String,
+        String,
+        Vec<pki_types::CertificateDer<'static>>,
+    )> {
         Some((
             fixture_bytes("blob.bin")?,
             fixture("blob.sig")?,
@@ -473,9 +483,11 @@ mod tests {
             return;
         };
         blob.push(b'!'); // flip the payload
-        let v =
-            CosignVerifier::new("https://token.actions.githubusercontent.com", DEFAULT_IDENTITY_REGEX)
-                .unwrap();
+        let v = CosignVerifier::new(
+            "https://token.actions.githubusercontent.com",
+            DEFAULT_IDENTITY_REGEX,
+        )
+        .unwrap();
         let err = v
             .verify_blob_with_roots(&blob, sig.trim(), &cert, &roots)
             .expect_err("tampered blob must fail");
@@ -516,9 +528,11 @@ mod tests {
         let Some((blob, sig, cert, _roots)) = full_fixture() else {
             return;
         };
-        let v =
-            CosignVerifier::new("https://token.actions.githubusercontent.com", DEFAULT_IDENTITY_REGEX)
-                .unwrap();
+        let v = CosignVerifier::new(
+            "https://token.actions.githubusercontent.com",
+            DEFAULT_IDENTITY_REGEX,
+        )
+        .unwrap();
         let err = v
             .verify_blob_with_roots(&blob, sig.trim(), &cert, &[])
             .expect_err("no trusted root must fail the chain check");

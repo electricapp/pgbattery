@@ -1,10 +1,15 @@
 # Mirrors deny.toml's [advisories].ignore so `cargo audit` and the CI
-# rustsec/audit-check action agree. Both are unmaintained-only advisories
-# (no vulnerability, no fix available) on a transitive/wrapper crate.
+# rustsec/audit-check action agree. All are transitive-dependency advisories
+# with no fix available. RUSTSEC-2023-0071 (rsa) is a timing-sidechannel
+# vulnerability on RSA private-key ops, which pgbattery's verify-only ECDSA
+# cosign usage does not exercise.
 [advisories]
 ignore = [
     # atomic-polyfill: transitive via postcard -> heapless, no upgrade available.
     "RUSTSEC-2023-0089",
     # rustls-pemfile: unmaintained wrapper; migration to rustls-pki-types planned.
     "RUSTSEC-2025-0134",
+    # rsa: transitive via sigstore; Marvin timing attack on RSA private-key ops,
+    # not reachable from verify-only ECDSA cosign verification; no fix released.
+    "RUSTSEC-2023-0071",
 ]
