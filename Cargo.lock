@@ -2878,7 +2878,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
- "const-oid 0.9.6",
+ "const-oid 0.10.2",
  "criterion",
  "dashmap",
  "figment",
