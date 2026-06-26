@@ -136,7 +136,7 @@ sigstore = { version = "0.14", default-features = false, features = [
 # short-lived, so it is verified at its own `not_before`, not "now"). Versions
 # track sigstore-rs's own deps so the lockfile stays conflict-free.
 x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
-const-oid = { version = "0.9", default-features = false }
+const-oid = { version = "0.10", default-features = false }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs"] }
 pki-types = { package = "rustls-pki-types", version = "1", default-features = false, features = ["std"] }
 base64 = "0.22"
