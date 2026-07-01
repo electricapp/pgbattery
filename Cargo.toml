@@ -82,7 +82,7 @@ tokio = { version = "1", features = ["full", "tracing"] }
 clap = { version = "4", features = ["derive", "env"] }
 # Pinned to the clap 4.6 family already in the lockfile (org policy: no deps
 # newer than 7 days). Used for `pgbattery completions` and `pgbattery man`.
-clap_complete = "=4.6.5"
+clap_complete = "=4.6.6"
 clap_mangen = "=0.3.0"
 
 # Protocol Parsing
