@@ -245,6 +245,13 @@ pub enum Commands {
         /// is NOT cryptographically verified).
         #[arg(long)]
         insecure_no_verify: bool,
+
+        /// Allow installing a version older than the running one. By default a
+        /// downgrade is refused as a possible rollback attack (a compromised
+        /// mirror serving an older, signed, vulnerable release). Use only for
+        /// an intentional rollback.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
 
     /// Run diagnostic checks on the cluster

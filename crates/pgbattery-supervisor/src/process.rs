@@ -266,6 +266,14 @@ fn validate_pg_identifier(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `slot_name` is a `replica_{id}` physical slot this node minted as a
+/// leader and may safely drop when orphaned. Guards the demote-time sweep so it
+/// only ever touches slots pgbattery owns (never an operator-created or
+/// otherwise-named slot) and never a name that fails identifier validation.
+fn is_sweepable_replica_slot(slot_name: &str) -> bool {
+    slot_name.starts_with("replica_") && validate_pg_identifier(slot_name).is_ok()
+}
+
 /// Supervisor configuration.
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
@@ -871,6 +879,13 @@ max_replication_slots = 10
 hot_standby = on
 hot_standby_feedback = on
 wal_keep_size = '1GB'
+# Backstop against a stuck/orphaned replication slot pinning WAL until the
+# disk fills: past this bound PG invalidates the slot (its consumer must
+# rebuild) rather than retaining WAL without limit. The primary defense is
+# dropping orphaned slots on demote (drop_inactive_replica_slots); this caps
+# the damage from any slot that survives (e.g. a long-down member's slot on
+# the live leader).
+max_slot_wal_keep_size = '10GB'
 synchronous_commit = on
 archive_mode = off
 wal_log_hints = on  # Required for pg_rewind
@@ -1256,19 +1271,51 @@ host all all ::/0 {auth_method}
         source_addr: SocketAddr,
         pre_stop_local_lsn: Option<u64>,
     ) -> Result<()> {
+        // Number of times to retry reading an LSN before failing closed.
+        // `wait_for_rewind_source` already confirmed the source is reachable, so
+        // a read miss here is transient and worth a few quick retries.
+        const REWIND_GATE_LSN_RETRIES: u32 = 3;
+        const REWIND_GATE_LSN_RETRY_DELAY_MS: u64 = 300;
+
+        // Local WAL position: captured pre-stop and passed in. If that failed we
+        // try once more, but PG is stopped by now so this usually fails too.
+        // Without the local LSN we CANNOT prove the rewind won't discard acked
+        // WAL, so we fail CLOSED rather than rewinding blind. The message is
+        // classified as "target untouched" (the gate runs before pg_rewind
+        // modifies anything), so the reconcile loop retries the whole demote —
+        // re-capturing the pre-stop LSN while PG is up.
         let local_lsn = match pre_stop_local_lsn {
             Some(lsn) => lsn,
-            None => match self.capture_lsn_for_rewind_gate().await {
-                Some(lsn) => lsn,
-                None => return Ok(()),
-            },
+            None => self.capture_lsn_for_rewind_gate().await.ok_or_else(|| {
+                metrics::counter!("pgbattery_pg_rewind_gate_probe_failed").increment(1);
+                Error::Postgres(
+                    "failed to probe rewind source: local WAL position unavailable, refusing \
+                     pg_rewind (cannot verify it will not discard acked WAL)"
+                        .to_string(),
+                )
+            })?,
         };
-        let Some(source_lsn) = self.get_remote_lsn(source_addr).await else {
-            tracing::warn!(
-                source = %source_addr,
-                "Could not read source LSN before pg_rewind — proceeding"
-            );
-            return Ok(());
+
+        // Source WAL position: retry a bounded number of times, then fail CLOSED.
+        // Previously a single read miss let the rewind proceed unchecked —
+        // exactly when we could not confirm it was safe.
+        let mut source_lsn = None;
+        for attempt in 0..REWIND_GATE_LSN_RETRIES {
+            if let Some(lsn) = self.get_remote_lsn(source_addr).await {
+                source_lsn = Some(lsn);
+                break;
+            }
+            if attempt + 1 < REWIND_GATE_LSN_RETRIES {
+                sleep(Duration::from_millis(REWIND_GATE_LSN_RETRY_DELAY_MS)).await;
+            }
+        }
+        let Some(source_lsn) = source_lsn else {
+            metrics::counter!("pgbattery_pg_rewind_gate_probe_failed").increment(1);
+            return Err(Error::Postgres(format!(
+                "failed to probe rewind source: could not read source LSN from {source_addr} \
+                 after {REWIND_GATE_LSN_RETRIES} attempts, refusing pg_rewind (cannot verify it \
+                 will not discard acked WAL)"
+            )));
         };
 
         match rewind_divergence_decision(
@@ -1704,6 +1751,18 @@ host all all ::/0 {auth_method}
         Ok(())
     }
 
+    /// Given whether local replay is ahead of the leader (`None` = probe
+    /// failed), decide the action for a config-changed timeline *mismatch*:
+    /// ahead → real divergence, rewind; at-or-behind → clean re-point, restart
+    /// and stream; unknown → defer and retry.
+    const fn standby_action_for_mismatch(local_ahead: Option<bool>) -> StandbyAction {
+        match local_ahead {
+            Some(true) => StandbyAction::Rewind,
+            Some(false) => StandbyAction::RestartOnly,
+            None => StandbyAction::Defer,
+        }
+    }
+
     /// Probe local + leader state to decide the demote action. Pure decision
     /// logic — no `stop()`, no config writes, no `pg_rewind` — so the caller
     /// can act atomically once it has the answer. See [`StandbyAction`] for
@@ -1715,8 +1774,33 @@ host all all ::/0 {auth_method}
             // Config IS changing. Probe timeline so we know whether to rewind
             // or just restart with new conninfo.
             return Ok(match self.check_timeline_state(new_leader_addr).await {
-                TimelineCheck::Mismatch => StandbyAction::Rewind,
                 TimelineCheck::Match => StandbyAction::RestartOnly,
+                TimelineCheck::Mismatch => {
+                    // A timeline mismatch alone is NOT divergence. A
+                    // just-promoted leader is one timeline ahead of a clean
+                    // follower that hasn't switched yet (the local timeline here
+                    // is the lagging `pg_controldata` checkpoint TLI, while the
+                    // leader's is its live write TLI), and such a follower can
+                    // adopt the new timeline by streaming
+                    // (`recovery_target_timeline='latest'`) with NO rewind. Only
+                    // rewind when this node's replayed WAL is actually ahead of
+                    // the leader — i.e. it holds WAL on the old timeline the
+                    // leader forked away from. If it is at-or-behind, re-point
+                    // and stream (RestartOnly). A misclassification is safe: a
+                    // still-diverged node fails to stream and the next tick's
+                    // config-unchanged `Mismatch -> Rewind` path catches it, and
+                    // the `pg_rewind` divergence gate is the final data-loss
+                    // backstop regardless.
+                    let action =
+                        Self::standby_action_for_mismatch(self.local_ahead_of_leader(new_leader_addr).await);
+                    if action == StandbyAction::Defer {
+                        tracing::debug!(
+                            new_leader = %new_leader_addr,
+                            "Timeline mismatch but local-vs-leader LSN probe inconclusive; deferring"
+                        );
+                    }
+                    action
+                }
                 TimelineCheck::Unknown => {
                     tracing::debug!(
                         new_leader = %new_leader_addr,
@@ -1879,6 +1963,10 @@ host all all ::/0 {auth_method}
 
             self.configure_standby(new_leader_addr).await?;
             self.start().await?;
+            // Sweep slots this node may still own from a prior leadership term.
+            if let Err(e) = self.drop_inactive_replica_slots().await {
+                tracing::warn!(error = %e, "Could not enumerate slots to sweep after demote");
+            }
             return Ok(());
         }
 
@@ -1921,6 +2009,11 @@ host all all ::/0 {auth_method}
                  Timeline divergence may require manual intervention (pg_basebackup)."
                     .to_string(),
             ));
+        }
+
+        // This node was the primary, so its `replica_*` slots are now orphaned.
+        if let Err(e) = self.drop_inactive_replica_slots().await {
+            tracing::warn!(error = %e, "Could not enumerate slots to sweep after demote");
         }
 
         tracing::info!("Demotion complete, now replica");
@@ -2122,10 +2215,12 @@ host all all ::/0 {auth_method}
         }
         let walfile = String::from_utf8_lossy(&output.stdout);
         let walfile = walfile.trim();
-        if walfile.len() < 8 {
-            return None;
-        }
-        u64::from_str_radix(&walfile[..8], 16).ok()
+        // `.get(..8)` (not `[..8]`): the length guard is a *byte* check, so on
+        // pathological output where byte 8 falls inside a multibyte char (e.g.
+        // a U+FFFD replacement from `from_utf8_lossy` on binary garbage) the
+        // slice `[..8]` would panic. `.get` returns None on a non-char-boundary.
+        let tli_hex = walfile.get(..8)?;
+        u64::from_str_radix(tli_hex, 16).ok()
     }
 
     /// Create an empty `standby.signal` file in the data directory if it isn't
@@ -2845,6 +2940,56 @@ host all all ::/0 {auth_method}
         }
     }
 
+    /// Drop every inactive `replica_*` physical slot this node still owns.
+    ///
+    /// Called on demotion (leader→standby). While this node was leader it
+    /// created a `replica_{id}` slot for each follower; once those followers
+    /// re-point at the new leader the slots lose their consumers and go
+    /// inactive. Nothing else in the cluster will ever drop them — the
+    /// leader-side reconciler only inspects the *current* leader's slots — so a
+    /// demoted former leader would leak WAL (an inactive slot pins every
+    /// segment past its frozen `restart_lsn`) until its disk fills, taking out
+    /// a voter. Only *inactive* slots are dropped: an active slot (a follower
+    /// still streaming through the brief re-point window) is left alone —
+    /// `pg_drop_replication_slot` would error on it anyway, and it will be
+    /// swept on a later transition once it goes idle.
+    ///
+    /// Best-effort: per-slot drop failures are logged, not propagated, so a
+    /// transient failure never fails the demotion of an otherwise-healthy
+    /// standby.
+    ///
+    /// # Errors
+    /// Returns an error only if the initial `pg_replication_slots` query fails.
+    pub async fn drop_inactive_replica_slots(&self) -> Result<()> {
+        let output = self
+            .execute_sql(
+                "SELECT slot_name FROM pg_replication_slots \
+                 WHERE slot_type = 'physical' AND NOT active;",
+            )
+            .await?;
+
+        for slot_name in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            // Only slots this node minted as a leader; leave anything else
+            // (and reject names that fail identifier validation) untouched.
+            if !is_sweepable_replica_slot(slot_name) {
+                continue;
+            }
+            let drop_sql = format!("SELECT pg_drop_replication_slot('{slot_name}');");
+            match self.execute_sql(&drop_sql).await {
+                Ok(_) => {
+                    tracing::info!(slot = %slot_name, "Dropped orphaned replica slot on demote");
+                    metrics::counter!("pgbattery_orphaned_slots_dropped").increment(1);
+                }
+                Err(e) => tracing::warn!(
+                    slot = %slot_name,
+                    error = %e,
+                    "Failed to drop orphaned replica slot on demote (will retry on next transition)"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// Check if `PostgreSQL` is in recovery mode.
     ///
     /// # Errors
@@ -3357,6 +3502,44 @@ mod tests {
     }
 
     #[test]
+    fn test_standby_action_for_mismatch_only_rewinds_on_real_divergence() {
+        // Regression: a clean follower re-pointing to a just-promoted leader
+        // sees a timeline mismatch (its checkpoint TLI lags the leader's live
+        // write TLI) but has NOT diverged — it must re-point and stream, not
+        // pay a full stop/rewind/start every failover.
+        assert_eq!(
+            Supervisor::standby_action_for_mismatch(Some(false)),
+            StandbyAction::RestartOnly
+        );
+        // Genuinely ahead of the leader → holds divergent WAL → rewind.
+        assert_eq!(
+            Supervisor::standby_action_for_mismatch(Some(true)),
+            StandbyAction::Rewind
+        );
+        // Probe inconclusive → defer and retry (never a blind rewind).
+        assert_eq!(
+            Supervisor::standby_action_for_mismatch(None),
+            StandbyAction::Defer
+        );
+    }
+
+    #[test]
+    fn test_sweepable_replica_slot_only_matches_owned_slots() {
+        // Slots this node minted as a leader — swept.
+        assert!(is_sweepable_replica_slot("replica_1"));
+        assert!(is_sweepable_replica_slot("replica_42"));
+        // Not ours: a follower's inbound slot name, an operator/logical slot,
+        // or the bare prefix — left untouched so the sweep can never drop a
+        // slot pgbattery does not own.
+        assert!(!is_sweepable_replica_slot("some_logical_slot"));
+        assert!(!is_sweepable_replica_slot("standby_1"));
+        assert!(!is_sweepable_replica_slot("replica"));
+        // A name that would fail identifier validation is never dropped
+        // (defense-in-depth against a crafted pg_replication_slots row).
+        assert!(!is_sweepable_replica_slot("replica_1; DROP TABLE x"));
+    }
+
+    #[test]
     fn test_identifier_too_long_rejected() {
         assert!(validate_pg_identifier(&"x".repeat(64)).is_err());
     }
@@ -3704,6 +3887,21 @@ mod tests {
                 threshold_bytes: 8,
             }
         ));
+        // The divergence gate's new fail-closed errors (local/source LSN
+        // unreadable) must also be classified as "target untouched": the gate
+        // runs before pg_rewind modifies anything, so the node is brought back
+        // up as a standby and the reconcile loop retries, rather than being
+        // left stopped.
+        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
+            "failed to probe rewind source: local WAL position unavailable, refusing pg_rewind \
+             (cannot verify it will not discard acked WAL)"
+                .to_string()
+        )));
+        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
+            "failed to probe rewind source: could not read source LSN from 172.28.0.11:5434 after \
+             3 attempts, refusing pg_rewind (cannot verify it will not discard acked WAL)"
+                .to_string()
+        )));
     }
 
     #[test]

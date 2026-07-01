@@ -878,13 +878,81 @@ impl BackupManager {
             ));
         }
         if status_code == 2 {
-            return Ok(());
+            // "No response" is not the same as "no postmaster owns this data
+            // dir": a postmaster that is alive but not answering (SIGSTOP'd,
+            // stuck in uninterruptible I/O, or a foreign/orphaned process)
+            // also returns 2, and renaming PGDATA out from under it would
+            // corrupt the cluster. Require positive evidence that no live
+            // postmaster owns the directory before proceeding.
+            return self.confirm_no_live_postmaster().await;
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(Error::Postgres(format!(
             "pg_isready returned unexpected status {status_code}: {stderr}"
         )))
+    }
+
+    /// Fail-closed check that no live postmaster owns `pg_data_dir`.
+    ///
+    /// Proceeds (Ok) only when we can POSITIVELY establish absence: no
+    /// `postmaster.pid`, or a pid file whose PID is confirmed dead
+    /// (`/proc/<pid>` missing, or its `State:` is Zombie/dead). Anything we
+    /// cannot confirm dead — a readable live process, an unparseable pid file,
+    /// or `/proc` unavailable for a *present* pid — refuses the restore. This
+    /// mirrors the liveness logic in `Supervisor::cleanup_stale_postgres` but
+    /// with the opposite default: cleanup only acts when positively dead;
+    /// restore only proceeds when positively dead.
+    async fn confirm_no_live_postmaster(&self) -> Result<()> {
+        let pid_file = self.pg_data_dir.join("postmaster.pid");
+        let content = match tokio::fs::read_to_string(&pid_file).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(Error::Postgres(format!(
+                    "Full restore: cannot read {} to confirm PostgreSQL is stopped: {e}",
+                    pid_file.display()
+                )));
+            }
+        };
+        let Some(pid) = content
+            .lines()
+            .next()
+            .map(str::trim)
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            return Err(Error::Postgres(format!(
+                "Full restore: {} exists but its PID is unreadable; refusing to overwrite PGDATA \
+                 (stop PostgreSQL and remove a stale pid file if the server is truly down)",
+                pid_file.display()
+            )));
+        };
+
+        let proc_dir_exists = tokio::fs::metadata(format!("/proc/{pid}")).await.is_ok();
+        let proc_status = tokio::fs::read_to_string(format!("/proc/{pid}/status"))
+            .await
+            .ok();
+        let positively_dead = if proc_dir_exists {
+            proc_status.as_ref().is_some_and(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("State:"))
+                    .is_some_and(|l| l.contains('Z') || l.contains('X'))
+            })
+        } else {
+            // /proc/<pid> absent → the process no longer exists.
+            true
+        };
+
+        if positively_dead {
+            Ok(())
+        } else {
+            Err(Error::Postgres(format!(
+                "Full restore: postmaster.pid references PID {pid}, which may still be alive \
+                 (pg_isready reported 'no response', but an alive-but-unresponsive postmaster reads \
+                 the same). Refusing to rename PGDATA out from under a live process. Stop \
+                 PostgreSQL and retry."
+            )))
+        }
     }
 
     fn stage_existing_data_dir(&self) -> Result<Option<PathBuf>> {
@@ -2428,5 +2496,47 @@ mod tests {
             other => panic!("expected postgres error, got: {other:?}"),
         };
         assert!(msg.contains("requires PostgreSQL to be stopped"));
+    }
+
+    #[tokio::test]
+    async fn confirm_no_live_postmaster_fails_closed() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("pgdata");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = BackupConfig {
+            enabled: true,
+            backup_dir: dir.path().join("backups"),
+            ..Default::default()
+        };
+        let manager = BackupManager::new(
+            config,
+            dir.path().join("bin"),
+            data_dir.clone(),
+            5432,
+            "postgres".to_string(),
+        );
+        let pid_file = data_dir.join("postmaster.pid");
+
+        // No pid file → no postmaster → proceed.
+        assert!(manager.confirm_no_live_postmaster().await.is_ok());
+
+        // Present but unparseable pid file → cannot confirm dead → refuse.
+        std::fs::write(&pid_file, "not-a-pid\n").unwrap();
+        assert!(manager.confirm_no_live_postmaster().await.is_err());
+
+        // A high, definitely-nonexistent PID → confirmed dead → proceed.
+        std::fs::write(&pid_file, "2147480000\n/var/lib/pgdata\n").unwrap();
+        assert!(manager.confirm_no_live_postmaster().await.is_ok());
+
+        // Our own (alive) PID must be refused. Only checkable on Linux, where
+        // /proc/<pid> exists and reports a live State; macOS has no /proc so
+        // the live-process branch cannot be exercised there.
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(&pid_file, format!("{}\n/var/lib/pgdata\n", std::process::id()))
+                .unwrap();
+            let err = manager.confirm_no_live_postmaster().await.unwrap_err();
+            assert!(format!("{err}").contains("may still be alive"));
+        }
     }
 }

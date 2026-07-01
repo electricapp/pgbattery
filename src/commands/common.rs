@@ -363,6 +363,27 @@ pub(super) fn fsync_dir(_path: &std::path::Path) -> std::io::Result<()> {
 pub(super) fn try_http_client(timeout_secs: u64) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        // Forbid an https->http downgrade across a redirect. None of our uses
+        // (release downloads, management API) has a legitimate reason to follow
+        // a redirect from a secure to an insecure scheme, and under
+        // `--insecure-no-verify` HTTPS is the only authenticity boundary — a
+        // server that 301s `https://…` to `http://attacker/…` must not be
+        // followed silently. An initial `http://` URL is unaffected (that is
+        // gated separately by `--allow-insecure-http`).
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            const MAX_REDIRECTS: usize = 10;
+            let from_https = attempt
+                .previous()
+                .last()
+                .is_some_and(|u| u.scheme() == "https");
+            if from_https && attempt.url().scheme() == "http" {
+                attempt.error("refusing https->http downgrade during redirect")
+            } else if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}. Check TLS configuration."))
 }

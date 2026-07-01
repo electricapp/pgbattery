@@ -167,6 +167,11 @@ impl ReplicationManager {
         tracing::info!(node_id = self.node_id, "Replication manager started");
 
         let mut check_interval = interval(self.check_interval);
+        // Skip missed ticks rather than firing them back-to-back: a slow tick
+        // (PG round-trips / ALTER SYSTEM / slot ops contending for the
+        // supervisor lock) must not pile the missed ticks onto an
+        // already-struggling PostgreSQL the instant it frees up.
+        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         loop {
@@ -387,6 +392,13 @@ impl ReplicationManager {
                 continue;
             }
             status.health = ReplicaHealth::Unhealthy;
+            // Once we've given up on the replica, keep `state` consistent with
+            // `health` (PG no longer reports a `pg_stat_replication.state` for
+            // it). Done here, WITH the health flip, not immediately on unseen —
+            // resetting `state` during the blip window would bypass the
+            // `disconnect_timeout` hysteresis that `collect_healthy_voter_names`
+            // relies on (it filters on `state == Streaming`).
+            status.state = ReplicationState::Unknown;
         }
     }
 
@@ -478,6 +490,29 @@ impl ReplicationManager {
         (all_voter_names, healthy_voter_count)
     }
 
+    /// Number of synchronous standbys required for RPO=0, given
+    /// `other_voter_count` (total voters minus this leader).
+    ///
+    /// Equals `ceil(N/2) - 1` where `N = other_voter_count + 1` — i.e.
+    /// `other_voter_count / 2` (integer floor). The leader plus this many
+    /// synchronous acks form a write set of size `k + 1 = ceil(N/2)`, which
+    /// intersects every Raft majority (`floor(N/2) + 1`) because their sizes
+    /// sum to more than `N`. So a committed-and-acked write is held by at least
+    /// one member of any quorum that could elect the next leader — no silent
+    /// loss on failover.
+    ///
+    /// | N (voters) | other | required |
+    /// |-----------:|------:|---------:|
+    /// | 1          | 0     | 0 (async, no standby)             |
+    /// | 2          | 1     | 0 (async safe: losing a node loses quorum, blocking any lossy failover) |
+    /// | 3          | 2     | 1        |
+    /// | 4          | 3     | 1        |
+    /// | 5          | 4     | 2        |
+    /// | 7          | 6     | 3        |
+    const fn required_sync_standbys(other_voter_count: usize) -> usize {
+        other_voter_count / 2
+    }
+
     /// Decide `synchronous_standby_names` and whether that choice is the
     /// degraded async fallback (RPO>0). `has_quorum` is this leader's Raft
     /// quorum status; `in_leader_grace` is true while this node has held
@@ -492,10 +527,17 @@ impl ReplicationManager {
         has_quorum: bool,
         in_leader_grace: bool,
     ) -> (String, bool) {
-        let sync_list = if all_voter_names.is_empty() {
+        // Require enough synchronous acks that the write set (leader + k sync
+        // standbys) intersects every Raft majority, so no elected leader can
+        // lack an acknowledged write. `FIRST 1` is only correct up to 4 voters;
+        // at >=5 it acks a write on leader + 1 standby = 2 of >=5 nodes, and a
+        // failover to the other majority silently loses it. See
+        // `required_sync_standbys`.
+        let required = Self::required_sync_standbys(all_voter_names.len());
+        let sync_list = if required == 0 {
             String::new()
         } else {
-            format!("FIRST 1 ({})", all_voter_names.join(", "))
+            format!("FIRST {required} ({})", all_voter_names.join(", "))
         };
 
         if healthy_voter_count == 0 && has_quorum && !in_leader_grace {
@@ -1083,6 +1125,47 @@ mod tests {
         let (plan, fallback) = ReplicationManager::plan_sync_replication(&voters, 1, true, false);
         assert_eq!(plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)");
         assert!(!fallback);
+    }
+
+    #[test]
+    fn test_required_sync_standbys_intersects_every_majority() {
+        // ceil(N/2) - 1, keyed by other-voter count (N-1).
+        assert_eq!(ReplicationManager::required_sync_standbys(0), 0); // N=1
+        assert_eq!(ReplicationManager::required_sync_standbys(1), 0); // N=2
+        assert_eq!(ReplicationManager::required_sync_standbys(2), 1); // N=3
+        assert_eq!(ReplicationManager::required_sync_standbys(3), 1); // N=4
+        assert_eq!(ReplicationManager::required_sync_standbys(4), 2); // N=5
+        assert_eq!(ReplicationManager::required_sync_standbys(5), 2); // N=6
+        assert_eq!(ReplicationManager::required_sync_standbys(6), 3); // N=7
+
+        // Property: leader + k sync acks must intersect every Raft majority.
+        for n in 1..=15usize {
+            let k = ReplicationManager::required_sync_standbys(n - 1);
+            let write_set = k + 1; // leader + k synchronous standbys
+            let majority = n / 2 + 1;
+            assert!(
+                write_set + majority > n,
+                "N={n}: write set {write_set} + majority {majority} must exceed {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sync_list_scales_to_five_voters() {
+        // Regression: a 5-voter cluster (4 other voters) must require TWO sync
+        // standbys, not one. `FIRST 1` here acks a write on leader + 1 = 2 of 5
+        // nodes, which a 3-node majority failover can silently drop.
+        let voters = [
+            "pgbattery_node_2".to_string(),
+            "pgbattery_node_3".to_string(),
+            "pgbattery_node_4".to_string(),
+            "pgbattery_node_5".to_string(),
+        ];
+        let (plan, _fallback) = ReplicationManager::plan_sync_replication(&voters, 4, true, false);
+        assert_eq!(
+            plan,
+            "FIRST 2 (pgbattery_node_2, pgbattery_node_3, pgbattery_node_4, pgbattery_node_5)"
+        );
     }
 
     /// The async fallback (empty `synchronous_standby_names`, RPO>0) is only

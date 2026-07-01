@@ -13,6 +13,11 @@ use cosign::CosignVerifier;
 
 const DEFAULT_UPGRADE_URL: &str = "https://pgbattery.io/releases";
 
+/// Ceiling on a downloaded upgrade binary — bounds memory against a
+/// hostile/misconfigured server streaming an unbounded body. Generous for a
+/// real release, far below what would exhaust memory.
+const MAX_UPGRADE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Exit code for `upgrade --check` when a newer version is available.
 /// Deliberately not 1 (generic failure) or 2 (clap usage error) so automation
 /// can distinguish "update available" from "check failed".
@@ -20,6 +25,30 @@ const UPDATE_AVAILABLE_EXIT_CODE: i32 = 10;
 
 /// Current version from Cargo.toml.
 pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Reject a target version older than the running one (anti-rollback).
+///
+/// Returns `Ok(())` when `target >= current`. Both are parsed as semver so the
+/// comparison is correct (`0.10.0 > 0.9.0`, unlike a string compare). An
+/// unparseable version fails **closed** (returns an error): if we cannot prove
+/// the target is not a downgrade, we refuse rather than risk installing a
+/// rollback. Callers may override with `--allow-downgrade` for an intentional
+/// rollback.
+fn ensure_not_downgrade(current: &str, target: &str) -> Result<()> {
+    let cur = semver::Version::parse(current).map_err(|e| {
+        anyhow::anyhow!("Cannot parse running version {current:?} as semver: {e}")
+    })?;
+    let tgt = semver::Version::parse(target)
+        .map_err(|e| anyhow::anyhow!("Cannot parse target version {target:?} as semver: {e}"))?;
+    if tgt < cur {
+        anyhow::bail!(
+            "Refusing to downgrade pgbattery {current} -> {target}: a lower version may be a \
+             rollback attack (an older, signed, vulnerable release served by a compromised \
+             mirror). Pass --allow-downgrade to override for an intentional rollback."
+        );
+    }
+    Ok(())
+}
 
 /// Run the upgrade command.
 ///
@@ -31,6 +60,10 @@ pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
     clippy::fn_params_excessive_bools,
     reason = "each bool maps 1:1 to a clap CLI flag for the upgrade subcommand"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the CLI's Upgrade subcommand flags one-to-one"
+)]
 pub async fn run_upgrade(
     check: bool,
     version: Option<String>,
@@ -39,6 +72,7 @@ pub async fn run_upgrade(
     allow_insecure_http: bool,
     identity: Option<String>,
     insecure_no_verify: bool,
+    allow_downgrade: bool,
 ) -> Result<()> {
     // Initialize minimal logging for CLI
     tracing_subscriber::fmt()
@@ -71,20 +105,6 @@ pub async fn run_upgrade(
         );
     }
 
-    // Build the cosign keyless verifier up front (compiles the identity regex
-    // and reads the issuer/identity overrides) so a malformed override fails
-    // before we touch the network. The Sigstore trust root (Fulcio CA certs) is
-    // fetched lazily, only once we actually have a binary to verify.
-    //
-    // When --insecure-no-verify is set we skip building the verifier entirely:
-    // the upgrade proceeds on SHA-256 integrity + HTTPS only (see the refusal
-    // below for the security trade-off).
-    let verifier = if insecure_no_verify {
-        None
-    } else {
-        Some(CosignVerifier::from_env(identity.as_deref())?)
-    };
-
     // Fetch latest version
     let latest = fetch_latest_version(base_url).await?;
 
@@ -108,6 +128,30 @@ pub async fn run_upgrade(
         info!("Already at version {}", VERSION);
         return Ok(());
     }
+
+    // Anti-rollback: refuse a target older than the running version unless the
+    // operator explicitly opts in. A compromised mirror can serve an older,
+    // genuinely-signed, vulnerable release at the requested tag — every
+    // signature/identity check would pass — so the version must be gated too.
+    if !allow_downgrade {
+        ensure_not_downgrade(VERSION, &target)?;
+    }
+
+    // Build the cosign keyless verifier now that the target version is known,
+    // pinning the accepted signer identity to the exact `v{target}` tag (so a
+    // mirror cannot substitute a different signed release). A malformed
+    // `--identity`/env override fails here, before any binary is downloaded.
+    // The Sigstore trust root (Fulcio CA certs + Rekor keys) is fetched lazily,
+    // only once we actually have a binary to verify.
+    //
+    // When --insecure-no-verify is set we skip the verifier entirely: the
+    // upgrade proceeds on SHA-256 integrity + HTTPS only (see the refusal
+    // below for the security trade-off).
+    let verifier = if insecure_no_verify {
+        None
+    } else {
+        Some(CosignVerifier::from_env(identity.as_deref(), &target)?)
+    };
 
     // Safety warning
     warn!(
@@ -276,7 +320,26 @@ async fn download_verify_replace(
         anyhow::bail!("Download failed ({}): {}", resp.status(), binary_url);
     }
 
+    // Cap the download so a hostile/misconfigured server cannot OOM us by
+    // streaming an unbounded body. A declared Content-Length over the ceiling
+    // is refused before reading a byte; the ceiling is generous for a real
+    // release binary but far below what would exhaust memory.
+    if let Some(len) = resp.content_length()
+        && len > MAX_UPGRADE_BINARY_BYTES
+    {
+        anyhow::bail!(
+            "Refusing download: server declared {len} bytes, over the {MAX_UPGRADE_BINARY_BYTES} \
+             byte ceiling for an upgrade binary"
+        );
+    }
+
     let bytes = resp.bytes().await?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_UPGRADE_BINARY_BYTES {
+        anyhow::bail!(
+            "Refusing download: body exceeded the {MAX_UPGRADE_BINARY_BYTES} byte ceiling for an \
+             upgrade binary"
+        );
+    }
     if bytes.is_empty() {
         anyhow::bail!("Downloaded file is empty");
     }
@@ -529,4 +592,40 @@ fn compute_sha256(data: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test code asserts on known-good values and panics are the failure signal"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_not_downgrade_allows_upgrade_and_same_version() {
+        assert!(ensure_not_downgrade("0.1.0", "0.2.0").is_ok());
+        assert!(ensure_not_downgrade("0.1.0", "0.1.0").is_ok());
+        // Semver-correct, not lexicographic: 0.10.0 > 0.9.0.
+        assert!(ensure_not_downgrade("0.9.0", "0.10.0").is_ok());
+        assert!(ensure_not_downgrade("1.0.0", "1.0.1").is_ok());
+    }
+
+    #[test]
+    fn ensure_not_downgrade_rejects_older_target() {
+        // The signed-downgrade attack: a valid, signed, older release.
+        let err = ensure_not_downgrade("0.2.0", "0.1.0").unwrap_err();
+        assert!(err.to_string().contains("Refusing to downgrade"));
+        // And the lexicographic trap the other direction: 0.9.0 < 0.10.0, so
+        // installing 0.9.0 while running 0.10.0 is a downgrade.
+        assert!(ensure_not_downgrade("0.10.0", "0.9.0").is_err());
+    }
+
+    #[test]
+    fn ensure_not_downgrade_fails_closed_on_unparseable() {
+        // If we can't prove it's not a downgrade, refuse.
+        assert!(ensure_not_downgrade("0.1.0", "not-a-version").is_err());
+        assert!(ensure_not_downgrade("garbage", "0.1.0").is_err());
+    }
 }

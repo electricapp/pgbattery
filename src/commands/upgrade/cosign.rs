@@ -63,11 +63,28 @@ use sigstore::trust::sigstore::SigstoreTrustRoot;
 /// OIDC-issuer extension. Overridable via [`ENV_ISSUER`] for forks/testing.
 const DEFAULT_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
-/// Expected SAN identity (regex) baked into the binary: this repository's
-/// release workflow, signing a `v*` tag. The leaf certificate's SAN URI must
-/// match. Overridable via [`ENV_IDENTITY`] or the `--identity` CLI flag.
+/// Expected SAN identity (regex) for this repository's release workflow signing
+/// any `v*` tag. The live upgrade path pins the *exact* tag via
+/// [`pinned_identity_regex`]; this wildcard form is retained as a test fixture
+/// for the issuer/identity-matching tests.
+#[cfg(test)]
 const DEFAULT_IDENTITY_REGEX: &str =
     r"^https://github\.com/electricapp/pgbattery/\.github/workflows/release\.yml@refs/tags/v.*$";
+
+/// Build the SAN identity regex pinned to the exact release tag `v{version}`.
+///
+/// Binding the accepted signer identity to the specific version being
+/// installed closes the signed-downgrade / version-substitution hole: without
+/// it, ANY genuinely-signed release from this repo's workflow (e.g. an older,
+/// vulnerable one served by a compromised mirror at the requested URL) would
+/// satisfy the identity check. `regex::escape` neutralises the `.` in the
+/// version so it cannot act as a wildcard.
+fn pinned_identity_regex(version: &str) -> String {
+    format!(
+        r"^https://github\.com/electricapp/pgbattery/\.github/workflows/release\.yml@refs/tags/v{}$",
+        regex::escape(version)
+    )
+}
 
 /// Override for the expected OIDC issuer (exact match).
 const ENV_ISSUER: &str = "PGBATTERY_RELEASE_OIDC_ISSUER";
@@ -103,13 +120,19 @@ pub(super) struct CosignVerifier {
 }
 
 impl CosignVerifier {
-    /// Build a verifier from the baked-in defaults, with optional overrides for
-    /// the SAN identity regex (CLI flag value, then [`ENV_IDENTITY`]) and the
-    /// OIDC issuer ([`ENV_ISSUER`]).
+    /// Build a verifier bound to a specific release version, with optional
+    /// overrides for the SAN identity regex (CLI flag value, then
+    /// [`ENV_IDENTITY`]) and the OIDC issuer ([`ENV_ISSUER`]).
+    ///
+    /// When no override is supplied the SAN identity regex is pinned to the
+    /// exact `v{target_version}` tag (see [`pinned_identity_regex`]) so a
+    /// compromised mirror cannot substitute a *different* genuinely-signed
+    /// release at the requested download URL — the cert's tag must match the
+    /// version being installed.
     ///
     /// # Errors
     /// Returns an error if the identity override is not a valid regex.
-    pub(super) fn from_env(identity_override: Option<&str>) -> Result<Self> {
+    pub(super) fn from_env(identity_override: Option<&str>, target_version: &str) -> Result<Self> {
         let issuer = std::env::var(ENV_ISSUER)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -122,7 +145,7 @@ impl CosignVerifier {
                     .ok()
                     .filter(|v| !v.trim().is_empty())
             })
-            .unwrap_or_else(|| DEFAULT_IDENTITY_REGEX.to_string());
+            .unwrap_or_else(|| pinned_identity_regex(target_version));
 
         Self::new(&issuer, &identity_pattern)
     }
@@ -232,6 +255,15 @@ impl CosignVerifier {
             SignedArtifactBundle::new_verified(bundle_json, &trust.rekor_keys).map_err(|e| {
                 anyhow::anyhow!("Rekor transparency-log inclusion does not verify: {e}")
             })?;
+
+        // (1b) Bind the verified Rekor entry to THIS artifact. `new_verified`
+        // only proved the SET over the payload; without this an attacker could
+        // staple any valid public Rekor SET onto a bundle and pass. This asserts
+        // the logged hash/signature/cert match the blob, the bundle signature,
+        // and the bundle cert — so `integrated_time` (the chain-check anchor
+        // below) and the inclusion claim actually describe this binary.
+        verify_rekor_body_binds_artifact(&bundle, blob)
+            .context("Rekor transparency-log entry does not bind to this artifact")?;
 
         // The Rekor log entry's integrated time: the transparency log's own
         // attestation of when the signature existed. We anchor the Fulcio chain
@@ -367,6 +399,119 @@ fn normalize_cert_to_pem(cert: &str) -> Result<String> {
         .decode(trimmed.as_bytes())
         .context("bundle certificate is neither PEM nor base64-encoded PEM")?;
     String::from_utf8(decoded).context("base64-decoded bundle certificate is not valid UTF-8 PEM")
+}
+
+/// The subset of a Rekor `hashedrekord` v0.0.1 entry body we bind to the
+/// artifact. The body is the base64 JSON inside `rekor_bundle.payload.body`.
+#[derive(serde::Deserialize)]
+struct RekorHashedRekordBody {
+    spec: RekorSpec,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorSpec {
+    data: RekorData,
+    signature: RekorSignature,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorData {
+    hash: RekorHash,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorHash {
+    algorithm: String,
+    value: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorSignature {
+    content: String,
+    #[serde(rename = "publicKey")]
+    public_key: RekorPublicKey,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorPublicKey {
+    content: String,
+}
+
+/// Lowercase hex SHA-256 of `data`.
+fn hex_sha256(data: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(data);
+    digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Bind the verified Rekor entry to THIS artifact.
+///
+/// [`SignedArtifactBundle::new_verified`] only proves the Signed Entry
+/// Timestamp over `rekor_bundle.payload` (which includes the base64 `body`) —
+/// it never decodes `body` to check it describes the artifact in hand, and the
+/// outer `cert` / `base64_signature` are not covered by the SET at all. So on
+/// its own the SET proves "*some* entry was logged," not "*this binary* was
+/// logged," and `integrated_time` (used as the Fulcio-chain verification time)
+/// would be attacker-chosen. This decodes the logged `hashedrekord` and
+/// requires it to match the blob's digest, the bundle signature, and the
+/// bundle certificate — turning the transparency-log check into a real
+/// artifact→log binding.
+///
+/// # Errors
+/// Returns an error if the body cannot be decoded or any of the three bindings
+/// (hash, signature, certificate) does not match.
+fn verify_rekor_body_binds_artifact(bundle: &SignedArtifactBundle, blob: &[u8]) -> Result<()> {
+    let body_bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle.rekor_bundle.payload.body.trim().as_bytes())
+        .context("Rekor payload body is not valid base64")?;
+    let body: RekorHashedRekordBody = serde_json::from_slice(&body_bytes)
+        .context("Rekor payload body is not a hashedrekord JSON entry")?;
+
+    // (a) The logged artifact digest is the digest of the blob we will install.
+    if !body.spec.data.hash.algorithm.eq_ignore_ascii_case("sha256") {
+        bail!(
+            "Rekor entry uses an unexpected hash algorithm {:?} (expected sha256)",
+            body.spec.data.hash.algorithm
+        );
+    }
+    let logged_hash = body.spec.data.hash.value.trim().to_ascii_lowercase();
+    if logged_hash != hex_sha256(blob) {
+        bail!(
+            "Rekor transparency-log entry hash does not match the downloaded artifact: the logged \
+             signature was for a different file"
+        );
+    }
+
+    // (b) The logged signature is the bundle signature we verified over the blob.
+    if body.spec.signature.content.trim() != bundle.base64_signature.trim() {
+        bail!("Rekor transparency-log entry signature does not match the bundle signature");
+    }
+
+    // (c) The logged signing key is the bundle's Fulcio certificate. Compare DER
+    // so PEM whitespace/wrapping differences don't matter.
+    let logged_pem = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(body.spec.signature.public_key.content.trim().as_bytes())
+            .context("Rekor entry publicKey is not valid base64")?,
+    )
+    .context("Rekor entry publicKey is not valid UTF-8 PEM")?;
+    let logged_der = parse_leaf_pem(&logged_pem)
+        .context("Rekor entry publicKey is not a parseable certificate")?
+        .to_der()
+        .context("failed to re-encode Rekor entry certificate")?;
+    let bundle_der = parse_leaf_pem(&normalize_cert_to_pem(&bundle.cert)?)
+        .context("bundle certificate is not parseable")?
+        .to_der()
+        .context("failed to re-encode bundle certificate")?;
+    if logged_der != bundle_der {
+        bail!("Rekor transparency-log entry certificate does not match the bundle certificate");
+    }
+
+    Ok(())
 }
 
 /// Convert a Rekor integrated time (Unix seconds, as an `i64`) into a
@@ -547,7 +692,8 @@ mod tests {
 
     #[test]
     fn cli_identity_override_takes_precedence() {
-        let v = CosignVerifier::from_env(Some(r"^https://github\.com/me/fork/.*$")).unwrap();
+        let v =
+            CosignVerifier::from_env(Some(r"^https://github\.com/me/fork/.*$"), "1.2.3").unwrap();
         assert!(
             v.identity_regex
                 .is_match("https://github.com/me/fork/.github/workflows/release.yml@refs/tags/v1")
@@ -555,6 +701,27 @@ mod tests {
         assert!(!v.identity_regex.is_match(
             "https://github.com/electricapp/pgbattery/.github/workflows/release.yml@refs/tags/v1"
         ));
+    }
+
+    #[test]
+    fn default_identity_is_pinned_to_the_target_tag() {
+        // With no override, the verifier accepts ONLY the exact requested tag,
+        // not any v* release — this is the version-substitution defense.
+        let v = CosignVerifier::from_env(None, "0.2.0").unwrap();
+        let base = "https://github.com/electricapp/pgbattery/.github/workflows/release.yml";
+        assert!(
+            v.identity_regex.is_match(&format!("{base}@refs/tags/v0.2.0")),
+            "the requested version's tag must match"
+        );
+        // A different (e.g. older, vulnerable) genuinely-signed release must NOT
+        // satisfy the identity check when 0.2.0 was requested.
+        assert!(
+            !v.identity_regex.is_match(&format!("{base}@refs/tags/v0.1.0")),
+            "a different signed tag must be rejected (signed-downgrade defense)"
+        );
+        assert!(!v.identity_regex.is_match(&format!("{base}@refs/tags/v0.2.00")));
+        // The version's dots are escaped, so they cannot act as wildcards.
+        assert!(!v.identity_regex.is_match(&format!("{base}@refs/tags/v0X2X0")));
     }
 
     // ── Fixture-backed end-to-end parse/identity tests ──
@@ -836,5 +1003,71 @@ mod tests {
         };
         v.verify_bundle_with_trust(&blob, bundle_json.trim(), &trust)
             .expect("a self-consistent release bundle must verify end-to-end");
+    }
+
+    /// The Rekor entry must bind to the specific artifact — not merely be a
+    /// valid log entry. Regression for the "staple any valid SET" gap: before
+    /// this binding a bundle carrying a real, unrelated Rekor entry would pass.
+    #[test]
+    fn rekor_body_binds_to_the_specific_artifact() {
+        use base64::engine::general_purpose::STANDARD;
+        use sigstore::cosign::bundle::{Bundle, Payload};
+
+        let Some(leaf_pem) = fixture("leaf.pem") else {
+            eprintln!("skipping: tests/fixtures/cosign/leaf.pem not present");
+            return;
+        };
+
+        let blob: &[u8] = b"the exact bytes this entry attests to";
+        let sig = "c2lnbmF0dXJlLWJhc2U2NA=="; // arbitrary; binding only compares strings
+        let cert_b64 = STANDARD.encode(leaf_pem.as_bytes());
+
+        let body_b64 = |hash: String, sig: &str, key_b64: &str| {
+            let body = serde_json::json!({
+                "apiVersion": "0.0.1",
+                "kind": "hashedrekord",
+                "spec": {
+                    "data": { "hash": { "algorithm": "sha256", "value": hash } },
+                    "signature": { "content": sig, "publicKey": { "content": key_b64 } }
+                }
+            });
+            STANDARD.encode(serde_json::to_vec(&body).unwrap())
+        };
+
+        let make = |body: String, cert: String, sig: String| SignedArtifactBundle {
+            base64_signature: sig,
+            cert,
+            rekor_bundle: Bundle {
+                signed_entry_timestamp: String::new(),
+                payload: Payload {
+                    body,
+                    integrated_time: 1_669_361_833,
+                    log_index: 1,
+                    log_id: String::new(),
+                },
+            },
+        };
+
+        // Self-consistent entry for `blob` binds successfully.
+        let good = make(
+            body_b64(hex_sha256(blob), sig, &cert_b64),
+            cert_b64.clone(),
+            sig.to_string(),
+        );
+        verify_rekor_body_binds_artifact(&good, blob).expect("matching artifact must bind");
+
+        // A DIFFERENT artifact (the core attack: a valid entry for another file)
+        // is rejected on the hash binding.
+        let err = verify_rekor_body_binds_artifact(&good, b"a different binary").unwrap_err();
+        assert!(format!("{err:#}").contains("hash"), "got: {err:#}");
+
+        // A logged signature that differs from the bundle signature is rejected.
+        let bad_sig = make(
+            body_b64(hex_sha256(blob), "b3RoZXItc2ln", &cert_b64),
+            cert_b64.clone(),
+            sig.to_string(),
+        );
+        let err = verify_rekor_body_binds_artifact(&bad_sig, blob).unwrap_err();
+        assert!(format!("{err:#}").contains("signature"), "got: {err:#}");
     }
 }

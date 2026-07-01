@@ -33,6 +33,22 @@ use metrics::gauge;
 
 use openraft::BasicNode;
 
+/// What `lease_enforcement_tick` should do this tick, decided purely from the
+/// post-probe `(lease_valid, pg_writable, in_recovery)` triple.
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseAction {
+    /// Invalid lease and PG is (or might be) a writable primary: set the
+    /// read-only GUC and evict client backends.
+    EmergencyFence,
+    /// Invalid lease, GUC already read-only, PG still a confirmed primary:
+    /// keep evicting sessions that bypass the GUC until PG leaves the role.
+    TerminateBypassers,
+    /// Valid lease, PG read-only, confirmed primary: recover write access.
+    RecoverWrites,
+    /// Nothing to do (standby, or already in the desired state).
+    None,
+}
+
 /// The main application struct representing a pgbattery node.
 #[derive(Debug)]
 pub struct App {
@@ -1067,8 +1083,18 @@ impl App {
         // already-open transaction nor a `BEGIN READ WRITE` can commit WAL that
         // the following `pg_rewind` would silently discard; (2) every blocking
         // sub-operation inside `demote` (stop, pg_rewind, wait_for_ready) is
-        // itself timeout-bounded, so the lock is held for a bounded interval,
-        // never indefinitely.
+        // itself timeout-bounded, so the lock is released eventually, never held
+        // indefinitely.
+        //
+        // "Bounded" here is NOT "brief": the worst case is `pg_rewind`
+        // (PG_REWIND_BUDGET, up to ~5 min) plus the post-restart crash-recovery
+        // wait (RECOVERY_TIMEOUT_SECS, up to ~10 min) ≈ ~15 min. While that
+        // runs, the 100 ms lease-enforcement tick blocks on the same lock (the
+        // per-tick SQL budget wraps the probe, not the lock acquisition). That
+        // is correctness-benign — this node was fenced read-only above before
+        // the long operation began, so a stalled lease tick cannot miss an
+        // unfenced-writes window on it — but it does stall this node's
+        // lease/health probing for the duration.
         let mut pg = postgres.lock().await;
         if let Err(e) = pg.set_readonly(true).await {
             metrics::counter!("pgbattery_demote_fence_failures").increment(1);
@@ -1363,17 +1389,61 @@ impl App {
         // prevent.
         let lease_valid = lease.read().is_valid();
 
-        if !lease_valid && pg_writable {
-            return Self::handle_emergency_fence(&pg, fence_failures, shutdown_tx).await;
+        match Self::lease_enforcement_action(lease_valid, pg_writable, in_recovery) {
+            LeaseAction::EmergencyFence => {
+                // GUC not yet read-only (or the probe failed → fail-closed): set
+                // it and evict client backends. `handle_emergency_fence`
+                // manages `fence_failures` and terminates on success.
+                Self::handle_emergency_fence(&pg, fence_failures, shutdown_tx).await
+            }
+            LeaseAction::TerminateBypassers => {
+                // Invalid lease, GUC already read-only, PG still a confirmed
+                // primary. The GUC only changes the *default* — a session that
+                // already ran `BEGIN READ WRITE` or `SET transaction_read_only =
+                // off` bypasses it. Termination is NOT a one-shot on the GUC
+                // off->on edge: re-run it every tick until PG leaves the primary
+                // role, so a bypasser that survived the fencing tick (e.g. the
+                // termination timed out) is evicted on the next one.
+                *fence_failures = 0;
+                Self::terminate_client_backends(&pg).await;
+                false
+            }
+            LeaseAction::RecoverWrites => {
+                // Lease valid + PG read-only on a confirmed primary → recover.
+                *fence_failures = 0;
+                Self::try_recover_writes(&pg).await;
+                false
+            }
+            LeaseAction::None => {
+                *fence_failures = 0;
+                false
+            }
         }
+    }
 
-        *fence_failures = 0;
-        // Lease valid + PG read-only → recover writes. Skip on standby
-        // (set_readonly is a no-op there).
-        if lease_valid && !pg_writable && matches!(in_recovery, Some(false)) {
-            Self::try_recover_writes(&pg).await;
+    /// Pure decision for `lease_enforcement_tick`, given the post-probe lease
+    /// validity, the fail-closed `pg_writable` signal (true when the probe
+    /// failed), and the probed recovery state (`None` = probe failed).
+    const fn lease_enforcement_action(
+        lease_valid: bool,
+        pg_writable: bool,
+        in_recovery: Option<bool>,
+    ) -> LeaseAction {
+        if !lease_valid {
+            if pg_writable {
+                LeaseAction::EmergencyFence
+            } else if matches!(in_recovery, Some(false)) {
+                // GUC read-only but still a primary: evict any bypassers.
+                LeaseAction::TerminateBypassers
+            } else {
+                // A standby (or unknown but not writable): no client can write.
+                LeaseAction::None
+            }
+        } else if !pg_writable && matches!(in_recovery, Some(false)) {
+            LeaseAction::RecoverWrites
+        } else {
+            LeaseAction::None
         }
-        false
     }
 
     /// Truth-source probe: ask PG every tick. Failures are fail-closed: we
@@ -2294,6 +2364,53 @@ mod tests {
         assert_eq!(
             promotion_lease_holddown(Some(50_000), 10_000, LEASE_MS),
             Some(0)
+        );
+    }
+
+    use super::{App, LeaseAction};
+
+    #[test]
+    fn test_lease_enforcement_action_matrix() {
+        // Invalid lease, writable (GUC off or probe failed) → set GUC + evict.
+        assert_eq!(
+            App::lease_enforcement_action(false, true, Some(false)),
+            LeaseAction::EmergencyFence
+        );
+        assert_eq!(
+            App::lease_enforcement_action(false, true, None),
+            LeaseAction::EmergencyFence,
+            "a failed probe (fail-closed) must still fence"
+        );
+
+        // Regression for the one-shot fence: invalid lease, GUC already
+        // read-only (pg_writable=false), but PG is still a confirmed primary.
+        // Previously this did nothing; a bypassing BEGIN READ WRITE session
+        // kept committing. Now we keep terminating every tick.
+        assert_eq!(
+            App::lease_enforcement_action(false, false, Some(false)),
+            LeaseAction::TerminateBypassers
+        );
+
+        // Invalid lease but PG is a standby: no client can write, nothing to do.
+        assert_eq!(
+            App::lease_enforcement_action(false, false, Some(true)),
+            LeaseAction::None
+        );
+
+        // Valid lease + read-only primary → recover writes.
+        assert_eq!(
+            App::lease_enforcement_action(true, false, Some(false)),
+            LeaseAction::RecoverWrites
+        );
+        // Valid lease, already writable → nothing.
+        assert_eq!(
+            App::lease_enforcement_action(true, true, Some(false)),
+            LeaseAction::None
+        );
+        // Valid lease on a standby → nothing (set_readonly is a no-op there).
+        assert_eq!(
+            App::lease_enforcement_action(true, false, Some(true)),
+            LeaseAction::None
         );
     }
 }

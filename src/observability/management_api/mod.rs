@@ -279,8 +279,12 @@ pub async fn start_management_api(
             "/api/v1/cluster/remove/{node_id}",
             post(cluster::remove_node),
         )
-        .route("/api/v1/backup/create", post(backup::create_backup))
-        .route("/api/v1/backup/restore", post(backup::restore_backup))
+        // Backup inventory is token-gated: it leaks absolute filesystem paths,
+        // the backup schedule, and database sizes (recon), and drives a
+        // recursive stat walk of every full-backup tree — an unauthenticated
+        // disk-I/O amplification vector. It is a diagnostic, not a discovery
+        // endpoint, so it belongs behind the token like the debug endpoints.
+        .route("/api/v1/backup/list", get(backup::list_backups))
         // Debug endpoints (for chaos testing and troubleshooting). GET-only
         // but still token-gated — see comment block above.
         .route("/debug/events", get(debug::get_events))
@@ -290,7 +294,27 @@ pub async fn start_management_api(
             require_management_token,
         ));
 
-    let app = Router::new()
+    // Backup create/restore are token-protected like the routes above but are
+    // DELIBERATELY exempt from the shared request timeout. A full restore holds
+    // the supervisor lock across stop() -> restore -> start() (backup.rs); if
+    // the TimeoutLayer cancelled that future between stop and start, dropping it
+    // would release the lock while PostgreSQL is stopped, and the 500 ms health
+    // tick would then observe is_alive()==false and trigger a self-shutdown
+    // mid-restore (half-restored PGDATA, possible re-bootstrap). A multi-GB
+    // restore legitimately exceeds 30 s. These handlers bound their own work,
+    // so they must not sit under the outer cap.
+    let backup_routes = Router::new()
+        .route("/api/v1/backup/create", post(backup::create_backup))
+        .route("/api/v1/backup/restore", post(backup::restore_backup))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_management_token,
+        ));
+
+    // Fast routes (public discovery + the bounded protected mutations) carry
+    // the slowloris timeout; the timeout is applied here, before merging the
+    // exempt backup routes, so it wraps only these.
+    let timed_routes = Router::new()
         // Health check
         .route("/health", get(health_check))
         // Leader discovery
@@ -308,14 +332,16 @@ pub async fn start_management_api(
         )
         // Membership operations
         .route("/api/v1/cluster/members", get(cluster::list_members))
-        // Backup operations
-        .route("/api/v1/backup/list", get(backup::list_backups))
         .merge(protected_routes)
-        .layer(DefaultBodyLimit::max(MGMT_API_BODY_LIMIT_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             StdDuration::from_secs(MGMT_API_REQUEST_TIMEOUT_SECS),
-        ))
+        ));
+
+    let app = timed_routes
+        .merge(backup_routes)
+        // Body limit applies to every route (create/restore bodies are tiny).
+        .layer(DefaultBodyLimit::max(MGMT_API_BODY_LIMIT_BYTES))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -453,5 +479,69 @@ mod tests {
         headers.insert(header::AUTHORIZATION, "Bearer from-bearer".parse().unwrap());
         // x-pgbattery-token is checked first
         assert_eq!(request_token(&headers).as_deref(), Some("from-x-header"));
+    }
+
+    /// The layering the backup-timeout exemption depends on: a `TimeoutLayer`
+    /// applied to a sub-router *before* it is merged must NOT wrap the routes
+    /// merged in afterwards. If this ever regresses (e.g. the timeout moves onto
+    /// the combined router), a long restore could be cancelled between `stop()`
+    /// and `start()` and self-shutdown the node mid-restore.
+    #[tokio::test]
+    async fn timeout_scoped_before_merge_does_not_wrap_merged_routes() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use std::time::Duration as StdDuration;
+        use tower::ServiceExt as _;
+
+        async fn slow() -> &'static str {
+            tokio::time::sleep(StdDuration::from_millis(250)).await;
+            "ok"
+        }
+
+        // Fast group carries a short timeout, applied before the merge — exactly
+        // how `start_management_api` scopes the request timeout to `timed_routes`.
+        let timed = Router::<()>::new().route("/timed", get(slow)).layer(
+            TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                StdDuration::from_millis(50),
+            ),
+        );
+        // Exempt group (the backup routes) merged in afterwards.
+        let exempt = Router::<()>::new().route("/exempt", get(slow));
+        let app = timed.merge(exempt);
+
+        let timed_status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/timed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            timed_status,
+            StatusCode::REQUEST_TIMEOUT,
+            "the timed route's slow handler must be cut off by the timeout"
+        );
+
+        let exempt_status = app
+            .oneshot(
+                Request::builder()
+                    .uri("/exempt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            exempt_status,
+            StatusCode::OK,
+            "the merged-in route must NOT inherit the timeout"
+        );
     }
 }
