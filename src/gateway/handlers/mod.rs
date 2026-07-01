@@ -160,6 +160,22 @@ fn is_trivial_commit(query: &str) -> bool {
         || q.eq_ignore_ascii_case("end transaction")
 }
 
+/// Whether it is safe to splice a `SELECT txid_current()` probe into the
+/// backend stream ahead of this simple-query COMMIT.
+///
+/// The probe is a simple query that we write to the backend and then drain by
+/// reading up to the first `ReadyForQuery`. That is only correct when the
+/// COMMIT is a standalone trivial statement (`lone_commit`) *and* no earlier
+/// client message from the same batch is still buffered (`pending_empty`).
+/// Otherwise the drain consumes the prior statement's (or the extended
+/// protocol's) responses — swallowing messages the client is owed and
+/// desyncing the session. The captured txid is only ever consumed for a
+/// standalone simple COMMIT anyway (see `probe_txid` in
+/// `handle_backend_disconnect`), so gating here loses nothing.
+const fn simple_commit_probe_is_safe(lone_commit: bool, pending_empty: bool) -> bool {
+    lone_commit && pending_empty
+}
+
 /// Leading keyword of the first statement in `query`: skips whitespace,
 /// `--` line comments, and (nested) `/* */` block comments, then takes the
 /// longest identifier run. Returns `None` when the query starts with
@@ -370,6 +386,13 @@ enum SessionChange {
     /// `DISCARD ALL` — server-side it deallocates every prepared statement
     /// and unlistens every channel, so the tracked state must follow.
     DiscardAll,
+    /// A statement leaving backend-local session state the gateway cannot
+    /// reconstruct on a migrated backend (temp table, SQL `PREPARE`, `WITH
+    /// HOLD` cursor, session advisory lock, `set_config(..., false)`). The
+    /// `&'static str` is the reason, for logging. Marks the connection
+    /// non-migratable so failover severs (08006) instead of silently losing
+    /// the state.
+    NonMigratable(&'static str),
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -1201,10 +1224,18 @@ impl ConnectionHandler {
                     }
                     lease_deadline =
                         Some(lease_deadline.map_or(valid_until, |d| d.min(valid_until)));
+                } else {
+                    // Not the leader: proxying to the leader's backend. The
+                    // unbiased `select!` may service a client write before the
+                    // loop observes `leader_rx.changed()`; if leadership moved,
+                    // `backend` is stale and the `is_leader` lease gate above did
+                    // not run. Sever rather than forward a write to a deposed
+                    // primary. See docs/STATE_MACHINE.md section 6.
+                    self.reject_if_backend_stale().await?;
                 }
             }
 
-            self.handle_query_message(header.msg_type, &msg, backend, &mut pending)
+            self.handle_query_message(header.msg_type, &msg, backend, &pending)
                 .await?;
 
             // Check for termination
@@ -1269,18 +1300,41 @@ impl ConnectionHandler {
         }
     }
 
+    /// Follower-path guard: sever (08006) if `backend` no longer points at the
+    /// current leader, so a write is never forwarded to a just-deposed primary.
+    /// Steady state (backend == current leader) returns Ok with no side effects.
+    async fn reject_if_backend_stale(&mut self) -> Result<()> {
+        let current_leader = *self.leader_rx.borrow();
+        let backend_addr = self.state.read().backend_addr;
+        if current_leader == backend_addr {
+            return Ok(());
+        }
+        tracing::warn!(
+            conn_id = self.id,
+            ?backend_addr,
+            ?current_leader,
+            "Backend is no longer the leader; severing before forwarding a write"
+        );
+        metrics::counter!("pgbattery_queries_rejected_stale_backend").increment(1);
+        self.send_failover_error_response(
+            "pgbattery: leader changed; reconnect to reach the new primary",
+        )
+        .await;
+        Err(Error::Fenced)
+    }
+
     /// Inspect a client message for state the gateway must track, injecting
     /// the txid probe when a COMMIT is detected.
     ///
-    /// `pending` holds messages approved for forwarding but not yet written.
-    /// Before any backend round-trip (the txid probe) it is flushed so the
-    /// backend sees client messages in their original order.
+    /// `pending` holds messages approved for forwarding but not yet written;
+    /// it is read (never mutated) here — the txid probe is only injected when
+    /// `pending` is empty, so it can never reorder buffered client messages.
     async fn handle_query_message(
         &mut self,
         msg_type: MessageType,
         msg: &BytesMut,
         backend: &mut TcpStream,
-        pending: &mut BytesMut,
+        pending: &BytesMut,
     ) -> Result<()> {
         match msg_type {
             MessageType::Query => {
@@ -1297,6 +1351,15 @@ impl ConnectionHandler {
                 let needs_session_state_analysis =
                     Self::might_contain_session_state_command(&query_text);
 
+                // Function-call session state (set_config / advisory locks) is
+                // not a statement-leading keyword, so it needs no parse — the
+                // cheap token scan is authoritative enough to fail closed.
+                if Self::might_leave_unmigratable_function_state(&query_text) {
+                    self.mark_session_non_migratable(
+                        "session function state (set_config / advisory lock)",
+                    );
+                }
+
                 if !needs_subscription_analysis
                     && !needs_commit_analysis
                     && !needs_session_state_analysis
@@ -1310,6 +1373,19 @@ impl ConnectionHandler {
                 // consumes `query_text`.
                 let lone_commit = is_trivial_commit(&query_text);
 
+                // OLTP fast path: a bare trivial COMMIT/END that needs no
+                // subscription or session-state analysis. We already know it
+                // commits and carries no session changes, so skip the
+                // blocking-thread hop + full libpg_query parse that every
+                // transaction would otherwise pay. (Reached only past the
+                // early-return above, so `needs_commit_analysis` holds here.)
+                if lone_commit && !needs_subscription_analysis && !needs_session_state_analysis {
+                    if simple_commit_probe_is_safe(lone_commit, pending.is_empty()) {
+                        self.capture_txid_for_commit(backend, true).await;
+                    }
+                    return Ok(());
+                }
+
                 // Offload the C parser (libpg_query) to a blocking thread so it
                 // cannot stall the Tokio worker under concurrent connections.
                 let query_owned = query_text.into_owned();
@@ -1319,9 +1395,15 @@ impl ConnectionHandler {
                         .map_err(|e| Error::Protocol(format!("query analysis task failed: {e}")))?;
 
                 self.apply_session_changes(query_analysis.session_changes);
-                if needs_commit_analysis && query_analysis.contains_commit {
-                    self.flush_pending(backend, pending).await?;
-                    self.capture_txid_for_commit(backend, lone_commit).await;
+                if needs_commit_analysis
+                    && query_analysis.contains_commit
+                    && simple_commit_probe_is_safe(lone_commit, pending.is_empty())
+                {
+                    // The predicate guarantees `pending` is empty, so the
+                    // injected probe cannot reorder earlier client messages and
+                    // draining it to the first ReadyForQuery consumes only the
+                    // probe's own response.
+                    self.capture_txid_for_commit(backend, true).await;
                 }
             }
             MessageType::Parse => {
@@ -1340,12 +1422,15 @@ impl ConnectionHandler {
                 if self.extended_commit_tracker.is_commit_execute(msg)
                     && self.state.read().tx_status == TransactionStatus::InTransaction =>
             {
-                // Extended protocol: the client's expected response sequence
-                // depends on the surrounding Describe/Execute/Sync chain, so
-                // the single-frame synthetic response is not safe here — mark
-                // not-lone so a disconnect severs (08006) rather than desyncs.
-                self.flush_pending(backend, pending).await?;
-                self.capture_txid_for_commit(backend, false).await;
+                // Extended-protocol COMMIT: deliberately do NOT inject a txid
+                // probe. The probe is a simple query; splicing it into a
+                // Parse/Bind/Execute/Sync sequence swallows the client's
+                // ParseComplete/BindComplete and clobbers the unnamed portal,
+                // desyncing the stream. The single-frame synthetic response
+                // likewise cannot match the sequence the client expects. An
+                // in-transaction connection is already non-migratable, so a
+                // mid-COMMIT failover severs (08006) rather than migrating —
+                // the correct outcome. See docs/STATE_MACHINE.md section 6.
             }
             // Same pattern: wire byte `C` is Close in the client-to-server
             // direction, whereas the variant is named after the server-side
@@ -1355,15 +1440,6 @@ impl ConnectionHandler {
                 self.handle_close_for_replay(msg);
             }
             _ => {}
-        }
-        Ok(())
-    }
-
-    /// Write out (and clear) the approved-but-unwritten message span.
-    async fn flush_pending(&self, backend: &mut TcpStream, pending: &mut BytesMut) -> Result<()> {
-        if !pending.is_empty() {
-            write_all_within_deadline(backend, pending, self.id).await?;
-            pending.clear();
         }
         Ok(())
     }
@@ -1398,12 +1474,35 @@ impl ConnectionHandler {
     /// Capture a Parse message so we can replay it on a new backend after
     /// failover.  Only named statements are captured — the unnamed statement
     /// is transient by protocol definition.
+    /// Cap on distinct named prepared statements tracked for failover replay,
+    /// per connection. A client that issues many named `Parse`s without
+    /// `Close`/`DEALLOCATE` would otherwise grow this map (each value up to
+    /// `MAX_GATEWAY_BUFFER_SIZE`) without bound, across every connection.
+    const MAX_TRACKED_PREPARED_STATEMENTS: usize = 1024;
+
     fn capture_parse_for_replay(&self, msg: &BytesMut) {
         let Some(name) = session_replay::parse_statement_name(msg) else {
             return;
         };
         let bytes = session_replay::capture_parse_message(msg);
         let mut state = self.state.write();
+        // Re-preparing an existing name just replaces it (no growth). Only a
+        // *new* name over the cap is a problem: stop tracking and mark the
+        // connection non-migratable so failover severs (08006) rather than
+        // silently under-replaying a statement we chose not to record.
+        if !state.replay.prepared.contains_key(&name)
+            && state.replay.prepared.len() >= Self::MAX_TRACKED_PREPARED_STATEMENTS
+        {
+            if !state.not_migratable {
+                tracing::warn!(
+                    conn_id = self.id,
+                    cap = Self::MAX_TRACKED_PREPARED_STATEMENTS,
+                    "Prepared-statement replay set hit its cap; marking connection non-migratable"
+                );
+                state.not_migratable = true;
+            }
+            return;
+        }
         state.replay.prepared.insert(name, bytes);
     }
 
@@ -1495,13 +1594,41 @@ impl ConnectionHandler {
     }
 
     /// Prefilter for statements that mutate tracked session state: session
-    /// GUCs (`SET`/`RESET`) and the prepared-statement replay set
-    /// (`DEALLOCATE`/`DISCARD`). All four are statement-leading keywords, so
-    /// the leading-keyword scan keeps `UPDATE t SET …` — the hottest write
-    /// shape there is — away from the C parser.
+    /// GUCs (`SET`/`RESET`), the prepared-statement replay set
+    /// (`DEALLOCATE`/`DISCARD`/`PREPARE`), backend-local temp tables
+    /// (`CREATE TEMP`), and `WITH HOLD` cursors (`DECLARE`). All are
+    /// statement-leading keywords, so the leading-keyword scan keeps
+    /// `UPDATE t SET …` / `SELECT …` — the hot shapes — away from the C parser.
     #[inline]
     fn might_contain_session_state_command(query: &str) -> bool {
-        leading_statement_keyword_matches(query, &["set", "reset", "deallocate", "discard"])
+        leading_statement_keyword_matches(
+            query,
+            &[
+                "set",
+                "reset",
+                "deallocate",
+                "discard",
+                "create",
+                "prepare",
+                "declare",
+            ],
+        )
+    }
+
+    /// Prefilter for session state left by *function calls* rather than
+    /// statement-leading keywords, which the leading-keyword scan cannot see:
+    /// `set_config(name, value, is_local=false)` (a session GUC set) and the
+    /// session-scoped advisory-lock family. A match marks the connection
+    /// non-migratable without a full parse — conservative (a `'set_config'`
+    /// string literal also matches), which is the safe direction: sever on
+    /// failover rather than silently migrate a session that holds this state.
+    /// `pg_advisory_xact_lock*` is intentionally excluded — it releases at
+    /// transaction end and so cannot survive to an Idle migration point.
+    #[inline]
+    fn might_leave_unmigratable_function_state(query: &str) -> bool {
+        Self::contains_token_ci(query, "set_config")
+            || Self::contains_token_ci(query, "pg_advisory_lock")
+            || Self::contains_token_ci(query, "pg_advisory_lock_shared")
     }
 
     /// Single-pass scan for the COMMIT/END and LISTEN/UNLISTEN keywords.
@@ -2194,6 +2321,17 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// Mark this connection non-migratable so a leader change severs it
+    /// (08006) rather than silently migrating it to a new backend that lacks
+    /// its session state. Idempotent; logs only on the first transition.
+    fn mark_session_non_migratable(&self, reason: &str) {
+        let mut state = self.state.write();
+        if !state.not_migratable {
+            tracing::debug!(conn_id = self.id, reason, "Marking connection non-migratable");
+            state.not_migratable = true;
+        }
+    }
+
     fn apply_session_changes(&self, changes: Vec<SessionChange>) {
         if changes.is_empty() {
             return;
@@ -2260,6 +2398,17 @@ impl ConnectionHandler {
                     // safe while migrating a dirty one is not.
                     state.replay.prepared.clear();
                     state.subscriptions.channels.clear();
+                }
+                SessionChange::NonMigratable(reason) => {
+                    if !state.not_migratable {
+                        tracing::debug!(
+                            conn_id = self.id,
+                            reason,
+                            "Statement leaves unreconstructable session state; \
+                             connection will be severed on next leader change"
+                        );
+                        state.not_migratable = true;
+                    }
                 }
             }
         }
@@ -2355,6 +2504,30 @@ impl ConnectionHandler {
                     Ok(pg_query::protobuf::DiscardMode::DiscardAll)
                 )
                 .then_some(SessionChange::DiscardAll)
+            }
+            // CREATE TEMP/TEMPORARY TABLE leaves a backend-local temporary
+            // relation. `relpersistence == "t"` is the temp marker ("p" =
+            // permanent, "u" = unlogged, both of which survive a migrated
+            // backend).
+            pg_query::protobuf::node::Node::CreateStmt(create_stmt) => create_stmt
+                .relation
+                .as_ref()
+                .is_some_and(|r| r.relpersistence == "t")
+                .then_some(SessionChange::NonMigratable("temp table")),
+            // SQL-level PREPARE: only extended-protocol Parse statements are
+            // captured for replay, so a migrated backend would answer a later
+            // EXECUTE with "prepared statement does not exist".
+            pg_query::protobuf::node::Node::PrepareStmt(_) => {
+                Some(SessionChange::NonMigratable("SQL PREPARE"))
+            }
+            // DECLARE ... CURSOR WITH HOLD persists past its transaction; a
+            // migrated backend would not have it. Non-HOLD cursors die at
+            // transaction end and can never reach an Idle migration point.
+            pg_query::protobuf::node::Node::DeclareCursorStmt(decl) => {
+                // `CURSOR_OPT_HOLD` bit (PostgreSQL `parsenodes.h`).
+                const CURSOR_OPT_HOLD: i32 = 0x0020;
+                (decl.options & CURSOR_OPT_HOLD != 0)
+                    .then_some(SessionChange::NonMigratable("WITH HOLD cursor"))
             }
             _ => None,
         }
@@ -2641,6 +2814,18 @@ impl ConnectionHandler {
 
         write_all_within_deadline(&mut self.client, &msg, self.id).await?;
 
+        // The synthetic 'Z' 'I' told the client its transaction is over and it
+        // is Idle. Bring the gateway's own view in sync: otherwise `tx_status`
+        // stays `InTransaction` (set before the crash) and the NEXT failover
+        // spuriously severs this healthy, now-idle session (08006) because
+        // `handle_leader_change` reads `tx_status`, while the registry's
+        // in-transaction gauge stays skewed until the connection closes. The
+        // synthesized ReadyForQuery is also the response the client was owed, so
+        // clear `awaiting_response`.
+        self.registry
+            .update_tx_status_on(&self.state, TransactionStatus::Idle);
+        self.state.write().awaiting_response = false;
+
         tracing::info!(
             conn_id = self.id,
             "Sent synthetic COMMIT response after verification"
@@ -2793,6 +2978,25 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_commit_probe_only_safe_for_standalone_commit() {
+        // Safe: a lone trivial COMMIT with nothing buffered ahead of it — the
+        // injected probe drains exactly its own response.
+        assert!(simple_commit_probe_is_safe(true, true));
+
+        // Unsafe: an earlier statement is still buffered in this batch (e.g.
+        // `Q(INSERT); Q(COMMIT)` pipelined). Draining the probe to the first
+        // ReadyForQuery would consume the INSERT's response and leak the
+        // probe's response to the client — the regression this gate closes.
+        assert!(!simple_commit_probe_is_safe(true, false));
+
+        // Unsafe: not a standalone COMMIT (e.g. `COMMIT AND CHAIN` or a
+        // multi-statement batch), so the synthetic single-frame response would
+        // not match what the client is owed.
+        assert!(!simple_commit_probe_is_safe(false, true));
+        assert!(!simple_commit_probe_is_safe(false, false));
+    }
+
+    #[test]
     fn test_analyze_query_subscription_changes() {
         let analysis = ConnectionHandler::analyze_query(
             r#"LISTEN events; UNLISTEN jobs; UNLISTEN *; LISTEN "MyChannel";"#,
@@ -2831,6 +3035,55 @@ mod tests {
 
         // A SET anywhere in a multi-statement query flags it.
         assert!(sets_session_var("SELECT 1; SET search_path = x"));
+    }
+
+    fn marks_non_migratable(query: &str) -> bool {
+        ConnectionHandler::analyze_query(query)
+            .session_changes
+            .iter()
+            .any(|c| matches!(c, SessionChange::NonMigratable(_)))
+    }
+
+    #[test]
+    fn test_analyze_query_flags_unmigratable_session_state() {
+        // Regression: these silently survived migration before, so a
+        // transparently-migrated client would find its temp table / prepared
+        // statement / cursor gone on the new backend.
+        assert!(marks_non_migratable("CREATE TEMP TABLE t (id int)"));
+        assert!(marks_non_migratable("CREATE TEMPORARY TABLE t (id int)"));
+        assert!(marks_non_migratable("PREPARE p AS SELECT 1"));
+        assert!(marks_non_migratable(
+            "DECLARE c CURSOR WITH HOLD FOR SELECT 1"
+        ));
+
+        // A permanent table is fine — it survives failover on the shared
+        // volume, so the connection stays migratable.
+        assert!(!marks_non_migratable("CREATE TABLE t (id int)"));
+        // A non-HOLD cursor dies at transaction end and never reaches an Idle
+        // migration point, so it must not flag the connection.
+        assert!(!marks_non_migratable("DECLARE c CURSOR FOR SELECT 1"));
+        assert!(!marks_non_migratable("SELECT 1"));
+    }
+
+    #[test]
+    fn test_function_state_prefilter_detects_set_config_and_advisory_locks() {
+        assert!(ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT set_config('search_path', 'x', false)"
+        ));
+        assert!(ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT pg_advisory_lock(42)"
+        ));
+        assert!(ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT pg_advisory_lock_shared(42)"
+        ));
+        // Transaction-scoped advisory locks release at commit — not session
+        // state — and plain reads must stay migratable.
+        assert!(!ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT pg_advisory_xact_lock(42)"
+        ));
+        assert!(!ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT id FROM t WHERE id = 1"
+        ));
     }
 
     #[test]

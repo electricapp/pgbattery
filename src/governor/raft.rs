@@ -203,6 +203,7 @@ impl Governor {
             state: state.clone(),
             storage: storage.clone(),
             applied_end: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Create log storage adapter
@@ -353,6 +354,16 @@ impl Governor {
 
         let is_leader = leader_id == Some(self.node_id);
 
+        // A different node is the stable leader — clear any anchor this node
+        // stamped for a failover it did not win, so it cannot later suppress
+        // the coalesced re-anchor below (see `should_clear_stale_failover_anchor`).
+        // Only take the write lock when there is actually something to clear.
+        if Self::should_clear_stale_failover_anchor(leader_id, is_leader)
+            && self.state.read().failover_started_at_unix_ms.is_some()
+        {
+            self.state.write().failover_started_at_unix_ms = None;
+        }
+
         // The watch can coalesce Leader(other) → None → Leader(self), dropping
         // the leader→none edge that stamps `failover_started_at_unix_ms` and
         // skipping the promotion hold-down (split-brain risk). Re-stamp on the
@@ -479,6 +490,28 @@ impl Governor {
         }
     }
 
+    /// Whether a stale promotion-hold-down anchor must be cleared this tick.
+    ///
+    /// True when a *different* node is the stable leader. The anchor
+    /// (`failover_started_at_unix_ms`) is stamped on the locally-observed
+    /// leader→none edge, but it is only meaningful for a failover *this* node
+    /// goes on to win — it is consumed and cleared by `promote_local_postgres`.
+    /// If this node witnesses a failover it does not win, the anchor would
+    /// otherwise persist indefinitely (it is never cleared on the
+    /// other-becomes-leader edge) and, on a *later* election this node does win
+    /// via a coalesced `other→none→self` transition,
+    /// `should_anchor_coalesced_failover` refuses to re-anchor because an
+    /// anchor already exists — so the hold-down reads that ancient timestamp as
+    /// long-elapsed and promotes immediately, skipping the wait for the deposed
+    /// leader's lease to expire (split-brain). Clearing here keeps the anchor
+    /// describing only the in-progress failover this node might complete.
+    const fn should_clear_stale_failover_anchor(
+        leader_id: Option<NodeId>,
+        is_leader: bool,
+    ) -> bool {
+        leader_id.is_some() && !is_leader
+    }
+
     /// Wall-clock Unix milliseconds, saturating on clock anomalies. Callers use
     /// `saturating_sub`, so extremes fail toward "no time elapsed" (defer).
     fn unix_now_ms() -> u64 {
@@ -512,6 +545,20 @@ impl Governor {
             // with a stored term far ahead of the cluster's committed term and
             // disrupting the cluster when it reconnects. Re-enable elections
             // when quorum is restored so legitimate failover still works.
+            //
+            // Deliberate liveness tradeoff: a follower whose leader just died
+            // also has `has_quorum == false` (it sees no leader yet), so this
+            // disables its election *retries* too — even if it is actually in
+            // the majority partition and could win. If its first openraft-driven
+            // election does not immediately succeed (split vote, or the LSN
+            // vote-gate rejects it), the cluster stays leaderless until
+            // `run_leaderless_watchdog` force-triggers a staggered election
+            // (~`LEADERLESS_RECOVERY_BASE_TIMEOUTS` election timeouts). That
+            // bounded window is the price of term-inflation safety without
+            // pre-vote; do NOT "fix" it by letting followers elect freely — that
+            // reintroduces the term inflation and split-vote cascades the gate +
+            // staggered watchdog exist to prevent. The real fix is adopting
+            // openraft's PreVote once released (see the TODO in config/constants).
             self.raft.runtime_config().elect(has_quorum);
         }
         // `send_replace` unconditionally stores the new state; `send` would
@@ -1146,6 +1193,19 @@ pub struct StateMachineStore {
     /// install), so `apply()` can read it without a redb transaction per
     /// batch. Atomic because the snapshot builder clones the struct.
     applied_end: Arc<std::sync::atomic::AtomicU64>,
+    /// Serializes `build_snapshot` against `install_snapshot`.
+    ///
+    /// openraft serializes `apply`/`install_snapshot`, but `build_snapshot`
+    /// runs on its own task and races them. `install_snapshot` writes redb
+    /// (`last_applied` + membership) and then swaps `self.state` in two steps;
+    /// a builder observing the redb write but the pre-swap state would emit a
+    /// snapshot whose meta is ahead of its data (dropped committed entries on
+    /// install). Holding this lock across the redb-write+state-swap in the
+    /// installer and across the meta-read+state-clone in the builder makes the
+    /// (meta, state) pair atomic to the builder. `apply` needs no lock: it
+    /// updates state *before* redb, so the builder only ever sees data at or
+    /// ahead of meta (safe — `ClusterCommand` re-application is idempotent).
+    snapshot_consistency: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RaftStateMachine<TypeConfig> for StateMachineStore {
@@ -1274,6 +1334,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             state: self.state.clone(),
             storage: self.storage.clone(),
             applied_end: self.applied_end.clone(),
+            snapshot_consistency: self.snapshot_consistency.clone(),
         }
     }
 
@@ -1312,6 +1373,12 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             ),
         };
         let installed_end = meta.last_log_id.map_or(0, |l| l.index.saturating_add(1));
+
+        // Hold the snapshot-consistency lock across BOTH the redb write and the
+        // in-memory swap so a concurrent `build_snapshot` (separate task) cannot
+        // observe the intermediate state where redb records this snapshot's
+        // position but `self.state` is still the previous machine.
+        let _consistency = self.snapshot_consistency.lock().await;
 
         // Persist data, metadata, and the snapshot's applied position +
         // membership in ONE transaction. The install replaces the state
@@ -1521,30 +1588,36 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        // Capture the applied position (and membership) BEFORE cloning the
-        // state: `apply` runs concurrently with this builder (openraft spawns
-        // snapshot builds on their own task), so the state cloned afterwards
-        // may include effects of entries beyond the captured position. That
-        // direction is safe — every `ClusterCommand` is idempotent, so a
-        // receiver that installs this snapshot and then re-applies those
-        // entries converges. The reverse order could record an index whose
-        // effects are missing from the data; an installing follower would
-        // lose those entries forever.
-        let last_applied = self
-            .storage
-            .load_last_applied()
-            .map_err(|e| storage_read_err(&e))?;
-        let persisted_membership = self
-            .storage
-            .load_applied_membership()
-            .map_err(|e| storage_read_err(&e))?;
-
-        // Clone state under the read lock, then release it before serializing.
-        // postcard serialization allocates and can be non-trivial for large
-        // states; holding the state lock across it blocks every reader and
-        // writer (including leader-change propagation, lease renewals, and
-        // LSN reporting) for its duration.
-        let state_snapshot: ClusterState = self.state.read().clone();
+        // Capture a CONSISTENT (membership, last_applied, state) triple.
+        //
+        // Two concurrent writers race this builder:
+        //  * `apply` updates `self.state` *before* redb `last_applied`, so the
+        //    cloned state is at or ahead of the captured `last_applied` —
+        //    idempotent re-application on install converges (data-ahead-of-meta
+        //    is safe). Reading `applied_membership` BEFORE `last_applied` keeps
+        //    membership at or below `last_applied` (never a membership from the
+        //    future) since both indices only advance.
+        //  * `install_snapshot` writes redb then swaps `self.state` in two
+        //    steps; a builder spanning them could read the new redb position
+        //    with the old state (meta-ahead-of-data → dropped entries). The
+        //    `snapshot_consistency` lock, also held by the installer across
+        //    both steps, makes that pair atomic here.
+        //
+        // Hold the lock across the redb reads and the state clone, then release
+        // it before the (potentially large) postcard serialization.
+        let (last_applied, persisted_membership, state_snapshot) = {
+            let _consistency = self.snapshot_consistency.lock().await;
+            let persisted_membership = self
+                .storage
+                .load_applied_membership()
+                .map_err(|e| storage_read_err(&e))?;
+            let last_applied = self
+                .storage
+                .load_last_applied()
+                .map_err(|e| storage_read_err(&e))?;
+            let state_snapshot: ClusterState = self.state.read().clone();
+            (last_applied, persisted_membership, state_snapshot)
+        };
         let data = postcard::to_allocvec(&state_snapshot)
             .map_err(|e| storage_write_err(&Error::Serialization(e)))?;
 
@@ -2246,6 +2319,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn stale_anchor_cleared_when_another_node_leads() {
+        // A different node is the stable leader: clear the anchor.
+        assert!(Governor::should_clear_stale_failover_anchor(Some(7), false));
+        // We are the leader: keep the anchor (promote consumes it).
+        assert!(!Governor::should_clear_stale_failover_anchor(Some(3), true));
+        // Leaderless (mid-failover): keep/stamp, don't clear.
+        assert!(!Governor::should_clear_stale_failover_anchor(None, false));
+    }
+
+    #[test]
+    fn witnessed_but_unwon_failover_does_not_skip_holddown_on_next_win() {
+        // Regression for the stale-anchor split-brain. Node 3 witnesses two
+        // failovers: it loses the first (node 7 wins) and wins the second via
+        // a coalesced 7→none→3 transition.
+        const SELF_ID: NodeId = 3;
+
+        // Failover #1: node 3 stamped an anchor on A→none, then node 7 won.
+        // On the tick where node 7 is the stable leader, node 3 clears the
+        // stale anchor instead of carrying it forever.
+        assert!(Governor::should_clear_stale_failover_anchor(
+            Some(7),
+            /* is_leader */ false
+        ));
+
+        // Failover #2 (coalesced 7→none→self): because the anchor was cleared,
+        // `failover_already_anchored` is now false, so the re-anchor fires and
+        // the promotion hold-down is enforced against a *fresh* timestamp.
+        // Before the fix the anchor was still set, this returned false, and the
+        // hold-down was skipped → double promotion.
+        assert!(Governor::should_anchor_coalesced_failover(
+            Some(7),
+            /* is_leader */ true,
+            SELF_ID,
+            /* failover_already_anchored (post-clear) */ false,
+        ));
+    }
+
     // ---- Snapshot membership fidelity ----
 
     #[test]
@@ -2373,6 +2484,76 @@ mod tests {
             state.max_cluster_lsn, 3000,
             "entry 8 (beyond last_applied) must not be replayed"
         );
+    }
+
+    /// `build_snapshot` must emit a self-consistent meta: the membership index
+    /// never ahead of `last_applied` (openraft requires
+    /// `last_membership.log_id <= last_log_id`), and the serialized data must
+    /// round-trip. Guards the read ordering (membership before `last_applied`)
+    /// and the meta construction the concurrency fix relies on.
+    #[tokio::test]
+    async fn build_snapshot_meta_is_self_consistent() {
+        use std::sync::atomic::AtomicU64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = RedbLogStorage::new(dir.path().join("raft.db")).unwrap();
+
+        // Membership applied at index 3; later normal entries advance
+        // last_applied to 7. build_snapshot must never report membership > 7.
+        let membership = LocalStoredMembership {
+            log_id_index: Some(3),
+            log_id_term: Some(1),
+            log_id_leader_node_id: 1,
+            configs: vec![vec![1, 2, 3]],
+            nodes: vec![
+                (1, "10.0.0.1:5433".into()),
+                (2, "10.0.0.2:5433".into()),
+                (3, "10.0.0.3:5433".into()),
+            ],
+        };
+        storage
+            .save_applied_membership_and_last_applied(
+                &membership,
+                &LastAppliedState {
+                    last_applied_term: Some(1),
+                    last_applied_index: Some(3),
+                    last_applied_leader_node_id: 1,
+                },
+            )
+            .unwrap();
+        storage
+            .save_last_applied(&LastAppliedState {
+                last_applied_term: Some(1),
+                last_applied_index: Some(7),
+                last_applied_leader_node_id: 1,
+            })
+            .unwrap();
+
+        let mut state = ClusterState::new();
+        state.apply(ClusterCommand::AddNode(test_node_info(1)));
+        state.apply(ClusterCommand::AddNode(test_node_info(2)));
+        state.apply(ClusterCommand::AddNode(test_node_info(3)));
+
+        let mut sm = StateMachineStore {
+            state: Arc::new(RwLock::new(state)),
+            storage,
+            applied_end: Arc::new(AtomicU64::new(8)),
+            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        let snap = sm.build_snapshot().await.unwrap();
+        let last_applied_idx = snap.meta.last_log_id.as_ref().map(|l| l.index);
+        let membership_idx = snap.meta.last_membership.log_id().as_ref().map(|l| l.index);
+        assert_eq!(last_applied_idx, Some(7));
+        assert_eq!(membership_idx, Some(3));
+        assert!(
+            membership_idx.unwrap() <= last_applied_idx.unwrap(),
+            "membership index {membership_idx:?} must be <= last_applied {last_applied_idx:?}"
+        );
+
+        // The serialized snapshot data round-trips to the state we cloned.
+        let restored: ClusterState = postcard::from_bytes(snap.snapshot.get_ref()).unwrap();
+        assert_eq!(restored.nodes.len(), 3);
     }
 
     /// With no snapshot, the rebuild replays the whole applied log prefix.

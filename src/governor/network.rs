@@ -156,6 +156,14 @@ impl RaftRpcServer {
     /// # Errors
     /// Returns an error if accepting a connection fails fatally.
     pub async fn run(mut self) -> Result<()> {
+        /// Cap on concurrently-served RPC connections. A healthy cluster needs a
+        /// handful (one persistent connection per peer); this is far above that
+        /// but bounds an attacker/misbehaving peer that opens many connections,
+        /// each pinning a task and buffering up to `MAX_RPC_FRAME_LEN` per
+        /// in-flight request. Excess connections are dropped (peers reconnect).
+        const MAX_CONCURRENT_RPC_CONNECTIONS: usize = 256;
+        let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RPC_CONNECTIONS));
+
         loop {
             tokio::select! {
                 _ = self.shutdown_rx.changed() => {
@@ -168,11 +176,24 @@ impl RaftRpcServer {
                 result = self.listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
+                            let Ok(permit) = Arc::clone(&conn_limiter).try_acquire_owned() else {
+                                tracing::warn!(
+                                    %peer_addr,
+                                    cap = MAX_CONCURRENT_RPC_CONNECTIONS,
+                                    "RPC connection cap reached; dropping connection"
+                                );
+                                metrics::counter!("pgbattery_rpc_connections_dropped").increment(1);
+                                drop(stream);
+                                continue;
+                            };
                             let raft = self.raft.clone();
                             let cluster_state = self.cluster_state.clone();
                             let tls_config = self.tls_config.clone();
 
                             tokio::spawn(async move {
+                                // Held for the connection's lifetime, freeing the
+                                // slot when this task ends.
+                                let _permit = permit;
                                 let result = if let Some(tls) = tls_config {
                                     // TLS connection. A peer that connects but
                                     // never completes the handshake would pin

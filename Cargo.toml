@@ -156,10 +156,17 @@ terminal_size = "0.4"
 # Backup
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 
+# Self-upgrade anti-rollback: proper semver comparison so a malicious mirror
+# cannot serve an older, genuinely-signed release. Already present transitively.
+semver = "1"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
+# ServiceExt::oneshot for exercising axum routers in tests. Already present
+# transitively via axum/tower-http.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "gateway"

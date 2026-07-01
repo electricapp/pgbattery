@@ -3,42 +3,46 @@
 //! Releases are signed in CI with `cosign sign-blob` in keyless mode: GitHub
 //! Actions presents its OIDC identity to Fulcio, which issues a short-lived
 //! signing certificate whose Subject Alternative Name (SAN) encodes the exact
-//! workflow + tag that ran. The signature and that certificate are published
-//! next to the binary (`<binary>.sig`, `<binary>.pem`). There is **no signing
-//! key to manage** — trust is anchored in the Sigstore/Fulcio root and the
-//! expected OIDC issuer + workflow identity.
+//! workflow + tag that ran. The signature, that certificate, and a **Sigstore
+//! bundle** (`<binary>.bundle`) are published next to the binary. There is **no
+//! signing key to manage** — trust is anchored in the Sigstore/Fulcio root, the
+//! Rekor transparency-log public key, and the expected OIDC issuer + workflow
+//! identity.
 //!
-//! [`CosignVerifier::verify_blob`] enforces, for a downloaded binary:
+//! The bundle is the primary verification path because it additionally carries
+//! the **Rekor transparency-log inclusion proof** (a Signed Entry Timestamp /
+//! SET over the log entry). The detached `.sig`/`.pem` are kept as a fallback
+//! for the same signature + chain + identity checks, minus Rekor.
 //!
-//! 1. **Signature over the blob** — the detached signature is valid over the
-//!    binary bytes under the certificate's public key
+//! [`CosignVerifier::verify_bundle`] enforces, for a downloaded binary:
+//!
+//! 1. **Rekor inclusion** — `SignedArtifactBundle::new_verified` validates the
+//!    bundle's Rekor SET against the trust root's Rekor public key, proving the
+//!    signing event was recorded in the public transparency log and yielding the
+//!    log's **integrated time**. A signature that was never logged in Rekor (or
+//!    whose SET does not verify) is rejected here.
+//! 2. **Signature over the blob** — the bundle's signature is valid over the
+//!    binary bytes under the bundle certificate's public key
 //!    (`sigstore::cosign::Client::verify_blob`).
-//! 2. **Certificate chains to Fulcio** — the leaf certificate chains to a
-//!    Fulcio CA from the Sigstore trust root (fetched via TUF). Because Fulcio
-//!    leaves are valid for only ~10 minutes, the chain is verified *at the
-//!    certificate's own `notBefore`* (cosign's model: "the cert is trusted
-//!    forever; we check the signature was made inside its validity window"),
-//!    not at "now" — otherwise every release would fail to verify minutes after
-//!    it was cut.
-//! 3. **Identity + issuer** — the certificate's OIDC-issuer extension equals
-//!    the expected issuer (GitHub Actions), and its SAN identity matches the
+//! 3. **Certificate chains to Fulcio** — the bundle's leaf certificate chains to
+//!    a Fulcio CA from the Sigstore trust root (fetched via TUF). The chain is
+//!    verified *at the Rekor integrated time* — the transparency log's own
+//!    attestation of when the signature existed — which is strictly better than
+//!    the certificate's `notBefore`: Fulcio leaves live only ~10 minutes, so
+//!    "now" would reject every release shortly after it is cut.
+//! 4. **Identity + issuer** — the certificate's OIDC-issuer extension equals the
+//!    expected issuer (GitHub Actions), and its SAN identity matches the
 //!    expected release-workflow regex. This is what stops an attacker who can
 //!    obtain *some* valid Fulcio certificate (e.g. for their own repo) from
 //!    passing verification: the identity must be *this* repo's release workflow.
 //!
-//! ## Known gap — Rekor transparency log (TODO)
-//!
-//! We verify only the `.sig` + `.pem`. We do **not** verify a Rekor
-//! transparency-log inclusion proof, because the published artifacts do not
-//! include a Rekor bundle and sigstore-rs (0.14) exposes Rekor verification
-//! only via the bundle path (`SignedArtifactBundle::new_verified`), not the
-//! detached `verify_blob` path. The practical consequence: we do not
-//! independently confirm the signature was logged in Rekor, and we rely on the
-//! certificate's `notBefore` (rather than a Rekor integrated timestamp) for the
-//! chain-validity instant. The signature, Fulcio chain, and identity/issuer
-//! checks are unaffected. To close this gap, also publish
-//! `cosign sign-blob --bundle <binary>.bundle` and verify the Rekor SET here.
-//! See `docs/RELEASING.md`.
+//! [`CosignVerifier::verify_blob`] is the detached-`.sig`/`.pem` fallback: it
+//! runs checks 2–4 but anchors the chain at the certificate's `notBefore` and
+//! does **not** verify Rekor inclusion (the detached artifacts carry no SET, and
+//! sigstore-rs 0.14 exposes Rekor verification only via the bundle path). See
+//! `docs/RELEASING.md`.
+
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -48,7 +52,9 @@ use x509_cert::Certificate as X509Certificate;
 use x509_cert::der::{Decode, DecodePem, Encode};
 
 use sigstore::cosign::CosignCapabilities;
+use sigstore::cosign::bundle::SignedArtifactBundle;
 use sigstore::cosign::client::Client as CosignClient;
+use sigstore::crypto::CosignVerificationKey;
 use sigstore::trust::TrustRoot;
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 
@@ -57,11 +63,28 @@ use sigstore::trust::sigstore::SigstoreTrustRoot;
 /// OIDC-issuer extension. Overridable via [`ENV_ISSUER`] for forks/testing.
 const DEFAULT_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
-/// Expected SAN identity (regex) baked into the binary: this repository's
-/// release workflow, signing a `v*` tag. The leaf certificate's SAN URI must
-/// match. Overridable via [`ENV_IDENTITY`] or the `--identity` CLI flag.
+/// Expected SAN identity (regex) for this repository's release workflow signing
+/// any `v*` tag. The live upgrade path pins the *exact* tag via
+/// [`pinned_identity_regex`]; this wildcard form is retained as a test fixture
+/// for the issuer/identity-matching tests.
+#[cfg(test)]
 const DEFAULT_IDENTITY_REGEX: &str =
     r"^https://github\.com/electricapp/pgbattery/\.github/workflows/release\.yml@refs/tags/v.*$";
+
+/// Build the SAN identity regex pinned to the exact release tag `v{version}`.
+///
+/// Binding the accepted signer identity to the specific version being
+/// installed closes the signed-downgrade / version-substitution hole: without
+/// it, ANY genuinely-signed release from this repo's workflow (e.g. an older,
+/// vulnerable one served by a compromised mirror at the requested URL) would
+/// satisfy the identity check. `regex::escape` neutralises the `.` in the
+/// version so it cannot act as a wildcard.
+fn pinned_identity_regex(version: &str) -> String {
+    format!(
+        r"^https://github\.com/electricapp/pgbattery/\.github/workflows/release\.yml@refs/tags/v{}$",
+        regex::escape(version)
+    )
+}
 
 /// Override for the expected OIDC issuer (exact match).
 const ENV_ISSUER: &str = "PGBATTERY_RELEASE_OIDC_ISSUER";
@@ -81,7 +104,7 @@ const SUBJECT_ALT_NAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5
 
 /// Code-signing extended-key-usage OID (`1.3.6.1.5.5.7.3.3`), required of Fulcio
 /// leaves. `ObjectIdentifier::as_bytes` is not `const`, so the DER value is
-/// materialised at use-site in [`verify_fulcio_chain`].
+/// materialised at use-site in [`verify_fulcio_chain_at`].
 const EKU_CODE_SIGNING_OID: ObjectIdentifier = const_oid::db::rfc5912::ID_KP_CODE_SIGNING;
 
 /// Verifies release artifacts against a Sigstore cosign keyless trust policy.
@@ -97,13 +120,19 @@ pub(super) struct CosignVerifier {
 }
 
 impl CosignVerifier {
-    /// Build a verifier from the baked-in defaults, with optional overrides for
-    /// the SAN identity regex (CLI flag value, then [`ENV_IDENTITY`]) and the
-    /// OIDC issuer ([`ENV_ISSUER`]).
+    /// Build a verifier bound to a specific release version, with optional
+    /// overrides for the SAN identity regex (CLI flag value, then
+    /// [`ENV_IDENTITY`]) and the OIDC issuer ([`ENV_ISSUER`]).
+    ///
+    /// When no override is supplied the SAN identity regex is pinned to the
+    /// exact `v{target_version}` tag (see [`pinned_identity_regex`]) so a
+    /// compromised mirror cannot substitute a *different* genuinely-signed
+    /// release at the requested download URL — the cert's tag must match the
+    /// version being installed.
     ///
     /// # Errors
     /// Returns an error if the identity override is not a valid regex.
-    pub(super) fn from_env(identity_override: Option<&str>) -> Result<Self> {
+    pub(super) fn from_env(identity_override: Option<&str>, target_version: &str) -> Result<Self> {
         let issuer = std::env::var(ENV_ISSUER)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -116,7 +145,7 @@ impl CosignVerifier {
                     .ok()
                     .filter(|v| !v.trim().is_empty())
             })
-            .unwrap_or_else(|| DEFAULT_IDENTITY_REGEX.to_string());
+            .unwrap_or_else(|| pinned_identity_regex(target_version));
 
         Self::new(&issuer, &identity_pattern)
     }
@@ -135,21 +164,34 @@ impl CosignVerifier {
         })
     }
 
-    /// Fetch the Sigstore trust root (Fulcio CA certificates) via TUF.
+    /// Fetch the Sigstore trust material (Fulcio CA certificates **and** Rekor
+    /// transparency-log public keys) via TUF.
     ///
     /// This is the only step that needs the network. It is async and may fetch
-    /// + cache TUF metadata under the OS cache dir.
-    async fn fulcio_roots(&self) -> Result<Vec<pki_types::CertificateDer<'static>>> {
+    /// and cache TUF metadata under the OS cache dir. The Rekor keys are parsed
+    /// into [`CosignVerificationKey`]s exactly as sigstore-rs's own
+    /// `ClientBuilder::build` does (`try_from_der`, hex `key_id` to key), so the
+    /// SET-verification key lookup in [`SignedArtifactBundle::new_verified`]
+    /// matches the trust root.
+    async fn trust_material(&self) -> Result<TrustMaterial> {
         let trust_root = SigstoreTrustRoot::new(None)
             .await
-            .context("Failed to fetch the Sigstore trust root (Fulcio CA) via TUF")?;
+            .context("Failed to fetch the Sigstore trust root (Fulcio CA + Rekor key) via TUF")?;
+
         let certs = trust_root
             .fulcio_certs()
             .context("Sigstore trust root contained no Fulcio CA certificates")?;
-        Ok(certs
+        let fulcio_roots: Vec<pki_types::CertificateDer<'static>> = certs
             .into_iter()
             .map(pki_types::CertificateDer::into_owned)
-            .collect())
+            .collect();
+
+        let rekor_keys = build_rekor_keys(&trust_root)?;
+
+        Ok(TrustMaterial {
+            fulcio_roots,
+            rekor_keys,
+        })
     }
 
     /// Verify a downloaded blob against the cosign keyless trust policy.
@@ -167,8 +209,87 @@ impl CosignVerifier {
         signature_b64: &str,
         certificate_pem: &str,
     ) -> Result<()> {
-        let fulcio_roots = self.fulcio_roots().await?;
-        self.verify_blob_with_roots(blob, signature_b64, certificate_pem, &fulcio_roots)
+        let trust = self.trust_material().await?;
+        self.verify_blob_with_roots(blob, signature_b64, certificate_pem, &trust.fulcio_roots)
+    }
+
+    /// Verify a downloaded blob against the cosign keyless trust policy **using
+    /// a Sigstore bundle** (`cosign sign-blob --bundle`).
+    ///
+    /// Unlike [`Self::verify_blob`], this additionally verifies the **Rekor
+    /// transparency-log inclusion proof** carried in the bundle, and anchors the
+    /// Fulcio chain check at the Rekor integrated time rather than the
+    /// certificate's `notBefore`. `bundle_json` is the raw JSON written by
+    /// `cosign sign-blob --bundle <file>`.
+    ///
+    /// # Errors
+    /// Returns an error if any check fails: Rekor SET inclusion, signature over
+    /// the blob, Fulcio chain, OIDC issuer, or SAN identity.
+    pub(super) async fn verify_bundle(&self, blob: &[u8], bundle_json: &str) -> Result<()> {
+        let trust = self.trust_material().await?;
+        self.verify_bundle_with_trust(blob, bundle_json, &trust)
+    }
+
+    /// The synchronous, network-free core of [`Self::verify_bundle`], separated
+    /// so it can be unit-tested with fixture trust material.
+    fn verify_bundle_with_trust(
+        &self,
+        blob: &[u8],
+        bundle_json: &str,
+        trust: &TrustMaterial,
+    ) -> Result<()> {
+        // (1) Rekor transparency-log inclusion. `new_verified` parses the bundle
+        // and validates its Signed Entry Timestamp (SET) against the trust
+        // root's Rekor public key, proving the signing event was recorded in the
+        // public log. It does NOT check the blob signature, the Fulcio chain, or
+        // the signer identity — those are checks (2)–(4) below, which is what
+        // makes the bundle path trustworthy rather than merely "logged".
+        if trust.rekor_keys.is_empty() {
+            bail!(
+                "Sigstore trust root contained no Rekor public key; cannot verify \
+                 transparency-log inclusion. Re-run after refreshing the trust root, or use the \
+                 detached .sig/.pem path."
+            );
+        }
+        let bundle =
+            SignedArtifactBundle::new_verified(bundle_json, &trust.rekor_keys).map_err(|e| {
+                anyhow::anyhow!("Rekor transparency-log inclusion does not verify: {e}")
+            })?;
+
+        // (1b) Bind the verified Rekor entry to THIS artifact. `new_verified`
+        // only proved the SET over the payload; without this an attacker could
+        // staple any valid public Rekor SET onto a bundle and pass. This asserts
+        // the logged hash/signature/cert match the blob, the bundle signature,
+        // and the bundle cert — so `integrated_time` (the chain-check anchor
+        // below) and the inclusion claim actually describe this binary.
+        verify_rekor_body_binds_artifact(&bundle, blob)
+            .context("Rekor transparency-log entry does not bind to this artifact")?;
+
+        // The Rekor log entry's integrated time: the transparency log's own
+        // attestation of when the signature existed. We anchor the Fulcio chain
+        // check here (see check (3)).
+        let integrated_time = bundle.rekor_bundle.payload.integrated_time;
+
+        // The bundle carries the Fulcio leaf certificate (base64-of-PEM in the
+        // `cert` field) and the base64 signature over the blob.
+        let certificate_pem = normalize_cert_to_pem(&bundle.cert)?;
+
+        // (2) Signature over the blob, under the bundle certificate's public key.
+        CosignClient::verify_blob(&certificate_pem, &bundle.base64_signature, blob)
+            .map_err(|e| anyhow::anyhow!("signature does not verify over the binary: {e}"))?;
+
+        // Parse the leaf once for the chain + identity checks.
+        let leaf = parse_leaf_pem(&certificate_pem)?;
+
+        // (3) The leaf chains to a Fulcio root, checked at the Rekor integrated
+        // time. A leaf that does not chain to Fulcio is rejected here.
+        let verification_time = integrated_time_to_unix(integrated_time)?;
+        verify_fulcio_chain_at(&trust.fulcio_roots, &leaf, verification_time)?;
+
+        // (4) OIDC issuer + SAN identity, identical to the detached path.
+        self.check_issuer_and_identity(&leaf)?;
+
+        Ok(())
     }
 
     /// The synchronous, network-free core of [`Self::verify_blob`], separated so
@@ -192,11 +313,27 @@ impl CosignVerifier {
         // (2) The leaf chains to a Fulcio root, checked at the leaf's notBefore
         // (cosign's "trusted forever, signed within window" model). A leaf that
         // does not chain to Fulcio — e.g. a self-signed cert an attacker minted
-        // — is rejected here.
-        verify_fulcio_chain(fulcio_roots, &leaf)?;
+        // — is rejected here. The bundle path anchors at the Rekor integrated
+        // time instead; here we have no transparency-log timestamp.
+        let not_before = leaf.tbs_certificate.validity.not_before.to_unix_duration();
+        verify_fulcio_chain_at(
+            fulcio_roots,
+            &leaf,
+            pki_types::UnixTime::since_unix_epoch(not_before),
+        )?;
 
-        // (3) OIDC issuer must be exactly the expected one.
-        let issuer = extract_oidc_issuer(&leaf)?;
+        // (3) + (4) OIDC issuer + SAN identity.
+        self.check_issuer_and_identity(&leaf)?;
+
+        Ok(())
+    }
+
+    /// Enforce that the leaf's OIDC-issuer extension equals the expected issuer
+    /// and its SAN identity matches the expected release-workflow regex. Shared
+    /// by the detached-`.sig` and bundle paths.
+    fn check_issuer_and_identity(&self, leaf: &X509Certificate) -> Result<()> {
+        // OIDC issuer must be exactly the expected one.
+        let issuer = extract_oidc_issuer(leaf)?;
         if issuer != self.expected_issuer {
             bail!(
                 "certificate OIDC issuer {issuer:?} does not match expected {:?}",
@@ -204,19 +341,187 @@ impl CosignVerifier {
             );
         }
 
-        // (4) SAN identity must match the expected release-workflow regex. This
+        // SAN identity must match the expected release-workflow regex. This
         // pins the signer to THIS repo's release workflow + a vX.Y.Z tag, so a
         // valid Fulcio cert for any other identity is rejected.
-        let identity = extract_san_identity(&leaf)?;
+        let identity = extract_san_identity(leaf)?;
         if !self.identity_regex.is_match(&identity) {
             bail!(
                 "certificate identity {identity:?} does not match expected pattern {:?}",
                 self.identity_regex.as_str()
             );
         }
-
         Ok(())
     }
+}
+
+/// Sigstore trust material needed for verification: Fulcio CA roots (for the
+/// chain check) and Rekor transparency-log public keys keyed by hex `log_id`
+/// (for the bundle SET check).
+#[derive(Debug)]
+pub(super) struct TrustMaterial {
+    fulcio_roots: Vec<pki_types::CertificateDer<'static>>,
+    rekor_keys: BTreeMap<String, CosignVerificationKey>,
+}
+
+/// Build the Rekor public-key map (`hex log_id` -> verification key) from a
+/// trust root, mirroring sigstore-rs's own `ClientBuilder::build`: each raw key
+/// is parsed with [`CosignVerificationKey::try_from_der`]. Keys that fail to
+/// parse are skipped (rather than aborting) so a single malformed/legacy log key
+/// does not break verification, exactly as upstream does.
+fn build_rekor_keys<R: TrustRoot + ?Sized>(
+    trust_root: &R,
+) -> Result<BTreeMap<String, CosignVerificationKey>> {
+    let raw = trust_root
+        .rekor_keys()
+        .context("Sigstore trust root did not expose any Rekor public keys")?;
+    let keys: BTreeMap<String, CosignVerificationKey> = raw
+        .into_iter()
+        .filter_map(|(key_id, data)| {
+            CosignVerificationKey::try_from_der(data)
+                .ok()
+                .map(|key| (key_id, key))
+        })
+        .collect();
+    Ok(keys)
+}
+
+/// Normalise a bundle/`.pem` certificate field to a PEM string. The bundle's
+/// `cert` field is base64-of-PEM; a `.pem` file is already PEM. Mirrors
+/// [`parse_leaf_pem`]'s tolerance but returns the PEM text (needed by
+/// `Client::verify_blob`, which re-parses PEM internally).
+fn normalize_cert_to_pem(cert: &str) -> Result<String> {
+    let trimmed = cert.trim();
+    if trimmed.starts_with("-----BEGIN") {
+        return Ok(trimmed.to_string());
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(trimmed.as_bytes())
+        .context("bundle certificate is neither PEM nor base64-encoded PEM")?;
+    String::from_utf8(decoded).context("base64-decoded bundle certificate is not valid UTF-8 PEM")
+}
+
+/// The subset of a Rekor `hashedrekord` v0.0.1 entry body we bind to the
+/// artifact. The body is the base64 JSON inside `rekor_bundle.payload.body`.
+#[derive(serde::Deserialize)]
+struct RekorHashedRekordBody {
+    spec: RekorSpec,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorSpec {
+    data: RekorData,
+    signature: RekorSignature,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorData {
+    hash: RekorHash,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorHash {
+    algorithm: String,
+    value: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorSignature {
+    content: String,
+    #[serde(rename = "publicKey")]
+    public_key: RekorPublicKey,
+}
+
+#[derive(serde::Deserialize)]
+struct RekorPublicKey {
+    content: String,
+}
+
+/// Lowercase hex SHA-256 of `data`.
+fn hex_sha256(data: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(data);
+    digest.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Bind the verified Rekor entry to THIS artifact.
+///
+/// [`SignedArtifactBundle::new_verified`] only proves the Signed Entry
+/// Timestamp over `rekor_bundle.payload` (which includes the base64 `body`) —
+/// it never decodes `body` to check it describes the artifact in hand, and the
+/// outer `cert` / `base64_signature` are not covered by the SET at all. So on
+/// its own the SET proves "*some* entry was logged," not "*this binary* was
+/// logged," and `integrated_time` (used as the Fulcio-chain verification time)
+/// would be attacker-chosen. This decodes the logged `hashedrekord` and
+/// requires it to match the blob's digest, the bundle signature, and the
+/// bundle certificate — turning the transparency-log check into a real
+/// artifact→log binding.
+///
+/// # Errors
+/// Returns an error if the body cannot be decoded or any of the three bindings
+/// (hash, signature, certificate) does not match.
+fn verify_rekor_body_binds_artifact(bundle: &SignedArtifactBundle, blob: &[u8]) -> Result<()> {
+    let body_bytes = base64::engine::general_purpose::STANDARD
+        .decode(bundle.rekor_bundle.payload.body.trim().as_bytes())
+        .context("Rekor payload body is not valid base64")?;
+    let body: RekorHashedRekordBody = serde_json::from_slice(&body_bytes)
+        .context("Rekor payload body is not a hashedrekord JSON entry")?;
+
+    // (a) The logged artifact digest is the digest of the blob we will install.
+    if !body.spec.data.hash.algorithm.eq_ignore_ascii_case("sha256") {
+        bail!(
+            "Rekor entry uses an unexpected hash algorithm {:?} (expected sha256)",
+            body.spec.data.hash.algorithm
+        );
+    }
+    let logged_hash = body.spec.data.hash.value.trim().to_ascii_lowercase();
+    if logged_hash != hex_sha256(blob) {
+        bail!(
+            "Rekor transparency-log entry hash does not match the downloaded artifact: the logged \
+             signature was for a different file"
+        );
+    }
+
+    // (b) The logged signature is the bundle signature we verified over the blob.
+    if body.spec.signature.content.trim() != bundle.base64_signature.trim() {
+        bail!("Rekor transparency-log entry signature does not match the bundle signature");
+    }
+
+    // (c) The logged signing key is the bundle's Fulcio certificate. Compare DER
+    // so PEM whitespace/wrapping differences don't matter.
+    let logged_pem = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(body.spec.signature.public_key.content.trim().as_bytes())
+            .context("Rekor entry publicKey is not valid base64")?,
+    )
+    .context("Rekor entry publicKey is not valid UTF-8 PEM")?;
+    let logged_der = parse_leaf_pem(&logged_pem)
+        .context("Rekor entry publicKey is not a parseable certificate")?
+        .to_der()
+        .context("failed to re-encode Rekor entry certificate")?;
+    let bundle_der = parse_leaf_pem(&normalize_cert_to_pem(&bundle.cert)?)
+        .context("bundle certificate is not parseable")?
+        .to_der()
+        .context("failed to re-encode bundle certificate")?;
+    if logged_der != bundle_der {
+        bail!("Rekor transparency-log entry certificate does not match the bundle certificate");
+    }
+
+    Ok(())
+}
+
+/// Convert a Rekor integrated time (Unix seconds, as an `i64`) into a
+/// [`pki_types::UnixTime`]. Rejects negative times defensively.
+fn integrated_time_to_unix(integrated_time: i64) -> Result<pki_types::UnixTime> {
+    let secs = u64::try_from(integrated_time)
+        .with_context(|| format!("Rekor integrated time {integrated_time} is negative"))?;
+    Ok(pki_types::UnixTime::since_unix_epoch(
+        std::time::Duration::from_secs(secs),
+    ))
 }
 
 /// Parse a PEM-encoded leaf certificate. `cosign` sometimes emits a
@@ -236,17 +541,18 @@ fn parse_leaf_pem(certificate_pem: &str) -> Result<X509Certificate> {
         .context("failed to parse base64-decoded leaf certificate PEM")
 }
 
-/// Verify the leaf chains to one of the Fulcio roots, anchored at the leaf's
-/// own `notBefore` instant and requiring the code-signing EKU.
-fn verify_fulcio_chain(
+/// Verify the leaf chains to one of the Fulcio roots at an explicit
+/// `verification_time`, requiring the code-signing EKU.
+///
+/// The detached-`.sig` path passes the leaf's own `notBefore` (Fulcio leaves
+/// live ~10 minutes, so "now" would reject every release shortly after it is
+/// cut); the bundle path passes the Rekor integrated time, the transparency
+/// log's attestation of when the signature existed.
+fn verify_fulcio_chain_at(
     fulcio_roots: &[pki_types::CertificateDer<'static>],
     leaf: &X509Certificate,
+    verification_time: pki_types::UnixTime,
 ) -> Result<()> {
-    // Anchor verification time at the leaf's notBefore. Fulcio leaves live ~10
-    // minutes, so "now" would reject every release shortly after it is cut.
-    let not_before = leaf.tbs_certificate.validity.not_before.to_unix_duration();
-    let verification_time = pki_types::UnixTime::since_unix_epoch(not_before);
-
     let trust_anchors: Vec<pki_types::TrustAnchor<'_>> = fulcio_roots
         .iter()
         .map(|der| {
@@ -386,7 +692,8 @@ mod tests {
 
     #[test]
     fn cli_identity_override_takes_precedence() {
-        let v = CosignVerifier::from_env(Some(r"^https://github\.com/me/fork/.*$")).unwrap();
+        let v =
+            CosignVerifier::from_env(Some(r"^https://github\.com/me/fork/.*$"), "1.2.3").unwrap();
         assert!(
             v.identity_regex
                 .is_match("https://github.com/me/fork/.github/workflows/release.yml@refs/tags/v1")
@@ -394,6 +701,27 @@ mod tests {
         assert!(!v.identity_regex.is_match(
             "https://github.com/electricapp/pgbattery/.github/workflows/release.yml@refs/tags/v1"
         ));
+    }
+
+    #[test]
+    fn default_identity_is_pinned_to_the_target_tag() {
+        // With no override, the verifier accepts ONLY the exact requested tag,
+        // not any v* release — this is the version-substitution defense.
+        let v = CosignVerifier::from_env(None, "0.2.0").unwrap();
+        let base = "https://github.com/electricapp/pgbattery/.github/workflows/release.yml";
+        assert!(
+            v.identity_regex.is_match(&format!("{base}@refs/tags/v0.2.0")),
+            "the requested version's tag must match"
+        );
+        // A different (e.g. older, vulnerable) genuinely-signed release must NOT
+        // satisfy the identity check when 0.2.0 was requested.
+        assert!(
+            !v.identity_regex.is_match(&format!("{base}@refs/tags/v0.1.0")),
+            "a different signed tag must be rejected (signed-downgrade defense)"
+        );
+        assert!(!v.identity_regex.is_match(&format!("{base}@refs/tags/v0.2.00")));
+        // The version's dots are escaped, so they cannot act as wildcards.
+        assert!(!v.identity_regex.is_match(&format!("{base}@refs/tags/v0X2X0")));
     }
 
     // ── Fixture-backed end-to-end parse/identity tests ──
@@ -537,5 +865,209 @@ mod tests {
             .verify_blob_with_roots(&blob, sig.trim(), &cert, &[])
             .expect_err("no trusted root must fail the chain check");
         assert!(format!("{err:#}").contains("chain"), "got: {err:#}");
+    }
+
+    // ── Bundle / Rekor transparency-log verification ──
+
+    #[test]
+    fn normalize_cert_accepts_plain_pem_and_base64_pem() {
+        let pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+        assert_eq!(normalize_cert_to_pem(pem).unwrap(), pem);
+        // Base64-of-PEM (what a cosign bundle's `cert` field carries) decodes
+        // back to the same PEM text.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pem.as_bytes());
+        assert_eq!(normalize_cert_to_pem(&b64).unwrap(), pem);
+        // Garbage that is neither PEM nor base64 is rejected.
+        assert!(normalize_cert_to_pem("@@not base64@@").is_err());
+    }
+
+    #[test]
+    fn integrated_time_rejects_negative_and_accepts_real_time() {
+        assert!(integrated_time_to_unix(-1).is_err());
+        // A real Rekor integrated time (2022-11-25) converts cleanly.
+        assert!(integrated_time_to_unix(1_669_361_833).is_ok());
+    }
+
+    /// Build the Rekor key map from the real Rekor public-key fixture
+    /// (`rekor_pub.pem` + `rekor_key_id.txt`). This is the *actual* Sigstore
+    /// Rekor key used to sign the bundle fixture's SET, captured from upstream
+    /// sigstore-rs test vectors so the SET check runs offline + deterministically.
+    fn fixture_rekor_keys() -> Option<BTreeMap<String, CosignVerificationKey>> {
+        let pem = fixture("rekor_pub.pem")?;
+        let key_id = fixture("rekor_key_id.txt")?.trim().to_string();
+        // try_from_pem mirrors how the trust root's DER key is parsed; from_pem
+        // here matches the PEM fixture form.
+        let key = CosignVerificationKey::from_pem(
+            pem.as_bytes(),
+            &sigstore::crypto::SigningScheme::default(),
+        )
+        .expect("rekor_pub.pem parses");
+        Some(BTreeMap::from([(key_id, key)]))
+    }
+
+    /// The Rekor inclusion check is REAL, not a no-op: a bundle whose SET
+    /// verifies against the real Rekor key passes [`SignedArtifactBundle::new_verified`],
+    /// and the same bundle FAILS when the Rekor key is wrong/absent. This is the
+    /// load-bearing evidence that transparency-log inclusion is actually verified.
+    ///
+    /// `rekor_valid.bundle` is a real public cosign bundle (from upstream
+    /// sigstore-rs test vectors, log index 7810348) whose SET is signed by the
+    /// production Rekor key in `rekor_pub.pem`. We assert the SET verifies (not
+    /// the full release path: its cert is a different identity that does not
+    /// chain to our fixture Fulcio root and signs a blob we do not ship).
+    #[test]
+    fn rekor_set_inclusion_is_actually_verified() {
+        let (Some(bundle_json), Some(good_keys)) =
+            (fixture("rekor_valid.bundle"), fixture_rekor_keys())
+        else {
+            eprintln!("skipping: rekor_valid.bundle / rekor_pub.pem not present");
+            return;
+        };
+
+        // Valid SET against the real Rekor key: new_verified succeeds and the
+        // parsed bundle reports the expected log index.
+        let bundle = SignedArtifactBundle::new_verified(bundle_json.trim(), &good_keys)
+            .expect("valid Rekor SET must verify against the real Rekor key");
+        assert_eq!(bundle.rekor_bundle.payload.log_index, 7_810_348);
+        assert_eq!(bundle.rekor_bundle.payload.integrated_time, 1_669_361_833);
+
+        // Empty key map: the Rekor key for this log id is unknown, so the SET
+        // cannot be checked and verification is refused. (`expect_err` itself
+        // proves rejection; any error variant is a rejection.)
+        SignedArtifactBundle::new_verified(bundle_json.trim(), &BTreeMap::new())
+            .expect_err("an unknown Rekor key must fail SET verification");
+
+        // Wrong key under the right key id: the SET signature does not verify.
+        let wrong_pem = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENptdY/l3nB0yqkXLBWkZWQwo6+cu\nOSWS1X9vPavpiQOoTTGC0xX57OojUadxF1cdQmrsiReWg2Wn4FneJfa8xw==\n-----END PUBLIC KEY-----";
+        let wrong_key = CosignVerificationKey::from_pem(
+            wrong_pem.as_bytes(),
+            &sigstore::crypto::SigningScheme::default(),
+        )
+        .expect("wrong key parses");
+        let key_id = fixture("rekor_key_id.txt").unwrap().trim().to_string();
+        let wrong_keys = BTreeMap::from([(key_id, wrong_key)]);
+        assert!(
+            SignedArtifactBundle::new_verified(bundle_json.trim(), &wrong_keys).is_err(),
+            "a different key under the right key id must fail SET verification"
+        );
+    }
+
+    /// `verify_bundle_with_trust` refuses outright when no Rekor key is present
+    /// in the trust material (otherwise the SET could not be checked at all).
+    #[test]
+    fn verify_bundle_refuses_without_rekor_key() {
+        let Some(bundle_json) = fixture("rekor_valid.bundle") else {
+            return;
+        };
+        let v = CosignVerifier::new(
+            "https://token.actions.githubusercontent.com",
+            DEFAULT_IDENTITY_REGEX,
+        )
+        .unwrap();
+        let trust = TrustMaterial {
+            fulcio_roots: vec![],
+            rekor_keys: BTreeMap::new(),
+        };
+        let err = v
+            .verify_bundle_with_trust(b"blob", bundle_json.trim(), &trust)
+            .expect_err("no Rekor key must refuse bundle verification");
+        assert!(format!("{err:#}").contains("Rekor"), "got: {err:#}");
+    }
+
+    /// Full offline bundle path against a *self-consistent* release-shaped
+    /// fixture: `release.bundle` (a bundle whose cert is our fixture leaf and
+    /// whose SET verifies against `rekor_pub.pem`), `blob.bin` it signs, our
+    /// fixture Fulcio root, and the real Rekor key. Skips if absent — a real
+    /// Rekor SET is signed by Rekor's private key and cannot be synthesised
+    /// offline, so this fixture must be captured from a genuine signing run.
+    /// See `tests/fixtures/cosign/README` for how to (re)generate it.
+    #[test]
+    fn verifies_full_release_bundle_when_fixture_present() {
+        let (Some(blob), Some(bundle_json), Some(roots), Some(rekor_keys)) = (
+            fixture_bytes("blob.bin"),
+            fixture("release.bundle"),
+            fixture_roots(),
+            fixture_rekor_keys(),
+        ) else {
+            eprintln!("skipping: release.bundle e2e fixture not present (see fixtures README)");
+            return;
+        };
+        let v = CosignVerifier::new(
+            "https://token.actions.githubusercontent.com",
+            DEFAULT_IDENTITY_REGEX,
+        )
+        .unwrap();
+        let trust = TrustMaterial {
+            fulcio_roots: roots,
+            rekor_keys,
+        };
+        v.verify_bundle_with_trust(&blob, bundle_json.trim(), &trust)
+            .expect("a self-consistent release bundle must verify end-to-end");
+    }
+
+    /// The Rekor entry must bind to the specific artifact — not merely be a
+    /// valid log entry. Regression for the "staple any valid SET" gap: before
+    /// this binding a bundle carrying a real, unrelated Rekor entry would pass.
+    #[test]
+    fn rekor_body_binds_to_the_specific_artifact() {
+        use base64::engine::general_purpose::STANDARD;
+        use sigstore::cosign::bundle::{Bundle, Payload};
+
+        let Some(leaf_pem) = fixture("leaf.pem") else {
+            eprintln!("skipping: tests/fixtures/cosign/leaf.pem not present");
+            return;
+        };
+
+        let blob: &[u8] = b"the exact bytes this entry attests to";
+        let sig = "c2lnbmF0dXJlLWJhc2U2NA=="; // arbitrary; binding only compares strings
+        let cert_b64 = STANDARD.encode(leaf_pem.as_bytes());
+
+        let body_b64 = |hash: String, sig: &str, key_b64: &str| {
+            let body = serde_json::json!({
+                "apiVersion": "0.0.1",
+                "kind": "hashedrekord",
+                "spec": {
+                    "data": { "hash": { "algorithm": "sha256", "value": hash } },
+                    "signature": { "content": sig, "publicKey": { "content": key_b64 } }
+                }
+            });
+            STANDARD.encode(serde_json::to_vec(&body).unwrap())
+        };
+
+        let make = |body: String, cert: String, sig: String| SignedArtifactBundle {
+            base64_signature: sig,
+            cert,
+            rekor_bundle: Bundle {
+                signed_entry_timestamp: String::new(),
+                payload: Payload {
+                    body,
+                    integrated_time: 1_669_361_833,
+                    log_index: 1,
+                    log_id: String::new(),
+                },
+            },
+        };
+
+        // Self-consistent entry for `blob` binds successfully.
+        let good = make(
+            body_b64(hex_sha256(blob), sig, &cert_b64),
+            cert_b64.clone(),
+            sig.to_string(),
+        );
+        verify_rekor_body_binds_artifact(&good, blob).expect("matching artifact must bind");
+
+        // A DIFFERENT artifact (the core attack: a valid entry for another file)
+        // is rejected on the hash binding.
+        let err = verify_rekor_body_binds_artifact(&good, b"a different binary").unwrap_err();
+        assert!(format!("{err:#}").contains("hash"), "got: {err:#}");
+
+        // A logged signature that differs from the bundle signature is rejected.
+        let bad_sig = make(
+            body_b64(hex_sha256(blob), "b3RoZXItc2ln", &cert_b64),
+            cert_b64.clone(),
+            sig.to_string(),
+        );
+        let err = verify_rekor_body_binds_artifact(&bad_sig, blob).unwrap_err();
+        assert!(format!("{err:#}").contains("signature"), "got: {err:#}");
     }
 }

@@ -138,6 +138,7 @@ async fn main() -> Result<()> {
             allow_insecure_http,
             identity,
             insecure_no_verify,
+            allow_downgrade,
         }) => {
             run_upgrade(
                 check,
@@ -147,6 +148,7 @@ async fn main() -> Result<()> {
                 allow_insecure_http,
                 identity,
                 insecure_no_verify,
+                allow_downgrade,
             )
             .await
         }

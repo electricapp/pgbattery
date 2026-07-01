@@ -2,10 +2,12 @@ name: Release
 
 # On a `vX.Y.Z` tag, build the binary matrix, sign each artifact with Sigstore
 # **cosign keyless** (GitHub Actions OIDC → Fulcio short-lived cert; no signing
-# secret to manage), and upload binary + .sha256 + .sig + .pem to the GitHub
-# release. `pgbattery upgrade` verifies the .sig/.pem against the expected OIDC
-# issuer + release-workflow identity (see src/commands/upgrade/cosign.rs and
-# docs/RELEASING.md).
+# secret to manage), and upload binary + .sha256 + .bundle + .sig + .pem to the
+# GitHub release. The `.bundle` carries the signature, Fulcio cert, AND the
+# Rekor transparency-log inclusion proof; `pgbattery upgrade` verifies it against
+# the expected OIDC issuer + release-workflow identity, confirming Rekor
+# inclusion (the .sig/.pem remain as a no-Rekor fallback). See
+# src/commands/upgrade/cosign.rs and docs/RELEASING.md.
 
 on:
   push:
@@ -116,23 +118,40 @@ jobs:
       # which issues a short-lived signing certificate. No signing secret. We
       # immediately verify the result against this repo's workflow identity so a
       # broken signature fails the release here rather than at upgrade time.
+      #
+      # We emit BOTH a Sigstore bundle (`--bundle`, the primary artifact: it
+      # carries the signature, Fulcio cert, AND the Rekor transparency-log
+      # inclusion proof / SET) and the detached `--output-signature`/
+      # `--output-certificate` pair (no-Rekor fallback for older clients).
       - name: Sign + verify artifact (cosign keyless)
         run: |
           set -euo pipefail
           ASSET="pgbattery-${{ matrix.os_name }}-${{ matrix.arch }}"
           # SHA-256 (integrity); kept alongside the cosign material.
           shasum -a 256 "dist/$ASSET" | awk '{print $1}' > "dist/$ASSET.sha256"
+          # Sigstore bundle (signature + cert + Rekor SET) AND detached sig/cert.
           cosign sign-blob --yes \
+            --bundle "dist/$ASSET.bundle" \
             --output-signature "dist/$ASSET.sig" \
             --output-certificate "dist/$ASSET.pem" \
             "dist/$ASSET"
+          # Verify the detached pair against this repo's issuer + workflow
+          # identity. --bundle additionally proves Rekor inclusion at upgrade
+          # time (client-side, see src/commands/upgrade/cosign.rs).
           cosign verify-blob \
             --signature "dist/$ASSET.sig" \
             --certificate "dist/$ASSET.pem" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v.*$" \
             "dist/$ASSET"
-          echo "Signed + verified: $ASSET"
+          # Verify the bundle too (Rekor SET + signature + cert) so a broken
+          # transparency-log proof fails the release here, not at upgrade time.
+          cosign verify-blob \
+            --bundle "dist/$ASSET.bundle" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v.*$" \
+            "dist/$ASSET"
+          echo "Signed + verified (bundle + detached): $ASSET"
         env:
           COSIGN_EXPERIMENTAL: "1"
 
@@ -144,5 +163,6 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             "dist/$ASSET" \
             "dist/$ASSET.sha256" \
+            "dist/$ASSET.bundle" \
             "dist/$ASSET.sig" \
             "dist/$ASSET.pem" --clobber

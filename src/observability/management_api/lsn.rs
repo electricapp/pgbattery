@@ -18,6 +18,17 @@ use tracing::error;
 
 use crate::config::constants::SYNC_LAG_THRESHOLD_BYTES;
 
+/// Process-global concurrency cap for the unauthenticated `txid-status`
+/// endpoint. It takes the supervisor lock, which the lease-enforcement loop
+/// also needs, so bound how many probes may contend for it at once; excess
+/// requests fail fast (503) rather than queueing on the lock and starving the
+/// lease loop. Sized for the legitimate caller (the gateway's per-connection
+/// failover commit probe) with headroom, but far below what a flood needs.
+fn txid_status_limiter() -> &'static tokio::sync::Semaphore {
+    static LIMITER: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| tokio::sync::Semaphore::new(4))
+}
+
 use super::ManagementApiState;
 
 /// Response for replication lag query
@@ -299,6 +310,20 @@ pub(super) async fn get_txid_status(
     }
 
     let Some(pg_manager) = &state.postgres_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(TxidStatusResponse { txid, status: None }),
+        );
+    };
+
+    // This endpoint is unauthenticated (the gateway probes it tokenless during
+    // failover) yet it takes the supervisor lock and runs SQL — the same lock
+    // the 100 ms lease-enforcement loop contends for. Bound how many probes may
+    // be in flight so a flood cannot serialize on the lock and starve the
+    // safety-critical lease loop; excess requests fail fast with 503 instead of
+    // queueing on the lock. The permit is held only for the lock + query below.
+    let Ok(_permit) = txid_status_limiter().try_acquire() else {
+        metrics::counter!("pgbattery_txid_status_throttled").increment(1);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(TxidStatusResponse { txid, status: None }),
