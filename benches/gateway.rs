@@ -250,11 +250,11 @@ fn bench_contains_token_ci(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// query_keyword_flags — single-pass scan replacing 4 × contains_token_ci.
-//
-// In the hot path each Query message runs:
-//   might_contain_commit_command (2 scans) + might_contain_subscription_command (2 scans)
-// The single-pass version should be ~4× faster than the combined prefilter above.
+// query_keyword_flags — the single full-text scan the per-message hot path
+// runs: one pass sets the commit (commit/end), subscription
+// (listen/unlisten), and session-function-state (set_config /
+// pg_advisory_lock*) flags that would otherwise each cost their own
+// contains_token_ci walk.
 // ---------------------------------------------------------------------------
 
 fn bench_query_keyword_flags(c: &mut Criterion) {

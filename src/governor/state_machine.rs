@@ -645,8 +645,9 @@ mod tests {
 
     /// L3 fail-closed must still fire when SOME peer has fresh data but
     /// the candidate's data is stale. This is the partitioned-stale
-    /// candidate threat. Mixing this test with the bootstrap-fallback
-    /// test above proves the fix didn't downgrade the L3 contract.
+    /// candidate threat. Paired with the bootstrap-fallback test above,
+    /// this proves the bootstrap allowance does not downgrade the L3
+    /// contract.
     /// Under sync mode, a candidate that's 9 KiB behind the cluster max
     /// must be rejected (only one WAL block of tolerance). Under async
     /// mode the same candidate is accepted (16 MB tolerance). The

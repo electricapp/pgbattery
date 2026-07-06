@@ -298,7 +298,7 @@ pub async fn start_management_api(
     // DELIBERATELY exempt from the shared request timeout. A full restore holds
     // the supervisor lock across stop() -> restore -> start() (backup.rs); if
     // the TimeoutLayer cancelled that future between stop and start, dropping it
-    // would release the lock while PostgreSQL is stopped, and the 500 ms health
+    // would release the lock while PostgreSQL is stopped, and the 1 s health
     // tick would then observe is_alive()==false and trigger a self-shutdown
     // mid-restore (half-restored PGDATA, possible re-bootstrap). A multi-GB
     // restore legitimately exceeds 30 s. These handlers bound their own work,
@@ -501,12 +501,13 @@ mod tests {
 
         // Fast group carries a short timeout, applied before the merge — exactly
         // how `start_management_api` scopes the request timeout to `timed_routes`.
-        let timed = Router::<()>::new().route("/timed", get(slow)).layer(
-            TimeoutLayer::with_status_code(
-                StatusCode::REQUEST_TIMEOUT,
-                StdDuration::from_millis(50),
-            ),
-        );
+        let timed =
+            Router::<()>::new()
+                .route("/timed", get(slow))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    StdDuration::from_millis(50),
+                ));
         // Exempt group (the backup routes) merged in afterwards.
         let exempt = Router::<()>::new().route("/exempt", get(slow));
         let app = timed.merge(exempt);

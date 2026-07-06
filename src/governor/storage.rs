@@ -322,22 +322,11 @@ impl RedbLogStorage {
                 .open_table(LOGS_TABLE)
                 .map_err(|e| Error::Storage(format!("Failed to open table: {e}")))?;
 
-            // Collect keys to delete
-            let mut to_delete: Vec<u64> = Vec::new();
-            let iter = table
-                .range(from_index..)
-                .map_err(|e| Error::Storage(format!("Failed to range: {e}")))?;
-            for item in iter {
-                let (k, _) =
-                    item.map_err(|e| Error::Storage(format!("Failed to read key: {e}")))?;
-                to_delete.push(k.value());
-            }
-
-            for key in to_delete {
-                table
-                    .remove(key)
-                    .map_err(|e| Error::Storage(format!("Failed to remove: {e}")))?;
-            }
+            // Single-pass range deletion: `retain_in` removes every entry the
+            // predicate rejects, with no collect-keys-then-point-remove pass.
+            table
+                .retain_in(from_index.., |_, _| false)
+                .map_err(|e| Error::Storage(format!("Failed to delete range: {e}")))?;
         }
 
         write_txn
@@ -372,25 +361,15 @@ impl RedbLogStorage {
                 .open_table(LOGS_TABLE)
                 .map_err(|e| Error::Storage(format!("Failed to open table: {e}")))?;
 
-            // Collect keys first (can't delete during iteration in redb).
-            // Use a bounded Vec since we know the range.
-            let keys: Vec<u64> = {
-                let iter = table
-                    .range(..=purge.index)
-                    .map_err(|e| Error::Storage(format!("Failed to range: {e}")))?;
-                iter.map(|item| {
-                    item.map(|(k, _)| k.value())
-                        .map_err(|e| Error::Storage(format!("Failed to read key: {e}")))
+            // Single-pass range deletion; the rejecting predicate doubles as
+            // the counter (no collect-keys-then-point-remove pass).
+            let mut count = 0_usize;
+            table
+                .retain_in(..=purge.index, |_, _| {
+                    count += 1;
+                    false
                 })
-                .collect::<Result<Vec<_>>>()?
-            };
-
-            let count = keys.len();
-            for key in keys {
-                table
-                    .remove(key)
-                    .map_err(|e| Error::Storage(format!("Failed to remove: {e}")))?;
-            }
+                .map_err(|e| Error::Storage(format!("Failed to delete range: {e}")))?;
             count
         };
 

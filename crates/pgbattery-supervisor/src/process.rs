@@ -67,11 +67,24 @@ fn classify_marker_line(line: &str, expected_seq: u64) -> MarkerLine {
     }
 }
 
+/// Cap on the retained tail of psql's stderr. Error text psql emits right
+/// before dying is short; only the most recent bytes matter for diagnostics.
+const STDERR_TAIL_CAP: usize = 8 * 1024;
+
 struct LocalSqlClient {
     child: Child,
     stdin: tokio::process::ChildStdin,
     stdout: BufReader<tokio::process::ChildStdout>,
-    stderr: tokio::process::ChildStderr,
+    /// Tail of psql's stderr, continuously pulled off the pipe by
+    /// `stderr_task` into this bounded ring. Continuous draining is
+    /// load-bearing: stderr is never read during normal operation, so
+    /// sustained NOTICE/WARNING traffic would otherwise fill the ~64 KiB
+    /// pipe buffer and block psql's writes — wedging every SQL round trip
+    /// into its timeout. Older output past `STDERR_TAIL_CAP` is discarded.
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    /// Drainer task reading stderr until EOF; joined (bounded) by
+    /// `drain_stderr`, aborted on `shutdown`.
+    stderr_task: tokio::task::JoinHandle<()>,
     /// Bytes of a stdout line that has not yet been fully received. Owned
     /// by the session (not a `run_query` future) so a cancelled read never
     /// loses a line prefix — see [`Self::next_line`].
@@ -173,21 +186,22 @@ impl LocalSqlClient {
         }
     }
 
-    /// Collect whatever psql wrote to stderr before exiting, formatted for
-    /// appending to an error message (empty when there is nothing to read).
+    /// Format whatever psql wrote to stderr for appending to an error
+    /// message (empty when there is nothing).
     ///
-    /// `ON_ERROR_STOP=1` makes psql exit after the first SQL error, so the
-    /// accumulated output is bounded; the budget only covers a pipe that is
-    /// closing but not yet closed.
+    /// The session is dying or dead when this is called, so stderr is at (or
+    /// heading for) EOF: give the drainer task a bounded window to pull
+    /// psql's final output off the pipe, then snapshot the retained tail.
     async fn drain_stderr(&mut self) -> String {
-        let mut buf = Vec::new();
-        tokio::time::timeout(
-            Duration::from_millis(500),
-            self.stderr.read_to_end(&mut buf),
-        )
-        .await
-        .ok();
-        let text = String::from_utf8_lossy(&buf);
+        drop(tokio::time::timeout(Duration::from_millis(500), &mut self.stderr_task).await);
+        let bytes: Vec<u8> = {
+            let tail = self
+                .stderr_tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tail.iter().copied().collect()
+        };
+        let text = String::from_utf8_lossy(&bytes);
         let trimmed = text.trim();
         if trimmed.is_empty() {
             String::new()
@@ -197,6 +211,7 @@ impl LocalSqlClient {
     }
 
     async fn shutdown(mut self) {
+        self.stderr_task.abort();
         self.child.start_kill().ok();
         self.child.wait().await.ok();
     }
@@ -539,6 +554,86 @@ fn rewind_failure_left_target_untouched(error: &Error) -> bool {
         return true;
     }
     pg_rewind_failure_is_pre_copy(&msg)
+}
+
+/// Durably install `bytes` at `path`, atomically. Returns `true` when the
+/// file was (re)written, `false` when the on-disk content already matched
+/// and nothing was touched.
+///
+/// Mirrors the `ensure_standby_signal` discipline for every
+/// pgbattery-managed file in PGDATA, with two properties a plain
+/// truncate-write-fsync cannot give:
+///
+/// * **Crash atomicity.** The bytes go to a `.pgbattery-tmp` sibling, which
+///   is fsynced and then `rename`d over `path` (atomic within one
+///   directory), followed by a directory fsync so the entry itself is
+///   durable. At every instant `path` names either the complete old content
+///   or the complete new content — never a truncated file. An empty
+///   `pg_hba.conf` after a mid-write crash would otherwise cut off the
+///   supervisor's own Unix-socket psql session (the regenerated hba carries
+///   only the managed `host` rules), wedging every SQL probe until an
+///   operator intervenes.
+/// * **Idempotent skip.** When the existing content already equals `bytes`,
+///   nothing is written and no fsync is paid — callers such as
+///   `configure_postgresql` regenerate identical config on every `start()`.
+///
+/// `parent` is the directory whose entry must be durable (PGDATA).
+async fn write_file_durably_in(
+    parent: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<bool> {
+    if let Ok(existing) = fs::read(path).await
+        && existing == bytes
+    {
+        return Ok(false);
+    }
+
+    // `<filename>.pgbattery-tmp` beside the target (rename is only atomic
+    // within one filesystem, and appending — rather than replacing — the
+    // extension keeps targets like `postgresql.conf` / `postgresql.auto.conf`
+    // from ever sharing a staging name.
+    let tmp_name = {
+        let mut name = path
+            .file_name()
+            .map_or_else(std::ffi::OsString::new, ToOwned::to_owned);
+        name.push(".pgbattery-tmp");
+        name
+    };
+    let tmp_path = path.with_file_name(tmp_name);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .await
+        .map_err(|e| Error::Postgres(format!("Failed to open {}: {e}", tmp_path.display())))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| Error::Postgres(format!("Failed to write {}: {e}", tmp_path.display())))?;
+    file.sync_all()
+        .await
+        .map_err(|e| Error::Postgres(format!("Failed to fsync {}: {e}", tmp_path.display())))?;
+    drop(file);
+
+    fs::rename(&tmp_path, path).await.map_err(|e| {
+        Error::Postgres(format!(
+            "Failed to move {} into place at {}: {e}",
+            tmp_path.display(),
+            path.display()
+        ))
+    })?;
+
+    let parent = parent.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let dir = std::fs::File::open(&parent)
+            .map_err(|e| Error::Postgres(format!("Failed to open pg_data_dir for fsync: {e}")))?;
+        dir.sync_all()
+            .map_err(|e| Error::Postgres(format!("Failed to fsync pg_data_dir: {e}")))
+    })
+    .await
+    .map_err(|e| Error::Postgres(format!("fsync task panicked: {e}")))??;
+    Ok(true)
 }
 
 fn parse_controldata_fields(output: &str) -> std::collections::HashMap<&str, &str> {
@@ -913,17 +1008,30 @@ effective_cache_size = '512MB'
         self.write_file_durably(&conf_path, conf_updated.as_bytes())
             .await?;
 
-        // Configure pg_hba.conf based on auth mode
+        // Configure pg_hba.conf based on auth mode. Config validation in the
+        // root crate refuses scram/md5/peer before a Supervisor exists; the
+        // arms here are the same refusal restated at this crate's boundary
+        // (the supervisor cannot assume its caller validated).
         let auth_method = match self.config.pg_auth_mode {
             PgAuthMode::Trust => {
                 tracing::warn!(
-                    "pg_auth_mode is 'trust' - this is INSECURE and should only be used for development. \
-                    Set pg_auth_mode to 'scram' or 'md5' for production deployments."
+                    "pg_auth_mode is 'trust': any client that can reach the PostgreSQL port has \
+                     unauthenticated superuser access — run the cluster on an isolated network"
                 );
                 "trust"
             }
-            PgAuthMode::Scram => "scram-sha-256",
-            PgAuthMode::Md5 => "md5",
+            // No component provisions credentials (primary_conninfo,
+            // pg_rewind, pg_basebackup, and the TCP probes all connect
+            // passwordless), so a credentialed hba would break replication
+            // and health checks rather than secure anything.
+            PgAuthMode::Scram | PgAuthMode::Md5 => {
+                return Err(Error::Postgres(
+                    "pg_auth_mode 'scram'/'md5' is not yet supported: credential provisioning \
+                     does not exist, so replication and internal probes would fail to \
+                     authenticate. Use 'trust' on an isolated network."
+                        .to_string(),
+                ));
+            }
             PgAuthMode::Peer => {
                 return Err(Error::Postgres(
                     "pg_auth_mode 'peer' is not supported for HA TCP replication".to_string(),
@@ -1208,10 +1316,12 @@ host all all ::/0 {auth_method}
     /// while PG can still answer.
     ///
     /// The rewind paths stop PG before [`Self::check_rewind_divergence_safe`]
-    /// runs, so the gate's input must be captured beforehand. Best-effort:
-    /// `None` downgrades the gate to warn-and-proceed. Deliberately not
-    /// `pg_controldata` — after a crash it understates the end-of-WAL
-    /// position, which would make the gate pass exactly when it must not.
+    /// runs, so the gate's input must be captured beforehand. `None` (probe
+    /// or parse failure) makes the gate fail CLOSED: it retries its own live
+    /// probe once and then refuses the rewind rather than run it blind.
+    /// Deliberately not `pg_controldata` — after a crash it understates the
+    /// end-of-WAL position, which would make the gate pass exactly when it
+    /// must not.
     ///
     /// Uses the received/durable position ([`Self::get_reportable_lsn`]), not
     /// the replayed position. A synchronous standby acknowledges a commit on
@@ -1227,7 +1337,7 @@ host all all ::/0 {auth_method}
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "Could not read local LSN for the pg_rewind divergence gate — proceeding (pg_rewind will surface its own errors)"
+                    "Could not read local LSN for the pg_rewind divergence gate — the gate will re-probe and otherwise refuse the rewind"
                 );
                 return None;
             }
@@ -1236,7 +1346,7 @@ host all all ::/0 {auth_method}
         if parsed.is_none() {
             tracing::warn!(
                 local_lsn = %lsn_str,
-                "Could not parse local LSN for the pg_rewind divergence gate — proceeding"
+                "Could not parse local LSN for the pg_rewind divergence gate — the gate will re-probe and otherwise refuse the rewind"
             );
         }
         parsed
@@ -1253,16 +1363,24 @@ host all all ::/0 {auth_method}
     /// `pre_stop_local_lsn` is the local LSN captured by the caller while
     /// PG was still up (the rewind paths stop PG before this check runs,
     /// so the SQL probe cannot answer here). When `None` — PG was already
-    /// stopped when the flow began — fall back to a live probe, and
-    /// proceed with a warning if that fails too.
+    /// stopped when the flow began — fall back to a live probe.
     ///
     /// Returns Ok if the rewind is safe to proceed (local <= source, or
     /// divergence ≤ `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`). Returns
-    /// `Error::RewindDataLossRisk` otherwise; the caller stays out of
-    /// the cluster pending operator inspection. On probe failure
-    /// (cannot read either side's LSN) returns Ok and lets the existing
-    /// `pg_rewind` retry/error path handle it — refusing here on probe
-    /// failure would deadlock joins under transient network blips.
+    /// `Error::RewindDataLossRisk` when divergence exceeds the threshold; the
+    /// caller stays out of the cluster pending operator inspection.
+    ///
+    /// Fails CLOSED on probe failure: if the local WAL position is unavailable,
+    /// or the source LSN cannot be read after `REWIND_GATE_LSN_RETRIES` bounded
+    /// retries, returns `Error::Postgres("failed to probe rewind source: …")`
+    /// rather than rewinding blind — without both LSNs we cannot prove the
+    /// rewind will not discard client-acked WAL. That message is classified
+    /// "target untouched" (the gate runs before `pg_rewind` modifies anything),
+    /// so recovery is a clean retry rather than a wedge: the in-recovery
+    /// reconcile loop re-runs the whole demote (re-capturing the pre-stop LSN
+    /// while PG is up), and a deposed primary restarts and rejoins. A transient
+    /// source blip is already absorbed by the bounded retries above, so failing
+    /// closed here does not deadlock joins.
     ///
     /// Pure comparison split into `rewind_divergence_decision` for unit
     /// testing without a live PG.
@@ -1296,9 +1414,9 @@ host all all ::/0 {auth_method}
             })?,
         };
 
-        // Source WAL position: retry a bounded number of times, then fail CLOSED.
-        // Previously a single read miss let the rewind proceed unchecked —
-        // exactly when we could not confirm it was safe.
+        // Source WAL position: retry a bounded number of times, then fail
+        // CLOSED. A read miss is precisely the state where the rewind's
+        // safety cannot be confirmed, so it must not proceed unchecked.
         let mut source_lsn = None;
         for attempt in 0..REWIND_GATE_LSN_RETRIES {
             if let Some(lsn) = self.get_remote_lsn(source_addr).await {
@@ -1791,8 +1909,9 @@ host all all ::/0 {auth_method}
                     // config-unchanged `Mismatch -> Rewind` path catches it, and
                     // the `pg_rewind` divergence gate is the final data-loss
                     // backstop regardless.
-                    let action =
-                        Self::standby_action_for_mismatch(self.local_ahead_of_leader(new_leader_addr).await);
+                    let action = Self::standby_action_for_mismatch(
+                        self.local_ahead_of_leader(new_leader_addr).await,
+                    );
                     if action == StandbyAction::Defer {
                         tracing::debug!(
                             new_leader = %new_leader_addr,
@@ -2275,42 +2394,11 @@ host all all ::/0 {auth_method}
         .map_err(|e| Error::Postgres(format!("fsync task panicked: {e}")))?
     }
 
-    /// Write `bytes` to `path` and fsync both the file and `pg_data_dir`.
-    ///
-    /// Mirrors the [`Self::ensure_standby_signal`] discipline for every
-    /// pgbattery-managed file in PGDATA: a `fs::write` returns before the
-    /// data is on disk and before the directory entry is durable. A crash
-    /// between write and the next PG start can leave the file truncated
-    /// or absent — for `postgresql.conf` / `pg_hba.conf` /
-    /// `postgresql.auto.conf` that means PG either refuses to start or
-    /// starts with the *previous* generation's settings (e.g. wrong
-    /// `primary_conninfo` on a former leader).
+    /// Durably install `bytes` at `path` (see [`write_file_durably_in`]).
     async fn write_file_durably(&self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
+        write_file_durably_in(&self.config.pg_data_dir, path, bytes)
             .await
-            .map_err(|e| Error::Postgres(format!("Failed to open {}: {e}", path.display())))?;
-        file.write_all(bytes)
-            .await
-            .map_err(|e| Error::Postgres(format!("Failed to write {}: {e}", path.display())))?;
-        file.sync_all()
-            .await
-            .map_err(|e| Error::Postgres(format!("Failed to fsync {}: {e}", path.display())))?;
-        drop(file);
-
-        let parent = self.config.pg_data_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let dir = std::fs::File::open(&parent).map_err(|e| {
-                Error::Postgres(format!("Failed to open pg_data_dir for fsync: {e}"))
-            })?;
-            dir.sync_all()
-                .map_err(|e| Error::Postgres(format!("Failed to fsync pg_data_dir: {e}")))
-        })
-        .await
-        .map_err(|e| Error::Postgres(format!("fsync task panicked: {e}")))?
+            .map(|_| ())
     }
 
     /// Run `pg_rewind` to synchronize a diverged former primary with the new primary.
@@ -2797,15 +2885,42 @@ host all all ::/0 {auth_method}
         let stdout = child.stdout.take().ok_or_else(|| {
             Error::Postgres("Failed to capture stdout for local psql session".to_string())
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
+        let mut stderr = child.stderr.take().ok_or_else(|| {
             Error::Postgres("Failed to capture stderr for local psql session".to_string())
         })?;
+
+        // Continuously drain stderr into a bounded ring (see the field doc on
+        // `LocalSqlClient::stderr_tail`). The task ends at pipe EOF, i.e.
+        // when psql exits.
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(1024),
+        ));
+        let tail = std::sync::Arc::clone(&stderr_tail);
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut ring = tail
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        ring.extend(buf.iter().take(n).copied());
+                        while ring.len() > STDERR_TAIL_CAP {
+                            ring.pop_front();
+                        }
+                        drop(ring);
+                    }
+                }
+            }
+        });
 
         Ok(LocalSqlClient {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            stderr,
+            stderr_tail,
+            stderr_task,
             line_buf: Vec::new(),
             next_seq: 0,
         })
@@ -3499,6 +3614,54 @@ mod tests {
     #[test]
     fn test_empty_identifier_rejected() {
         assert!(validate_pg_identifier("").is_err());
+    }
+
+    #[tokio::test]
+    async fn write_file_durably_atomic_and_idempotent() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pg_hba.conf");
+
+        // Fresh write installs the content and reports having written.
+        assert!(
+            write_file_durably_in(dir.path(), &path, b"generation 1\n")
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"generation 1\n");
+
+        // Identical content: nothing touched — same inode, same mtime, and
+        // the call reports the skip.
+        let before = std::fs::metadata(&path).unwrap();
+        assert!(
+            !write_file_durably_in(dir.path(), &path, b"generation 1\n")
+                .await
+                .unwrap()
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+        assert_eq!(before.mtime(), after.mtime());
+
+        // Changed content replaces the file whole (rename swaps the inode)
+        // and leaves no staging file behind.
+        assert!(
+            write_file_durably_in(dir.path(), &path, b"generation 2\n")
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"generation 2\n");
+        assert_ne!(before.ino(), std::fs::metadata(&path).unwrap().ino());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains("pgbattery-tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging file left behind: {leftovers:?}"
+        );
     }
 
     #[test]

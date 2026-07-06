@@ -56,9 +56,14 @@ pub struct ReportLsnResponse {
 }
 
 /// Response for transaction status probe.
+///
+/// The txid is unsigned: xid8 values are 64-bit unsigned, and the
+/// `Path<u64>` extractor rejecting negatives is part of the endpoint's input
+/// validation (a negative literal would error the `::xid8` cast
+/// server-side).
 #[derive(Debug, Serialize)]
 pub struct TxidStatusResponse {
-    pub txid: i64,
+    pub txid: u64,
     pub status: Option<String>,
 }
 
@@ -293,7 +298,7 @@ pub(super) async fn report_lsn(
 /// Used by gateway no-lost-commit verification after failover.
 pub(super) async fn get_txid_status(
     State(state): State<Arc<ManagementApiState>>,
-    Path(txid): Path<i64>,
+    Path(txid): Path<u64>,
 ) -> impl IntoResponse {
     // Budget the call. A hung postmaster on the leader must not pin the
     // supervisor lock for 30 s (the Supervisor's `SQL_TIMEOUT`), which would
@@ -330,16 +335,34 @@ pub(super) async fn get_txid_status(
         );
     };
 
-    // SAFETY: `txid: i64` is parsed by axum's `Path<i64>` extractor before we
-    // get here, so the `Display` impl can only emit `[-]?[0-9]+` — there is
-    // no path for caller-controlled characters to reach the SQL string. We
-    // still keep this as the *only* un-parameterised SQL in the API; do not
-    // add more without an explicit ticket.
-    let sql = format!("SELECT txid_status('{txid}'::xid8);");
+    // SAFETY: `txid: u64` is parsed by axum's `Path<u64>` extractor before we
+    // get here (negatives are rejected with 400 at extraction), so the
+    // `Display` impl can only emit `[0-9]+` — there is no path for
+    // caller-controlled characters to reach the SQL string. We still keep
+    // this as the *only* un-parameterised SQL in the API; do not add more
+    // without an explicit ticket.
+    //
+    // The xmax guard keeps this endpoint from erroring the supervisor's
+    // shared psql session: `txid_status()` raises for a txid in the future,
+    // and under `ON_ERROR_STOP=1` any SQL error kills the persistent session
+    // (forcing a reconnect and failing whatever supervisor query runs next).
+    // This endpoint is unauthenticated, so "probe a future txid" must be a
+    // clean empty answer, not a session-killing error. `pg_current_snapshot`
+    // reads the running snapshot without assigning a txid; CASE evaluates
+    // lazily, so `txid_status` is never called for a future value. An empty
+    // result serializes as `status: None` — the same "unknown" the gateway
+    // already handles for a too-old txid.
+    let sql = txid_status_sql(txid);
 
-    let pg = pg_manager.lock().await;
-    let query = tokio::time::timeout(TXID_STATUS_BUDGET, pg.execute_sql(&sql)).await;
-    drop(pg);
+    // One budget over lock acquisition AND the query: the supervisor lock can
+    // be held for minutes by a demote/promote, and a permit parked on it that
+    // long would exhaust the limiter exactly when the gateway needs failover
+    // probes. Same pattern as `leader_current_write_lsn`.
+    let query = tokio::time::timeout(TXID_STATUS_BUDGET, async {
+        let pg = pg_manager.lock().await;
+        pg.execute_sql(&sql).await
+    })
+    .await;
     match query {
         Ok(Ok(output)) => {
             let status = output
@@ -367,5 +390,45 @@ pub(super) async fn get_txid_status(
                 Json(TxidStatusResponse { txid, status: None }),
             )
         }
+    }
+}
+
+/// SQL for the txid-status probe. The xmax guard makes a future txid answer
+/// `''` (serialized as `status: None`) instead of letting `txid_status()`
+/// raise — which, under the persistent psql session's `ON_ERROR_STOP=1`,
+/// would kill the session this unauthenticated endpoint shares with every
+/// supervisor probe. `CASE` evaluates lazily, so `txid_status` never runs
+/// for a future value; `pg_current_snapshot()` reads the snapshot without
+/// assigning a txid.
+fn txid_status_sql(txid: u64) -> String {
+    format!(
+        "SELECT CASE WHEN '{txid}'::xid8 >= pg_snapshot_xmax(pg_current_snapshot()) \
+         THEN '' ELSE COALESCE(txid_status('{txid}'::xid8)::text, '') END;"
+    )
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test code asserts on known-good values and panics are the failure signal"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txid_status_sql_guards_future_xids_and_stays_digits_only() {
+        let sql = txid_status_sql(12_345);
+        // The guard must run BEFORE txid_status so a future xid cannot raise
+        // and kill the shared psql session.
+        let guard_pos = sql.find("pg_snapshot_xmax(pg_current_snapshot())").unwrap();
+        let call_pos = sql.find("txid_status(").unwrap();
+        assert!(guard_pos < call_pos);
+        // NULL (too-old txid) folds to the same empty "unknown" answer.
+        assert!(sql.contains("COALESCE"));
+        // u64 formatting is the injection barrier: the interpolated value
+        // must be digits only. Quote census: two quoted txid literals plus
+        // the two `''` empty-string answers.
+        assert_eq!(txid_status_sql(u64::MAX).matches('\'').count(), 8);
+        assert!(!txid_status_sql(u64::MAX).contains('-'));
     }
 }

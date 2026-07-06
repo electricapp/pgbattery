@@ -561,12 +561,25 @@ impl Governor {
             // openraft's PreVote once released (see the TODO in config/constants).
             self.raft.runtime_config().elect(has_quorum);
         }
-        // `send_replace` unconditionally stores the new state; `send` would
-        // discard it when there are no receivers, so a late subscriber would
-        // see stale fence state instead of the current one.
-        self.fence_tx.send_replace(FenceState {
+        // `send_if_modified` stores (and wakes receivers) only when the fence
+        // state actually changed. This runs on every Raft metrics update —
+        // tens per second — and during a failover every connection parked in
+        // the gateway's fence/failover waits subscribes to this watch; an
+        // unconditional store would wake all of them (up to max_connections)
+        // per heartbeat just to re-observe the same state. A late subscriber
+        // still sees the current value: the stored state is always the latest
+        // one, changed or not.
+        let new_fence = FenceState {
             fenced: should_fence,
             has_quorum,
+        };
+        self.fence_tx.send_if_modified(|current| {
+            if *current == new_fence {
+                false
+            } else {
+                *current = new_fence;
+                true
+            }
         });
     }
 
@@ -1082,6 +1095,15 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
         }
     }
 
+    /// Appends are durable before the flush callback fires, and the fsync is
+    /// awaited inline — openraft cannot pipeline the next batch into storage
+    /// during a flush. Combined with the per-apply-batch `last_applied`
+    /// persistence, sustained write throughput ceilings at roughly half the
+    /// disk's fsync rate (hundreds of batches/s on ordinary SSDs). That is
+    /// orders of magnitude above this log's workload — coordination entries
+    /// plus LSN heartbeats, single digits per second — so simplicity wins
+    /// over pipelining here. Revisit only if the log ever carries a
+    /// high-rate command stream.
     async fn append<I>(
         &mut self,
         entries: I,
@@ -1409,15 +1431,15 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
     async fn get_current_snapshot(
         &mut self,
     ) -> std::result::Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        let meta = self
-            .storage
-            .load_snapshot_meta()
-            .map_err(|e| storage_read_err(&e))?;
-
-        let data = self
-            .storage
-            .load_snapshot_verified()
-            .map_err(|e| storage_read_err(&e))?;
+        // Off the runtime thread: the verified load reads the full snapshot
+        // and SHA-256s it — cheap at current sizes, but a cold read on a
+        // stalled disk would otherwise pin an async worker (writes already
+        // route through `storage_io`; reads deserve the same discipline).
+        let (meta, data) = storage_io(&self.storage, |s| {
+            Ok((s.load_snapshot_meta()?, s.load_snapshot_verified()?))
+        })
+        .await
+        .map_err(|e| storage_read_err(&e))?;
 
         match (meta, data) {
             (Some(meta), Some(data)) => Ok(Some(Snapshot {
@@ -1588,15 +1610,30 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        // Capture a CONSISTENT (membership, last_applied, state) triple.
+        // Capture a (membership, last_applied, state) triple for the snapshot.
+        // Two concurrent writers race this builder; only `install_snapshot`
+        // takes `snapshot_consistency`, `apply` never does.
         //
-        // Two concurrent writers race this builder:
-        //  * `apply` updates `self.state` *before* redb `last_applied`, so the
-        //    cloned state is at or ahead of the captured `last_applied` —
-        //    idempotent re-application on install converges (data-ahead-of-meta
-        //    is safe). Reading `applied_membership` BEFORE `last_applied` keeps
-        //    membership at or below `last_applied` (never a membership from the
-        //    future) since both indices only advance.
+        //  * A NORMAL `apply` writes `self.state` *before* redb `last_applied`,
+        //    so the cloned state is at or ahead of the captured `last_applied`
+        //    (data-ahead-of-meta); idempotent re-application on install
+        //    converges. Reading `applied_membership` BEFORE `last_applied`
+        //    keeps the captured membership at or below `last_applied` — never a
+        //    membership from the future — since both redb indices only advance.
+        //  * A MEMBERSHIP `apply` (`apply_membership_entry_atomic`) is the
+        //    exception: it persists redb (`applied_membership` + `last_applied`)
+        //    FIRST, then updates `self.state` via `sync_membership_into`. That
+        //    redb-first order is deliberate for crash-consistency and must not
+        //    be flipped, so the cloned state's membership projection can lag the
+        //    captured meta by one generation (meta-ahead-of-data on the
+        //    membership dimension only). This is safe: `meta.last_membership` is
+        //    authoritative for Raft — install writes redb membership from it —
+        //    and the cloned `voter_ids` is re-derived from `RaftMetrics` every
+        //    metrics tick by `sync_voter_ids`, self-healing within ~one tick;
+        //    `nodes`/`learner_ids` reconcile on the next membership apply. An
+        //    installing node is a follower that acts on none of these until
+        //    healed. A future leader-side decision made from `nodes`/
+        //    `learner_ids` right after install would need its own re-derivation.
         //  * `install_snapshot` writes redb then swaps `self.state` in two
         //    steps; a builder spanning them could read the new redb position
         //    with the old state (meta-ahead-of-data → dropped entries). The
@@ -1646,10 +1683,12 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
         let snapshot_id = snapshot_id_of(&meta.last_applied);
 
         // Persist data + metadata atomically so a crash mid-build cannot
-        // leave storage with metadata pointing at unwritten data.
-        let snapshot_data = data.clone();
-        storage_io(&self.storage, move |s| {
-            s.save_snapshot(&meta, &snapshot_data)
+        // leave storage with metadata pointing at unwritten data. The bytes
+        // ride into the blocking closure and back out for the returned
+        // Cursor — one buffer, no copy.
+        let data = storage_io(&self.storage, move |s| {
+            s.save_snapshot(&meta, &data)?;
+            Ok(data)
         })
         .await
         .map_err(|e| storage_write_err(&e))?;
@@ -2224,8 +2263,8 @@ mod tests {
         assert!(t0 < t1, "rank 0 must fire before rank 1");
         assert!(t1 < t2, "rank 1 must fire before rank 2");
 
-        // Concrete values at the default election timeout reproduce the
-        // previously-tuned 5 s / 13 s / 21 s schedule.
+        // Concrete values at the default election timeout: the staggered
+        // 5 s / 13 s / 21 s schedule the watchdog is tuned for.
         assert_eq!(t0, std::time::Duration::from_secs(5));
         assert_eq!(t1, std::time::Duration::from_secs(13));
         assert_eq!(t2, std::time::Duration::from_secs(21));
@@ -2345,10 +2384,10 @@ mod tests {
         ));
 
         // Failover #2 (coalesced 7→none→self): because the anchor was cleared,
-        // `failover_already_anchored` is now false, so the re-anchor fires and
-        // the promotion hold-down is enforced against a *fresh* timestamp.
-        // Before the fix the anchor was still set, this returned false, and the
-        // hold-down was skipped → double promotion.
+        // `failover_already_anchored` is false, so the re-anchor fires and the
+        // promotion hold-down is enforced against a *fresh* timestamp. A
+        // still-set stale anchor here would suppress the re-anchor and skip
+        // the hold-down — the double-promotion window this pairing prevents.
         assert!(Governor::should_anchor_coalesced_failover(
             Some(7),
             /* is_leader */ true,

@@ -316,7 +316,17 @@ impl ReplicationManager {
         // `has_sync_quorum` and `emit_replica_metrics` would keep counting
         // a departed voter's last-observed `sync_state=Sync` forever,
         // manufacturing quorum from a node that no longer exists.
-        status_map.retain(|id, _| known_node_ids.contains(id));
+        status_map.retain(|id, _| {
+            if known_node_ids.contains(id) {
+                return true;
+            }
+            // The metrics registry never forgets a labeled series: without an
+            // explicit reset, a removed node's gauges keep reporting their
+            // last values to Prometheus indefinitely (a departed replica
+            // shown healthy/in-sync forever). Zero them as the entry leaves.
+            Self::zero_replica_metrics(*id);
+            false
+        });
         let seen_nodes = self.upsert_replica_statuses(&mut status_map, &repl_stats, now);
         self.mark_unseen_replicas_unhealthy(&mut status_map, &seen_nodes, now);
         Self::emit_replica_metrics(&status_map);
@@ -400,6 +410,17 @@ impl ReplicationManager {
             // relies on (it filters on `state == Streaming`).
             status.state = ReplicationState::Unknown;
         }
+    }
+
+    /// Reset a departed node's labeled gauges to their "gone" values
+    /// (0 = unhealthy / async / no lag data). See the prune in
+    /// `refresh_replica_health_and_metrics`.
+    fn zero_replica_metrics(node_id: NodeId) {
+        let node_label = node_id.to_string();
+        metrics::gauge!("pgbattery_replica_lag_bytes", "node" => node_label.clone()).set(0.0);
+        metrics::gauge!("pgbattery_replica_lag_seconds", "node" => node_label.clone()).set(0.0);
+        metrics::gauge!("pgbattery_replica_health", "node" => node_label.clone()).set(0.0);
+        metrics::gauge!("pgbattery_replica_is_sync", "node" => node_label).set(0.0);
     }
 
     fn emit_replica_metrics(status_map: &HashMap<NodeId, ReplicaStatus>) {

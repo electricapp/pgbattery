@@ -88,8 +88,14 @@ pub struct Config {
     #[serde(default = "default_pg_user")]
     pub pg_user: String,
 
-    /// `PostgreSQL` authentication mode for `pg_hba.conf`
-    /// WARNING: 'trust' mode should only be used for development/testing
+    /// `PostgreSQL` authentication mode for `pg_hba.conf`.
+    ///
+    /// Only 'trust' currently forms a working cluster: pgbattery does not
+    /// provision credentials, so 'scram'/'md5' are refused at validation
+    /// (replication and internal probes would fail to authenticate) and
+    /// 'peer' cannot serve TCP replication. Run 'trust' on an isolated
+    /// network only — any client that can reach the `PostgreSQL` port has
+    /// unauthenticated superuser access.
     #[serde(default)]
     pub pg_auth_mode: PgAuthMode,
 
@@ -541,19 +547,39 @@ impl Config {
         }
         if self.pg_auth_mode == PgAuthMode::Peer {
             anyhow::bail!(
-                "pg_auth_mode 'peer' is not supported for HA TCP replication; use 'scram', 'md5', or 'trust'"
+                "pg_auth_mode 'peer' is not supported for HA TCP replication; use 'trust' on an \
+                 isolated network"
+            );
+        }
+        // scram/md5 hba rules would be written, but no component provisions
+        // credentials: `primary_conninfo`, `pg_rewind --source-server`,
+        // `pg_basebackup`, and the supervisor's TCP probes all connect
+        // passwordless (no PGPASSWORD / passfile plumbing exists), so
+        // cross-node replication and the health probes authenticate-fail and
+        // the cluster cannot form. Refuse at config parse — a clear error
+        // now beats a cluster that half-starts and then wedges — until
+        // credential provisioning is implemented end-to-end.
+        if matches!(self.pg_auth_mode, PgAuthMode::Scram | PgAuthMode::Md5) {
+            anyhow::bail!(
+                "pg_auth_mode '{}' is not yet supported: pgbattery does not provision PostgreSQL \
+                 credentials, so replication and internal probes would fail to authenticate. Set \
+                 pg_auth_mode = \"trust\" and run the cluster on an isolated network.",
+                match self.pg_auth_mode {
+                    PgAuthMode::Scram => "scram",
+                    _ => "md5",
+                }
             );
         }
         // `trust` accepts any client without a password. On a non-loopback
         // gateway bind that is unauthenticated superuser access to PostgreSQL —
         // the same exposure the management-API token check guards against. We
-        // warn rather than hard-fail because dev/CI clusters legitimately run
-        // `trust` on an isolated network; production must move to scram/md5.
+        // warn rather than hard-fail because clusters legitimately run `trust`
+        // on an isolated network (and no credentialed mode exists yet).
         if self.pg_auth_mode == PgAuthMode::Trust && !self.listen_addr.ip().is_loopback() {
             warn!(
                 listen_addr = %self.listen_addr,
                 "pg_auth_mode='trust' on a non-loopback gateway address exposes UNAUTHENTICATED \
-                 superuser access to PostgreSQL — use 'scram' or 'md5' in production"
+                 superuser access to PostgreSQL — restrict the network this cluster runs on"
             );
         }
         // Raft consensus RPC (votes, AppendEntries, snapshots, membership) is
@@ -763,6 +789,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
         "#;
 
         let mut file = NamedTempFile::new().unwrap();
@@ -787,6 +814,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
 
             [[peers]]
             id = 2
@@ -878,6 +906,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
             election_timeout_ms = 999
             heartbeat_interval_ms = 499
         "#;
@@ -891,63 +920,43 @@ mod tests {
         );
     }
 
+    /// Credentialed auth modes are refused until credential provisioning
+    /// exists: nothing plumbs a password into `primary_conninfo`,
+    /// `pg_rewind`, `pg_basebackup`, or the probes, so a scram/md5 cluster
+    /// half-starts (localhost trust from initdb keeps local probes alive)
+    /// and then fails cross-node replication. The default (`scram`) refuses
+    /// too — an operator must explicitly choose `trust`, the only mode that
+    /// currently forms a working cluster.
     #[test]
-    fn test_pg_auth_mode_default_is_scram() {
-        let toml = r#"
-            node_id = 1
-            listen_addr = "0.0.0.0:5432"
-            raft_addr = "0.0.0.0:5433"
-            metrics_addr = "0.0.0.0:9090"
-            management_api_token = "test-token"
-            pg_bin_dir = "/usr/lib/postgresql/16/bin"
-            pg_data_dir = "/var/lib/postgresql/data"
-        "#;
+    fn test_pg_auth_mode_credentialed_modes_are_refused() {
+        for mode_line in ["", "pg_auth_mode = \"scram\"", "pg_auth_mode = \"md5\""] {
+            let toml = format!(
+                r#"
+                node_id = 1
+                listen_addr = "0.0.0.0:5432"
+                raft_addr = "0.0.0.0:5433"
+                metrics_addr = "0.0.0.0:9090"
+                management_api_token = "test-token"
+                pg_bin_dir = "/usr/lib/postgresql/16/bin"
+                pg_data_dir = "/var/lib/postgresql/data"
+                {mode_line}
+            "#
+            );
 
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(toml.as_bytes()).unwrap();
-
-        let config = Config::load_from(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.pg_auth_mode, PgAuthMode::Scram);
-    }
-
-    #[test]
-    fn test_pg_auth_mode_scram() {
-        let toml = r#"
-            node_id = 1
-            listen_addr = "0.0.0.0:5432"
-            raft_addr = "0.0.0.0:5433"
-            metrics_addr = "0.0.0.0:9090"
-            management_api_token = "test-token"
-            pg_bin_dir = "/usr/lib/postgresql/16/bin"
-            pg_data_dir = "/var/lib/postgresql/data"
-            pg_auth_mode = "scram"
-        "#;
-
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(toml.as_bytes()).unwrap();
-
-        let config = Config::load_from(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.pg_auth_mode, PgAuthMode::Scram);
-    }
-
-    #[test]
-    fn test_pg_auth_mode_md5() {
-        let toml = r#"
-            node_id = 1
-            listen_addr = "0.0.0.0:5432"
-            raft_addr = "0.0.0.0:5433"
-            metrics_addr = "0.0.0.0:9090"
-            management_api_token = "test-token"
-            pg_bin_dir = "/usr/lib/postgresql/16/bin"
-            pg_data_dir = "/var/lib/postgresql/data"
-            pg_auth_mode = "md5"
-        "#;
-
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(toml.as_bytes()).unwrap();
-
-        let config = Config::load_from(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.pg_auth_mode, PgAuthMode::Md5);
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(toml.as_bytes()).unwrap();
+            let result = Config::load_from(file.path().to_str().unwrap());
+            assert!(result.is_err(), "config with `{mode_line}` must be refused");
+            let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(
+                message.contains("not yet supported"),
+                "refusal must explain itself: {message}"
+            );
+            assert!(
+                message.contains("trust"),
+                "refusal must name the working alternative: {message}"
+            );
+        }
     }
 
     #[test]
@@ -960,7 +969,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
-            pg_auth_mode = "scram"
+            pg_auth_mode = "trust"
         "#;
 
         let mut file = NamedTempFile::new().unwrap();
@@ -969,7 +978,7 @@ mod tests {
         let config = Config::load_from(file.path().to_str().unwrap()).unwrap();
         let supervisor_config = config.supervisor_config();
 
-        assert_eq!(supervisor_config.pg_auth_mode, PgAuthMode::Scram);
+        assert_eq!(supervisor_config.pg_auth_mode, PgAuthMode::Trust);
     }
 
     #[test]
@@ -1047,6 +1056,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
             election_timeout_ms = 10000
             heartbeat_interval_ms = 700
         "#;
@@ -1109,6 +1119,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
         "#;
 
         let mut file = NamedTempFile::new().unwrap();
@@ -1127,6 +1138,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
         "#;
 
         let mut file = NamedTempFile::new().unwrap();
@@ -1151,6 +1163,7 @@ mod tests {
             management_api_token = "test-token"
             pg_bin_dir = "/usr/lib/postgresql/16/bin"
             pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
         "#;
 
         let mut file = NamedTempFile::new().unwrap();

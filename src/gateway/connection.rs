@@ -123,6 +123,15 @@ pub struct CommitProbeState {
     pub txid: Option<i64>,
     /// Whether we're waiting for a COMMIT response from backend
     pub pending_commit: bool,
+    /// True while the probe's own response frames (`RowDescription`, `DataRow`,
+    /// `CommandComplete`, `ReadyForQuery`) are still inbound from the backend.
+    /// The probe is written immediately ahead of the client's COMMIT in one
+    /// pipelined flow — no extra round trip on the COMMIT's latency — so its
+    /// response arrives as a prefix of the backend stream. While this flag is
+    /// set, the backend scan diverts those head frames (capturing the txid
+    /// from the `DataRow`) instead of forwarding them; the probe's
+    /// `ReadyForQuery` clears it, and everything after belongs to the client.
+    pub awaiting_probe_response: bool,
     /// True only when the in-flight COMMIT was a standalone simple-query
     /// `COMMIT` (nothing else in the batch). The synthetic commit response
     /// emits exactly one `CommandComplete`+`ReadyForQuery`, which is only
@@ -183,26 +192,35 @@ pub struct ConnectionState {
     /// Populated as the client issues PARSE / SET messages.
     pub replay: SessionReplay,
 
-    /// Commit probe state for transaction status verification on failover
-    pub commit_probe: CommitProbeState,
-
     /// Backend key data (PID, secret) received from `PostgreSQL`.
     /// Used for routing cancel requests to the correct backend.
     pub backend_key: Option<BackendKey>,
 
-    /// True when we have forwarded a client message to the backend and have
-    /// not yet observed the follow-up `ReadyForQuery`.
+    /// Number of forwarded client messages whose `ReadyForQuery` has not yet
+    /// arrived: +1 per `Query`/`Sync`/`FunctionCall` forwarded, -1 per full
+    /// `ReadyForQuery` observed. A pipelining client (libpq pipeline mode,
+    /// JDBC batching) can have several outstanding at once, and every one of
+    /// them must land before the session is safe to migrate — a lone bool
+    /// would read "response arrived" off the *first* RFQ while later
+    /// responses are still owed.
     ///
-    /// This is the "is a request in flight?" bit, distinct from `tx_status`.
-    /// `tx_status` is the *transaction* status as of the last
-    /// `ReadyForQuery` — between messages we can be `Idle` (last-seen status)
-    /// *and* have a query in flight whose response hasn't arrived yet. On
-    /// backend disconnect with this flag set, the outcome of the last
-    /// request is unknown — silently migrating the session would leave the
-    /// client waiting forever for a response that the new backend has no
-    /// knowledge of. We emit an `ErrorResponse` (SQLSTATE `08006`) so the
-    /// driver applies its transport-retry logic instead of hanging.
-    pub awaiting_response: bool,
+    /// This is the "requests in flight?" count, distinct from `tx_status`
+    /// (the *transaction* status as of the last `ReadyForQuery`). On backend
+    /// disconnect with responses outstanding, their outcomes are unknown —
+    /// silently migrating would leave the client waiting forever, so the
+    /// gateway emits `ErrorResponse` (SQLSTATE `08006`) and the driver's
+    /// transport-retry logic takes over.
+    pub responses_outstanding: u32,
+
+    /// True when extended-protocol work (`Parse`/`Bind`/`Describe`/`Execute`/
+    /// `Close`) has been forwarded with no `Sync` after it. Those messages
+    /// elicit no `ReadyForQuery` until the pipeline's `Sync`, so
+    /// `responses_outstanding` cannot see them — yet the backend holds
+    /// prepared-but-unsynced state (an unnamed statement, an open portal)
+    /// that a migrated backend would not have. Cleared when a `Sync` is
+    /// forwarded: the Sync's own RFQ (counted above) then covers the whole
+    /// pipeline.
+    pub extended_unsynced: bool,
 
     /// Set when the session carries state we cannot reconstruct on a new
     /// backend — `LISTEN "*"` or any session-scoped `SET`. Such a connection is
@@ -231,11 +249,20 @@ impl ConnectionState {
             created_at: Instant::now(), // Only called once per connection
             subscriptions: NotifySubscriptions::default(),
             replay: SessionReplay::default(),
-            commit_probe: CommitProbeState::default(),
             backend_key: None,
-            awaiting_response: false,
+            responses_outstanding: 0,
+            extended_unsynced: false,
             not_migratable: false,
         }
+    }
+
+    /// True when any backend response is still owed to the client — either a
+    /// counted `ReadyForQuery` (`responses_outstanding`) or an unsynced
+    /// extended-protocol pipeline (`extended_unsynced`).
+    #[inline]
+    #[must_use]
+    pub const fn response_pending(&self) -> bool {
+        self.responses_outstanding > 0 || self.extended_unsynced
     }
 
     /// Check if this connection can be migrated during failover.
@@ -243,7 +270,8 @@ impl ConnectionState {
     /// A connection is migratable only if:
     /// - Transaction status is Idle (not in a transaction)
     /// - Proxy mode allows inspection (not in COPY or SSL passthrough)
-    /// - No client request is in flight awaiting a backend response
+    /// - No client request is in flight awaiting a backend response, and no
+    ///   extended-protocol pipeline is open without a `Sync`
     /// - The session does not depend on state we cannot reconstruct on a new
     ///   backend (`LISTEN "*"`, or any session-scoped `SET`)
     #[inline]
@@ -251,7 +279,7 @@ impl ConnectionState {
     pub const fn is_migratable(&self) -> bool {
         self.tx_status.is_migratable()
             && self.proxy_mode.is_migratable()
-            && !self.awaiting_response
+            && !self.response_pending()
             && !self.not_migratable
     }
 
@@ -400,6 +428,13 @@ impl ConnectionRegistry {
     /// periodically.
     #[inline]
     pub fn update_tx_status_on(&self, conn: &SharedConnectionState, new_status: TransactionStatus) {
+        // Steady state (Idle -> Idle on every query completion) is a no-op:
+        // settle it with a read lock and skip the write path entirely. The
+        // handler task is the sole writer of its own tx_status, so the value
+        // cannot change between this check and the write below.
+        if conn.read().tx_status == new_status {
+            return;
+        }
         // Step 1: Update connection state (no registry lock held)
         let old_status = {
             let mut state = conn.write();
@@ -454,6 +489,12 @@ impl ConnectionRegistry {
     /// handle — no `DashMap` lookup on the hot path.
     #[inline]
     pub fn update_proxy_mode_on(&self, conn: &SharedConnectionState, new_mode: ProxyMode) {
+        // Same single-writer no-op short-circuit as `update_tx_status_on`:
+        // every ReadyForQuery batch reports a Normal-mode transition, so the
+        // steady state is unchanged-mode and needs only a read lock.
+        if conn.read().proxy_mode == new_mode {
+            return;
+        }
         let old_mode = {
             let mut state = conn.write();
             let old = state.proxy_mode;
@@ -560,10 +601,18 @@ mod tests {
 
         // Idle + normal, but a request is in flight — not migratable
         // (outcome of the in-flight query would be unknown on the new backend)
-        state.awaiting_response = true;
+        state.responses_outstanding = 1;
         assert!(!state.is_migratable());
 
-        state.awaiting_response = false;
+        state.responses_outstanding = 0;
+        assert!(state.is_migratable());
+
+        // An extended-protocol pipeline open without a Sync also blocks
+        // migration — the backend holds unsynced statement/portal state.
+        state.extended_unsynced = true;
+        assert!(!state.is_migratable());
+
+        state.extended_unsynced = false;
         assert!(state.is_migratable());
     }
 

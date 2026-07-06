@@ -136,7 +136,11 @@ sigstore = { version = "0.14", default-features = false, features = [
 # short-lived, so it is verified at its own `not_before`, not "now"). Versions
 # track sigstore-rs's own deps so the lockfile stays conflict-free.
 x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
-const-oid = { version = "0.9", default-features = false }
+# 0.10 for our OID constants + the rfc5912 `db` table. x509-cert 0.2 (via
+# sigstore) still hands us `extn_id` as const-oid 0.9's `ObjectIdentifier`, so
+# the two const-oid generations coexist and we compare OIDs by value
+# (`as_bytes()`), never by type — see `extract_oidc_issuer`/`extract_san_identity`.
+const-oid = { version = "0.10", default-features = false, features = ["db"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs"] }
 pki-types = { package = "rustls-pki-types", version = "1", default-features = false, features = ["std"] }
 base64 = "0.22"

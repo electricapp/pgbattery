@@ -35,9 +35,8 @@ pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// rollback. Callers may override with `--allow-downgrade` for an intentional
 /// rollback.
 fn ensure_not_downgrade(current: &str, target: &str) -> Result<()> {
-    let cur = semver::Version::parse(current).map_err(|e| {
-        anyhow::anyhow!("Cannot parse running version {current:?} as semver: {e}")
-    })?;
+    let cur = semver::Version::parse(current)
+        .map_err(|e| anyhow::anyhow!("Cannot parse running version {current:?} as semver: {e}"))?;
     let tgt = semver::Version::parse(target)
         .map_err(|e| anyhow::anyhow!("Cannot parse target version {target:?} as semver: {e}"))?;
     if tgt < cur {
@@ -258,7 +257,10 @@ async fn fetch_latest_version(base_url: &str) -> Result<String> {
         );
     }
 
-    Ok(resp.text().await?.trim().to_string())
+    Ok(read_text_capped(resp, "latest version")
+        .await?
+        .trim()
+        .to_string())
 }
 
 fn check_write_permissions(exe_path: &Path) -> Result<()> {
@@ -288,6 +290,87 @@ fn check_write_permissions(exe_path: &Path) -> Result<()> {
     }
 }
 
+/// Ceiling on the small text assets fetched from the release server
+/// (version string, checksum, signature, certificate, Sigstore bundle).
+/// The largest is the bundle at a few KB; 1 MiB is generous while keeping a
+/// hostile mirror from streaming an unbounded "text" body into memory.
+const MAX_UPGRADE_TEXT_BYTES: u64 = 1024 * 1024;
+
+/// Collect a response body as UTF-8 text, enforcing `MAX_UPGRADE_TEXT_BYTES`
+/// incrementally as it streams (`Response::text()` would buffer the whole
+/// body before any size check could run — same rationale as
+/// `download_binary_capped`).
+async fn read_text_capped(resp: reqwest::Response, what: &str) -> Result<String> {
+    let mut resp = resp;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read {what}: {e}"))?
+    {
+        if u64::try_from(bytes.len().saturating_add(chunk.len())).unwrap_or(u64::MAX)
+            > MAX_UPGRADE_TEXT_BYTES
+        {
+            anyhow::bail!(
+                "Refusing {what}: body exceeded the {MAX_UPGRADE_TEXT_BYTES} byte ceiling for a \
+                 release text asset"
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("{what} is not valid UTF-8: {e}"))
+}
+
+/// Download `url` into memory, enforcing `MAX_UPGRADE_BINARY_BYTES` both up
+/// front (a declared `Content-Length` over the ceiling is refused before any
+/// body is read) and incrementally as the body streams in. The streaming check
+/// is the load-bearing one: a chunked or length-less response carries no
+/// `Content-Length`, so `Response::bytes()` would otherwise buffer the whole
+/// body into memory before any size check could run — a hostile mirror could
+/// OOM the upgrader that way. The ceiling is generous for a real release binary
+/// but far below what would exhaust memory.
+async fn download_binary_capped(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Download failed ({}): {}", resp.status(), url);
+    }
+
+    if let Some(len) = resp.content_length()
+        && len > MAX_UPGRADE_BINARY_BYTES
+    {
+        anyhow::bail!(
+            "Refusing download: server declared {len} bytes, over the {MAX_UPGRADE_BINARY_BYTES} \
+             byte ceiling for an upgrade binary"
+        );
+    }
+
+    // Start from an empty buffer rather than a Content-Length-sized one so a
+    // hostile server cannot force a large up-front allocation with a false
+    // header.
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?
+    {
+        if u64::try_from(bytes.len().saturating_add(chunk.len())).unwrap_or(u64::MAX)
+            > MAX_UPGRADE_BINARY_BYTES
+        {
+            anyhow::bail!(
+                "Refusing download: body exceeded the {MAX_UPGRADE_BINARY_BYTES} byte ceiling for \
+                 an upgrade binary"
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "download/verify/replace threads the binary + each verification asset URL through one \
@@ -310,36 +393,7 @@ async fn download_verify_replace(
 
     // Download binary
     info!("Downloading binary");
-    let resp = client
-        .get(binary_url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("Download failed ({}): {}", resp.status(), binary_url);
-    }
-
-    // Cap the download so a hostile/misconfigured server cannot OOM us by
-    // streaming an unbounded body. A declared Content-Length over the ceiling
-    // is refused before reading a byte; the ceiling is generous for a real
-    // release binary but far below what would exhaust memory.
-    if let Some(len) = resp.content_length()
-        && len > MAX_UPGRADE_BINARY_BYTES
-    {
-        anyhow::bail!(
-            "Refusing download: server declared {len} bytes, over the {MAX_UPGRADE_BINARY_BYTES} \
-             byte ceiling for an upgrade binary"
-        );
-    }
-
-    let bytes = resp.bytes().await?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_UPGRADE_BINARY_BYTES {
-        anyhow::bail!(
-            "Refusing download: body exceeded the {MAX_UPGRADE_BINARY_BYTES} byte ceiling for an \
-             upgrade binary"
-        );
-    }
+    let bytes = download_binary_capped(&client, binary_url).await?;
     if bytes.is_empty() {
         anyhow::bail!("Downloaded file is empty");
     }
@@ -471,7 +525,7 @@ async fn fetch_text(client: &reqwest::Client, url: &str, what: &str) -> Result<S
         );
     }
 
-    Ok(resp.text().await?)
+    read_text_capped(resp, what).await
 }
 
 /// Verify the downloaded binary against the cosign keyless trust policy.
@@ -549,7 +603,7 @@ async fn fetch_optional_text(
     if !resp.status().is_success() {
         anyhow::bail!("Failed to fetch {what} ({}): {}", resp.status(), url);
     }
-    Ok(Some(resp.text().await?))
+    Ok(Some(read_text_capped(resp, what).await?))
 }
 
 async fn fetch_checksum(client: &reqwest::Client, url: &str) -> Result<String> {
@@ -570,7 +624,7 @@ async fn fetch_checksum(client: &reqwest::Client, url: &str) -> Result<String> {
     }
 
     // Parse checksum (format: "abc123  filename" or just "abc123")
-    let text = resp.text().await?;
+    let text = read_text_capped(resp, "checksum").await?;
     let checksum = text
         .split_whitespace()
         .next()

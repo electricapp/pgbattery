@@ -597,7 +597,10 @@ fn extract_oidc_issuer(leaf: &X509Certificate) -> Result<String> {
 
     let ext = extensions
         .iter()
-        .find(|e| e.extn_id == SIGSTORE_OIDC_ISSUER_OID)
+        // `extn_id` is x509-cert 0.2's (const-oid 0.9) ObjectIdentifier while
+        // our constant is const-oid 0.10's; the types don't unify, so compare by
+        // encoded value — identical across const-oid generations for one OID.
+        .find(|e| e.extn_id.as_bytes() == SIGSTORE_OIDC_ISSUER_OID.as_bytes())
         .context("certificate is missing the Sigstore OIDC-issuer extension")?;
 
     // The original issuer extension (1.1) is a raw UTF-8 string (not DER-wrapped
@@ -620,7 +623,8 @@ fn extract_san_identity(leaf: &X509Certificate) -> Result<String> {
 
     let ext = extensions
         .iter()
-        .find(|e| e.extn_id == SUBJECT_ALT_NAME_OID)
+        // Value comparison across const-oid generations (see extract_oidc_issuer).
+        .find(|e| e.extn_id.as_bytes() == SUBJECT_ALT_NAME_OID.as_bytes())
         .context("certificate is missing a Subject Alternative Name")?;
 
     let san = SubjectAltName::from_der(ext.extn_value.as_bytes())
@@ -710,18 +714,26 @@ mod tests {
         let v = CosignVerifier::from_env(None, "0.2.0").unwrap();
         let base = "https://github.com/electricapp/pgbattery/.github/workflows/release.yml";
         assert!(
-            v.identity_regex.is_match(&format!("{base}@refs/tags/v0.2.0")),
+            v.identity_regex
+                .is_match(&format!("{base}@refs/tags/v0.2.0")),
             "the requested version's tag must match"
         );
         // A different (e.g. older, vulnerable) genuinely-signed release must NOT
         // satisfy the identity check when 0.2.0 was requested.
         assert!(
-            !v.identity_regex.is_match(&format!("{base}@refs/tags/v0.1.0")),
+            !v.identity_regex
+                .is_match(&format!("{base}@refs/tags/v0.1.0")),
             "a different signed tag must be rejected (signed-downgrade defense)"
         );
-        assert!(!v.identity_regex.is_match(&format!("{base}@refs/tags/v0.2.00")));
+        assert!(
+            !v.identity_regex
+                .is_match(&format!("{base}@refs/tags/v0.2.00"))
+        );
         // The version's dots are escaped, so they cannot act as wildcards.
-        assert!(!v.identity_regex.is_match(&format!("{base}@refs/tags/v0X2X0")));
+        assert!(
+            !v.identity_regex
+                .is_match(&format!("{base}@refs/tags/v0X2X0"))
+        );
     }
 
     // ── Fixture-backed end-to-end parse/identity tests ──

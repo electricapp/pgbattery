@@ -33,6 +33,15 @@ use metrics::gauge;
 
 use openraft::BasicNode;
 
+/// Cadence state for `report_lsn`, owned by the supervisor loop task.
+#[derive(Default)]
+struct LsnReportCadence {
+    /// LSN carried by the last successful report.
+    last_reported: Option<u64>,
+    /// Ticks since the last successful report.
+    ticks_since_report: u32,
+}
+
 /// What `lease_enforcement_tick` should do this tick, decided purely from the
 /// post-probe `(lease_valid, pg_writable, in_recovery)` triple.
 #[derive(Debug, PartialEq, Eq)]
@@ -677,11 +686,19 @@ impl App {
         tokio::spawn(async move {
             let mut lsn_interval =
                 tokio::time::interval(Duration::from_millis(constants::REPLICA_CHECK_INTERVAL_MS));
-            let mut health_interval = tokio::time::interval(Duration::from_millis(500));
+            // 1 s cadence: each healthy probe forks a psql plus a PG backend,
+            // so the tick rate is a steady per-node CPU cost. Detection speed
+            // for a hung postmaster is governed by the 2 s per-probe budget,
+            // not the tick spacing (failed probes run back-to-back under
+            // `MissedTickBehavior::Skip`), so ~10-12 s to the shutdown
+            // threshold holds at this cadence.
+            let mut health_interval = tokio::time::interval(Duration::from_secs(1));
             // Safety reconciler. The leader_rx event path is the primary
             // signal; this fires only as a fallback if a watch update is
             // ever missed. With cache-free `ensure_follows`, a tick on a
-            // stable cluster is a single cheap PG probe and a no-op.
+            // stable cluster is a few cheap PG probes and an idempotent
+            // no-op (promote fast-path on the leader, fence-skip + no-op
+            // demote on followers).
             let mut reconcile_interval = tokio::time::interval(Duration::from_secs(2));
             // Coalesce, don't burst. The default `Burst` behaviour fires every
             // missed tick back-to-back the instant a long lock hold (a demote /
@@ -712,6 +729,7 @@ impl App {
                 }
             };
             let mut consecutive_pg_probe_failures: u32 = 0;
+            let mut lsn_cadence = LsnReportCadence::default();
 
             loop {
                 tokio::select! {
@@ -735,6 +753,7 @@ impl App {
                             &raft_client,
                             &cluster_state,
                             &lsn_http_client,
+                            &mut lsn_cadence,
                         )
                         .await;
                     }
@@ -748,7 +767,7 @@ impl App {
         })
     }
 
-    /// Supervisor liveness tick (every 500ms).
+    /// Supervisor liveness tick (every 1 s).
     ///
     /// Two-stage check (in order):
     ///
@@ -780,8 +799,10 @@ impl App {
         consecutive_probe_failures: &mut u32,
     ) {
         /// Consecutive `SELECT 1` failures before treating PG as dead.
-        /// At 500ms ticks × 2s probe budget each, this is at most ~12s
-        /// of unresponsiveness.
+        /// Sustained unresponsiveness reaches this in ~10-12 s: each failed
+        /// probe consumes its 2 s budget and the ticker's Skip behavior runs
+        /// the next probe immediately, so the per-probe budget — not the
+        /// tick interval — sets the detection time.
         const PG_PROBE_FAILURE_THRESHOLD: u32 = 5;
         /// Per-probe wall-clock budget. The libpq `connect_timeout` is
         /// half this so DNS / TCP handshake hangs fail before the outer
@@ -1058,13 +1079,16 @@ impl App {
         }
     }
 
-    /// Fence then reconfigure local PG as a standby of `leader_addr`.
+    /// Reconfigure local PG as a standby of `leader_addr`, fencing first when
+    /// local PG is (or may be) a writable primary.
     ///
     /// Errors are logged but not propagated — orchestration calls this from
     /// the reconcile loop, which retries on the next tick. The
     /// fence-before-demote ordering is load-bearing: a still-writable primary
     /// must stop accepting writes before its data is rewound to follow a new
-    /// leader.
+    /// leader. A node already in recovery skips the fence entirely
+    /// (`should_fence_before_demote`), so the steady-state reconcile tick on a
+    /// healthy follower is probes plus an idempotent no-op demote.
     async fn demote_to_leader(
         postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
         leader_addr: SocketAddr,
@@ -1086,26 +1110,38 @@ impl App {
         // itself timeout-bounded, so the lock is released eventually, never held
         // indefinitely.
         //
-        // "Bounded" here is NOT "brief": the worst case is `pg_rewind`
-        // (PG_REWIND_BUDGET, up to ~5 min) plus the post-restart crash-recovery
-        // wait (RECOVERY_TIMEOUT_SECS, up to ~10 min) ≈ ~15 min. While that
-        // runs, the 100 ms lease-enforcement tick blocks on the same lock (the
-        // per-tick SQL budget wraps the probe, not the lock acquisition). That
-        // is correctness-benign — this node was fenced read-only above before
-        // the long operation began, so a stalled lease tick cannot miss an
-        // unfenced-writes window on it — but it does stall this node's
-        // lease/health probing for the duration.
+        // "Bounded" here is NOT "brief". The dominant worst-case terms are
+        // `pg_rewind` (PG_REWIND_BUDGET, up to ~5 min) and the post-restart
+        // crash-recovery wait (RECOVERY_TIMEOUT_SECS, up to ~10 min); the
+        // demote's remaining steps — stop, role probes, the pre-stop LSN
+        // capture, and the post-start inactive-slot sweep (one enumerate plus
+        // one drop per slot, each under the 30 s SQL timeout) — add a few
+        // more minutes of individually-timeout-bounded work, ~20 min all
+        // told. While that runs, the 100 ms lease-enforcement tick blocks on
+        // the same lock (the per-tick SQL budget wraps the probe, not the
+        // lock acquisition). That is correctness-benign — this node was
+        // fenced read-only above before the long operation began, so a
+        // stalled lease tick cannot miss an unfenced-writes window on it —
+        // but it does stall this node's lease/health probing for the
+        // duration.
         let mut pg = postgres.lock().await;
-        if let Err(e) = pg.set_readonly(true).await {
-            metrics::counter!("pgbattery_demote_fence_failures").increment(1);
-            error!(error = %e, "Failed to fence before {context} - aborting demote");
-            return;
+        // The fence applies only to a (possibly) writable primary — see
+        // `should_fence_before_demote`. A steady-state follower takes the
+        // probe-and-skip path every reconcile tick, leaving hot-standby
+        // reader sessions untouched.
+        if Self::should_fence_before_demote(pg.is_in_recovery().await.ok()) {
+            if let Err(e) = pg.set_readonly(true).await {
+                metrics::counter!("pgbattery_demote_fence_failures").increment(1);
+                error!(error = %e, "Failed to fence before {context} - aborting demote");
+                return;
+            }
+            // `set_readonly` only changes the read-only *default*; existing
+            // sessions and `BEGIN READ WRITE` bypass it. Sever client backends
+            // so an in-flight write can't outlive the fence and land in WAL
+            // that pg_rewind then destroys — the same escalation the emergency
+            // lease fence uses.
+            Self::terminate_client_backends(&pg).await;
         }
-        // `set_readonly` only changes the read-only *default*; existing sessions
-        // and `BEGIN READ WRITE` bypass it. Sever client backends so an in-flight
-        // write can't outlive the fence and land in WAL that pg_rewind then
-        // destroys — the same escalation the emergency lease fence uses.
-        Self::terminate_client_backends(&pg).await;
         if let Err(e) = pg.demote(leader_addr).await {
             metrics::counter!("pgbattery_demote_apply_failures").increment(1);
             error!(error = %e, "Failed to configure standby for new leader");
@@ -1140,6 +1176,7 @@ impl App {
         raft_client: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         lsn_http_client: &reqwest::Client,
+        cadence: &mut LsnReportCadence,
     ) {
         let lsn_result = {
             let pg = postgres.lock().await;
@@ -1148,7 +1185,7 @@ impl App {
             // see `Supervisor::get_reportable_lsn`. Reporting the replayed
             // position stalled failover under write load.
             //
-            // Budgeted: this runs in the same select! task as the 500 ms
+            // Budgeted: this runs in the same select! task as the 1 s
             // health tick, and it holds the supervisor lock. An unbudgeted
             // query against a hung postmaster would block both for the
             // supervisor's full 30 s SQL timeout, stretching hung-postmaster
@@ -1181,7 +1218,22 @@ impl App {
             metrics::counter!("pgbattery_lsn_parse_failures").increment(1);
             return;
         };
-        if Self::is_local_leader(raft_client, node_id) {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "LSN metric; exact precision not needed"
+        )]
+        gauge!("pgbattery_local_lsn_bytes").set(lsn_bytes as f64);
+
+        // The local probe above runs every tick (change detection needs it);
+        // only the cluster-visible report — a Raft consensus round or an HTTP
+        // call to the leader — is rate-limited while the LSN is unchanged.
+        cadence.ticks_since_report = cadence.ticks_since_report.saturating_add(1);
+        let changed = cadence.last_reported != Some(lsn_bytes);
+        if !Self::should_report_lsn(changed, cadence.ticks_since_report) {
+            return;
+        }
+
+        let reported = if Self::is_local_leader(raft_client, node_id) {
             let req = ClusterRequest {
                 command: ClusterCommand::UpdateLsn {
                     node_id,
@@ -1189,8 +1241,12 @@ impl App {
                     timestamp: 0,
                 },
             };
-            if let Err(e) = raft_client.client_write(req).await {
-                error!(error = %e, lsn_bytes = lsn_bytes, "Failed to update LSN in Raft");
+            match raft_client.client_write(req).await {
+                Ok(_) => true,
+                Err(e) => {
+                    error!(error = %e, lsn_bytes = lsn_bytes, "Failed to update LSN in Raft");
+                    false
+                }
             }
         } else {
             Self::report_lsn_to_leader(
@@ -1200,23 +1256,23 @@ impl App {
                 raft_client,
                 lsn_http_client,
             )
-            .await;
+            .await
+        };
+        if reported {
+            cadence.last_reported = Some(lsn_bytes);
+            cadence.ticks_since_report = 0;
         }
-
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "LSN metric; exact precision not needed"
-        )]
-        gauge!("pgbattery_local_lsn_bytes").set(lsn_bytes as f64);
     }
 
+    /// Returns true when the report reached the leader (the cadence tracker
+    /// only advances on success, so failures retry every tick).
     async fn report_lsn_to_leader(
         node_id: u64,
         lsn_bytes: u64,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
         lsn_http_client: &reqwest::Client,
-    ) {
+    ) -> bool {
         // Live truth source for *who* the leader is (per STATE_MACHINE.md);
         // `cluster_state.nodes` is still used to map node_id → mgmt_addr,
         // which is membership data, not leadership.
@@ -1232,20 +1288,24 @@ impl App {
             leader_id.and_then(|id| state.nodes.get(&id).map(|n| n.mgmt_addr))
         };
         let Some(mgmt_addr) = leader_mgmt_addr else {
-            return;
+            return false;
         };
 
         let url = format!("http://{mgmt_addr}/api/v1/cluster/report-lsn");
         let payload = crate::observability::management_api::ReportLsnRequest { node_id, lsn_bytes };
 
-        if let Err(e) = lsn_http_client
+        match lsn_http_client
             .post(&url)
             .json(&payload)
             .timeout(Duration::from_secs(2))
             .send()
             .await
         {
-            debug!(error = %e, "Failed to report LSN to leader (may be transient)");
+            Ok(resp) => resp.status().is_success(),
+            Err(e) => {
+                debug!(error = %e, "Failed to report LSN to leader (may be transient)");
+                false
+            }
         }
     }
 
@@ -1419,6 +1479,34 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Every `LSN_UNCHANGED_REPORT_TICKS`th tick still reports an unchanged
+    /// LSN so the Raft entry's freshness timestamp stays far inside the 30 s
+    /// staleness window (`LSN_STALENESS_THRESHOLD_SECS`), while an idle
+    /// cluster stops paying a full consensus round — two durable redb
+    /// commits per node — every second for a value that did not move.
+    const LSN_UNCHANGED_REPORT_TICKS: u32 = 5;
+
+    /// Pure decision for `report_lsn`'s cadence: report when the LSN moved
+    /// since the last successful report, otherwise heartbeat on the
+    /// `LSN_UNCHANGED_REPORT_TICKS` cadence. A failed report leaves the tick
+    /// counter past the threshold, so retries happen every tick until one
+    /// succeeds.
+    const fn should_report_lsn(changed: bool, ticks_since_last_report: u32) -> bool {
+        changed || ticks_since_last_report >= Self::LSN_UNCHANGED_REPORT_TICKS
+    }
+
+    /// Pure decision for `demote_to_leader`: fence (read-only default +
+    /// client-backend termination) only when local PG is not positively a
+    /// standby. The fence exists to stop a still-writable primary from
+    /// committing WAL that the demote's `pg_rewind` would discard; a node
+    /// already in recovery cannot accept writes, and terminating its client
+    /// backends would evict hot-standby readers on every reconcile tick for
+    /// no safety gain. `None` (probe failed) fences: an unknown role must be
+    /// treated as a possibly-writable primary.
+    const fn should_fence_before_demote(in_recovery: Option<bool>) -> bool {
+        !matches!(in_recovery, Some(true))
     }
 
     /// Pure decision for `lease_enforcement_tick`, given the post-probe lease
@@ -2382,10 +2470,10 @@ mod tests {
             "a failed probe (fail-closed) must still fence"
         );
 
-        // Regression for the one-shot fence: invalid lease, GUC already
-        // read-only (pg_writable=false), but PG is still a confirmed primary.
-        // Previously this did nothing; a bypassing BEGIN READ WRITE session
-        // kept committing. Now we keep terminating every tick.
+        // Invalid lease, GUC already read-only (pg_writable=false), but PG is
+        // still a confirmed primary: a bypassing BEGIN READ WRITE session can
+        // commit past the GUC, so eviction must repeat every tick, not fire
+        // once on the fence edge.
         assert_eq!(
             App::lease_enforcement_action(false, false, Some(false)),
             LeaseAction::TerminateBypassers
@@ -2412,5 +2500,46 @@ mod tests {
             App::lease_enforcement_action(true, false, Some(true)),
             LeaseAction::None
         );
+    }
+
+    #[test]
+    fn test_lsn_report_cadence() {
+        // A moved LSN reports immediately, whatever the tick count.
+        assert!(App::should_report_lsn(true, 0));
+        assert!(App::should_report_lsn(true, 1));
+
+        // Unchanged LSN: quiet until the heartbeat tick, which must land far
+        // inside the 30 s staleness window at the 1 s tick interval.
+        assert!(!App::should_report_lsn(false, 1));
+        assert!(!App::should_report_lsn(
+            false,
+            App::LSN_UNCHANGED_REPORT_TICKS - 1
+        ));
+        assert!(App::should_report_lsn(
+            false,
+            App::LSN_UNCHANGED_REPORT_TICKS
+        ));
+
+        // A failed report leaves the counter past the threshold, so every
+        // subsequent tick retries until one succeeds.
+        assert!(App::should_report_lsn(
+            false,
+            App::LSN_UNCHANGED_REPORT_TICKS + 1
+        ));
+    }
+
+    #[test]
+    fn test_fence_before_demote_only_for_possible_primary() {
+        // A confirmed standby cannot accept writes; fencing it would only
+        // evict hot-standby reader sessions on every reconcile tick.
+        assert!(!App::should_fence_before_demote(Some(true)));
+
+        // A confirmed primary must be fenced before demote so no in-flight
+        // write lands in WAL that pg_rewind then discards.
+        assert!(App::should_fence_before_demote(Some(false)));
+
+        // Probe failure: role unknown → treat as a possibly-writable primary
+        // and fence (fail closed).
+        assert!(App::should_fence_before_demote(None));
     }
 }

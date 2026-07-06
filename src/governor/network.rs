@@ -4,12 +4,31 @@
 //! including `AppendEntries`, `Vote`, and `InstallSnapshot`.
 //!
 //! Supports optional TLS for secure inter-node communication.
+//!
+//! # Wire format and cancellation safety
+//!
+//! Every frame is `len(4, big-endian) + type(1) + corr_id(8, big-endian) +
+//! body`, where `len` counts everything after itself. A response echoes its
+//! request's `corr_id`.
+//!
+//! openraft cancels an RPC by dropping its future, and a drop can land at
+//! any await point — after half a frame was written, or with half a response
+//! read. The client therefore keeps per-connection staging buffers that
+//! survive cancellation (`FramedIo`): a torn outbound frame is completed
+//! before the next request is sent (the peer never sees a byte-desynced
+//! stream), and a partially-read inbound frame resumes exactly where it
+//! stopped. The correlation ID then makes response matching structural: a
+//! straggler response to an abandoned request is skipped by ID, an ID from
+//! the future or a type mismatch is a protocol violation that drops the
+//! connection. Desync is impossible by construction, not by the discipline
+//! of remembering to drop connections after every cancellation — and a
+//! cancelled RPC no longer costs a TCP+TLS reconnect.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
@@ -48,10 +67,14 @@ const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// bound instead of pinning their server task forever.
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Bytes of a frame counted by its length prefix besides the body:
+/// type (1) + correlation ID (8).
+const FRAME_OVERHEAD_AFTER_LEN: usize = 1 + 8;
+
 fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
-    if len == 0 {
+    if len < FRAME_OVERHEAD_AFTER_LEN {
         return Err(Error::Protocol(format!(
-            "Invalid RPC {context} frame length: 0"
+            "Invalid RPC {context} frame length: {len} (minimum {FRAME_OVERHEAD_AFTER_LEN})"
         )));
     }
     if len > MAX_RPC_FRAME_LEN {
@@ -59,7 +82,55 @@ fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
             "RPC {context} frame too large: {len}"
         )));
     }
-    Ok(len - 1)
+    Ok(len - FRAME_OVERHEAD_AFTER_LEN)
+}
+
+/// Append one framed message to `buf`: length prefix, type byte,
+/// correlation ID, body.
+fn append_frame(buf: &mut BytesMut, rpc_type: RpcType, corr_id: u64, body: &[u8]) -> Result<()> {
+    let total_len = FRAME_OVERHEAD_AFTER_LEN + body.len();
+    let total_len_u32 = u32::try_from(total_len)
+        .map_err(|_| Error::Protocol("RPC frame length exceeds u32".to_string()))?;
+    buf.reserve(4 + total_len);
+    buf.put_u32(total_len_u32);
+    buf.put_u8(rpc_type as u8);
+    buf.put_u64(corr_id);
+    buf.put_slice(body);
+    Ok(())
+}
+
+/// One parsed inbound frame.
+struct Frame {
+    type_byte: u8,
+    corr_id: u64,
+    body: BytesMut,
+}
+
+/// Split one complete frame off the front of `buf`, if present.
+///
+/// `Ok(None)` means more bytes are needed; the partial frame stays in `buf`
+/// untouched, which is what lets a cancelled read resume losslessly. A
+/// length prefix outside the valid range is a protocol violation.
+fn take_frame(buf: &mut BytesMut, context: &str) -> Result<Option<Frame>> {
+    let Some(len_bytes) = buf.get(..4) else {
+        return Ok(None);
+    };
+    let len = u32::from_be_bytes(<[u8; 4]>::try_from(len_bytes).unwrap_or_default()) as usize;
+    let body_len = validate_rpc_frame_len(len, context)?;
+    let total = 4 + len;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let mut frame = buf.split_to(total);
+    frame.advance(4);
+    let type_byte = frame.get_u8();
+    let corr_id = frame.get_u64();
+    debug_assert_eq!(frame.len(), body_len);
+    Ok(Some(Frame {
+        type_byte,
+        corr_id,
+        body: frame,
+    }))
 }
 
 /// RPC message types.
@@ -274,32 +345,49 @@ where
         let len = u32::from_be_bytes(len_buf) as usize;
         let body_len = validate_rpc_frame_len(len, "request")?;
 
-        // Read message type (1 byte)
+        // Read message type (1 byte) + correlation ID (8 bytes). The ID is
+        // echoed verbatim in the response so the client can match it against
+        // the request — including skipping responses to requests it has
+        // since abandoned.
         let mut type_buf = [0u8; 1];
         tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut type_buf))
             .await
             .map_err(|_| Error::ConnectionTimeout(peer_addr))??;
         let rpc_type = RpcType::try_from(type_buf[0])?;
-
-        // Read message body
-        let mut body = BytesMut::with_capacity(body_len);
-        body.resize(body_len, 0);
-        tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut body))
+        let mut corr_buf = [0u8; 8];
+        tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut corr_buf))
             .await
             .map_err(|_| Error::ConnectionTimeout(peer_addr))??;
+        let corr_id = u64::from_be_bytes(corr_buf);
+
+        // Read message body. `read_buf` appends into the reserved (but
+        // uninitialized) capacity, so the buffer is written exactly once by
+        // the socket read — no zero-fill pass over `body_len` bytes first,
+        // which matters at InstallSnapshot chunk sizes (up to 4 MB). Each
+        // read is `take`-bounded to the remaining frame bytes:
+        // `with_capacity` may round the allocation up, and an unbounded
+        // `read_buf` fills to capacity — swallowing the start of the next
+        // frame and desyncing the connection.
+        let mut body = BytesMut::with_capacity(body_len);
+        tokio::time::timeout(RPC_IO_TIMEOUT, async {
+            while body.len() < body_len {
+                let remaining = (body_len - body.len()) as u64;
+                let n = (&mut stream).take(remaining).read_buf(&mut body).await?;
+                if n == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::ConnectionTimeout(peer_addr))??;
 
         let (resp_type, resp_body) =
             process_request(rpc_type, &body, peer_addr, &raft, &cluster_state).await?;
 
-        // Send response
-        let total_len = 1 + resp_body.len();
-        let total_len_u32 = u32::try_from(total_len)
-            .map_err(|_| Error::Protocol("RPC response length exceeds u32".to_string()))?;
-
-        let mut response_buf = BytesMut::with_capacity(4 + total_len);
-        response_buf.put_u32(total_len_u32);
-        response_buf.put_u8(resp_type as u8);
-        response_buf.put_slice(&resp_body);
+        // Send response, echoing the request's correlation ID.
+        let mut response_buf = BytesMut::new();
+        append_frame(&mut response_buf, resp_type, corr_id, &resp_body)?;
 
         tokio::time::timeout(RPC_IO_TIMEOUT, stream.write_all(&response_buf))
             .await
@@ -431,11 +519,19 @@ async fn process_request(
 ///
 /// Owned by the per-peer `NetworkConnection` so that heartbeats and log
 /// replication reuse one TCP (and TLS) session instead of paying
-/// connect + handshake per RPC.
+/// connect + handshake per RPC. The connection survives a cancelled RPC:
+/// `io` stages torn frames across drops (see the module docs) and
+/// `next_corr_id` keeps request/response matching structural, so the slot
+/// holding this connection is only cleared on a real error.
 #[derive(Debug)]
 pub struct PeerConnection {
     stream: PeerStream,
     addr: SocketAddr,
+    /// Correlation ID assigned to the next request. Monotonic per
+    /// connection; any inbound frame with a lower ID is a straggler response
+    /// to an abandoned (cancelled) request and is skipped.
+    next_corr_id: u64,
+    io: FramedIo,
 }
 
 enum PeerStream {
@@ -453,13 +549,15 @@ impl std::fmt::Debug for PeerStream {
 }
 
 impl PeerConnection {
-    /// Run one framed request/response cycle, consuming the connection and
-    /// returning it only on clean completion. If the returned future is
-    /// dropped mid-exchange the connection is dropped with it — its protocol
-    /// state would be unknown (a response may still be in flight), so it must
-    /// never be reused.
-    async fn exchange(mut self, rpc_type: RpcType, body: &[u8]) -> Result<(Self, Vec<u8>)> {
-        let request_buf = frame_request(rpc_type, body)?;
+    /// Run one framed request/response cycle in place.
+    ///
+    /// Cancellation-safe by design: if this future is dropped at any await
+    /// point, the staging buffers in `self.io` hold whatever was in flight
+    /// (an unwritten frame tail, a partially-read response) and the next
+    /// call resumes losslessly. An `Err` means the connection is genuinely
+    /// broken (I/O error, EOF, no progress within `RPC_IO_TIMEOUT`, or a
+    /// protocol violation) and must be discarded by the caller.
+    async fn exchange(&mut self, rpc_type: RpcType, body: &[u8]) -> Result<Vec<u8>> {
         // Each request type has exactly one valid response type; validating it
         // catches a desynced stream before postcard decodes the wrong frame.
         let expected = match rpc_type {
@@ -472,79 +570,139 @@ impl PeerConnection {
                 )));
             }
         };
+        let corr_id = self.next_corr_id;
+        self.next_corr_id += 1;
         let addr = self.addr;
-        let response = match &mut self.stream {
-            PeerStream::Plain(stream) => exchange_on(stream, &request_buf, addr, expected).await?,
-            PeerStream::Tls(stream) => {
-                exchange_on(stream.as_mut(), &request_buf, addr, expected).await?
+        match &mut self.stream {
+            PeerStream::Plain(stream) => {
+                self.io
+                    .exchange_frames(stream, rpc_type, corr_id, body, expected, addr)
+                    .await
             }
-        };
-        Ok((self, response))
+            PeerStream::Tls(stream) => {
+                self.io
+                    .exchange_frames(stream.as_mut(), rpc_type, corr_id, body, expected, addr)
+                    .await
+            }
+        }
     }
 }
 
-/// Frame a request: 4-byte big-endian length, 1-byte type, body.
-fn frame_request(rpc_type: RpcType, body: &[u8]) -> Result<BytesMut> {
-    let total_len = 1 + body.len();
-    let total_len_u32 = u32::try_from(total_len)
-        .map_err(|_| Error::Protocol("RPC request length exceeds u32".to_string()))?;
-    let mut request_buf = BytesMut::with_capacity(4 + total_len);
-    request_buf.put_u32(total_len_u32);
-    request_buf.put_u8(rpc_type as u8);
-    request_buf.put_slice(body);
-    Ok(request_buf)
+/// Per-connection staging buffers that make a framed request/response
+/// exchange safe to cancel at any await point.
+///
+/// `write_buf` holds bytes not yet accepted by the socket: `AsyncWriteExt::
+/// write` is cancel-safe (a cancelled write wrote nothing), so after a drop
+/// the buffer is exactly the unsent remainder, and the next exchange
+/// finishes the torn frame before its own — the peer never observes a
+/// byte-desynced stream. `read_buf` accumulates inbound bytes via the
+/// equally cancel-safe `read_buf`; a partial frame simply stays staged until
+/// the next exchange resumes reading.
+#[derive(Debug, Default)]
+struct FramedIo {
+    read_buf: BytesMut,
+    write_buf: BytesMut,
 }
 
-/// Write a framed request and read the framed response over a stream.
-async fn exchange_on<S>(
-    stream: &mut S,
-    request_buf: &BytesMut,
-    addr: SocketAddr,
-    expected: RpcType,
-) -> Result<Vec<u8>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    // Send request
-    tokio::time::timeout(RPC_IO_TIMEOUT, stream.write_all(request_buf))
+impl FramedIo {
+    /// Stragglers a single exchange will skip before declaring the peer
+    /// broken. Each abandoned request leaves at most one response, so a
+    /// healthy connection can never accumulate more stale frames than it had
+    /// cancelled RPCs since the last completed one; a peer spraying frames
+    /// past this bound is misbehaving.
+    const MAX_STALE_FRAMES_PER_EXCHANGE: usize = 64;
+
+    async fn exchange_frames<S>(
+        &mut self,
+        stream: &mut S,
+        rpc_type: RpcType,
+        corr_id: u64,
+        body: &[u8],
+        expected: RpcType,
+        addr: SocketAddr,
+    ) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Stage this request after any torn predecessor, then drain. The
+        // timeout bounds total progress; on expiry the connection is dead to
+        // the caller, so partial state doesn't matter.
+        append_frame(&mut self.write_buf, rpc_type, corr_id, body)?;
+        tokio::time::timeout(RPC_IO_TIMEOUT, async {
+            while !self.write_buf.is_empty() {
+                let n = stream.write(&self.write_buf).await?;
+                if n == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                }
+                self.write_buf.advance(n);
+            }
+            stream.flush().await
+        })
         .await
         .map_err(|_| Error::ConnectionTimeout(addr))??;
 
-    tokio::time::timeout(RPC_IO_TIMEOUT, stream.flush())
+        // Read until this request's response appears. Frames with a lower
+        // correlation ID are responses to abandoned requests — skipped. A
+        // higher ID, an unknown type byte, or a type that isn't this
+        // request's response type means the stream cannot be trusted.
+        let mut skipped = 0_usize;
+        tokio::time::timeout(RPC_IO_TIMEOUT, async {
+            loop {
+                while let Some(frame) = take_frame(&mut self.read_buf, "response")? {
+                    if frame.corr_id < corr_id {
+                        skipped += 1;
+                        if skipped > Self::MAX_STALE_FRAMES_PER_EXCHANGE {
+                            return Err(Error::Protocol(format!(
+                                "RPC stream from {addr} produced more than \
+                                 {} stale frames in one exchange",
+                                Self::MAX_STALE_FRAMES_PER_EXCHANGE
+                            )));
+                        }
+                        tracing::debug!(
+                            %addr,
+                            stale_corr_id = frame.corr_id,
+                            corr_id,
+                            "Skipping straggler response to a cancelled RPC"
+                        );
+                        continue;
+                    }
+                    if frame.corr_id > corr_id {
+                        return Err(Error::Protocol(format!(
+                            "RPC correlation mismatch from {addr}: expected {corr_id}, \
+                             got {} (from the future)",
+                            frame.corr_id
+                        )));
+                    }
+                    // postcard is positional/untagged, so a wrong-type frame
+                    // could decode as a structurally-valid-but-wrong message
+                    // (e.g. a fabricated VoteResponse) — a safety hazard on
+                    // the election path. Correlation plus this check make
+                    // that impossible.
+                    let resp_type = RpcType::try_from(frame.type_byte)?;
+                    if resp_type != expected {
+                        return Err(Error::Protocol(format!(
+                            "RPC response type mismatch from {addr}: \
+                             expected {expected:?}, got {resp_type:?}"
+                        )));
+                    }
+                    return Ok(frame.body.into());
+                }
+                // Need more bytes. Reserve so `read_buf` has room to append
+                // (it reads nothing into a full buffer); the frame-length
+                // validation in `take_frame` bounds how large the staged
+                // buffer can be asked to grow.
+                self.read_buf.reserve(4096);
+                let n = stream.read_buf(&mut self.read_buf).await?;
+                if n == 0 {
+                    return Err(Error::Protocol(format!(
+                        "RPC connection to {addr} closed mid-response"
+                    )));
+                }
+            }
+        })
         .await
-        .map_err(|_| Error::ConnectionTimeout(addr))??;
-
-    // Read response length
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| Error::ConnectionTimeout(addr))??;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let body_len = validate_rpc_frame_len(len, "response")?;
-
-    // Read response type and validate it against what this request expects.
-    // postcard is positional/untagged, so a desynced stream could otherwise be
-    // decoded as a structurally-valid-but-wrong message (e.g. a fabricated
-    // VoteResponse) — a safety hazard on the election path.
-    let mut type_buf = [0u8; 1];
-    tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut type_buf))
-        .await
-        .map_err(|_| Error::ConnectionTimeout(addr))??;
-    let resp_type = RpcType::try_from(type_buf[0])?;
-    if resp_type != expected {
-        return Err(Error::Protocol(format!(
-            "RPC response type mismatch from {addr}: expected {expected:?}, got {resp_type:?}"
-        )));
+        .map_err(|_| Error::ConnectionTimeout(addr))?
     }
-
-    // Read response body
-    let mut response_body = BytesMut::with_capacity(body_len);
-    response_body.resize(body_len, 0);
-    tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut response_body))
-        .await
-        .map_err(|_| Error::ConnectionTimeout(addr))??;
-
-    Ok(response_body.to_vec())
 }
 
 /// Raft RPC client for sending requests to other nodes.
@@ -639,14 +797,17 @@ impl RaftRpcClient {
     /// Run one request/response cycle against `addr`, reusing the cached
     /// connection in `conn` and reconnecting once if it fails.
     ///
-    /// The slot is `take()`n for the duration of the exchange: if this future
-    /// is dropped mid-exchange (openraft cancels RPCs on timeout) the
-    /// connection's protocol state is unknown, so it is only put back after a
-    /// complete cycle. A failed exchange on a cached connection most likely
-    /// means the connection went stale (peer restart, server idle reaping),
-    /// so one fresh connect + retry is attempted; a failure on the fresh
-    /// connection fails the RPC — openraft handles RPC errors with its own
-    /// retry logic, so no backoff here.
+    /// The connection stays in the slot for the whole exchange: `exchange`
+    /// is cancellation-safe (torn frames are staged in the connection and
+    /// resumed; correlation IDs make straggler responses skippable), so a
+    /// future dropped mid-exchange — openraft cancels RPCs on timeout —
+    /// retains the connection for the next attempt instead of paying a
+    /// TCP+TLS reconnect. Only an `Err` from `exchange` (I/O failure, EOF,
+    /// stalled progress, protocol violation) clears the slot; that most
+    /// likely means the connection went stale (peer restart, server idle
+    /// reaping), so one fresh connect + retry is attempted. A failure on the
+    /// fresh connection fails the RPC — openraft handles RPC errors with its
+    /// own retry logic, so no backoff here.
     async fn request(
         &self,
         conn: &mut Option<PeerConnection>,
@@ -654,22 +815,31 @@ impl RaftRpcClient {
         rpc_type: RpcType,
         body: &[u8],
     ) -> Result<Vec<u8>> {
-        if let Some(cached) = conn.take() {
+        if let Some(cached) = conn.as_mut() {
             match cached.exchange(rpc_type, body).await {
-                Ok((cached, response)) => {
-                    *conn = Some(cached);
-                    return Ok(response);
-                }
+                Ok(response) => return Ok(response),
                 Err(e) => {
+                    *conn = None;
                     tracing::debug!(%addr, error = %e, "Cached Raft connection failed; reconnecting");
                 }
             }
         }
 
-        let fresh = self.connect(addr).await?;
-        let (fresh, response) = fresh.exchange(rpc_type, body).await?;
-        *conn = Some(fresh);
-        Ok(response)
+        // Slot-first so a cancellation mid-exchange keeps the fresh
+        // connection too.
+        *conn = Some(self.connect(addr).await?);
+        let Some(fresh) = conn.as_mut() else {
+            return Err(Error::Protocol(
+                "connection slot unexpectedly empty".to_string(),
+            ));
+        };
+        match fresh.exchange(rpc_type, body).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                *conn = None;
+                Err(e)
+            }
+        }
     }
 
     /// Establish a new connection (TCP + optional TLS handshake) to a peer.
@@ -711,7 +881,12 @@ impl RaftRpcClient {
             PeerStream::Plain(stream)
         };
 
-        Ok(PeerConnection { stream, addr })
+        Ok(PeerConnection {
+            stream,
+            addr,
+            next_corr_id: 0,
+            io: FramedIo::default(),
+        })
     }
 }
 
@@ -739,10 +914,252 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rpc_frame_len_rejects_zero() {
-        let result = validate_rpc_frame_len(0, "request");
-        assert!(result.is_err());
-        let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(msg.contains("length: 0"));
+    fn test_validate_rpc_frame_len_bounds() {
+        // Below the fixed overhead (type + correlation ID) is malformed.
+        assert!(validate_rpc_frame_len(0, "request").is_err());
+        assert!(validate_rpc_frame_len(FRAME_OVERHEAD_AFTER_LEN - 1, "request").is_err());
+        // Overhead-only = empty body, valid.
+        assert_eq!(
+            validate_rpc_frame_len(FRAME_OVERHEAD_AFTER_LEN, "request").unwrap(),
+            0
+        );
+        assert!(validate_rpc_frame_len(MAX_RPC_FRAME_LEN, "request").is_ok());
+        assert!(validate_rpc_frame_len(MAX_RPC_FRAME_LEN + 1, "request").is_err());
+    }
+
+    const TEST_ADDR: &str = "127.0.0.1:9";
+
+    fn addr() -> SocketAddr {
+        TEST_ADDR.parse().unwrap()
+    }
+
+    /// Peer-side helper: read one full frame with plain `read_exact` (tests
+    /// control cancellation explicitly, so the simple reader is fine here).
+    async fn read_frame_from<S: AsyncRead + Unpin>(stream: &mut S) -> (u8, u64, Vec<u8>) {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut rest = vec![0u8; len];
+        stream.read_exact(&mut rest).await.unwrap();
+        let type_byte = rest[0];
+        let corr_id = u64::from_be_bytes(<[u8; 8]>::try_from(&rest[1..9]).unwrap());
+        (type_byte, corr_id, rest[9..].to_vec())
+    }
+
+    async fn write_frame_to<S: AsyncWrite + Unpin>(
+        stream: &mut S,
+        rpc_type: RpcType,
+        corr_id: u64,
+        body: &[u8],
+    ) {
+        let mut buf = BytesMut::new();
+        append_frame(&mut buf, rpc_type, corr_id, body).unwrap();
+        stream.write_all(&buf).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_round_trips_and_echoes_correlation() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let mut io = FramedIo::default();
+
+        let peer = tokio::spawn(async move {
+            let (type_byte, corr_id, body) = read_frame_from(&mut theirs).await;
+            assert_eq!(type_byte, RpcType::Vote as u8);
+            assert_eq!(corr_id, 5);
+            assert_eq!(body, b"ballot");
+            write_frame_to(&mut theirs, RpcType::VoteResponse, corr_id, b"granted").await;
+            theirs
+        });
+
+        let response = io
+            .exchange_frames(
+                &mut ours,
+                RpcType::Vote,
+                5,
+                b"ballot",
+                RpcType::VoteResponse,
+                addr(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, b"granted");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn straggler_responses_are_skipped_by_correlation() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let mut io = FramedIo::default();
+
+        // Responses to two abandoned requests sit in the stream ahead of the
+        // one this exchange is waiting for.
+        write_frame_to(&mut theirs, RpcType::VoteResponse, 0, b"stale-0").await;
+        write_frame_to(&mut theirs, RpcType::VoteResponse, 1, b"stale-1").await;
+        write_frame_to(&mut theirs, RpcType::VoteResponse, 2, b"fresh").await;
+
+        let response = io
+            .exchange_frames(
+                &mut ours,
+                RpcType::Vote,
+                2,
+                b"req",
+                RpcType::VoteResponse,
+                addr(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, b"fresh");
+    }
+
+    #[tokio::test]
+    async fn cancelled_read_resumes_mid_frame_and_skips_the_straggler() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let mut io = FramedIo::default();
+
+        // The peer delivers only HALF of the response to request 0, then the
+        // exchange is cancelled (external timeout, as openraft does). The
+        // half frame must stay staged.
+        let mut full = BytesMut::new();
+        append_frame(&mut full, RpcType::VoteResponse, 0, b"abandoned-response").unwrap();
+        let split_at = full.len() / 2;
+        theirs.write_all(&full[..split_at]).await.unwrap();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            io.exchange_frames(
+                &mut ours,
+                RpcType::Vote,
+                0,
+                b"req-0",
+                RpcType::VoteResponse,
+                addr(),
+            ),
+        )
+        .await;
+        assert!(cancelled.is_err(), "exchange must have been cancelled");
+        assert!(!io.read_buf.is_empty(), "partial frame must stay staged");
+
+        // The rest of the abandoned response arrives, followed by the next
+        // request's response. The resumed reader must reassemble the torn
+        // frame, skip it by correlation ID, and return the fresh one.
+        theirs.write_all(&full[split_at..]).await.unwrap();
+        write_frame_to(&mut theirs, RpcType::VoteResponse, 1, b"fresh").await;
+
+        let response = io
+            .exchange_frames(
+                &mut ours,
+                RpcType::Vote,
+                1,
+                b"req-1",
+                RpcType::VoteResponse,
+                addr(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, b"fresh");
+        assert!(io.read_buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn torn_write_is_completed_before_the_next_request() {
+        // A duplex buffer far smaller than the request forces the write to
+        // stall mid-frame; the external cancellation then leaves a torn
+        // outbound frame staged in `write_buf`.
+        let (mut ours, mut theirs) = tokio::io::duplex(64);
+        let mut io = FramedIo::default();
+        let big_body = vec![0xAB_u8; 1024];
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            io.exchange_frames(
+                &mut ours,
+                RpcType::AppendEntries,
+                0,
+                &big_body,
+                RpcType::AppendEntriesResponse,
+                addr(),
+            ),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "write must have stalled and been cancelled"
+        );
+        assert!(!io.write_buf.is_empty(), "torn frame must stay staged");
+
+        // The peer now reads: it must receive request 0 INTACT (the resumed
+        // writer finishes the torn frame first) and then request 1, and it
+        // answers both in order.
+        let peer = tokio::spawn(async move {
+            let (t0, c0, b0) = read_frame_from(&mut theirs).await;
+            assert_eq!(t0, RpcType::AppendEntries as u8);
+            assert_eq!(c0, 0);
+            assert_eq!(b0, vec![0xAB_u8; 1024]);
+            write_frame_to(&mut theirs, RpcType::AppendEntriesResponse, 0, b"resp-0").await;
+
+            let (t1, c1, b1) = read_frame_from(&mut theirs).await;
+            assert_eq!(t1, RpcType::AppendEntries as u8);
+            assert_eq!(c1, 1);
+            assert_eq!(b1, b"next");
+            write_frame_to(&mut theirs, RpcType::AppendEntriesResponse, 1, b"resp-1").await;
+            theirs
+        });
+
+        let response = io
+            .exchange_frames(
+                &mut ours,
+                RpcType::AppendEntries,
+                1,
+                b"next",
+                RpcType::AppendEntriesResponse,
+                addr(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, b"resp-1");
+        assert!(io.write_buf.is_empty());
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn correlation_from_the_future_is_a_protocol_violation() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let mut io = FramedIo::default();
+        write_frame_to(&mut theirs, RpcType::VoteResponse, 7, b"who?").await;
+
+        let err = io
+            .exchange_frames(
+                &mut ours,
+                RpcType::Vote,
+                1,
+                b"req",
+                RpcType::VoteResponse,
+                addr(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("correlation mismatch"));
+    }
+
+    #[tokio::test]
+    async fn response_type_mismatch_is_a_protocol_violation() {
+        let (mut ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let mut io = FramedIo::default();
+        // Correct correlation ID, wrong frame type: without the type check a
+        // positional postcard decode could accept this as a valid VoteResponse.
+        write_frame_to(&mut theirs, RpcType::AppendEntriesResponse, 1, b"wrong").await;
+
+        let err = io
+            .exchange_frames(
+                &mut ours,
+                RpcType::Vote,
+                1,
+                b"req",
+                RpcType::VoteResponse,
+                addr(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("type mismatch"));
     }
 }

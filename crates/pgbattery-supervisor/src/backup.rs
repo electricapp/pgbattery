@@ -938,9 +938,23 @@ impl BackupManager {
                     .find(|l| l.starts_with("State:"))
                     .is_some_and(|l| l.contains('Z') || l.contains('X'))
             })
-        } else {
-            // /proc/<pid> absent → the process no longer exists.
+        } else if tokio::fs::metadata("/proc/self").await.is_ok() {
+            // procfs is mounted and /proc/<pid> is absent → the process no
+            // longer exists. Known limits of this source: procfs mounted
+            // `hidepid=2` hides other users' pids, and a supervisor in a
+            // different PID namespace than the postmaster (sidecar sharing a
+            // volume) cannot see it — both would read a live postmaster as
+            // absent. The supported deployment runs the supervisor and
+            // postmaster in one container (same namespace, same user), where
+            // absence is authoritative.
             true
+        } else {
+            // No procfs on this host (e.g. macOS/BSD dev boxes): the absence of
+            // /proc/<pid> proves nothing, so we CANNOT positively establish that
+            // the postmaster is dead. Fail closed rather than rename PGDATA out
+            // from under a possibly-live process. (Production runs in Linux
+            // containers where the branch above applies.)
+            false
         };
 
         if positively_dead {
@@ -2524,19 +2538,26 @@ mod tests {
         std::fs::write(&pid_file, "not-a-pid\n").unwrap();
         assert!(manager.confirm_no_live_postmaster().await.is_err());
 
-        // A high, definitely-nonexistent PID → confirmed dead → proceed.
+        // A high, definitely-nonexistent PID. On Linux, /proc positively
+        // confirms the process is gone → proceed. On a host without procfs
+        // (macOS/BSD dev boxes) the absence of /proc/<pid> proves nothing, so
+        // the check fails closed → refuse.
         std::fs::write(&pid_file, "2147480000\n/var/lib/pgdata\n").unwrap();
-        assert!(manager.confirm_no_live_postmaster().await.is_ok());
-
-        // Our own (alive) PID must be refused. Only checkable on Linux, where
-        // /proc/<pid> exists and reports a live State; macOS has no /proc so
-        // the live-process branch cannot be exercised there.
         #[cfg(target_os = "linux")]
-        {
-            std::fs::write(&pid_file, format!("{}\n/var/lib/pgdata\n", std::process::id()))
-                .unwrap();
-            let err = manager.confirm_no_live_postmaster().await.unwrap_err();
-            assert!(format!("{err}").contains("may still be alive"));
-        }
+        assert!(manager.confirm_no_live_postmaster().await.is_ok());
+        #[cfg(not(target_os = "linux"))]
+        assert!(manager.confirm_no_live_postmaster().await.is_err());
+
+        // Our own (alive) PID must ALWAYS be refused — on Linux via the live
+        // /proc State, and on a non-procfs host via the fail-closed default.
+        // Treating an unverifiable pid as dead would rename PGDATA out from
+        // under a live postmaster.
+        std::fs::write(
+            &pid_file,
+            format!("{}\n/var/lib/pgdata\n", std::process::id()),
+        )
+        .unwrap();
+        let err = manager.confirm_no_live_postmaster().await.unwrap_err();
+        assert!(format!("{err}").contains("may still be alive"));
     }
 }

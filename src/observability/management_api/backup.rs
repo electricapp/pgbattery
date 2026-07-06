@@ -398,7 +398,7 @@ pub(super) async fn restore_backup(
     // Hold the supervisor lock continuously across stop → restore → start.
     //
     // Why: dropping the lock between `stop` and `start` lets
-    // `handle_supervisor_health_tick` run (every 500ms) while PG is
+    // `handle_supervisor_health_tick` run (every 1 s) while PG is
     // intentionally stopped. The health tick sees `is_alive() == false`,
     // assumes PG crashed, and triggers process shutdown — Docker then
     // restarts pgbattery in bootstrap mode, which spins up a brand-new
