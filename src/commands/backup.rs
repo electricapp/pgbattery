@@ -35,6 +35,20 @@ fn build_restore_request<'a>(
     }
 }
 
+fn build_list_request(
+    client: &reqwest::Client,
+    node_addr: &str,
+    management_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let url = format!("http://{node_addr}/api/v1/backup/list");
+    let request = client.get(&url);
+    if let Some(token) = management_token {
+        request.header(MANAGEMENT_API_TOKEN_HEADER, token)
+    } else {
+        request
+    }
+}
+
 fn build_create_request(
     client: &reqwest::Client,
     node_addr: &str,
@@ -162,12 +176,12 @@ pub async fn run_backup_list(
     let node_addr = resolve_node_addr(node, config_path.as_deref()).await?;
 
     let client = http_client(30)?;
+    let token = management_api_token(config_path.as_deref());
 
-    let url = format!("http://{node_addr}/api/v1/backup/list");
-    let resp =
-        client.get(&url).send().await.map_err(|e| {
-            anyhow::anyhow!("{}\nError: {}", hints::connection_failed(&node_addr), e)
-        })?;
+    let resp = build_list_request(&client, &node_addr, token.as_deref())
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}\nError: {}", hints::connection_failed(&node_addr), e))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -176,7 +190,7 @@ pub async fn run_backup_list(
             "Backup list request",
             status,
             &body,
-            false
+            token.is_some()
         ));
     }
 
@@ -351,7 +365,32 @@ pub async fn run_backup_restore(
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
-    use super::{MANAGEMENT_API_TOKEN_HEADER, build_create_request, build_restore_request};
+    use super::{
+        MANAGEMENT_API_TOKEN_HEADER, build_create_request, build_list_request,
+        build_restore_request,
+    };
+
+    #[test]
+    fn test_build_list_request_includes_token() {
+        // The server token-gates GET /api/v1/backup/list (it leaks paths,
+        // sizes, and the backup schedule), so the CLI must send the token
+        // when one is configured.
+        let client = reqwest::Client::new();
+        let request = build_list_request(&client, "127.0.0.1:9091", Some("secret-token")).build();
+        assert!(request.is_ok());
+        let request = request.unwrap_or_else(|_| unreachable!());
+        let header = request.headers().get(MANAGEMENT_API_TOKEN_HEADER);
+        assert_eq!(header.and_then(|v| v.to_str().ok()), Some("secret-token"));
+    }
+
+    #[test]
+    fn test_build_list_request_without_token_sends_no_header() {
+        let client = reqwest::Client::new();
+        let request = build_list_request(&client, "127.0.0.1:9091", None).build();
+        assert!(request.is_ok());
+        let request = request.unwrap_or_else(|_| unreachable!());
+        assert!(request.headers().get(MANAGEMENT_API_TOKEN_HEADER).is_none());
+    }
 
     #[test]
     fn test_build_restore_request_encodes_query_values() {

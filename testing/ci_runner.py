@@ -1225,8 +1225,12 @@ class CIRunner:
         else:
             expected = [int(item) for item in expect_status]
 
+        # POSTs are mutations and always carry the token. GETs default to
+        # unauthenticated so the public discovery contract stays tested;
+        # token-gated GETs (e.g. /api/v1/backup/list) opt in with `auth: true`.
+        send_auth = method == "POST" or bool(step.get("auth", False))
         auth_headers = (
-            {"x-pgbattery-token": self.mgmt_token} if method == "POST" and self.mgmt_token else {}
+            {"x-pgbattery-token": self.mgmt_token} if send_auth and self.mgmt_token else {}
         )
         status, body = self._http_request(
             method, url, timeout_sec=int(step.get("timeout_sec", 10)), headers=auth_headers

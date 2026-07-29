@@ -929,6 +929,7 @@
           "type": "http",
           "method": "GET",
           "url": "http://localhost:9081/api/v1/backup/list",
+          "auth": true,
           "expect_status": 200,
           "json_fields": [
             "backups"
@@ -1455,6 +1456,7 @@
           "type": "http",
           "method": "GET",
           "url": "http://localhost:9081/api/v1/backup/list",
+          "auth": true,
           "expect_status": 200,
           "json_fields": [
             "backups"
@@ -1595,8 +1597,8 @@
         },
         {
           "type": "cmd",
-          "comment": "restore connectivity so node1 can rejoin as follower",
-          "cmd": "docker network connect \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\""
+          "comment": "Restore connectivity so node1 can rejoin as follower. --ip is mandatory: `docker network disconnect` destroys the compose-assigned static endpoint, and a bare reconnect picks a dynamic IPAM address, so peers keep dialing the membership address 172.28.0.11 into a void — node1's outbound RPCs work but inbound replication never arrives, and it campaigns forever (leaders=0 wedge). `docker compose restart` does not re-apply static IPs (restart is not recreate).",
+          "cmd": "docker network connect --ip 172.28.0.11 \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\""
         },
         {
           "type": "cmd",

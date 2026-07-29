@@ -4,7 +4,7 @@ Raft-based HA manager for PostgreSQL. Rust binary (`pgbattery`) that manages a 3
 
 ## Correctness is Paramount
 
-This is a distributed database system. If you observe inconsistent state (split-brain, lost writes, stuck replication, missing slots), **STOP**, investigate, and document in `BUGS.md` before continuing.
+This is a distributed database system. If you observe inconsistent state (split-brain, lost writes, stuck replication, missing slots), **STOP** and investigate to root cause. Once the root cause is clear, prefer fixing it immediately over writing it up. `BUGS.md` is only for deferred fixes and unclear root causes — not a changelog of bugs that were found and fixed in the same session.
 
 ## State machines: `docs/STATE_MACHINE.md` is canonical
 
@@ -69,11 +69,12 @@ All on port 9091 internally (mapped to 9081/9082/9083).
 - `GET /api/v1/cluster/members` → Raft membership
 - `GET /api/v1/cluster/node/{id}/lag` → `{lag_bytes, is_synced}`
 
-**Mutations (require `x-pgbattery-token` header):**
+**Token-required (`x-pgbattery-token` header):**
 
 - `POST /api/v1/cluster/transfer-leadership/{target_id}`
 - `POST /api/v1/cluster/join`, `/promote/{id}`, `/remove/{id}`
 - `POST /api/v1/backup/create`, `/restore?filename=...`
+- `GET /api/v1/backup/list` — read-only but gated: it leaks filesystem paths, sizes, and the backup schedule, and drives a stat walk of every backup tree
 
 ## Testing
 
