@@ -19,6 +19,12 @@ updates:
           - "patch"
           - "minor"
           - "major"
+    ignore:
+      # x509-cert must stay on the same version sigstore-rs itself uses
+      # (see Cargo.toml): a solo bump splits the graph into two x509-cert
+      # versions whose cert types don't unify. Bump it manually, together
+      # with sigstore.
+      - dependency-name: "x509-cert"
 
   # GitHub Actions workflows — Dependabot bumps both the SHA pin and the
   # trailing version comment.

@@ -662,7 +662,7 @@ mod tests {
         // path produces a valid BytesMut and doesn't panic.
         let multibyte = "é".repeat(400); // each 'é' is 2 bytes => 800 bytes
         let msg = build_failover_error_response(&multibyte);
-        assert!(msg.first() == Some(&b'E'));
+        assert_eq!(msg.first(), Some(&b'E'));
     }
 
     #[test]

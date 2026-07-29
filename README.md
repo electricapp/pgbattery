@@ -3,7 +3,7 @@
 ![TLA+ Verified](https://img.shields.io/badge/Verified-TLA%2B-blue)
 ![License](https://img.shields.io/badge/License-AGPLv3-green)
 ![Status](https://img.shields.io/badge/Status-Alpha-orange)
-![Rust](https://img.shields.io/badge/Rust-1.96%2B-orange)
+![Rust](https://img.shields.io/badge/Rust-1.97%2B-orange)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey)
 
 </div>

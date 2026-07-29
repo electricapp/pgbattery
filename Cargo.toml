@@ -7,11 +7,11 @@ members = [
 
 # Shared package metadata — single source of truth for every workspace
 # crate. Each crate's [package] inherits via `*.workspace = true`, so a
-# bump to (e.g.) rust-version 1.96 happens in one place.
+# bump to (e.g.) rust-version happens in one place.
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "AGPL-3.0-only"
 repository = "https://github.com/electricapp/pgbattery"
 

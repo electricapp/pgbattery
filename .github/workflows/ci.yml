@@ -38,7 +38,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
           components: rustfmt
 
       - name: Format check
@@ -58,7 +58,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
           components: clippy
 
       - name: Cache dependencies
@@ -71,7 +71,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clippy check
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   # The fuzz crate lives outside the main workspace, so the `clippy` job above
   # never compiles its targets — they silently drift against the lib API (a
@@ -108,7 +108,7 @@ jobs:
           key: ${{ runner.os }}-fuzz-clippy-${{ hashFiles('fuzz/Cargo.toml', 'Cargo.lock') }}
 
       - name: Clippy fuzz targets
-        run: cd fuzz && cargo clippy --all-targets -- -D warnings
+        run: cd fuzz && cargo clippy --all-targets --locked -- -D warnings
 
   test:
     name: Test
@@ -124,7 +124,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
 
       - name: Cache dependencies
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
@@ -136,7 +136,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose --locked
 
   msrv:
     name: MSRV Check
@@ -152,7 +152,7 @@ jobs:
       - name: Install MSRV Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
 
       - name: Cache dependencies
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
@@ -164,7 +164,7 @@ jobs:
           key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check MSRV
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets --locked
 
   doc:
     name: Doc Check
@@ -180,7 +180,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
 
       - name: Cache dependencies
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
@@ -194,7 +194,7 @@ jobs:
       - name: Check documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --workspace --no-deps --all-features --locked
 
   deny:
     name: Cargo Deny
@@ -262,7 +262,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
 
       - name: Install cargo-machete
         uses: taiki-e/install-action@ace6ebe54a6a0c86dfb5f7764b17f793b6925bc3 # v2.82.3
@@ -286,7 +286,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
 
       - name: Cache dependencies
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
@@ -298,7 +298,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check benchmarks compile
-        run: cargo bench --no-run
+        run: cargo bench --workspace --no-run --locked
 
   build:
     name: Build
@@ -315,7 +315,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.96"
+          toolchain: "1.97"
 
       - name: Cache dependencies
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
@@ -327,7 +327,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release
-        run: cargo build --release --verbose
+        run: cargo build --release --verbose --locked
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

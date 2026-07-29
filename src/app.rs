@@ -161,7 +161,7 @@ impl App {
     /// Returns an error if observability setup or the data-node run loop fails.
     pub async fn run(self, bootstrap: bool) -> Result<()> {
         // Initialize observability
-        crate::observability::logging::init_logging(self.config.log_json)?;
+        crate::observability::logging::init_logging(self.config.log_json);
         crate::observability::metrics::init_metrics(self.config.metrics_addr)?;
 
         self.run_data_node(bootstrap).await

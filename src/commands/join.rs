@@ -195,7 +195,7 @@ pub async fn run_join(
     // Load config and initialize logging before any code paths that might
     // emit tracing events (HTTP client, Raft startup, etc.).
     let mut config = load_config(config_path.as_deref())?;
-    crate::observability::logging::init_logging(config.log_json)?;
+    crate::observability::logging::init_logging(config.log_json);
 
     // Restart fast-path: if this node already has local Raft state, skip the
     // join-info fetch and hand off to run_join_flow, which already contains

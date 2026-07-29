@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: "1.96.0"
+  RUST_TOOLCHAIN: "1.97.0"
 
 concurrency:
   group: ${{ github.workflow }}
@@ -36,13 +36,15 @@ jobs:
 
       - name: Install cargo-audit + cargo-deny
         run: |
-          cargo install cargo-audit@0.21.2 --locked
-          cargo install cargo-deny@0.19.5 --locked
+          cargo install cargo-audit@0.22.2 --locked
+          cargo install cargo-deny@0.20.2 --locked
 
       - name: Advisory + yanked audit (committed lockfile)
         run: |
           cargo audit --deny warnings
           cargo audit --deny yanked
 
+      # deny.toml is discovered from the repo root; cargo-deny 0.20 no longer
+      # accepts `check --config`.
       - name: License / bans / sources policy
-        run: cargo deny check --config deny.toml
+        run: cargo deny check

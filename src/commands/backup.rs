@@ -7,6 +7,7 @@ use super::common::{
     http_client, management_api_token, resolve_node_addr, with_spinner,
 };
 use crate::cli::BackupTypeArg;
+use crate::cluster::client::management_api_failure;
 
 fn build_restore_request<'a>(
     client: &reqwest::Client,
@@ -95,9 +96,8 @@ pub async fn run_backup_create(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
-            "Backup request failed ({}): {}\n{}",
-            status,
-            body,
+            "{}\n{}",
+            management_api_failure("Backup request", status, &body, token.is_some()),
             hints::backup_failed()
         );
     }
@@ -172,7 +172,12 @@ pub async fn run_backup_list(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Backup list request failed ({status}): {body}");
+        anyhow::bail!(management_api_failure(
+            "Backup list request",
+            status,
+            &body,
+            false
+        ));
     }
 
     let response: BackupListResponse = resp.json().await?;
@@ -318,9 +323,8 @@ pub async fn run_backup_restore(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!(
-            "Restore request failed ({}): {}\n{}",
-            status,
-            body,
+            "{}\n{}",
+            management_api_failure("Restore request", status, &body, token.is_some()),
             hints::restore_failed()
         );
     }

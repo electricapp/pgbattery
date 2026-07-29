@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.4
-FROM rust:1.96 AS builder
+FROM rust:1.97 AS builder
 WORKDIR /app
 
 # Build profile: "release" (default) or "dev" for fast iteration
@@ -10,12 +10,17 @@ RUN apt-get update && apt-get install -y libclang-dev clang && rm -rf /var/lib/a
 
 COPY . .
 
+# Strip build-host paths from the binary: panic locations, tracing callsite
+# metadata, and file!() strings from registry deps embed absolute paths as
+# data, which `strip` cannot remove.
+ENV RUSTFLAGS="--remap-path-prefix=/app=/src --remap-path-prefix=/usr/local/cargo=/cargo"
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     if [ "$BUILD_PROFILE" = "release" ]; then \
-        cargo build --release && cp target/release/pgbattery /pgbattery; \
+        cargo build --release --locked && cp target/release/pgbattery /pgbattery; \
     else \
-        cargo build && cp target/debug/pgbattery /pgbattery; \
+        cargo build --locked && cp target/debug/pgbattery /pgbattery; \
     fi
 
 FROM postgres:18

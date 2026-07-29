@@ -1,10 +1,9 @@
 //! pgbattery - `PostgreSQL` High-Availability Single Binary
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
 use pgbattery::Config;
 use pgbattery::app::App;
-use pgbattery::cli::{BackupCommands, Cli, ClusterCommands, Commands, OutputFormat};
+use pgbattery::cli::{BackupCommands, ClusterCommands, Commands, OutputFormat};
 use pgbattery::commands::{
     GlobalFlags, InitParams, init_globals, run_backup_create, run_backup_list, run_backup_restore,
     run_doctor, run_init, run_join, run_leader, run_members, run_promote, run_remove, run_status,
@@ -53,7 +52,7 @@ fn load_config(path: Option<&str>) -> Result<Config> {
     reason = "flat command dispatch; splitting obscures the routing"
 )]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = pgbattery::cli::parse();
 
     init_globals(GlobalFlags {
         no_color: cli.no_color,
@@ -62,28 +61,41 @@ async fn main() -> Result<()> {
         token_file: cli.token_file,
     });
 
+    // -v precedence (flag > RUST_LOG > default) applies to every subscriber
+    // installed after this point.
+    pgbattery::observability::logging::set_cli_verbosity(cli.verbose);
+    // Control commands install no tracing subscriber of their own; with -v
+    // they get one here (human format, stderr). The node paths (`run`, and
+    // `join` once it transitions into node mode) install theirs with the
+    // config's log_json format — `run` is excluded so -v never flips a
+    // service's configured log format, only its filter. For `join`, the
+    // operator is at a terminal debugging interactively: human format wins.
+    if cli.verbose > 0 && !matches!(cli.command, Commands::Run { .. }) {
+        pgbattery::observability::logging::init_logging(false);
+    }
+
     match cli.command {
-        Some(Commands::Version) => {
+        Commands::Version => {
             println!("pgbattery {}", pgbattery::cli::LONG_VERSION);
             Ok(())
         }
-        Some(Commands::Status {
+        Commands::Status {
             nodes,
             discover,
             format,
             json,
             watch,
-        }) => {
+        } => {
             let format = if json { OutputFormat::Json } else { format };
             run_status(nodes, discover, format, watch, cli.config).await
         }
-        Some(Commands::Join {
+        Commands::Join {
             peer,
             node_id,
             voter,
             write_config,
-        }) => run_join(peer, node_id, voter, write_config, cli.config).await,
-        Some(Commands::Init {
+        } => run_join(peer, node_id, voter, write_config, cli.config).await,
+        Commands::Init {
             output,
             node_id,
             listen_addr,
@@ -92,7 +104,7 @@ async fn main() -> Result<()> {
             pg_data_dir,
             pg_bin_dir,
             force,
-        }) => {
+        } => {
             run_init(InitParams {
                 output,
                 node_id,
@@ -105,7 +117,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Some(Commands::Cluster(cluster_cmd)) => match cluster_cmd {
+        Commands::Cluster(cluster_cmd) => match cluster_cmd {
             ClusterCommands::Leader { node, json } => run_leader(node, json, cli.config).await,
             ClusterCommands::Promote { node_id, leader } => {
                 run_promote(node_id, leader, cli.config).await
@@ -118,7 +130,7 @@ async fn main() -> Result<()> {
             } => run_remove(node_id, self_remove, leader, yes, cli.config).await,
             ClusterCommands::Members { node, json } => run_members(node, json, cli.config).await,
         },
-        Some(Commands::Backup(backup_cmd)) => match backup_cmd {
+        Commands::Backup(backup_cmd) => match backup_cmd {
             BackupCommands::Create { backup_type, node } => {
                 run_backup_create(backup_type, node, cli.config).await
             }
@@ -130,7 +142,7 @@ async fn main() -> Result<()> {
                 yes,
             } => run_backup_restore(filename, node, database, yes, cli.config).await,
         },
-        Some(Commands::Upgrade {
+        Commands::Upgrade {
             check,
             version,
             url,
@@ -139,7 +151,7 @@ async fn main() -> Result<()> {
             identity,
             insecure_no_verify,
             allow_downgrade,
-        }) => {
+        } => {
             run_upgrade(
                 check,
                 version,
@@ -152,7 +164,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Doctor {
+        Commands::Doctor {
             nodes,
             discover,
             format,
@@ -160,7 +172,7 @@ async fn main() -> Result<()> {
             skip_network,
             skip_disk,
             strict,
-        }) => {
+        } => {
             let format = if json { OutputFormat::Json } else { format };
             run_doctor(
                 nodes,
@@ -173,27 +185,23 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Commands::Completions { shell }) => {
+        Commands::Completions { shell } => {
             clap_complete::generate(
                 shell,
-                &mut Cli::command(),
+                &mut pgbattery::cli::styled_command(),
                 "pgbattery",
                 &mut std::io::stdout(),
             );
             Ok(())
         }
-        Some(Commands::Man) => {
-            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        Commands::Man => {
+            clap_mangen::Man::new(pgbattery::cli::styled_command())
+                .render(&mut std::io::stdout())?;
             Ok(())
         }
-        Some(Commands::Run { bootstrap }) => {
+        Commands::Run { bootstrap } => {
             let config = load_config(cli.config.as_deref())?;
             App::new(config).run(bootstrap).await
-        }
-        None => {
-            // Default behavior when no subcommand: run the node without bootstrap.
-            let config = load_config(cli.config.as_deref())?;
-            App::new(config).run(false).await
         }
     }
 }

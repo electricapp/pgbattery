@@ -49,7 +49,7 @@ jobs:
       # channel, so nightly is requested explicitly here; fuzz/rust-toolchain.toml
       # also selects nightly for everything under fuzz/ (rustup resolves the
       # nearest toolchain file to the cwd), so the `cargo fuzz` step below runs on
-      # nightly while the rest of the project stays on 1.96.
+      # nightly while the rest of the project stays on 1.97.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:

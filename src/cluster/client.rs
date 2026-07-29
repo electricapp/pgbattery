@@ -179,6 +179,38 @@ async fn read_error_body(resp: reqwest::Response) -> String {
     }
 }
 
+/// Compose the operator-facing message for a non-success management API
+/// response. On 401/403 it appends an authentication hint that states whether
+/// a token was sent at all — the one diagnostic fact only the client side
+/// knows — and where a token can come from.
+pub(crate) fn management_api_failure(
+    what: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    token_sent: bool,
+) -> String {
+    let mut msg = format!("{what} failed ({status}): {body}");
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        if token_sent {
+            msg.push_str(
+                "\nHint: the management API token was sent but rejected. Ensure it matches \
+                 the cluster's management_api_token (sources, most preferred first: \
+                 --token-file, PGBATTERY_MANAGEMENT_API_TOKEN, config file).",
+            );
+        } else {
+            msg.push_str(
+                "\nHint: no management API token was sent. This operation requires one: \
+                 pass --token-file <path>, set PGBATTERY_MANAGEMENT_API_TOKEN, or set \
+                 management_api_token in the config file.",
+            );
+        }
+    }
+    msg
+}
+
 impl ClusterClient {
     /// Discover the current cluster leader.
     ///
@@ -249,7 +281,12 @@ impl ClusterClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = read_error_body(resp).await;
-            anyhow::bail!("Leader request failed ({status}): {body}");
+            anyhow::bail!(management_api_failure(
+                "Leader request",
+                status,
+                &body,
+                false
+            ));
         }
 
         Ok(resp.json().await?)
@@ -271,7 +308,12 @@ impl ClusterClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = read_error_body(resp).await;
-            anyhow::bail!("Members request failed ({status}): {body}");
+            anyhow::bail!(management_api_failure(
+                "Members request",
+                status,
+                &body,
+                false
+            ));
         }
 
         Ok(resp.json().await?)
@@ -296,7 +338,12 @@ impl ClusterClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = read_error_body(resp).await;
-            anyhow::bail!("Promote request failed ({status}): {body}");
+            anyhow::bail!(management_api_failure(
+                "Promote request",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
         }
 
         Ok(resp.json().await?)
@@ -317,7 +364,12 @@ impl ClusterClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = read_error_body(resp).await;
-            anyhow::bail!("Remove request failed ({status}): {body}");
+            anyhow::bail!(management_api_failure(
+                "Remove request",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
         }
 
         Ok(resp.json().await?)
@@ -345,7 +397,12 @@ impl ClusterClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = read_error_body(resp).await;
-            anyhow::bail!("Transfer request failed ({status}): {body}");
+            anyhow::bail!(management_api_failure(
+                "Transfer request",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
         }
 
         let transfer: TransferResponse = resp
@@ -375,7 +432,12 @@ impl ClusterClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = read_error_body(resp).await;
-            anyhow::bail!("Nodes request failed ({status}): {body}");
+            anyhow::bail!(management_api_failure(
+                "Nodes request",
+                status,
+                &body,
+                false
+            ));
         }
 
         Ok(resp.json().await?)
@@ -414,5 +476,47 @@ mod tests {
             client.local_mgmt_addr(),
             Some("127.0.0.1:9091".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn test_failure_message_carries_status_and_body() {
+        let msg = management_api_failure(
+            "Promote request",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "boom",
+            true,
+        );
+        assert!(msg.contains("Promote request failed"), "{msg}");
+        assert!(msg.contains("500"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(
+            !msg.contains("Hint"),
+            "no auth hint on non-auth errors: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unauthorized_without_token_says_none_was_sent() {
+        let msg = management_api_failure(
+            "Promote request",
+            reqwest::StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            false,
+        );
+        assert!(msg.contains("no management API token was sent"), "{msg}");
+        assert!(msg.contains("--token-file"), "{msg}");
+        assert!(msg.contains("PGBATTERY_MANAGEMENT_API_TOKEN"), "{msg}");
+    }
+
+    #[test]
+    fn test_unauthorized_with_token_says_it_was_rejected() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let msg = management_api_failure("Remove request", status, "denied", true);
+            assert!(msg.contains("rejected"), "{msg}");
+            assert!(msg.contains("management_api_token"), "{msg}");
+        }
     }
 }
