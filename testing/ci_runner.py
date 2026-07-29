@@ -1294,19 +1294,30 @@ class CIRunner:
             f"{self.node_map[leader_id].mgmt_url}"
             f"/api/v1/cluster/transfer-leadership/{target_node_id}"
         )
-        status, body = self._http_request(
-            "POST",
-            url,
-            timeout_sec=int(step.get("timeout_sec", 15)),
-            headers={"x-pgbattery-token": self.mgmt_token} if self.mgmt_token else {},
-        )
+        # 409 means "not now, retry after replication converges" (e.g. the
+        # target standby is still catching up on WAL right after a preceding
+        # case restarted it — reuse_cluster suites hit this). The server's
+        # refusal is the safety gate working; honor its retry semantics with
+        # a bounded window instead of failing the case on the first attempt.
+        retry_deadline = time.monotonic() + float(step.get("retry_sec", 60))
+        attempts = []
+        while True:
+            status, body = self._http_request(
+                "POST",
+                url,
+                timeout_sec=int(step.get("timeout_sec", 15)),
+                headers={"x-pgbattery-token": self.mgmt_token} if self.mgmt_token else {},
+            )
+            attempts.append({"status": status, "body": body})
+            if status != 409 or time.monotonic() >= retry_deadline:
+                break
+            time.sleep(2.0)
         self._write_text(
             step_log,
             json.dumps(
                 {
                     "url": url,
-                    "status": status,
-                    "body": body,
+                    "attempts": attempts,
                     "leader_before": leader_id,
                 },
                 indent=2,
@@ -2022,7 +2033,21 @@ class CIRunner:
             try:
                 self._start_cluster(self.suite_name)
                 cluster_started = True
-                for case_id in self.selected_case_ids:
+                for index, case_id in enumerate(self.selected_case_ids):
+                    if index > 0:
+                        # Convergence barrier: every case starts from a settled
+                        # cluster (one leader, all voters, healthy replica
+                        # shape), not from whatever churn the previous case's
+                        # cleanup left behind — a just-restarted standby can
+                        # still be catching up on WAL, and the next case's
+                        # first step would race that convergence.
+                        self._wait_for_cluster(
+                            expected_nodes=self.matrix.cluster.expected_nodes,
+                            expected_leaders=1,
+                            timeout_sec=self.suite_config.max_wait_cluster_seconds or 90,
+                            require_all_voters=True,
+                            require_replication_health=True,
+                        )
                     if not self._run_case(case_id):
                         break
             finally:

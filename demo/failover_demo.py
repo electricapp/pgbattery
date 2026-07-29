@@ -149,8 +149,33 @@ def main() -> int:
         f"  ({last_ok_ts is not None and 'connection migrated' or 'lost'})"
     )
 
-    # Restart the killed node so the cluster is back to 3-of-3 for next run.
+    # Restart the killed node and wait for the cluster to heal back to 3-of-3.
+    # The README GIF records the watcher TUI above this pane, so the demo only
+    # exits once every node is back and agreeing on the leader — the viewer
+    # sees the killed node rejoin as a standby, not just the failover.
     subprocess.run(["docker", "start", container], check=True, capture_output=True)
+    console.print(f"[dim]{stamp()}  docker start {container} — waiting for node{leader_before} to rejoin[/]")
+    heal_deadline = time.monotonic() + 90
+    while time.monotonic() < heal_deadline:
+        try:
+            views = {
+                int(httpx.get(f"{base}/api/v1/cluster/leader", timeout=2).json()["leader_id"])
+                for base in MGMT_BASES
+            }
+            if len(views) == 1:
+                break
+        except Exception:
+            pass
+        time.sleep(1.0)
+    else:
+        console.print("[yellow]node did not rejoin within 90s — check the cluster[/]")
+        return 0
+    # Let the watcher TUI above tick over to the fully healthy view before the
+    # final line lands (replication state trails the mgmt API by a beat).
+    time.sleep(5.0)
+    console.print(
+        f"[bold green]✓ cluster healed[/]  node{leader_before} rejoined as standby — 3/3 nodes"
+    )
     return 0
 
 

@@ -646,6 +646,8 @@ impl Governor {
             current_term = metrics.current_term,
             current_leader = ?leader_id,
             last_log_index = ?metrics.last_log_index,
+            millis_since_quorum_ack = ?metrics.millis_since_quorum_ack,
+            has_quorum,
             "Raft metrics update"
         );
 

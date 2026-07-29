@@ -2013,12 +2013,15 @@
         },
         {
           "type": "cmd",
-          "cmd": "docker compose exec -T node3 pkill -9 pgbattery"
+          "comment": "kill the whole container; pkill alone races with docker's restart policy (restart: unless-stopped resurrects pgbattery in seconds and quorum silently returns)",
+          "cmd": "docker compose kill node3"
         },
         {
           "type": "wait_cluster",
+          "comment": "Leader-presence only: node3's container is dead, so its replica entry lingers as Async in the leader's metrics and the full replication-shape check can never pass. The sync mid-batch write below is the real gate — it only commits if node1+node2 sync replication works.",
           "nodes": 3,
           "leaders": 1,
+          "require_replication_health": false,
           "timeout_sec": 60
         },
         {
@@ -2029,7 +2032,8 @@
         },
         {
           "type": "cmd",
-          "cmd": "docker compose exec -T node2 pkill -9 pgbattery"
+          "comment": "second container kill: quorum is now genuinely lost and must stay lost for the fenced-write probe",
+          "cmd": "docker compose kill node2"
         },
         {
           "type": "sleep",
