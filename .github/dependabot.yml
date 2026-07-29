@@ -1,8 +1,11 @@
 version: 2
 updates:
-  # Rust dependencies (Cargo.toml / Cargo.lock).
+  # Rust dependencies (Cargo.toml / Cargo.lock). The fuzz crate lives outside
+  # the workspace with its own lockfile that path-depends on the root crate,
+  # so both directories update together — otherwise every root dep bump
+  # strands fuzz/Cargo.lock and the --locked fuzz clippy job fails.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories: ["/", "/fuzz"]
     schedule:
       interval: "daily"
     commit-message:
