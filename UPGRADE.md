@@ -49,7 +49,7 @@ Thin loop over existing APIs, run from any operator machine:
 2. For each follower, in lag order (most caught-up last):
    a. Upgrade the binary on that node (existing single-node `upgrade` path).
    b. Restart pgbattery; wait until the node rejoins Raft and its standby is
-      streaming again (`/cluster/node/{id}/lag` below threshold).
+   streaming again (`/cluster/node/{id}/lag` below threshold).
 3. `transfer-leadership` to an already-upgraded follower.
 4. Upgrade the former leader (now a follower) the same way.
 5. Postflight: `doctor --strict`; all nodes report the target version.
