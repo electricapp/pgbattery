@@ -40,7 +40,7 @@ import json
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import typer
 from rich.console import Console
@@ -293,6 +293,111 @@ def check_case_contract_refs() -> None:
         raise AssertionError(" | ".join(violations))
 
 
+RAW_FAULT_VERB: Final[re.Pattern[str]] = re.compile(
+    r"docker\s+(?:network\s+(?:dis)?connect|kill|stop|start|pause|unpause|restart)\b"
+    r"|\biptables\b"
+    r"|\btc\s+(?:qdisc|filter)\b"
+)
+"""Shell verbs that inject or heal a fault.
+
+``iptables`` and ``tc`` are only ever faults. ``docker`` is not, so only its
+fault subcommands are listed: ``docker compose ps`` and ``docker exec psql``
+are ordinary reads and must stay allowed.
+"""
+
+PRIMITIVE_MODULE: Final[str] = "fault_primitives.py"
+
+PENDING_FAULT_MIGRATION: Final[frozenset[str]] = frozenset(
+    {
+        # Drives its asymmetric partition with iptables and its latency with tc,
+        # each behind its own verifier. Pending H-02.
+        "ci_runner.py",
+        # Also addresses containers by literal name, so it inherits the Class A1
+        # bug the moment it runs under a non-default compose project. Pending H-12.
+        "overnight_test.py",
+    }
+)
+"""Modules that still inject faults directly, each tracked by a task.
+
+The point of this list is to stop the *spread*. It is not a correctness check:
+matching source text cannot tell a command from a sentence about a command, and
+a verb assembled at runtime is invisible to it. What it does buy is that a new
+module cannot quietly start injecting faults, and that these two cannot be
+forgotten — a file that becomes clean has to be removed from the list, which is
+the only ratchet worth having here.
+"""
+
+FAULT_VERB_SCAN_EXEMPT: Final[frozenset[str]] = frozenset(
+    {
+        PRIMITIVE_MODULE,
+        # This module has to spell the verbs out to detect them.
+        "lint_matrix.py",
+    }
+)
+
+
+def count_raw_fault_verbs(source: str) -> list[int]:
+    """Line numbers of string literals containing a raw fault verb.
+
+    Parses rather than greps so comments and docstrings — which discuss these
+    commands constantly — cannot register as injections. Docstrings are string
+    literals too, so they are excluded explicitly.
+
+    Deliberately shallow: a verb assembled at runtime is invisible to it. It
+    answers "does this module name a fault command", which is enough to notice a
+    new module starting to, and not enough to be relied on for anything else.
+    """
+    tree = ast.parse(source)
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            body = getattr(node, "body", [])
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstrings.add(id(body[0].value))
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and RAW_FAULT_VERB.search(node.value)
+    )
+
+
+def check_fault_injection_confined() -> None:
+    """Keep direct fault injection confined to the modules already tracked for it.
+
+    A fault has to verify its own effect or it reads as coverage while injecting
+    nothing; that verification lives in `fault_primitives.py`. This checks only
+    which modules inject directly, not how many times, because a count is noise
+    that churns on unrelated edits without saying anything more.
+    """
+    problems: list[str] = []
+    for path in sorted(TESTING_DIR.glob("*.py")):
+        if path.name in FAULT_VERB_SCAN_EXEMPT or path.name.startswith("test_"):
+            continue
+        injects = bool(count_raw_fault_verbs(path.read_text(encoding="utf-8")))
+        pending = path.name in PENDING_FAULT_MIGRATION
+        if injects and not pending:
+            problems.append(
+                f"{path.name} injects faults directly; route them through "
+                f"{PRIMITIVE_MODULE}, which verifies its own effect and resolves "
+                f"docker names against the active compose project"
+            )
+        elif pending and not injects:
+            problems.append(
+                f"{path.name} no longer injects faults directly — drop it from "
+                f"PENDING_FAULT_MIGRATION so it cannot regress unnoticed"
+            )
+    if problems:
+        raise AssertionError(" | ".join(problems))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -315,6 +420,7 @@ def lint() -> None:
     check("No duplicate case IDs", check_no_duplicate_case_ids)
     check("CONTRACTS.md defines contract IDs", check_contracts_doc)
     check("Cases reference real contract IDs", check_case_contract_refs)
+    check("Fault injection confined to tracked modules", check_fault_injection_confined)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

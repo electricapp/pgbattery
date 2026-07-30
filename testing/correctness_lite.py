@@ -173,6 +173,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+import fault_primitives as fp
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -666,14 +668,6 @@ def find_leader() -> tuple[str | None, int | None]:
     return None, None
 
 
-def find_network() -> str | None:
-    """Return the Docker network name containing 'raft_net', or None."""
-    rc, out, _ = run_cmd("docker network ls --format '{{.Name}}' | grep raft_net")
-    if rc == 0 and out.strip():
-        return out.strip().splitlines()[0]
-    return None
-
-
 def wait_cluster_healthy(timeout: int = 60) -> bool:
     """Poll until a leader is discoverable or *timeout* seconds pass."""
     deadline = time.time() + timeout
@@ -1072,44 +1066,28 @@ def _kill_leader_now() -> str | None:
     return leader
 
 
-def _has_cluster_address(service: str) -> bool:
-    """Report whether ``service``'s container still holds a cluster-network IP."""
-    rc, out, _ = run_cmd(
-        f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}} "
-        f"{{{{end}}}}' {container_name(service)}",
-        timeout=10,
-    )
-    return rc == 0 and "172.28." in out
-
-
 def _partition_leader_now(heal_after: float = 4.0) -> str | None:
+    """Detach the leader now; heal in the background after `heal_after`.
+
+    The window is opened synchronously so the caller's writes land inside it, and
+    closed from a thread. Both halves are verified by the primitive, including
+    the reattach — which restores the address read off the container rather than
+    one derived from a node index, so it cannot put a node back somewhere else.
+    """
     leader, _ = find_leader()
     if leader is None:
         return None
-    idx = NODES.index(leader) + 1
-    net = raft_network_name()
-    cid = container_name(leader)
-    # Fail loudly: a disconnect that silently no-ops leaves an empty fault
-    # window, and an empty window reads as "no violations during the partition"
-    # rather than "the partition never happened".
-    rc, _, err = run_cmd(f"docker network disconnect {net} {cid}", timeout=10)
-    if rc != 0:
-        raise RuntimeError(
-            f"failed to partition {leader} from {net}: {err.strip() or f'exit {rc}'}"
-        )
-    if _has_cluster_address(leader):
-        raise RuntimeError(
-            f"partition of {leader} did not take effect: still holds a 172.28.x address"
-        )
+    # enter_context injects and verifies synchronously, raising if the detach did
+    # not land: an empty fault window otherwise reads as "no violations during
+    # the partition" rather than "the partition never happened".
+    stack = contextlib.ExitStack()
+    stack.enter_context(fp.network_detached(leader))
 
     def _heal() -> None:
         time.sleep(heal_after)
-        run_cmd(
-            f"docker network connect --ip 172.28.0.1{idx} {net} {cid}",
-            timeout=10,
-        )
+        stack.close()
 
-    threading.Thread(target=_heal, daemon=True).start()
+    _spawn_fault_thread(_heal, f"heal-partition-{leader}")
     return leader
 
 
@@ -1178,7 +1156,7 @@ def _quorum_loss_now(restore_after: float = 4.0) -> str | None:
         time.sleep(restore_after)
         docker_compose("start", others[0])
 
-    threading.Thread(target=_restore, daemon=True).start()
+    _spawn_fault_thread(_restore, "restore-quorum")
     return leader
 
 
@@ -1198,8 +1176,46 @@ def _chaos_storm_now(duration: float = 8.0, seed: int | None = None) -> str | No
         elapsed = time.monotonic() - start
         if ft > elapsed:
             time.sleep(ft - elapsed)
-        threading.Thread(target=_FAULT_DISPATCH[kind], daemon=True).start()
+        _spawn_fault_thread(_FAULT_DISPATCH[kind], f"chaos-{kind}")
     return leader
+
+
+_FAULT_THREAD_ERRORS: list[str] = []
+"""Failures raised inside fault threads, for `main` to fail the run on.
+
+Faults are fired from daemon threads, so an exception in one is printed to stderr
+and then discarded: the run continues, finds no violation in a window where no
+fault was ever injected, and reports PASS. The primitives raise rather than
+no-op, which only helps if somebody reads the exception."""
+
+_FAULT_THREAD_LOCK: Final[threading.Lock] = threading.Lock()
+
+
+def _spawn_fault_thread(target: Callable[[], object], name: str) -> threading.Thread:
+    """Run `target` in a daemon thread, recording any failure it raises."""
+
+    def _wrapped() -> None:
+        try:
+            target()
+        except BaseException as exc:
+            with _FAULT_THREAD_LOCK:
+                _FAULT_THREAD_ERRORS.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    thread = threading.Thread(target=_wrapped, name=name, daemon=True)
+    thread.start()
+    return thread
+
+
+def _record_fault_error(where: str, detail: str) -> None:
+    """Record a fault that could not be injected, for `main` to fail on."""
+    with _FAULT_THREAD_LOCK:
+        _FAULT_THREAD_ERRORS.append(f"{where}: {detail}")
+
+
+def fault_thread_errors() -> list[str]:
+    """Snapshot of failures raised inside fault threads."""
+    with _FAULT_THREAD_LOCK:
+        return list(_FAULT_THREAD_ERRORS)
 
 
 _FAULT_DISPATCH: dict[str, Callable[[], str | None]] = {
@@ -1263,29 +1279,34 @@ def step_pause_random(history: History, console: Console) -> None:
 
 
 def step_network_partition_leader(history: History, console: Console) -> None:
-    """Step 4: Disconnect the leader from the raft overlay network during 50 inserts."""
+    """Step 4: Detach the leader from the raft overlay network during 50 inserts.
+
+    Previously this reattached with a bare ``docker network connect``, which
+    assigns a fresh address instead of the compose-pinned one, leaving every
+    later step addressing the node at an IP it no longer held. The primitive
+    restores the address it read.
+
+    A missing leader is recorded as a fault error rather than degrading to 50
+    unfaulted inserts: those would enter the history labelled as a partition
+    window and read as coverage of a fault that never happened.
+    """
     console.print("[bold]Step 4:[/] network-disconnect leader")
     leader, _ = find_leader()
-    net = find_network()
-    if leader is None or net is None:
-        console.print(f"  [yellow]WARNING:[/] leader={leader}, net={net} — inserting without fault")
-        do_inserts(50, history, console)
+    if leader is None:
+        _record_fault_error("step_network_partition_leader", "no leader to detach")
         return
 
-    _, container_id, _ = run_cmd(f"docker compose ps -q {leader}")
-    container_id = container_id.strip()
-    if not container_id:
-        console.print("  [yellow]WARNING:[/] could not find container ID — skipping partition")
-        do_inserts(50, history, console)
-        return
-
-    console.print(f"  disconnecting {leader} ({container_id[:12]}) from {net}")
+    console.print(f"  detaching {leader} from {raft_network_name()}")
     fw = history.open_fault("network_partition", f"partitioned {leader}")
-    run_cmd(f"docker network disconnect {net} {container_id}")
-    do_inserts(50, history, console)
-    run_cmd(f"docker network connect {net} {container_id}")
-    wait_cluster_healthy(timeout=60)
-    history.close_fault(fw)
+    try:
+        with fp.network_detached(leader):
+            do_inserts(50, history, console)
+    except fp.FaultError as exc:
+        _record_fault_error("step_network_partition_leader", str(exc))
+        return
+    finally:
+        wait_cluster_healthy(timeout=60)
+        history.close_fault(fw)
     take_snapshot(history, "network_partition", console)
 
 
@@ -2347,6 +2368,19 @@ def run(
     results_path = artifact_path / "results.json"
     results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     console.print(f"Results written to {results_path}")
+
+    # A fault that failed to inject makes this run prove nothing: the invariants
+    # would be checked against a window where nothing happened. Exit 2 (infra),
+    # distinct from 1 (a real violation), and only after the artifacts are on
+    # disk so the failure is debuggable.
+    fault_errors = fault_thread_errors()
+    if fault_errors:
+        console.print(
+            "\n[bold red]FATAL:[/] faults failed to inject, so the invariants "
+            "above were checked against windows that may contain no fault:\n  "
+            + "\n  ".join(fault_errors)
+        )
+        raise typer.Exit(code=2)
 
     raise typer.Exit(code=0 if not violations else 1)
 

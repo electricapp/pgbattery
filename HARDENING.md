@@ -394,15 +394,35 @@ Nothing else in Wave 1 is safe or cheap until these land.
       defaulted `per_key`, and a loop missing its `cfg` parameter.
       _Blocks_ H-03 · _Effort_ S
 
-- [ ] **H-02 — Route every fault through the primitive layer.** `ci_runner.py`'s
-      step handlers and `linearizability_register.py`'s attack table are two more
-      implementations of partition / pause / clock-skew with their own flags and
-      heal paths. Make both thin callers of `fault_primitives.py`, which already
-      carries effect verification, privilege handling, and project-aware name
-      resolution.
-      **Done when** no `docker`, `iptables`, or `tc` invocation exists outside
-      `fault_primitives.py`, a `lint_matrix.py` check enforces that, and the Elle
-      smoke plus `ha-sequential` still pass.
+- [ ] **H-02 — Route every fault through the primitive layer.** Partly done.
+      `linearizability_register.py` and `correctness_lite.py` now inject nothing
+      directly: their partition, latency, loss, asymmetric-partition, and scrub
+      paths call `fault_primitives.py`, which verifies its own effect and resolves
+      docker names against the active compose project. The primitive layer gained
+      that name resolution plus a `network_detached` total-partition primitive,
+      which is the one fault that cannot be expressed as a compose service.
+
+      Three defects fell out and are fixed: the two partition attacks used literal
+      docker names, which `elle.yml` had been working around by pinning
+      `COMPOSE_PROJECT_NAME` (now un-pinned, so Elle has per-run isolation like
+      every other workflow); both harnesses fired faults from daemon threads whose
+      exceptions were discarded, so a fault that failed to inject still produced a
+      PASS; and `correctness_lite`'s reattach used a bare `docker network connect`,
+      which assigns a fresh address rather than the compose-pinned one, leaving
+      later steps addressing a node at an IP it no longer held.
+
+      `lint_matrix.py` now checks which modules inject directly, not how many
+      times — it stops the spread to new modules and forces a migrated file off
+      the pending list. It is explicitly not a correctness check: matching source
+      text cannot tell a command from prose about one, and a verb assembled at
+      runtime is invisible to it.
+
+      **Remaining:** `ci_runner.py` still drives asymmetric partition with
+      `iptables` and latency with `tc` behind its own verifiers, and its netem
+      parser has a different contract from the primitive layer's (`None` versus
+      `0.0` for a delay-less qdisc), so merging them needs care rather than a
+      rename. Then the real gate: a live Elle smoke and `ha-sequential`, neither
+      of which has run against these changes.
       _Closes_ Class A1 structurally · _Blocks_ H-05…H-09, H-12 · _Effort_ M
 
 - [ ] **H-03 — Split `linearizability_register.py`** (about 1,750 lines) along its

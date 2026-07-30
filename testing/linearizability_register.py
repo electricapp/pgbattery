@@ -852,21 +852,15 @@ def asymmetric_partition_after(delay: float, hold: float = 4.0) -> None:
     leader, _ = find_leader()
     if leader is None:
         return
-    leader_idx = NODES.index(leader) + 1
-    peer_ips = [f"172.28.0.1{i}" for i in range(1, len(NODES) + 1) if i != leader_idx]
-    try:
-        for ip in peer_ips:
-            run_cmd(
-                f"docker compose exec -T --user root {leader} iptables -I INPUT -s {ip} -j DROP",
-                timeout=5,
+    # One window per peer, each verified: the primitive confirms the rule is
+    # installed *and* matched packets, so a rule that exists but drops nothing
+    # is a failure rather than a quiet pass.
+    with contextlib.ExitStack() as stack:
+        for peer in (n for n in NODES if n != leader):
+            stack.enter_context(
+                fp.partition_asymmetric(peer, leader, direction=fp.Direction.INBOUND)
             )
         time.sleep(hold)
-    finally:
-        for ip in peer_ips:
-            run_cmd(
-                f"docker compose exec -T --user root {leader} iptables -D INPUT -s {ip} -j DROP",
-                timeout=5,
-            )
 
 
 def network_slow_after(delay: float, hold: float = 5.0, delay_ms: int = 250) -> None:
@@ -881,18 +875,8 @@ def network_slow_after(delay: float, hold: float = 5.0, delay_ms: int = 250) -> 
     leader, _ = find_leader()
     if leader is None:
         return
-    try:
-        run_cmd(
-            f"docker compose exec -T --user root {leader} "
-            f"tc qdisc add dev eth0 root netem delay {delay_ms}ms",
-            timeout=5,
-        )
+    with fp.partition_lossy(leader, drop_pct=0.0, latency_ms=delay_ms):
         time.sleep(hold)
-    finally:
-        run_cmd(
-            f"docker compose exec -T --user root {leader} tc qdisc del dev eth0 root",
-            timeout=5,
-        )
 
 
 def network_loss_after(delay: float, hold: float = 5.0, loss_pct: int = 30) -> None:
@@ -906,18 +890,8 @@ def network_loss_after(delay: float, hold: float = 5.0, loss_pct: int = 30) -> N
     leader, _ = find_leader()
     if leader is None:
         return
-    try:
-        run_cmd(
-            f"docker compose exec -T --user root {leader} "
-            f"tc qdisc add dev eth0 root netem loss {loss_pct}%",
-            timeout=5,
-        )
+    with fp.partition_lossy(leader, drop_pct=float(loss_pct), latency_ms=0):
         time.sleep(hold)
-    finally:
-        run_cmd(
-            f"docker compose exec -T --user root {leader} tc qdisc del dev eth0 root",
-            timeout=5,
-        )
 
 
 def clock_skew_after(delay: float, skew_s: int = 30, hold: float = 5.0) -> None:
@@ -1249,39 +1223,28 @@ def start_killed_nodes() -> None:
         run_cmd(f"docker compose start {n}", timeout=15)
 
 
-def scrub_chaos_residue() -> None:
-    """Best-effort cleanup of fault residue. Runs every test, idempotent.
+def scrub_chaos_residue() -> list[str]:
+    """Clear fault residue, returning whatever survived.
 
-    The discipline is that every fault function cleans up its own scope in
-    its own `finally`. This is the belt + suspenders: if a fault crashed
-    or the test was interrupted, we don't want iptables rules, tc qdiscs,
-    skewed clocks, or filler files lingering into the next run.
+    Each fault heals its own scope in its own `finally`; this is the backstop for
+    a fault that crashed or a run that was interrupted. The primitive layer
+    clears more than this used to — notably it resumes any postgres process left
+    in state ``T``, which otherwise survives the whole run and poisons every
+    later case.
+
+    Residue is returned rather than raised because the caller runs this before
+    persisting the history, and losing that artifact costs more than the delay
+    in reporting.
     """
-    for n in NODES:
-        # iptables: flush our chains
-        run_cmd(
-            f"docker compose exec -T --user root {n} iptables -F INPUT",
-            timeout=5,
-        )
-        # tc netem: drop any root qdisc we may have added
-        run_cmd(
-            f"docker compose exec -T --user root {n} tc qdisc del dev eth0 root",
-            timeout=5,
-        )
-        # Clock skew: reset to zero offset
-        run_cmd(
-            f"docker compose exec -T {n} sh -c \"echo '+0s' > /tmp/faketime\"",
-            timeout=5,
-        )
-        # Disk-full filler
-        run_cmd(
-            f"docker compose exec -T --user root {n} "
-            "rm -f /var/lib/postgresql/data/_chaos_fill.bin",
-            timeout=5,
-        )
+    residue: list[str] = []
+    try:
+        residue.extend(fp.scrub().residue)
+    except fp.FaultError as exc:
+        residue.append(str(exc))
     # Witness: tear it down so the next run starts from the canonical
     # 3-node topology.
     run_cmd("docker compose --profile witness rm -sf witness", timeout=30)
+    return residue
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1700,7 +1663,7 @@ def run(
     killer.join(timeout=10)
 
     start_killed_nodes()
-    scrub_chaos_residue()
+    residue = scrub_chaos_residue()
     console.print("Waiting for cluster recovery…")
     wait_cluster_healthy(timeout=90)
     time.sleep(2)
@@ -1726,6 +1689,12 @@ def run(
         console.print(
             f"[bold red]FATAL:[/] the {attack} injector did not finish within the "
             "join timeout; the fault window is unknown, so no verdict is possible."
+        )
+        raise typer.Exit(code=2)
+    if residue:
+        console.print(
+            "[bold red]FATAL:[/] fault residue survived the scrub, so this run "
+            "would poison the next one:\n  " + "\n  ".join(residue)
         )
         raise typer.Exit(code=2)
 
