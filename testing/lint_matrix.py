@@ -41,7 +41,7 @@ from __future__ import annotations
 import ast
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
@@ -591,7 +591,7 @@ def _rust_corpus() -> str:
     return "\n".join(chunks)
 
 
-def missing_log_markers(markers: dict[str, tuple[str, ...]], corpus: str) -> list[str]:
+def missing_log_markers(markers: Mapping[str, Sequence[str]], corpus: str) -> list[str]:
     """Markers the harness greps for that no longer appear in the Rust sources."""
     return [
         f"{group}: {marker!r}"

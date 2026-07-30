@@ -24,7 +24,7 @@ pub type NodeId = u64;
 /// one from an arbitrary string, so "is this slot ours" is answered by whether
 /// a value exists rather than by inspecting text at each call site.
 ///
-/// [`fmt::Display`] and [`str::FromStr`] are the only places the scheme is
+/// [`fmt::Display`] and [`std::str::FromStr`] are the only places the scheme is
 /// written, which makes them inverse by construction. That matters beyond
 /// tidiness: minting and recognising happen in different crates — the
 /// supervisor creates and drops slots and writes `primary_slot_name`, the

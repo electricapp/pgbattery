@@ -24,7 +24,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import topology
 from topology import TopologyError
@@ -248,7 +248,7 @@ class MatrixClusterReconciliation(unittest.TestCase):
     node is down."""
 
     @staticmethod
-    def _real() -> tuple[dict, topology.Topology]:
+    def _real() -> tuple[dict[str, Any], topology.Topology]:
         import json
 
         data = json.loads((REPO_ROOT / "testing" / "ci_matrix.yaml").read_text(encoding="utf-8"))

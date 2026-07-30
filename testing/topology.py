@@ -112,6 +112,21 @@ class Topology:
         )
 
 
+def _list_field(service: str, spec: dict[str, object], key: str) -> list[object]:
+    """The list a service declares under `key`, empty if it declares none.
+
+    Compose lets the key be absent. Anything present that is not a list is a
+    file this module does not understand, and reading it as empty would drop
+    the ports or volumes it declares while still yielding a plausible node.
+    """
+    value = spec.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TopologyError(f"{service}: {key} is {type(value).__name__}, expected a list")
+    return value
+
+
 def _published_ports(service: str, spec: dict[str, object]) -> dict[int, int]:
     """Map container port to host port for one service.
 
@@ -121,7 +136,7 @@ def _published_ports(service: str, spec: dict[str, object]) -> dict[int, int]:
     every derived port lookup failing later and further from the cause.
     """
     published: dict[int, int] = {}
-    for entry in spec.get("ports", []) or []:
+    for entry in _list_field(service, spec, "ports"):
         if isinstance(entry, str):
             parts = entry.split(":")
             if len(parts) < 2:
@@ -137,7 +152,7 @@ def _published_ports(service: str, spec: dict[str, object]) -> dict[int, int]:
 
 def _config_path(service: str, spec: dict[str, object]) -> Path:
     """The config file this service mounts as its `pgbattery.toml`."""
-    for volume in spec.get("volumes", []) or []:
+    for volume in _list_field(service, spec, "volumes"):
         if isinstance(volume, str) and CONFIG_MOUNT in volume:
             return REPO_ROOT / volume.split(":", 1)[0]
     raise TopologyError(f"{service}: no {CONFIG_MOUNT} mount, so it has no declared identity")

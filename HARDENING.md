@@ -675,7 +675,7 @@ No new infrastructure. Highest confidence per unit of effort.
       different costume. A shape that strands nodes makes them self-fence to
       process exit, and `restart: unless-stopped` brings them back — so
       convergence includes a restart and rejoin, not just an election
-      (`REFENCE_CONVERGE_TIMEOUT_S`, measured). Worse, `await_leader` returns
+      (`RE_FENCE_CONVERGE_TIMEOUT_S`, measured). Worse, `await_leader` returns
       happily while a stranded node is *still restarting*, because the other
       four can agree without it. The next shape then counted that node on one
       side, so "3 of 5" was really 2 and could not elect. `await_all_healthy()`

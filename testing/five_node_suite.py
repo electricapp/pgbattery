@@ -62,7 +62,7 @@ GATEWAY_PORT: Final[dict[int, int]] = {n.node_id: n.gateway_port for n in _FIVE.
 BOOTSTRAP_TIMEOUT_S: Final[float] = 180.0
 CONVERGE_TIMEOUT_S: Final[float] = 90.0
 
-REFENCE_CONVERGE_TIMEOUT_S: Final[float] = 240.0
+RE_FENCE_CONVERGE_TIMEOUT_S: Final[float] = 240.0
 """Budget for shapes that strand nodes without quorum.
 
 Fencing escalates to process exit when a node cannot hold its lease, and
@@ -223,7 +223,7 @@ def voters() -> list[int]:
     return sorted(n for n, role in members().items() if role == "voter")
 
 
-def await_all_healthy(timeout_s: float = REFENCE_CONVERGE_TIMEOUT_S) -> int:
+def await_all_healthy(timeout_s: float = RE_FENCE_CONVERGE_TIMEOUT_S) -> int:
     """Wait until all five nodes answer *and* are voters, then return the leader.
 
     `await_leader` is not enough as a precondition for the partition shapes.
@@ -452,7 +452,7 @@ def phase_majority_isolation(leader: int) -> None:
     partition_groups([minority, majority])
     console.print(f"  minority={minority} majority={majority}")
     try:
-        deadline = time.time() + REFENCE_CONVERGE_TIMEOUT_S
+        deadline = time.time() + RE_FENCE_CONVERGE_TIMEOUT_S
         while time.time() < deadline:
             accepting = [n for n in majority if writable(n)]
             if len(accepting) == 1:
@@ -477,7 +477,7 @@ def phase_three_way_split() -> None:
     partition_groups(groups)
     console.print(f"  groups={groups}, largest={max(len(g) for g in groups)} of {QUORUM} needed")
     try:
-        await_no_writer(REFENCE_CONVERGE_TIMEOUT_S)
+        await_no_writer(RE_FENCE_CONVERGE_TIMEOUT_S)
         console.print("  no node accepts writes")
     finally:
         partition_groups(groups, heal=True)
@@ -498,7 +498,7 @@ def phase_follower_bridge(leader: int) -> None:
     partition_groups([isolated, rest])
     console.print(f"  leader node{leader} sees only node{companion}; rest={rest}")
     try:
-        deadline = time.time() + REFENCE_CONVERGE_TIMEOUT_S
+        deadline = time.time() + RE_FENCE_CONVERGE_TIMEOUT_S
         while time.time() < deadline:
             if not writable(leader):
                 break
@@ -514,7 +514,7 @@ def phase_follower_bridge(leader: int) -> None:
         # the promotion hold-down, which is a full lease duration, so a single
         # check right after the old leader steps down is always too early.
         accepting: list[int] = []
-        deadline = time.time() + REFENCE_CONVERGE_TIMEOUT_S
+        deadline = time.time() + RE_FENCE_CONVERGE_TIMEOUT_S
         while time.time() < deadline:
             accepting = [n for n in rest if writable(n)]
             if len(accepting) == 1:
