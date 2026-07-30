@@ -74,7 +74,12 @@ pub struct ManagementApiState {
     /// Shared token for protected mutating endpoints.
     pub management_api_token: Option<RedactedSecret>,
     /// Debug event buffer for state transitions
-    pub debug_events: DebugEventBuffer,
+    /// Shared with the transition observer in `app.rs`, which is what actually
+    /// fills it. Held as its own `Arc` rather than inline because this struct
+    /// is moved into `start_management_api`: an inline buffer is reachable only
+    /// by the HTTP handlers that read it, so every emitter would be
+    /// uncallable and the endpoint would always return an empty list.
+    pub debug_events: Arc<DebugEventBuffer>,
     /// Serializes concurrent leadership-transfer requests.  Two parallel
     /// transfers would both disable heartbeats, both sleep through the
     /// lease-drain window, and then both call trigger-elect on different

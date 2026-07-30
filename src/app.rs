@@ -73,6 +73,7 @@ struct DataNodeTaskHandles {
     replication: JoinHandle<()>,
     management_api: JoinHandle<()>,
     lease_enforcement: JoinHandle<()>,
+    transition_observer: JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -499,6 +500,10 @@ impl App {
             raft_tls_config,
         } = input;
 
+        // Cloned before the gateway takes ownership of these receivers.
+        let observer_leader_rx = leader_rx.clone();
+        let observer_fence_rx = fence_rx.clone();
+
         let rpc_server = RaftRpcServer::new_with_tls(
             self.config.raft_addr,
             raft.clone(),
@@ -529,34 +534,25 @@ impl App {
         // shutdown when it cannot fence PostgreSQL (rather than silently
         // looping forever while the node accepts stale writes).
         let lease_shutdown_tx = shutdown_tx.clone();
-        let mgmt_state = Arc::new(ManagementApiState {
-            node_id: self.config.node_id,
-            raft: raft.clone(),
-            cluster_state: cluster_state.clone(),
-            postgres_manager: Some(postgres_manager.clone()),
+        // Held separately from `mgmt_state` so the transition observer below can
+        // write to the same buffer the HTTP handlers read.
+        let debug_events = Arc::new(crate::observability::debug_events::DebugEventBuffer::new());
+        let observer_node_id = self.config.node_id;
+        let observer_shutdown_rx = shutdown_rx.clone();
+        let mgmt_state = self.build_management_state(
+            &raft,
+            &cluster_state,
+            &postgres_manager,
             backup_manager,
-            management_api_token: self.config.management_api_token.clone(),
-            debug_events: crate::observability::debug_events::DebugEventBuffer::new(),
-            transfer_lock: tokio::sync::Mutex::new(()),
-            membership_lock: tokio::sync::Mutex::new(()),
-            backup_lock: tokio::sync::Mutex::new(()),
-            auth_failures: parking_lot::Mutex::new((Instant::now(), 0)),
-        });
+            Arc::clone(&debug_events),
+        );
         // Also clone the token into an owned String copy for the CLI-style
         // HTTP client used by the auto-promotion path, below.
         let management_addr = self.config.get_mgmt_addr();
 
         Ok(DataNodeTaskHandles {
-            governor: tokio::spawn(async move {
-                if let Err(e) = governor.run().await {
-                    error!(error = %e, "Governor error");
-                }
-            }),
-            gateway: tokio::spawn(async move {
-                if let Err(e) = gateway.run().await {
-                    error!(error = %e, "Gateway error");
-                }
-            }),
+            governor: Self::spawn_logging_errors("Governor", async move { governor.run().await }),
+            gateway: Self::spawn_logging_errors("Gateway", async move { gateway.run().await }),
             supervisor: self.spawn_supervisor_loop(
                 leader_rx,
                 supervisor_shutdown_rx,
@@ -565,28 +561,28 @@ impl App {
                 raft,
                 cluster_state,
             ),
-            rpc: tokio::spawn(async move {
-                if let Err(e) = rpc_server.run().await {
-                    error!(error = %e, "Raft RPC server error");
-                }
+            rpc: Self::spawn_logging_errors(
+                "Raft RPC server",
+                async move { rpc_server.run().await },
+            ),
+            replication: Self::spawn_logging_errors("Replication manager", async move {
+                replication_manager.run().await
             }),
-            replication: tokio::spawn(async move {
-                if let Err(e) = replication_manager.run().await {
-                    error!(error = %e, "Replication manager error");
-                }
-            }),
-            management_api: tokio::spawn(async move {
-                if let Err(e) =
-                    start_management_api(management_addr, mgmt_state, management_shutdown_rx).await
-                {
-                    error!(error = %e, "Management API error");
-                }
+            management_api: Self::spawn_logging_errors("Management API", async move {
+                start_management_api(management_addr, mgmt_state, management_shutdown_rx).await
             }),
             lease_enforcement: Self::spawn_lease_enforcement_loop(
                 lease_state,
                 postgres_manager,
                 lease_shutdown_tx,
                 lease_shutdown_rx,
+            ),
+            transition_observer: Self::spawn_transition_observer(
+                observer_node_id,
+                debug_events,
+                observer_leader_rx,
+                observer_fence_rx,
+                observer_shutdown_rx,
             ),
         })
     }
@@ -606,7 +602,7 @@ impl App {
         shutdown_tx.send(true)?;
 
         let shutdown_result = tokio::time::timeout(Duration::from_secs(30), async {
-            let (gov_res, gw_res, sup_res, rpc_res, repl_res, mgmt_res, lease_res) = tokio::join!(
+            let (gov_res, gw_res, sup_res, rpc_res, repl_res, mgmt_res, lease_res, obs_res) = tokio::join!(
                 handles.governor,
                 handles.gateway,
                 handles.supervisor,
@@ -614,7 +610,9 @@ impl App {
                 handles.replication,
                 handles.management_api,
                 handles.lease_enforcement,
+                handles.transition_observer,
             );
+            Self::log_join_error(obs_res, "Transition observer");
             Self::log_join_error(gov_res, "Governor");
             Self::log_join_error(gw_res, "Gateway");
             Self::log_join_error(sup_res, "Supervisor");
@@ -662,6 +660,130 @@ impl App {
             Ok(Some(tls_config))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Spawn a long-running component, logging its terminal error under `name`.
+    ///
+    /// These loops all end the same way — run to completion, or return an error
+    /// nobody is left to propagate to — so the shape is shared rather than
+    /// repeated once per component.
+    fn spawn_logging_errors<F, E>(name: &'static str, fut: F) -> JoinHandle<()>
+    where
+        F: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        tokio::spawn(async move {
+            if let Err(e) = fut.await {
+                error!(error = %e, component = name, "Component error");
+            }
+        })
+    }
+
+    /// Assemble the state the management API serves from.
+    ///
+    /// `debug_events` arrives as an already-shared `Arc` rather than being
+    /// constructed here: this struct is moved into `start_management_api`, so a
+    /// buffer created inline would be reachable only by the handlers that read
+    /// it, and every emitter would be uncallable.
+    fn build_management_state(
+        &self,
+        raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        postgres_manager: &Arc<tokio::sync::Mutex<Supervisor>>,
+        backup_manager: Option<Arc<BackupManager>>,
+        debug_events: Arc<crate::observability::debug_events::DebugEventBuffer>,
+    ) -> Arc<ManagementApiState> {
+        Arc::new(ManagementApiState {
+            node_id: self.config.node_id,
+            raft: raft.clone(),
+            cluster_state: cluster_state.clone(),
+            postgres_manager: Some(postgres_manager.clone()),
+            backup_manager,
+            management_api_token: self.config.management_api_token.clone(),
+            debug_events,
+            transfer_lock: tokio::sync::Mutex::new(()),
+            membership_lock: tokio::sync::Mutex::new(()),
+            backup_lock: tokio::sync::Mutex::new(()),
+            auth_failures: parking_lot::Mutex::new((Instant::now(), 0)),
+        })
+    }
+
+    fn spawn_transition_observer(
+        node_id: NodeId,
+        events: Arc<crate::observability::debug_events::DebugEventBuffer>,
+        leader_rx: watch::Receiver<Option<SocketAddr>>,
+        fence_rx: watch::Receiver<FenceState>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(Self::run_transition_observer(
+            node_id,
+            events,
+            leader_rx,
+            fence_rx,
+            shutdown_rx,
+        ))
+    }
+
+    /// Record leader and fence transitions into the debug-event buffer.
+    ///
+    /// Observes the `watch` channels the gateway and lease enforcer already
+    /// consume, rather than threading the buffer through the transition sites
+    /// themselves. That keeps the split-brain-prevention core free of
+    /// observability edits: a bug here can drop an event but cannot change a
+    /// fencing decision.
+    ///
+    /// `watch` is lossy by design — it holds the latest value, not a queue — so
+    /// a transition that is superseded before this task wakes is not recorded.
+    /// That is the right trade for the safety paths (they must never block on a
+    /// slow observer) and the reason this stream is a debugging aid rather than
+    /// an audit log.
+    async fn run_transition_observer(
+        node_id: NodeId,
+        events: Arc<crate::observability::debug_events::DebugEventBuffer>,
+        mut leader_rx: watch::Receiver<Option<SocketAddr>>,
+        mut fence_rx: watch::Receiver<FenceState>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let mut last_leader = *leader_rx.borrow();
+        let mut last_fence = *fence_rx.borrow();
+        loop {
+            tokio::select! {
+                changed = leader_rx.changed() => {
+                    if changed.is_err() {
+                        return; // sender dropped: the governor is gone
+                    }
+                    let new_leader = *leader_rx.borrow();
+                    if new_leader != last_leader {
+                        events.leader_change(
+                            node_id,
+                            last_leader.map(|addr| u64::from(addr.port())),
+                            new_leader.map(|addr| u64::from(addr.port())),
+                        );
+                        last_leader = new_leader;
+                    }
+                }
+                changed = fence_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let new_fence = *fence_rx.borrow();
+                    if new_fence != last_fence {
+                        let reason = if new_fence.has_quorum {
+                            "lease"
+                        } else {
+                            "quorum-loss"
+                        };
+                        events.fence_change(node_id, new_fence.fenced, reason);
+                        last_fence = new_fence;
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -2393,6 +2515,136 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const LEASE: Duration = Duration::from_secs(2);
+
+    /// The debug-event endpoint returned an empty list for the whole life of
+    /// the project: five emitters were defined and none was reachable, because
+    /// the buffer lived inside the `ManagementApiState` that `app.rs` moves
+    /// into `start_management_api`. These drive the observer directly and
+    /// assert it records, so "the endpoint is wired to something" is checked
+    /// rather than assumed.
+    mod transition_observer {
+        use crate::app::App;
+        use crate::governor::raft::FenceState;
+        use crate::observability::debug_events::DebugEventBuffer;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::watch;
+
+        fn addr(port: u16) -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        /// Wait for at least one event, then stop the observer.
+        ///
+        /// The observer snapshots current state when it starts, so a value sent
+        /// before it is scheduled is absorbed as the baseline rather than seen
+        /// as a change. Callers therefore send *two* distinct values: whichever
+        /// one the task snapshots, the other is unambiguously a transition. No
+        /// sleep gates the assertion — the wait is bounded so a regression fails
+        /// as a timeout rather than hanging.
+        async fn observe_until_event(
+            events: &Arc<DebugEventBuffer>,
+            handle: tokio::task::JoinHandle<()>,
+            shutdown_tx: &watch::Sender<bool>,
+        ) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while events.current_seq() == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            shutdown_tx.send(true).unwrap();
+            drop(tokio::time::timeout(std::time::Duration::from_secs(5), handle).await);
+        }
+
+        #[tokio::test]
+        async fn records_a_leader_change() {
+            let events = Arc::new(DebugEventBuffer::new());
+            let (leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);
+            let (_fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(App::run_transition_observer(
+                7,
+                Arc::clone(&events),
+                leader_rx,
+                fence_rx,
+                shutdown_rx,
+            ));
+            // Let the observer reach its first await and snapshot the baseline.
+            // Without this the sends land before it is ever scheduled, it
+            // snapshots the final value, and sees no transition at all.
+            tokio::task::yield_now().await;
+            leader_tx.send(Some(addr(5434))).unwrap();
+            observe_until_event(&events, handle, &shutdown_tx).await;
+
+            let recorded = events.get_last(10);
+            assert!(!recorded.is_empty(), "observer recorded nothing");
+            let last = recorded.last().unwrap();
+            assert_eq!(last.event_type, "leader_change");
+            assert_eq!(last.data.get("new_leader"), Some(&serde_json::json!(5434)));
+        }
+
+        #[tokio::test]
+        async fn records_a_fence_change_with_its_cause() {
+            let events = Arc::new(DebugEventBuffer::new());
+            let (_leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);
+            let (fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let handle = tokio::spawn(App::run_transition_observer(
+                7,
+                Arc::clone(&events),
+                leader_rx,
+                fence_rx,
+                shutdown_rx,
+            ));
+            tokio::task::yield_now().await;
+            // Quorum loss: no new leader is coming to lift this fence, which is
+            // the distinction an operator reading the stream needs.
+            fence_tx
+                .send(FenceState {
+                    fenced: true,
+                    has_quorum: false,
+                })
+                .unwrap();
+            observe_until_event(&events, handle, &shutdown_tx).await;
+
+            let recorded = events.get_last(10);
+            assert!(!recorded.is_empty(), "observer recorded nothing");
+            let last = recorded.last().unwrap();
+            assert_eq!(last.event_type, "fence");
+            assert_eq!(
+                last.data.get("reason"),
+                Some(&serde_json::json!("quorum-loss"))
+            );
+        }
+
+        #[tokio::test]
+        async fn ignores_a_resend_of_the_same_value() {
+            // `watch` fires on send, not on change, so without the equality
+            // guard a steady cluster would fill the buffer with duplicates and
+            // push the real transitions out of a bounded ring.
+            let events = Arc::new(DebugEventBuffer::new());
+            let (_leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);
+            let (fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            for _ in 0..5 {
+                fence_tx.send(FenceState::unfenced()).unwrap();
+            }
+            let handle = tokio::spawn(App::run_transition_observer(
+                7,
+                Arc::clone(&events),
+                leader_rx,
+                fence_rx,
+                shutdown_rx,
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            shutdown_tx.send(true).unwrap();
+            drop(tokio::time::timeout(std::time::Duration::from_secs(5), handle).await);
+
+            assert_eq!(events.get_last(10).len(), 0, "resends were recorded");
+        }
+    }
 
     /// No tracked failover (bootstrap, or already consumed) → nothing to wait out.
     #[test]

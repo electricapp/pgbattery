@@ -945,7 +945,7 @@ the repo.
 The four specs are non-vacuous, but the spec-to-code mapping is _comments_, so
 nothing detects drift.
 
-- [ ] **H-33 — Emit structured state-transition events**: lease renew and expire,
+- [x] **H-33 — Emit structured state-transition events**: lease renew and expire,
       anchor stamp and clear, promote and demote, fence escalation.
       **Done when** the event stream is complete enough to reconstruct a failover
       without reading logs.
@@ -964,10 +964,30 @@ nothing detects drift.
       out — keep a clone of the `Arc`, or hold the buffer as its own
       `Arc<DebugEventBuffer>` shared by both. The second is cleaner.
 
-      Prefer observing the existing `watch` channels (`fence_tx`/`fence_rx` and
-      the leader watch) from one task over threading a buffer through the
-      split-brain-prevention core. That gets every transition with no edit to the
-      safety paths at all.
+      **Done.** The buffer is now its own `Arc<DebugEventBuffer>`, constructed in
+      `app.rs` and shared with `ManagementApiState` rather than living inside it,
+      so the emitters are reachable. A `run_transition_observer` task watches the
+      existing `leader_rx` and `fence_rx` channels and records leader changes and
+      fence transitions — including whether a fence is lease-driven or
+      quorum-loss-driven, which is the distinction that tells an operator whether
+      a new leader is coming to lift it.
+
+      No safety path was edited, which was the point of observing the channels
+      rather than threading the buffer through the transition sites: a bug in the
+      observer can drop an event but cannot change a fencing decision.
+
+      Two properties are pinned by tests, both of which failed before they
+      passed. The observer must actually record — the whole defect was an event
+      API that emitted nothing — and it must ignore a resend of an unchanged
+      value, because `watch` fires on send rather than on change and a steady
+      cluster would otherwise fill a bounded ring with duplicates and push the
+      real transitions out.
+
+      **Known limit, deliberate:** `watch` is lossy by design — it holds the
+      latest value, not a queue — so a transition superseded before the observer
+      wakes is not recorded. That is the correct trade for safety paths that must
+      never block on a slow observer, and it is why this stream is a debugging
+      aid rather than an audit log. H-34 should not treat it as a complete trace.
       _Blocks_ H-34 · _Effort_ M
 
 - [ ] **H-34 — Validate real traces against the specs.** This turns "we have
