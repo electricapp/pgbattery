@@ -31,6 +31,7 @@ from rich.table import Table
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ci_runner
+import fault_primitives as fp
 import lint_matrix
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -422,19 +423,23 @@ Chain INPUT (policy ACCEPT 3 packets, 180 bytes)
 
 
 def test_iptables_drop_rule_detection() -> None:
-    assert ci_runner.iptables_drop_rule_present(IPTABLES_WITH_RULE, "172.28.0.12") is True
-    assert ci_runner.iptables_drop_rule_present(IPTABLES_WITH_RULE, "172.28.0.13") is False
-    assert ci_runner.iptables_drop_rule_present(IPTABLES_EMPTY, "172.28.0.12") is False
+    """Rule parsing now lives in the primitive layer; these assert the contract
+    the runner depends on, against the module that actually implements it."""
+    assert fp.parse_peer_drop_rule(IPTABLES_WITH_RULE, "172.28.0.12") is True
+    assert fp.parse_peer_drop_rule(IPTABLES_WITH_RULE, "172.28.0.13") is False
+    assert fp.parse_peer_drop_rule(IPTABLES_EMPTY, "172.28.0.12") is False
     # Bare address without /32 (as the runner writes it) must also match.
-    assert (
-        ci_runner.iptables_drop_rule_present("-A INPUT -s 172.28.0.13 -j DROP", "172.28.0.13")
-        is True
-    )
+    assert fp.parse_peer_drop_rule("-A INPUT -s 172.28.0.13 -j DROP", "172.28.0.13") is True
     # An ACCEPT rule for the same source is not a partition.
-    assert (
-        ci_runner.iptables_drop_rule_present("-A INPUT -s 172.28.0.13 -j ACCEPT", "172.28.0.13")
-        is False
-    )
+    assert fp.parse_peer_drop_rule("-A INPUT -s 172.28.0.13 -j ACCEPT", "172.28.0.13") is False
+
+
+def test_peer_drop_command_round_trips_through_its_own_parser() -> None:
+    """The builder and the verifier must agree, or a landed fault reads as absent."""
+    added = fp.iptables_peer_drop_cmd("172.28.0.12", insert=True)
+    printed = added.replace("iptables -A", "-A")
+    assert fp.parse_peer_drop_rule(printed, "172.28.0.12") is True
+    assert fp.iptables_peer_drop_cmd("172.28.0.12", insert=False).startswith("iptables -D")
 
 
 def test_verify_iptables_drop_fails_when_rule_absent() -> None:
@@ -484,16 +489,31 @@ NETEM_CLEAN = "qdisc noqueue 0: root refcnt 2 \n"
 
 
 def test_netem_parsing() -> None:
-    assert ci_runner.netem_present(NETEM_SHOW) is True
-    assert ci_runner.netem_present(NETEM_CLEAN) is False
-    assert ci_runner.parse_netem_delay_ms(NETEM_SHOW) == 200.0
-    assert ci_runner.parse_netem_delay_ms(NETEM_CLEAN) is None
+    """Qdisc parsing moved to the primitive layer. Its contract is strictly
+    richer than the local parser it replaced: a netem qdisc carrying no delay
+    clause now reports `delay_ms == 0.0` instead of None, so "no qdisc" and
+    "qdisc with no delay" stop looking alike to the verifier."""
+    assert fp.parse_netem(NETEM_CLEAN) is None
+
+    installed = fp.parse_netem(NETEM_SHOW)
+    assert installed is not None
+    assert installed.delay_ms == 200.0
+    assert installed.jitter_ms == 50.0
+
     # Fractional and non-ms units.
-    assert ci_runner.parse_netem_delay_ms("qdisc netem 1: root delay 149.9ms 40ms") == 149.9
-    assert ci_runner.parse_netem_delay_ms("qdisc netem 1: root delay 1s") == 1000.0
-    assert ci_runner.parse_netem_delay_ms("qdisc netem 1: root delay 500us") == 0.5
-    # netem installed but with loss only: no delay to report.
-    assert ci_runner.parse_netem_delay_ms("qdisc netem 1: root loss 30%") is None
+    for text, expected in (
+        ("qdisc netem 1: root delay 149.9ms 40ms", 149.9),
+        ("qdisc netem 1: root delay 1s", 1000.0),
+        ("qdisc netem 1: root delay 500us", 0.5),
+    ):
+        state = fp.parse_netem(text)
+        assert state is not None
+        assert state.delay_ms == expected
+
+    loss_only = fp.parse_netem("qdisc netem 1: root loss 30%")
+    assert loss_only is not None, "a loss-only qdisc is still an installed qdisc"
+    assert loss_only.delay_ms == 0.0
+    assert loss_only.loss_pct == 30.0
 
 
 def test_verify_netem_requires_the_expected_delay() -> None:
@@ -502,7 +522,7 @@ def test_verify_netem_requires_the_expected_delay() -> None:
     assert_raises(
         ci_runner.RunnerError,
         lambda: runner._verify_netem("node2", 150, runner.artifact_dir / "s.log"),
-        "no netem delay on node2 after injection",
+        "no netem qdisc on node2 after injection",
     )
     runner.probe_handler = lambda _command: probe(NETEM_SHOW)
     assert_raises(
@@ -951,6 +971,154 @@ def test_real_matrix_still_parses() -> None:
     assert matrix.cases
     for suite in matrix.suites.values():
         assert suite.cases
+
+
+# ---------------------------------------------------------------------------
+# Leadership resolution across nodes
+# ---------------------------------------------------------------------------
+
+
+def test_quorum_leader_needs_a_majority_of_the_configured_cluster() -> None:
+    runner = make_runner()
+    assert len(runner.node_map) == 3
+
+    # Two of three agreeing is a quorum.
+    assert runner._quorum_leader({1: 3, 2: 3, 3: 3}) == (3, True)
+    assert runner._quorum_leader({1: 1, 2: 3, 3: 3}) == (3, True)
+
+    # One node's opinion never establishes a leader, however sure it is. This
+    # is the isolated-ex-leader case: node1 alone still naming itself.
+    assert runner._quorum_leader({1: 1}) == (None, False)
+
+    # Sizing the majority on the configured cluster, not on who replied: two
+    # reachable nodes that disagree cannot certify either answer.
+    assert runner._quorum_leader({1: 1, 2: 3}) == (None, False)
+
+    # A leaderless cluster is not a disagreement.
+    assert runner._quorum_leader({1: None, 2: None, 3: None}) == (None, False)
+
+
+def test_partitioned_ex_leader_does_not_count_as_the_leader() -> None:
+    """The `asymmetric-leader-partition` shape: node1 is isolated and still
+    names itself, while the majority has already elected node3.
+
+    Resolving leadership from one node's view picked node1 — deterministically,
+    since it sorts first — so a correct failover read as "leadership never
+    moved".
+    """
+    runner = make_runner()
+    leader, agreed = runner._quorum_leader({1: 1, 2: 3, 3: 3})
+    assert agreed is True
+    assert leader == 3, "the majority's leader, not the first responder's"
+
+
+def test_self_claims_are_the_only_observable_form_of_split_brain() -> None:
+    """`/cluster/nodes` marks `is_leader` from a single `Option<node_id>`, so
+    at most one entry in any one response is ever true. Counting leaders in
+    that response can never exceed 1, which made the old split-brain check
+    unreachable. Two nodes each naming *themselves* is the observable form."""
+
+    def self_claims(views: dict[int, int | None]) -> list[int]:
+        return sorted(node_id for node_id, seen in views.items() if seen == node_id)
+
+    # Both node1 and node3 believe they lead — a suspicion worth confirming.
+    assert self_claims({1: 1, 2: 1, 3: 3}) == [1, 3]
+    # Healthy: one self-claim, everyone else pointing at it.
+    assert self_claims({1: 3, 2: 3, 3: 3}) == [3]
+    # Hearsay cannot manufacture a second leader.
+    assert self_claims({1: 3, 2: 3, 3: 1}) == []
+
+
+def test_split_brain_requires_two_valid_leases_not_two_beliefs() -> None:
+    """An isolated ex-leader keeps naming itself — it cannot learn otherwise —
+    while its lease expires and it fences itself. That is the documented
+    asymmetric-partition behaviour, not split brain. L1 constrains write
+    authority, so the lease is what the check must confirm against.
+    """
+    runner = make_runner()
+    leases: dict[int, float] = {}
+
+    def stub_metric(node_id: int, metric_name: str) -> list[float]:
+        assert metric_name == "pgbattery_lease_valid"
+        return [leases[node_id]]
+
+    runner._fetch_metric_values = stub_metric  # type: ignore[method-assign]
+
+    # Isolated ex-leader (node1) still claiming, but fenced. Not split brain.
+    leases = {1: 0.0, 3: 1.0}
+    assert [n for n in (1, 3) if runner._holds_valid_lease(n)] == [3]
+
+    # Two live leases at once is the real thing, and must still be reachable.
+    leases = {1: 1.0, 3: 1.0}
+    assert [n for n in (1, 3) if runner._holds_valid_lease(n)] == [1, 3]
+
+
+def test_lease_probe_treats_a_scrape_failure_as_no_lease() -> None:
+    """This only ever escalates a suspicion into a failure, so a scrape error
+    must not invent a second leader."""
+    runner = make_runner()
+
+    def boom(node_id: int, metric_name: str) -> list[float]:
+        raise ci_runner.RunnerError("unreachable")
+
+    runner._fetch_metric_values = boom  # type: ignore[method-assign]
+    assert runner._holds_valid_lease(1) is False
+
+
+# ---------------------------------------------------------------------------
+# Fault-injection confinement
+# ---------------------------------------------------------------------------
+
+INJECTION_COMMANDS = (
+    "iptables -A INPUT -s 172.28.0.12 -j DROP",
+    "iptables -D INPUT -s 172.28.0.12 -j DROP",
+    "iptables -I INPUT -p tcp -s 172.28.0.12 --dport 5433 -j DROP",
+    "tc qdisc add dev eth0 root netem delay 200ms 50ms",
+    "tc qdisc del dev eth0 root",
+    "tc filter add dev eth0 parent ffff: protocol ip prio 1 u32",
+    "docker network disconnect pgbattery_raft_net node1",
+    "docker kill node1",
+)
+
+READ_ONLY_COMMANDS = (
+    # Naming the binary is not running it: a presence check and a log label.
+    "iptables",
+    "iptables-172.28.0.12",
+    "iptables -S INPUT",
+    "iptables -L INPUT -n -v",
+    "tc qdisc show dev eth0",
+    "tc -s qdisc show dev eth0",
+    "docker compose ps -q node1",
+    "docker exec node1 psql",
+)
+
+
+def test_fault_verb_pattern_matches_mutations_only() -> None:
+    """The scan must key on the mutating subcommand, not the tool name.
+
+    Flagging the bare word pushes a caller into renaming a log label to get
+    past the check, which looks like migration and is not.
+    """
+    for command in INJECTION_COMMANDS:
+        assert lint_matrix.RAW_FAULT_VERB.search(command), f"missed injection: {command}"
+    for command in READ_ONLY_COMMANDS:
+        assert not lint_matrix.RAW_FAULT_VERB.search(command), f"false positive: {command}"
+
+
+def test_fault_verb_scan_sees_a_literal_but_not_a_docstring() -> None:
+    """Docstrings discuss these commands constantly; only literals count."""
+    source = '"""Runs iptables -A INPUT to partition."""\nCMD = "iptables -A INPUT -j DROP"\n'
+    assert lint_matrix.count_raw_fault_verbs(source) == [2]
+
+
+def test_pending_migration_entries_still_inject() -> None:
+    """A file that stops injecting must leave the list, or the list becomes a
+    permanent exemption rather than a ratchet."""
+    for name in lint_matrix.PENDING_FAULT_MIGRATION:
+        source = (PROJECT_ROOT / "testing" / name).read_text(encoding="utf-8")
+        assert lint_matrix.count_raw_fault_verbs(source), (
+            f"{name} no longer injects directly; drop it from PENDING_FAULT_MIGRATION"
+        )
 
 
 # ---------------------------------------------------------------------------

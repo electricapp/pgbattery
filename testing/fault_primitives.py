@@ -903,6 +903,29 @@ def iptables_port_drop_cmd(peer_ip: str, port: int, *, insert: bool, from_listen
     return f"iptables {action} INPUT -p tcp -s {peer_ip} {match} -j DROP"
 
 
+def iptables_peer_drop_cmd(peer_ip: str, *, insert: bool, chain: str = "INPUT") -> str:
+    """Add or remove a DROP for every packet from `peer_ip`, any port.
+
+    The whole-peer counterpart to `iptables_port_drop_cmd`. Because it matches
+    on source alone it needs no `--sport`/`--dport` pair: one rule already
+    covers both directions of every channel.
+    """
+    action = "-A" if insert else "-D"
+    return f"iptables {action} {chain} -s {peer_ip} -j DROP"
+
+
+def parse_peer_drop_rule(text: str, peer_ip: str, *, chain: str = "INPUT") -> bool:
+    """Whether `iptables -S` output carries a whole-peer DROP for `peer_ip`.
+
+    Tolerates the ``/32`` iptables appends when printing rules back, and the
+    counter dump appended by `iptables_rules_cmd`.
+    """
+    pattern = re.compile(
+        rf"^-A\s+{re.escape(chain)}\s+.*-s\s+{re.escape(peer_ip)}(?:/\d+)?\s+.*-j\s+DROP\b"
+    )
+    return any(pattern.match(line.strip()) for line in text.splitlines())
+
+
 def iptables_rules_cmd() -> str:
     """Dump INPUT rules plus their packet counters in one exec."""
     return "iptables -S INPUT; echo '--- counters ---'; iptables -L INPUT -n -v"
@@ -1522,9 +1545,19 @@ def read_ingress_filters(container: str, *, dev: str = NET_DEVICE) -> str:
     return exec_in(container, f"tc -s filter show dev {dev} parent ffff:").output
 
 
+def read_qdiscs_cmd(dev: str = NET_DEVICE) -> str:
+    """``tc -s qdisc show``, counters included.
+
+    Split from `read_qdiscs` so a caller that runs its own exec (ci_runner
+    drives probes through its retry/logging layer) shares the command instead
+    of restating it.
+    """
+    return f"tc -s qdisc show dev {dev}"
+
+
 def read_qdiscs(container: str, *, dev: str = NET_DEVICE) -> str:
     """``tc -s qdisc show``, counters included."""
-    return exec_in(container, f"tc -s qdisc show dev {dev}").output
+    return exec_in(container, read_qdiscs_cmd(dev)).output
 
 
 def drop_ingress_qdisc_if_empty(container: str, *, dev: str = NET_DEVICE) -> bool:

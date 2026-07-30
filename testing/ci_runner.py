@@ -37,6 +37,8 @@ from pydantic import BaseModel, ValidationError, field_validator
 from rich.console import Console
 from rich.table import Table
 
+import fault_primitives as fp
+
 # ---------------------------------------------------------------------------
 # Step types
 # ---------------------------------------------------------------------------
@@ -143,18 +145,21 @@ class StepType(StrEnum):
     PGBENCH = "pgbench"
 
 
-# Static IP addresses for each node on the raft_net bridge network.
-# Used by asymmetric_partition / asymmetric_heal to build iptables rules.
+# Static IP addresses for each node on the raft_net bridge network, keyed by
+# node id. Re-keyed from the primitive layer rather than restated: these are
+# declared once in docker-compose.yml, and two copies drift.
+# `witness` is skipped: the matrix addresses nodes by Raft id, and the witness
+# has no id to key on.
 _NODE_IPS: Final[dict[int, str]] = {
-    1: "172.28.0.11",
-    2: "172.28.0.12",
-    3: "172.28.0.13",
+    int(service.removeprefix("node")): ip
+    for service, ip in fp.NODE_IPS.items()
+    if service.removeprefix("node").isdigit()
 }
 
 # The raft_net subnet prefix; a container attached to raft_net always holds an
 # address in it, so its presence/absence is the observable effect of
 # ``docker network connect`` / ``docker network disconnect``.
-_RAFT_SUBNET_PREFIX: Final[str] = "172.28."
+_RAFT_SUBNET_PREFIX: Final[str] = fp.CLUSTER_SUBNET_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -681,59 +686,11 @@ def parse_compose_services(output: str) -> set[str]:
     }
 
 
-def iptables_drop_rule_present(output: str, src_ip: str, chain: str = "INPUT") -> bool:
-    """Report whether ``iptables -S`` output contains a DROP rule for ``src_ip``.
-
-    Tolerates the ``/32`` netmask iptables appends when it prints rules back,
-    and ignores any ``iptables -L -v`` counter output appended to the same
-    probe.
-
-    Args:
-        output: Probe output containing ``-A <chain> ...`` rule lines.
-        src_ip: Source address the rule must match.
-        chain: Chain the rule must live in.
-
-    Returns:
-        ``True`` if a matching DROP rule exists.
-    """
-    rule_pattern = re.compile(
-        rf"^-A\s+{re.escape(chain)}\s+.*-s\s+{re.escape(src_ip)}(?:/\d+)?\s+.*-j\s+DROP\b"
-    )
-    return any(rule_pattern.match(line.strip()) for line in output.splitlines())
-
-
-def netem_present(output: str) -> bool:
-    """Report whether ``tc qdisc show`` output contains a netem qdisc.
-
-    Args:
-        output: Probe output.
-
-    Returns:
-        ``True`` if a netem qdisc is installed.
-    """
-    return any(line.strip().startswith("qdisc netem") for line in output.splitlines())
-
-
-_NETEM_DELAY_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bdelay\s+(\d+(?:\.\d+)?)(us|ms|s)\b")
-_TIME_UNIT_TO_MS: Final[dict[str, float]] = {"us": 0.001, "ms": 1.0, "s": 1000.0}
-
-
-def parse_netem_delay_ms(output: str) -> float | None:
-    """Extract the base netem delay from ``tc qdisc show`` output, in ms.
-
-    Args:
-        output: Probe output (e.g. ``qdisc netem 8001: root refcnt 2 limit 1000
-            delay 200ms 50ms``).
-
-    Returns:
-        The delay in milliseconds, or ``None`` if no netem delay is present.
-    """
-    if not netem_present(output):
-        return None
-    match = _NETEM_DELAY_PATTERN.search(output)
-    if not match:
-        return None
-    return float(match.group(1)) * _TIME_UNIT_TO_MS[match.group(2)]
+# Rule and qdisc parsing lives in `fault_primitives`; this module used to carry
+# its own copies. The netem contract differs slightly and the primitive one is
+# the keeper: `parse_netem` returns a state with `delay_ms == 0.0` for a qdisc
+# installed without a delay clause, where the old local parser returned None and
+# so could not tell that apart from no qdisc at all.
 
 
 def parse_ps_stat_comm(output: str) -> list[tuple[str, str]]:
@@ -1457,6 +1414,52 @@ class CIRunner:
                 errors.append(str(exc))
         raise RunnerError("Unable to fetch cluster nodes from management API: " + "; ".join(errors))
 
+    def _get_self_claimed_leaders(self) -> dict[int, int | None]:
+        """Every reachable node's answer to "who is the leader", by node id.
+
+        Thin wrapper over :meth:`_get_leader_views` that exists to name the
+        distinction the convergence check depends on: a *self*-claim (node N
+        says the leader is N) is the only claim a partitioned node can make
+        without hearing from anyone, so two distinct self-claims are the
+        observable signature of split brain. A node naming *someone else* is
+        reporting hearsay and cannot manufacture a second leader.
+        """
+        return self._get_leader_views()
+
+    def _holds_valid_lease(self, node_id: int) -> bool:
+        """Whether `node_id` reports a currently valid write lease.
+
+        Unreachable or metric-less counts as "no lease": this only ever gates
+        escalating a suspicion to a split-brain failure, so the conservative
+        answer is the one that does not invent a second leader out of a scrape
+        error.
+        """
+        try:
+            values = self._fetch_metric_values(node_id, "pgbattery_lease_valid")
+        except RunnerError:
+            return False
+        return any(value >= 0.5 for value in values)
+
+    def _quorum_leader(self, views: Mapping[int, int | None]) -> tuple[int | None, bool]:
+        """Reduce per-node leader views to ``(leader_id, agreed)``.
+
+        A leader is established only when a strict majority of the *configured*
+        cluster — not of the nodes that happened to answer — names the same one.
+        Sizing the majority on the configured count is what stops a minority
+        partition from certifying its own view: two reachable nodes out of three
+        that disagree cannot produce a leader, and one reachable node can never
+        produce one on its own.
+        """
+        quorum = len(self.node_map) // 2 + 1
+        tally: dict[int, int] = {}
+        for seen in views.values():
+            if seen is not None:
+                tally[seen] = tally.get(seen, 0) + 1
+        for leader_id, count in tally.items():
+            if count >= quorum:
+                return leader_id, True
+        return None, False
+
     def _get_leader_id(self) -> int | None:
         """Query ``/api/v1/cluster/leader`` from each node until one responds.
 
@@ -1637,20 +1640,37 @@ class CIRunner:
             try:
                 nodes = self._get_cluster_nodes()
                 node_count = len(nodes)
-                leaders = [node for node in nodes if node.is_leader]
-                leader_count = len(leaders)
-                # Split-brain is never a transient legitimate state.
-                if leader_count > 1:
-                    raise RunnerError(
-                        f"Illegal cluster state: {leader_count} concurrent leaders "
-                        f"(split brain): {[n.node_id for n in leaders]}"
-                    )
+                # Leadership is resolved across every node, not from the single
+                # node that answered `/cluster/nodes` first. That response marks
+                # `is_leader` from one `Option<node_id>`, so exactly one entry
+                # can ever be true in it: counting leaders there can neither see
+                # split brain nor notice that the node answering is an isolated
+                # ex-leader still naming itself.
+                views = self._get_self_claimed_leaders()
+                self_claimants = sorted(
+                    node_id for node_id, seen in views.items() if seen == node_id
+                )
+                # Two self-claims is a suspicion, not a verdict. An isolated
+                # ex-leader legitimately keeps naming itself until it can hear
+                # someone again — it has no way to learn otherwise — while its
+                # lease expires and it fences itself. Split brain is two nodes
+                # with *write authority*, so confirm against the lease before
+                # calling it: that, not the belief, is what L1 constrains.
+                if len(self_claimants) > 1:
+                    leased = [nid for nid in self_claimants if self._holds_valid_lease(nid)]
+                    if len(leased) > 1:
+                        raise RunnerError(
+                            f"Illegal cluster state: {len(leased)} concurrent leaders "
+                            f"holding valid leases (split brain): {leased}"
+                        )
+                quorum_leader, quorum_agreed = self._quorum_leader(views)
+                leader_count = 1 if quorum_agreed else 0
                 topology_ok = node_count == expected_nodes and leader_count == expected_leaders
                 leader_changed = leader_not is None or (
-                    leader_count == 1 and leaders[0].node_id != leader_not
+                    quorum_agreed and quorum_leader != leader_not
                 )
                 leader_eq_ok = leader_equals is None or (
-                    leader_count == 1 and leaders[0].node_id == leader_equals
+                    quorum_agreed and quorum_leader == leader_equals
                 )
                 voters_ok = True
                 voter_count = expected_nodes
@@ -1666,18 +1686,12 @@ class CIRunner:
                 # ``disconnect_timeout`` after the partition starts).
                 views_ok = True
                 views_detail = ""
-                if require_replication_health and topology_ok and leader_count == 1:
-                    elected_leader = leaders[0].node_id
-                    views = self._get_leader_views()
-                    self_claimed_leaders = {nid for nid, seen in views.items() if seen == nid}
-                    # Split-brain: two distinct nodes each claim themselves as
-                    # leader. Raft forbids this for a given term; surface it
-                    # immediately rather than waiting for the timeout.
-                    if len(self_claimed_leaders) > 1:
-                        raise RunnerError(
-                            f"Illegal cluster state: multiple self-claimed leaders "
-                            f"{sorted(self_claimed_leaders)}"
-                        )
+                if require_replication_health and topology_ok and quorum_leader is not None:
+                    elected_leader = quorum_leader
+                    # `views` and the split-brain check above already ran, and
+                    # ran unconditionally — this branch is off whenever a case
+                    # partitions the cluster, which is the one time two
+                    # self-claims are actually reachable.
                     missing = sorted(set(self.node_map) - set(views))
                     disagreeing = sorted(
                         nid for nid, seen in views.items() if seen != elected_leader
@@ -1692,8 +1706,8 @@ class CIRunner:
                         f" missing={missing}/{allowed_missing_views}"
                         f" disagreeing={disagreeing}"
                     )
-                if require_replication_health and topology_ok and leader_count == 1:
-                    leader_id = leaders[0].node_id
+                if require_replication_health and topology_ok and quorum_leader is not None:
+                    leader_id = quorum_leader
                     fetch_failed = False
                     try:
                         per_replica = self._fetch_metric_values(
@@ -1778,13 +1792,11 @@ class CIRunner:
                     last_error += f", expected_voters={expected_nodes}"
                 if leader_not is not None and leader_count == 1:
                     last_error += (
-                        f", current_leader={leaders[0].node_id}"
-                        f" (waiting for change from {leader_not})"
+                        f", current_leader={quorum_leader} (waiting for change from {leader_not})"
                     )
                 if leader_equals is not None and leader_count == 1:
                     last_error += (
-                        f", current_leader={leaders[0].node_id}"
-                        f" (waiting for leader={leader_equals})"
+                        f", current_leader={quorum_leader} (waiting for leader={leader_equals})"
                     )
                 if require_replication_health:
                     last_error += views_detail
@@ -2462,15 +2474,12 @@ class CIRunner:
             RunnerError: If the chain does not match the expectation.
         """
         prefix = container_exec_prefix(service, privileged=True)
-        probe = (
-            f"{prefix} sh -c "
-            f"\"iptables -S INPUT; echo '--- counters ---'; iptables -L INPUT -n -v\""
-        )
+        probe = f'{prefix} sh -c "{fp.iptables_rules_cmd()}"'
 
         def check(result: ProbeResult) -> str | None:
             if result.exit_code != 0 and not result.stdout.strip():
                 return f"could not read the INPUT chain on {service}: {result.combined.strip()}"
-            found = iptables_drop_rule_present(result.stdout, src_ip)
+            found = fp.parse_peer_drop_rule(result.stdout, src_ip)
             if found is present:
                 return None
             if present:
@@ -2502,23 +2511,23 @@ class CIRunner:
         # whole tc lifecycle, so a verification result can never disagree with
         # the injection for a permission reason.
         prefix = container_exec_prefix(service, privileged=True)
-        probe = f"{prefix} tc qdisc show dev eth0"
+        probe = f"{prefix} {fp.read_qdiscs_cmd()}"
 
         def check(result: ProbeResult) -> str | None:
-            observed = parse_netem_delay_ms(result.stdout)
+            state = fp.parse_netem(result.stdout)
             if expected_delay_ms is None:
-                if netem_present(result.stdout):
+                if state is not None:
                     return f"netem qdisc still installed on {service}: {result.stdout.strip()}"
                 return None
-            if observed is None:
+            if state is None:
                 return (
-                    f"no netem delay on {service} after injection: "
+                    f"no netem qdisc on {service} after injection: "
                     f"{result.combined.strip() or '<no output>'}"
                 )
             tolerance = max(1.0, expected_delay_ms * 0.05)
-            if abs(observed - expected_delay_ms) > tolerance:
+            if abs(state.delay_ms - expected_delay_ms) > tolerance:
                 return (
-                    f"netem delay on {service} is {observed:g}ms, "
+                    f"netem delay on {service} is {state.delay_ms:g}ms, "
                     f"expected {expected_delay_ms}ms (±{tolerance:g}ms)"
                 )
             return None
@@ -3094,7 +3103,7 @@ class CIRunner:
                     raise RunnerError(f"Unknown from_node {from_id} for asymmetric_partition.")
                 self._require_container_binary(node_name, "iptables", step_log)
                 prefix = container_exec_prefix(node_name, privileged=True)
-                cmd = f"{prefix} iptables -A INPUT -s {src_ip} -j DROP"
+                cmd = f"{prefix} {fp.iptables_peer_drop_cmd(src_ip, insert=True)}"
                 self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
                 self._verify_iptables_drop(node_name, src_ip, present=True, step_log=step_log)
 
@@ -3106,7 +3115,7 @@ class CIRunner:
                 if not src_ip:
                     raise RunnerError(f"Unknown from_node {from_id} for asymmetric_heal.")
                 prefix = container_exec_prefix(node_name, privileged=True)
-                cmd = f"{prefix} iptables -D INPUT -s {src_ip} -j DROP"
+                cmd = f"{prefix} {fp.iptables_peer_drop_cmd(src_ip, insert=False)}"
                 self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
                 self._verify_iptables_drop(node_name, src_ip, present=False, step_log=step_log)
 
@@ -3178,19 +3187,22 @@ class CIRunner:
                 jitter_ms = int(step.get("jitter_ms", 50))
                 node_name = f"node{node_id}"
                 self._require_container_binary(node_name, "tc", step_log)
-                inner = (
-                    f"tc qdisc del dev eth0 root 2>/dev/null; "
-                    f"tc qdisc add dev eth0 root netem delay {delay_ms}ms {jitter_ms}ms"
-                )
+                # No `qdisc del` first: an interface that already carries a root
+                # qdisc fails the add with "Exclusivity flag on", which is how a
+                # case learns it inherited residue instead of quietly
+                # overwriting whatever the previous case left behind.
                 prefix = container_exec_prefix(node_name, privileged=True)
-                cmd = f'{prefix} sh -c "{inner}"'
+                netem = fp.netem_add_cmd(delay_ms=delay_ms, jitter_ms=jitter_ms, loss_pct=0)
+                cmd = f"{prefix} {netem}"
                 self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
                 self._verify_netem(node_name, expected_delay_ms=delay_ms, step_log=step_log)
 
             case StepType.NETWORK_HEAL:
                 node_id = int(step["node"])
                 node_name = f"node{node_id}"
-                inner = "tc qdisc del dev eth0 root 2>/dev/null; true"
+                # Healing stays tolerant of an already-clean interface: removing
+                # a qdisc that is not there is the state the step asks for.
+                inner = f"{fp.netem_del_cmd()} 2>/dev/null; true"
                 prefix = container_exec_prefix(node_name, privileged=True)
                 cmd = f'{prefix} sh -c "{inner}"'
                 self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))

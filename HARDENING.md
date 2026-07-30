@@ -418,13 +418,83 @@ Nothing else in Wave 1 is safe or cheap until these land.
       text cannot tell a command from prose about one, and a verb assembled at
       runtime is invisible to it.
 
-      **Remaining:** `ci_runner.py` still drives asymmetric partition with
-      `iptables` and latency with `tc` behind its own verifiers, and its netem
-      parser has a different contract from the primitive layer's (`None` versus
-      `0.0` for a delay-less qdisc), so merging them needs care rather than a
-      rename. Then the real gate: a live Elle smoke and `ha-sequential`, neither
-      of which has run against these changes.
+      `ci_runner.py` is now migrated too and off the pending list. Its
+      asymmetric partition and latency steps build their commands with
+      `iptables_peer_drop_cmd` / `netem_add_cmd` and verify them with
+      `parse_peer_drop_rule` / `parse_netem`; `_NODE_IPS` is re-keyed from
+      `fp.NODE_IPS` rather than restated. The commands are byte-identical to the
+      ones they replaced, which is what made the swap checkable rather than
+      hopeful.
+
+      Two contracts had to be reconciled rather than renamed. The netem parser:
+      the local one returned `None` both for "no qdisc" and for "qdisc with no
+      delay clause"; the primitive's returns a state with `delay_ms == 0.0` for
+      the second, and it is the keeper. And the add polarity: `ci_runner`
+      prefixed every `netem` add with `qdisc del ... 2>/dev/null`, silently
+      clobbering whatever was installed. The primitive deliberately does not, so
+      inherited residue now fails the add with "Exclusivity flag on" instead of
+      being overwritten. Healing stays tolerant of an already-clean interface —
+      strict add, idempotent delete.
+
+      The fault-verb scan was tightened from the tool name to the mutating
+      subcommand (`iptables -[AIDF]`, `tc qdisc|filter add|del|…`). Naming
+      `iptables` to assert the binary exists, or to label a log file, was being
+      flagged as injection, which pushes a caller into renaming things to get
+      past the check — the appearance of migration without the substance.
+
+      Live-gated on a real cluster: `network-latency-stability` passes, and its
+      cleanup re-heals already-clean interfaces without failing, which is the
+      strict-add/tolerant-heal asymmetry doing what it says.
       _Closes_ Class A1 structurally · _Blocks_ H-05…H-09, H-12 · _Effort_ M
+
+- [x] **H-42 — Resolve leadership across nodes, not from whichever answers
+      first.** Found by H-02's live gate: `asymmetric-leader-partition` fails,
+      and has since the initial commit. The cluster is not at fault. Driven by
+      hand under the same partition, node2 and node3 elect node3 within 10 s,
+      and node1 — isolated, still naming itself leader — is correctly fenced:
+      `pgbattery_lease_valid 0`, `pgbattery_emergency_fence 1`, and a real
+      `INSERT` refused with `cannot execute ... in a read-only transaction`. L1
+      holds. Only the observer was wrong.
+
+      `_get_cluster_nodes` returns the first node that answers, in id order, so
+      every convergence check in `wait_cluster` was evaluated against node1's
+      view — deterministically the one node guaranteed to be wrong when node1 is
+      the partitioned ex-leader. A correct failover read as "leadership never
+      moved".
+
+      The worse half is the split-brain check. `/api/v1/cluster/nodes` fills
+      `is_leader` from a single `Option<node_id>`, so at most one entry per
+      response is ever true and `leader_count > 1` was **structurally
+      unreachable** — an oracle that cannot fail, guarding the property this
+      system exists to protect. A second, real check on distinct self-claims did
+      exist, but only under `require_replication_health`, which the partition
+      cases switch off precisely because a partition is up. It was disabled in
+      the one scenario that can produce two self-claims.
+
+      `wait_cluster` now polls every node. A leader counts only when a strict
+      majority of the **configured** cluster names the same one — sized on the
+      configured count, not on who replied, so a minority partition cannot
+      certify its own view.
+
+      Split brain is checked unconditionally, and against the lease rather than
+      the belief. Two distinct *self*-claims is only the suspicion: a node
+      naming someone else is reporting hearsay and cannot manufacture a second
+      leader, but an isolated ex-leader naming itself is expected — it has no
+      way to learn otherwise. The first version of this check stopped there and
+      failed the case on `[1, 3]`, which was wrong in the informative direction:
+      it proved the oracle fires, on a cluster where node1 was already fenced.
+      L1 constrains write *authority*, so a suspicion is escalated only when
+      more than one self-claimant reports `pgbattery_lease_valid`. A scrape
+      failure counts as no lease — this path only ever turns a suspicion into a
+      failure, so it must not invent a leader out of an unreachable node.
+
+      Red-green across all three states: the original code failed on "leadership
+      never moved"; the self-claim-only check failed with the new split-brain
+      message, which is the proof it can fire; the lease-confirmed check passes
+      the case end to end in 99 s, dual-writability prober and data oracles
+      included.
+      _Closes_ Class B (recovery unobservable; split-brain oracle unreachable)
+      · _Effort_ S
 
 - [x] **H-03 — Split `linearizability_register.py`.** All six seams extracted.
       `linreg/` holds `records.py` (`Op`, `JepsenRecord`, `History`),

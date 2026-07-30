@@ -295,25 +295,28 @@ def check_case_contract_refs() -> None:
 
 RAW_FAULT_VERB: Final[re.Pattern[str]] = re.compile(
     r"docker\s+(?:network\s+(?:dis)?connect|kill|stop|start|pause|unpause|restart)\b"
-    r"|\biptables\b"
-    r"|\btc\s+(?:qdisc|filter)\b"
+    r"|\biptables\s+-[AIDF]\b"
+    r"|\btc\s+(?:qdisc|filter)\s+(?:add|del|change|replace)\b"
 )
-"""Shell verbs that inject or heal a fault.
+"""Shell verbs that mutate network state to inject or heal a fault.
 
-``iptables`` and ``tc`` are only ever faults. ``docker`` is not, so only its
-fault subcommands are listed: ``docker compose ps`` and ``docker exec psql``
-are ordinary reads and must stay allowed.
+Each entry requires the mutating subcommand, not just the tool name. A module
+legitimately names ``iptables`` without running it — asserting the binary
+exists in the image, labelling a log file — and flagging the bare word would
+push callers into renaming things to get past the check rather than routing the
+command through the primitive layer.
+
+``docker`` is a tool whose ordinary uses far outnumber its fault ones, so only
+its fault subcommands are listed: ``docker compose ps`` and ``docker exec psql``
+are reads and must stay allowed.
 """
 
 PRIMITIVE_MODULE: Final[str] = "fault_primitives.py"
 
 PENDING_FAULT_MIGRATION: Final[frozenset[str]] = frozenset(
     {
-        # Drives its asymmetric partition with iptables and its latency with tc,
-        # each behind its own verifier. Pending H-02.
-        "ci_runner.py",
-        # Also addresses containers by literal name, so it inherits the Class A1
-        # bug the moment it runs under a non-default compose project. Pending H-12.
+        # Addresses containers by literal name, so it inherits the Class A1 bug
+        # the moment it runs under a non-default compose project. Pending H-12.
         "overnight_test.py",
     }
 )
