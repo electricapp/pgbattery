@@ -206,6 +206,22 @@ NODES: Final[tuple[NodeTarget, ...]] = (
     NodeTarget(node_id=3, service="node3", pg_ip="172.28.0.13"),
 )
 
+FIVE_NODES: Final[tuple[NodeTarget, ...]] = tuple(
+    NodeTarget(node_id=n, service=f"node{n}", pg_ip=f"172.29.0.{10 + n}") for n in range(1, 6)
+)
+"""`docker-compose.5node.yml`, which uses its own subnet so both clusters can
+exist at once.
+
+L1 is a cluster-wide property, so the prober has to cover every node there is:
+at five nodes, racing only three ports leaves two that could accept a write
+unobserved, and the run would report "at most one acceptance" having never
+asked the other two."""
+
+TOPOLOGIES: Final[dict[str, tuple[NodeTarget, ...]]] = {
+    "three": NODES,
+    "five": FIVE_NODES,
+}
+
 PG_USER: Final[str] = "postgres"
 PG_DBNAME: Final[str] = "postgres"
 
@@ -1809,17 +1825,31 @@ def run(
         "exactly one writable node. Use ~0.95 for a healthy-cluster sanity run; "
         "leave at 0 when faults are being injected.",
     ),
+    topology: str = typer.Option(
+        "three",
+        "--topology",
+        help="three | five. Selects which cluster to probe: the default "
+        "docker-compose.yml (172.28.0.x) or docker-compose.5node.yml "
+        "(172.29.0.x). L1 is cluster-wide, so probing three ports of a "
+        "five-node cluster would leave two unobserved.",
+    ),
     json_out: str = typer.Option(
         "",
         "--json",
         help="Write the full report, including every violating round, to this path.",
     ),
 ) -> None:
-    """Probe all three nodes concurrently and assert at most one accepts writes.
+    """Probe every node concurrently and assert at most one accepts writes.
 
     Exit codes: 0 PASS, 1 L1 violated, 2 infrastructure error, 3 inconclusive.
     """
+    if topology not in TOPOLOGIES:
+        console.print(
+            f"[red]unknown --topology {topology!r}[/]; expected one of {sorted(TOPOLOGIES)}"
+        )
+        raise typer.Exit(code=2)
     config = ProberConfig(
+        nodes=TOPOLOGIES[topology],
         round_period_s=round_ms / 1000.0,
         attempt_timeout_s=(attempt_ms / 1000.0) if attempt_ms > 0 else None,
         transport=transport,

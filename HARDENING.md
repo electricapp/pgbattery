@@ -690,15 +690,36 @@ No new infrastructure. Highest confidence per unit of effort.
       prober is wired to the 3-node ports. Left open and re-pointed at H-44.
       _Blocked by_ H-02, H-04 · _Effort_ M
 
-- [ ] **H-44 — Point the dual-writability prober at the 5-node cluster.** RW-1
-      is a timing window, not a shape: the deposed leader's lease anchors at its
-      last quorum ack, which can be later than the winner's local detection of
-      leaderlessness, so both can believe they may write for a bounded interval.
-      Observing it needs concurrent real writes at the prober's 50 ms resolution
-      across five internal PostgreSQL ports; today it is wired to the 3-node
-      ports and topology.
-      **Done when** the prober runs against `docker-compose.5node.yml` and a
-      5-node asymmetric partition case asserts at most one acceptance.
+- [x] **H-44 — Prober points at the 5-node cluster; RW-1 observed.** The prober
+      gained `--topology {three,five}`, and the 5-node entry covers all five
+      internal PostgreSQL ports: L1 is cluster-wide, so racing three of five
+      would leave two able to accept a write unobserved.
+
+      Phase 2d isolates the leader with one companion and runs the prober across
+      the whole window at its 50 ms period. At most one node accepted a write.
+      An `INCONCLUSIVE` result — too many indeterminate probes to assert
+      anything — is treated as a failure rather than a pass, so a blind run
+      cannot read as a clean one.
+
+      **A liveness regression I introduced in H-11 surfaced here and is fixed.**
+      The aged-LSN tiebreak inherited the *tight* catch-up threshold (a single
+      WAL block) under sync mode. The "somebody always qualifies" argument holds
+      cluster-wide — the node at `aged_max` compares against itself — but not
+      inside a partition, where that node may be on the far side. Every
+      reachable follower was then rejected and the majority could not elect: a
+      live 3/2 split sat leaderless for four minutes. The aged branch now uses
+      the loose threshold, whose premise (synchronous replication is currently
+      holding acked WAL) is exactly as stale as the numbers once every report
+      has aged out. RW-7 survives the loosening by an order of magnitude — a
+      restored basebackup is a whole backup behind, not 16 MB.
+      `test_ordinary_lag_stays_electable_in_a_leaderless_window` pins it and
+      goes red under the tight threshold.
+
+      Two suite preconditions also got stricter. `await_all_healthy` now
+      requires every node's **PostgreSQL** to answer, not just its management
+      API: a node stranded by an earlier shape can serve `/cluster/leader` while
+      its pgbattery crash-loops and its postmaster refuses connections, and
+      counting it healthy put a dead node on one side of the next partition.
       _Closes_ RW-1 · _Blocked by_ H-04 · _Effort_ M
 
 - [ ] **H-07 — Trigger faults on protocol state, not wall-clock offsets.** Replace

@@ -233,11 +233,22 @@ def await_all_healthy(timeout_s: float = REFENCE_CONVERGE_TIMEOUT_S) -> int:
         roles = members()
         healthy = sorted(views)
         all_voters = sorted(n for n, r in roles.items() if r == "voter")
-        if len(healthy) == len(NODES) and len(all_voters) == len(NODES):
+        # PostgreSQL too, not just the management API. A node can answer
+        # `/cluster/leader` while its pgbattery is crash-looping and its
+        # postmaster refuses connections — which is exactly what a node
+        # stranded by an earlier shape looks like. Counting it as healthy puts
+        # a dead node on one side of the next partition, and "3 of 5" is really
+        # 2.
+        pg_up = sorted(n for n in NODES if psql(n, "SELECT 1", timeout=8)[0] == 0)
+        if (
+            len(healthy) == len(NODES)
+            and len(all_voters) == len(NODES)
+            and len(pg_up) == len(NODES)
+        ):
             leader = quorum_leader()
             if leader is not None:
                 return leader
-        last = f"responding={healthy} voters={all_voters}"
+        last = f"responding={healthy} voters={all_voters} pg_up={pg_up}"
         time.sleep(3)
     raise SuiteError(
         f"cluster did not return to all-{len(NODES)}-healthy within {timeout_s:.0f}s ({last}); "
@@ -506,6 +517,51 @@ def phase_follower_bridge(leader: int) -> None:
         partition_groups([isolated, rest], heal=True)
 
 
+def phase_rw1_asymmetric(leader: int) -> None:
+    """RW-1: the deposed leader's lease can outlive the winner's election.
+
+    The lease anchors at the leader's *last quorum ack*, which can be later than
+    the instant the eventual winner locally observed the cluster going
+    leaderless. So winning an election is not proof the old lease has expired,
+    and for a bounded interval both nodes can believe they may write. The
+    promotion hold-down closes the prompt case; when the deposed leader kept a
+    quorum that excluded the winner, safety rests on the quorum-loss self-fence
+    and on synchronous replication refusing un-acked commits.
+
+    That window is measured in hundreds of milliseconds, so a control-plane
+    sample cannot see it. The prober races real writes at every node on a 50 ms
+    period across the whole partition and asks PostgreSQL — not the control
+    plane — which one accepted. At five nodes it must cover all five: probing
+    three of them would leave two able to accept a write unobserved.
+    """
+    console.print("[bold]Phase 2d[/] RW-1 — deposed leader's lease vs. the winner")
+    minority = [leader, next(n for n in NODES if n != leader)]
+    majority = [n for n in NODES if n not in minority]
+    partition_groups([minority, majority])
+    console.print(f"  isolating leader node{leader} with {minority[1]}; majority={majority}")
+    try:
+        artifact = "testing/artifacts/dual-writability-5node-rw1"
+        rc, out, err = run(
+            f"mkdir -p {artifact} && ./testing/dual_writability_prober.py "
+            f"--topology five --duration 30 --json {artifact}/result.json",
+            timeout=300,
+        )
+        if rc == 1:
+            raise SuiteError(f"L1 VIOLATED across the RW-1 window: {out.strip() or err.strip()}")
+        if rc not in (0, 3):
+            raise SuiteError(f"prober failed to run (rc={rc}): {err.strip() or out.strip()}")
+        if rc == 3:
+            # Inconclusive is not a pass: too many probes came back
+            # indeterminate to claim anything about L1.
+            raise SuiteError(
+                "prober returned INCONCLUSIVE — too many indeterminate probes to "
+                f"assert L1 over this window: {out.strip()[-400:]}"
+            )
+        console.print("  at most one node accepted a write for the whole window")
+    finally:
+        partition_groups([minority, majority], heal=True)
+
+
 @app.command()
 def run_suite() -> None:
     """Run Phase 1. Exits non-zero on any failed assertion."""
@@ -540,6 +596,10 @@ def run_suite() -> None:
         await_all_healthy()
         phase_three_way_split()
         results.append(("three-way split: nobody writes", "PASS"))
+
+        leader = await_all_healthy()
+        phase_rw1_asymmetric(leader)
+        results.append(("RW-1: at most one writer across the window", "PASS"))
     except SuiteError as exc:
         console.print(f"[red]FAIL[/] {exc}")
         results.append(("suite", f"FAIL: {exc}"))

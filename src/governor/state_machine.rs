@@ -434,7 +434,28 @@ impl ClusterState {
                     "no LSN report for candidate in a leaderless window (fail-closed)",
                 );
             };
-            if aged_max > candidate_lsn && (aged_max - candidate_lsn) > catchup_threshold_bytes {
+            // The LOOSE threshold here, deliberately, even under sync mode.
+            //
+            // The tight threshold's premise is that synchronous replication is
+            // *currently* holding acked WAL on a standby, so a candidate even
+            // one block behind may be missing an ack. Once every report has
+            // aged past the staleness window, that premise is exactly as stale
+            // as the numbers are: the silence that invalidates the LSNs
+            // invalidates the assumption about sync state along with them.
+            //
+            // It also has to be loose to stay live. "Somebody always qualifies"
+            // holds cluster-wide — the node at `aged_max` compares against
+            // itself — but not inside a partition, where that node may be on
+            // the other side. With a single-block tolerance every reachable
+            // follower is then rejected and the majority cannot elect at all.
+            // Measured: a 3/2 split left the majority unable to elect for four
+            // minutes under the tight threshold.
+            //
+            // RW-7 survives the loosening by an order of magnitude — a node
+            // restored from an old basebackup is a whole backup behind, not
+            // 16 MB.
+            let leaderless_threshold = crate::config::constants::lsn_catchup_threshold_for(false);
+            if aged_max > candidate_lsn && (aged_max - candidate_lsn) > leaderless_threshold {
                 return (
                     false,
                     "candidate LSN too far behind cluster max (aged reports)",
@@ -761,6 +782,45 @@ mod tests {
             electable.contains(&2),
             "the node holding the aged maximum must always be electable, got {electable:?}"
         );
+    }
+
+    /// A normally-lagging follower must stay electable in a leaderless window,
+    /// even under sync mode.
+    ///
+    /// This is the regression the aged tiebreak first shipped with. The tight
+    /// threshold is a single WAL block, and "somebody always qualifies" holds
+    /// cluster-wide but not inside a partition — the node at the aged maximum
+    /// may be on the far side of it. Under the tight threshold every reachable
+    /// follower was then rejected and the majority could not elect: a live 3/2
+    /// split sat leaderless for four minutes.
+    #[test]
+    fn test_ordinary_lag_stays_electable_in_a_leaderless_window() {
+        let mut state = ClusterState::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for id in 1..=3 {
+            add_test_node(&mut state, id);
+        }
+        // Sync mode active: without the explicit loosening this uses the
+        // single-block threshold.
+        state.sync_replication_active = Some(true);
+        let stale_ts =
+            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
+        state.node_lsns.insert(1, (100_000_000, stale_ts));
+        // A few hundred KB behind — ordinary streaming lag, far beyond one
+        // block but nowhere near a stale basebackup.
+        state.node_lsns.insert(2, (99_600_000, stale_ts));
+        state.node_lsns.insert(3, (99_700_000, stale_ts));
+
+        for id in [2, 3] {
+            let (acceptable, reason) = state.is_lsn_acceptable_for_election(id);
+            assert!(
+                acceptable,
+                "node{id} with ordinary lag was rejected in a leaderless window: {reason}"
+            );
+        }
     }
 
     /// A cluster that has genuinely never reported stays permissive: there is
