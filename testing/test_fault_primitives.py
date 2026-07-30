@@ -20,22 +20,30 @@ Run with:
 
 from __future__ import annotations
 
+import os
 import re
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from unittest import mock
 
 from fault_primitives import (
+    DEFAULT_COMPOSE_PROJECT,
     Aim,
     CommandResult,
     Direction,
     DiskUsage,
     FaultEffectNotObserved,
+    FaultInjectionError,
     FaultPreconditionError,
     FilterMatch,
     LeaseBoundarySkew,
     NetemState,
     ProcessInfo,
+    cluster_network,
+    compose_project,
+    container_id,
+    container_networks_cmd,
     count_prio_for,
     curl_probe_cmd,
     df_cmd,
@@ -51,6 +59,8 @@ from fault_primitives import (
     ip_to_u32_hex,
     netem_add_cmd,
     netem_del_cmd,
+    network_detached,
+    parse_container_networks,
     parse_curl_seconds,
     parse_df,
     parse_netem,
@@ -69,8 +79,10 @@ from fault_primitives import (
     sigstop_checkpointer,
     sweep_around,
     verify_added_latency,
+    verify_attached,
     verify_bounded_filesystem,
     verify_clock_offset,
+    verify_detached,
     verify_filter_absent,
     verify_filter_present,
     verify_netem_absent,
@@ -1193,6 +1205,237 @@ class DataclassContractTests(unittest.TestCase):
     def test_netem_state_and_process_info_are_plain_values(self) -> None:
         self.assertEqual(NetemState(200.0, 50.0, 30.0).loss_pct, 30.0)
         self.assertTrue(ProcessInfo(1, "T", "postgres: checkpointer").is_stopped)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compose object naming
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ComposeProjectTests(unittest.TestCase):
+    """Literal docker object names are the Class A1 bug: they resolve locally,
+    where compose uses its own ``name:``, and silently do not exist under CI's
+    per-run project."""
+
+    def test_falls_back_to_the_compose_file_name(self) -> None:
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("COMPOSE_PROJECT_NAME", None)
+            self.assertEqual(compose_project(), DEFAULT_COMPOSE_PROJECT)
+            self.assertEqual(cluster_network(), f"{DEFAULT_COMPOSE_PROJECT}_raft_net")
+
+    def test_honours_a_per_run_project(self) -> None:
+        with mock.patch.dict(os.environ, {"COMPOSE_PROJECT_NAME": "pgbha_seq_42_1"}):
+            self.assertEqual(compose_project(), "pgbha_seq_42_1")
+            self.assertEqual(cluster_network(), "pgbha_seq_42_1_raft_net")
+
+    def test_empty_value_falls_back_rather_than_naming_a_bare_suffix(self) -> None:
+        """An empty env var would otherwise yield the network ``_raft_net``."""
+        with mock.patch.dict(os.environ, {"COMPOSE_PROJECT_NAME": ""}):
+            self.assertEqual(compose_project(), DEFAULT_COMPOSE_PROJECT)
+
+
+class ParseContainerNetworksTests(unittest.TestCase):
+    def test_single_network(self) -> None:
+        parsed = parse_container_networks("pgbattery_raft_net=172.28.0.11 ")
+        self.assertEqual(parsed, {"pgbattery_raft_net": "172.28.0.11"})
+
+    def test_multiple_networks(self) -> None:
+        parsed = parse_container_networks("a_raft_net=172.28.0.12 bridge=172.17.0.4 ")
+        self.assertEqual(parsed, {"a_raft_net": "172.28.0.12", "bridge": "172.17.0.4"})
+
+    def test_attached_without_an_address_is_not_absent(self) -> None:
+        self.assertEqual(parse_container_networks("net="), {"net": ""})
+
+    def test_detached_container_reports_nothing(self) -> None:
+        self.assertEqual(parse_container_networks("   "), {})
+
+
+class NetworkVerificationTests(unittest.TestCase):
+    NET = "proj_raft_net"
+
+    def test_detach_unobserved_when_still_attached(self) -> None:
+        with self.assertRaises(FaultEffectNotObserved):
+            verify_detached({self.NET: "172.28.0.11"}, target="node1", network=self.NET)
+
+    def test_detach_observed_when_gone(self) -> None:
+        verify_detached({"bridge": "172.17.0.2"}, target="node1", network=self.NET)
+
+    def test_reattach_unobserved_when_absent(self) -> None:
+        with self.assertRaises(FaultEffectNotObserved):
+            verify_attached({}, target="node1", network=self.NET)
+
+    def test_reattach_unobserved_when_off_subnet(self) -> None:
+        """A reattach that lands outside 172.28.x is not the topology the rest of
+        the suite assumes."""
+        with self.assertRaises(FaultEffectNotObserved):
+            verify_attached({self.NET: "10.0.0.5"}, target="node1", network=self.NET)
+
+    def test_reattach_observed_on_cluster_subnet(self) -> None:
+        verify_attached({self.NET: "172.28.0.11"}, target="node1", network=self.NET)
+
+
+class NetworkRunner:
+    """Answers a `network_detached` window, sequencing the inspect calls.
+
+    `attached_sequence` is the answer to each successive ``docker inspect``:
+    attached before the detach, absent after it, attached again after the heal.
+    """
+
+    def __init__(
+        self,
+        network: str,
+        *,
+        attached_sequence: Sequence[bool],
+        ip: str = "172.28.0.11",
+        cid: str = "c0ffee123456",
+        detach_result: CommandResult | None = None,
+        reattach_result: CommandResult | None = None,
+    ) -> None:
+        self.network = network
+        self.attached_sequence = list(attached_sequence)
+        self.ip = ip
+        self.cid = cid
+        self.detach_result = detach_result
+        self.reattach_result = reattach_result
+        self.calls: list[str] = []
+        self.inspects = 0
+
+    def __call__(self, cmd: str, timeout_s: float) -> CommandResult:
+        self.calls.append(cmd)
+        if "docker compose ps -q" in cmd:
+            return CommandResult(0, f"{self.cid}\n", "")
+        if "docker inspect" in cmd:
+            idx = min(self.inspects, len(self.attached_sequence) - 1)
+            self.inspects += 1
+            attached = self.attached_sequence[idx]
+            return CommandResult(0, f"{self.network}={self.ip} " if attached else "", "")
+        if "docker network disconnect" in cmd and self.detach_result is not None:
+            return self.detach_result
+        if "docker network connect" in cmd and self.reattach_result is not None:
+            return self.reattach_result
+        return CommandResult(0, "", "")
+
+    def matching(self, needle: str) -> list[str]:
+        return [c for c in self.calls if needle in c]
+
+
+class NetworkDetachedTests(unittest.TestCase):
+    PROJECT = "pgbha_elle_99_1"
+
+    def setUp(self) -> None:
+        self.network = f"{self.PROJECT}_raft_net"
+        patcher = mock.patch.dict(os.environ, {"COMPOSE_PROJECT_NAME": self.PROJECT})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.events: list[dict[str, object]] = []
+        previous_sink = set_event_sink(self.events.append)
+        self.addCleanup(set_event_sink, previous_sink)
+
+    def install(self, runner: NetworkRunner) -> NetworkRunner:
+        previous = set_command_runner(runner)
+        self.addCleanup(set_command_runner, previous)
+        return runner
+
+    def test_detach_names_the_active_projects_network(self) -> None:
+        """The regression guard: under a per-run project the disconnect must name
+        that project's network, never the compose file's default."""
+        runner = self.install(NetworkRunner(self.network, attached_sequence=[True, False, True]))
+        with network_detached("node1"):
+            pass
+        disconnects = runner.matching("docker network disconnect")
+        self.assertEqual(len(disconnects), 1, runner.calls)
+        self.assertIn(self.network, disconnects[0])
+        self.assertIn("c0ffee123456", disconnects[0])
+        self.assertNotIn(f"{DEFAULT_COMPOSE_PROJECT}_raft_net", disconnects[0])
+
+    def test_reattaches_with_the_address_it_read(self) -> None:
+        """Reading the address beats deriving it from a node index, which cannot
+        notice that it is wrong."""
+        runner = self.install(
+            NetworkRunner(self.network, attached_sequence=[True, False, True], ip="172.28.0.13")
+        )
+        with network_detached("node3") as handle:
+            self.assertEqual(handle.restore_ip, "172.28.0.13")
+            self.assertEqual(handle.network, self.network)
+        connects = runner.matching("docker network connect")
+        self.assertEqual(len(connects), 1, runner.calls)
+        self.assertIn("--ip 172.28.0.13", connects[0])
+
+    def test_raises_when_the_node_was_never_attached(self) -> None:
+        runner = self.install(NetworkRunner(self.network, attached_sequence=[False]))
+        with self.assertRaises(FaultPreconditionError), network_detached("node1"):
+            pass
+        self.assertEqual(runner.matching("docker network disconnect"), [])
+
+    def test_raises_when_the_detach_does_not_take_effect(self) -> None:
+        """The Class A1 shape: the command reports success and nothing happened."""
+        runner = self.install(NetworkRunner(self.network, attached_sequence=[True, True]))
+        with self.assertRaises(FaultEffectNotObserved), network_detached("node1"):
+            pass
+        self.assertEqual(len(runner.matching("docker network disconnect")), 1)
+
+    def test_raises_when_the_detach_command_fails(self) -> None:
+        self.install(
+            NetworkRunner(
+                self.network,
+                attached_sequence=[True, False, True],
+                detach_result=CommandResult(1, "", "No such network"),
+            )
+        )
+        with self.assertRaises(FaultInjectionError), network_detached("node1"):
+            pass
+
+    def test_raises_when_the_reattach_fails(self) -> None:
+        """A node left off the network poisons every later case, so this must be
+        loud rather than best-effort."""
+        self.install(
+            NetworkRunner(
+                self.network,
+                attached_sequence=[True, False, False],
+                reattach_result=CommandResult(1, "", "address already in use"),
+            )
+        )
+        with self.assertRaises(FaultInjectionError), network_detached("node1"):
+            pass
+
+    def test_raises_when_the_reattach_is_not_observed(self) -> None:
+        self.install(NetworkRunner(self.network, attached_sequence=[True, False, False]))
+        with self.assertRaises(FaultEffectNotObserved), network_detached("node1"):
+            pass
+
+    def test_emits_inject_and_heal_events(self) -> None:
+        self.install(NetworkRunner(self.network, attached_sequence=[True, False, True]))
+        with network_detached("node1"):
+            pass
+        kinds = [(e.get("event"), e.get("primitive")) for e in self.events]
+        self.assertIn(("inject", "network_detached"), kinds)
+        self.assertIn(("heal", "network_detached"), kinds)
+
+    def test_unresolvable_service_is_a_precondition_failure(self) -> None:
+        """No container id means the project is wrong or the cluster is down —
+        either way nothing can be injected."""
+
+        def runner(cmd: str, timeout_s: float) -> CommandResult:
+            if "docker compose ps -q" in cmd:
+                return CommandResult(0, "\n", "")
+            return CommandResult(0, "", "")
+
+        previous = set_command_runner(runner)
+        self.addCleanup(set_command_runner, previous)
+        with self.assertRaises(FaultPreconditionError):
+            container_id("node1")
+
+
+class ContainerNetworksCmdTests(unittest.TestCase):
+    def test_command_targets_the_given_container(self) -> None:
+        cmd = container_networks_cmd("abc123")
+        self.assertIn("docker inspect", cmd)
+        self.assertTrue(cmd.endswith("abc123"))
+
+    def test_command_asks_for_name_and_address(self) -> None:
+        cmd = container_networks_cmd("abc123")
+        self.assertIn(".NetworkSettings.Networks", cmd)
+        self.assertIn(".IPAddress", cmd)
 
 
 if __name__ == "__main__":

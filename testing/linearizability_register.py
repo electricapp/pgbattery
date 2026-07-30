@@ -101,6 +101,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+import fault_primitives as fp
 from db_clients import PsycopgWorkerClient
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -724,6 +725,35 @@ def worker_loop(
         history.append(op)
 
 
+@dataclass
+class InjectorOutcome:
+    """Whether the fault injector finished, and why not if it did not.
+
+    The injector is a daemon thread, so an exception raised inside it is printed
+    to stderr and then discarded: the run continues, finds no anomaly in a
+    workload that was never faulted, and reports PASS. The fault primitives raise
+    rather than no-op, which only helps if somebody reads the exception, so
+    `run()` checks this before computing a verdict.
+    """
+
+    error: BaseException | None = None
+    finished: bool = False
+
+
+def run_injector(
+    fn: Callable[..., None],
+    args: tuple[object, ...],
+    outcome: InjectorOutcome,
+) -> None:
+    """Call `fn(*args)`, recording the outcome for `run()` to inspect."""
+    try:
+        fn(*args)
+    except BaseException as exc:
+        outcome.error = exc
+    finally:
+        outcome.finished = True
+
+
 def kill_leader_after(delay: float) -> None:
     """Sleep `delay` seconds, then kill whichever node is currently leader."""
     time.sleep(delay)
@@ -734,19 +764,13 @@ def kill_leader_after(delay: float) -> None:
 
 
 def partition_leader_after(delay: float, heal_after: float = 4.0) -> None:
-    """Disconnect leader from raft_net, then reconnect after `heal_after`."""
+    """Detach the leader from the cluster network, reattach after `heal_after`."""
     time.sleep(delay)
     leader, _ = find_leader()
     if leader is None:
         return
-    leader_idx = NODES.index(leader) + 1
-    ip = f"172.28.0.1{leader_idx}"
-    run_cmd(f"docker network disconnect pgbattery_raft_net pgbattery-{leader}-1", timeout=10)
-    time.sleep(heal_after)
-    run_cmd(
-        f"docker network connect --ip {ip} pgbattery_raft_net pgbattery-{leader}-1",
-        timeout=10,
-    )
+    with fp.network_detached(leader):
+        time.sleep(heal_after)
 
 
 def freeze_leader_after(delay: float, hold: float = 3.0) -> None:
@@ -1016,18 +1040,8 @@ def flap_partition_after(delay: float, cycles: int = 8, period_s: float = 0.6) -
         if leader is None:
             time.sleep(period_s)
             continue
-        leader_idx = NODES.index(leader) + 1
-        ip = f"172.28.0.1{leader_idx}"
-        container = f"pgbattery-{leader}-1"
-        run_cmd(
-            f"docker network disconnect pgbattery_raft_net {container}",
-            timeout=5,
-        )
-        time.sleep(period_s / 2)
-        run_cmd(
-            f"docker network connect --ip {ip} pgbattery_raft_net {container}",
-            timeout=5,
-        )
+        with fp.network_detached(leader):
+            time.sleep(period_s / 2)
         time.sleep(period_s / 2)
 
 
@@ -1663,9 +1677,10 @@ def run(
     injector_args: tuple[object, ...] = (cfg.fault_at,)
     if attack in SEEDED_ATTACKS:
         injector_args = (cfg.fault_at, CHAOS_STORM_DURATION, actual_seed)
+    injector = InjectorOutcome()
     killer = threading.Thread(
-        target=ATTACK_DISPATCH[attack],
-        args=injector_args,
+        target=run_injector,
+        args=(ATTACK_DISPATCH[attack], injector_args, injector),
         daemon=True,
         name="injector",
     )
@@ -1696,6 +1711,23 @@ def run(
         json.dumps([op.to_jsonable() for op in history.ops], indent=2),
         encoding="utf-8",
     )
+
+    # An injector that raised leaves a history with no fault in it. Checking that
+    # history would find no anomaly and report PASS, so refuse a verdict instead.
+    # Exit 2 (infra), not 1 (violation): the run proves nothing either way.
+    if injector.error is not None:
+        console.print(
+            f"[bold red]FATAL:[/] the {attack} injector failed, so no fault was "
+            f"injected for at least part of the run:\n  "
+            f"{type(injector.error).__name__}: {injector.error}"
+        )
+        raise typer.Exit(code=2)
+    if not injector.finished:
+        console.print(
+            f"[bold red]FATAL:[/] the {attack} injector did not finish within the "
+            "join timeout; the fault window is unknown, so no verdict is possible."
+        )
+        raise typer.Exit(code=2)
 
     any_failure = False
     results: dict[int, dict[str, object]] = {}

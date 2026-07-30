@@ -157,6 +157,7 @@ the legacy ``_chaos_fill.bin`` filler path) so nothing leaks between runs.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -402,6 +403,119 @@ def exec_in(
 ) -> CommandResult:
     """Run `script` inside `container`."""
     return run(compose_exec(container, script, as_root=as_root), timeout_s)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compose object naming
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every primitive above reaches containers as compose *services*, which compose
+# resolves inside whatever project is active. Some faults cannot be expressed
+# that way — detaching a container from a network needs the real container and
+# network names — and those are the ones that silently no-op when a literal name
+# is wrong. Resolve them here and nowhere else.
+
+DEFAULT_COMPOSE_PROJECT: Final[str] = "pgbattery"
+"""What compose uses when the environment does not override it, from
+``docker-compose.yml``'s own ``name:``."""
+
+RAFT_NETWORK_SUFFIX: Final[str] = "raft_net"
+"""Compose prefixes network names with the project, so the full name is
+``<project>_raft_net``."""
+
+CLUSTER_SUBNET_PREFIX: Final[str] = "172.28."
+"""Cluster subnet from ``docker-compose.yml``. Attachment is confirmed by an
+address in this range rather than by a command's exit code."""
+
+
+def compose_project() -> str:
+    """Active compose project name.
+
+    ``COMPOSE_PROJECT_NAME`` overrides the compose file's ``name:``, and every CI
+    workflow but one sets a per-run value. A literal ``pgbattery_raft_net``
+    therefore does not exist in CI, which is what turned two partition attacks
+    into no-ops that still reported PASS.
+    """
+    return os.environ.get("COMPOSE_PROJECT_NAME") or DEFAULT_COMPOSE_PROJECT
+
+
+def cluster_network(suffix: str = RAFT_NETWORK_SUFFIX) -> str:
+    """Full name of a compose-created network in the active project."""
+    return f"{compose_project()}_{suffix}"
+
+
+def container_networks_cmd(container: str) -> str:
+    """Build a command listing ``network=ip`` pairs for `container`."""
+    fmt = "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}"
+    return f"docker inspect -f '{fmt}' {container}"
+
+
+def parse_container_networks(text: str) -> dict[str, str]:
+    """Parse `container_networks_cmd` output into network name → IP.
+
+    A network attached with no address yet maps to the empty string, which is
+    deliberately distinct from being absent.
+    """
+    out: dict[str, str] = {}
+    for token in text.split():
+        name, _, ip = token.partition("=")
+        if name:
+            out[name] = ip
+    return out
+
+
+def container_id(service: str) -> str:
+    """Resolve a compose service to its container id.
+
+    Asks compose rather than string-building a name, so a change to its naming
+    convention surfaces as a precondition failure instead of an unresolvable
+    name that the fault then shrugs off.
+    """
+    result = run(f"docker compose ps -q {service}")
+    cid = result.stdout.strip().split("\n")[-1].strip() if result.ok else ""
+    if not cid:
+        raise FaultPreconditionError(
+            f"cannot resolve a container for compose service {service!r} in "
+            f"project {compose_project()!r}: "
+            f"{result.stderr.strip() or 'no container id returned'}. "
+            "Check the cluster is up and COMPOSE_PROJECT_NAME matches it."
+        )
+    return cid
+
+
+def read_container_networks(service: str) -> dict[str, str]:
+    """Network name → IP for `service`'s container."""
+    result = run(container_networks_cmd(container_id(service)))
+    if not result.ok:
+        raise FaultInjectionError(
+            f"could not inspect networks for {service}: {result.stderr.strip()}"
+        )
+    return parse_container_networks(result.stdout)
+
+
+def verify_detached(networks: dict[str, str], *, target: str, network: str) -> None:
+    """Assert `network` is gone. A disconnect that no-ops leaves an empty fault
+    window, and an empty window reads as "no violations during the partition"."""
+    if network in networks:
+        raise FaultEffectNotObserved(
+            f"{target} is still attached to {network} after disconnect "
+            f"(attached: {sorted(networks)})"
+        )
+
+
+def verify_attached(networks: dict[str, str], *, target: str, network: str) -> None:
+    """Assert `network` is back, with a cluster address. Leaving a node detached
+    poisons every later case in the run."""
+    ip = networks.get(network)
+    if ip is None:
+        raise FaultEffectNotObserved(
+            f"{target} was not reattached to {network} (attached: {sorted(networks)})"
+        )
+    if not ip.startswith(CLUSTER_SUBNET_PREFIX):
+        raise FaultEffectNotObserved(
+            f"{target} reattached to {network} with address {ip!r}, which is "
+            f"outside the cluster subnet {CLUSTER_SUBNET_PREFIX}x"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1372,6 +1486,16 @@ class Aim(StrEnum):
     boundary anyway"."""
 
 
+@dataclass(frozen=True)
+class NetworkDetachHandle:
+    """Live state of a :func:`network_detached` window."""
+
+    service: str
+    container: str
+    network: str
+    restore_ip: str
+
+
 @dataclass
 class NetemHandle:
     """Live state of a :func:`partition_lossy` window."""
@@ -1469,6 +1593,54 @@ class DiskFullHandle:
 # ─────────────────────────────────────────────────────────────────────────────
 # Primitives
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def network_detached(
+    service: str,
+    *,
+    network: str | None = None,
+) -> Iterator[NetworkDetachHandle]:
+    """Detach `service` from the cluster network for the duration of the block.
+
+    A total partition, as distinct from :func:`partition_lossy` (which degrades a
+    link) and :func:`partition_asymmetric` (which drops one direction). The node
+    keeps running and keeps its data; it simply cannot be reached.
+
+    The restore address is read from the container beforehand rather than derived
+    from a node index, so reattaching cannot put a node back on a different
+    address than it had. Both the detach and the reattach are verified, and a
+    failed reattach raises: leaving a node off the network would poison every
+    later case in the run.
+    """
+    net = network if network is not None else cluster_network()
+    cid = container_id(service)
+    before = read_container_networks(service)
+    restore_ip = before.get(net, "")
+    if not restore_ip:
+        raise FaultPreconditionError(
+            f"{service} is not attached to {net} (attached: {sorted(before)}), so "
+            "detaching it would inject nothing. Check the cluster is up and "
+            f"COMPOSE_PROJECT_NAME ({compose_project()!r}) matches it."
+        )
+
+    _emit("inject", "network_detached", service, {"network": net, "ip": restore_ip})
+    detach = run(f"docker network disconnect {net} {cid}")
+    if not detach.ok:
+        raise FaultInjectionError(f"could not detach {service} from {net}: {detach.stderr.strip()}")
+    verify_detached(read_container_networks(service), target=service, network=net)
+
+    handle = NetworkDetachHandle(service=service, container=cid, network=net, restore_ip=restore_ip)
+    try:
+        yield handle
+    finally:
+        reattach = run(f"docker network connect --ip {restore_ip} {net} {cid}")
+        if not reattach.ok:
+            raise FaultInjectionError(
+                f"could not reattach {service} to {net} at {restore_ip}: {reattach.stderr.strip()}"
+            )
+        verify_attached(read_container_networks(service), target=service, network=net)
+        _emit("heal", "network_detached", service, {"network": net, "ip": restore_ip})
 
 
 @contextmanager

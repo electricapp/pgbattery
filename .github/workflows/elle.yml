@@ -183,14 +183,7 @@ jobs:
       ELLE_PROFILE: ${{ needs.plan.outputs.profile }}
       ELLE_SEED: ${{ needs.plan.outputs.seed }}
       ELLE_SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }}
-      # MUST be the compose file's own project name. The harness addresses
-      # docker objects by literal name for the network faults
-      # (`docker network disconnect pgbattery_raft_net pgbattery-node1-1` in
-      # partition_leader_after / flap_partition_after), and those commands are
-      # best-effort — a per-run project name makes them fail silently, so the
-      # partition attacks degrade to no-ops. Every job here gets its own
-      # ephemeral runner, so a fixed name cannot collide.
-      COMPOSE_PROJECT_NAME: pgbattery
+      COMPOSE_PROJECT_NAME: pgbha_elle_${{ matrix.shard }}_${{ github.run_id }}_${{ github.run_attempt }}
       PGBATTERY_MANAGEMENT_API_TOKEN: ci-elle-token-${{ github.run_id }}
       # This job downloads the prebuilt uberjar artifact and has no lein/JDK
       # build toolchain — trust the jar, don't let run_elle_matrix.sh rebuild.
