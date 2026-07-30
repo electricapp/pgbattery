@@ -395,7 +395,7 @@ Nothing else in Wave 1 is safe or cheap until these land.
       defaulted `per_key`, and a loop missing its `cfg` parameter.
       _Blocks_ H-03 · _Effort_ S
 
-- [ ] **H-02 — Route every fault through the primitive layer.** Partly done.
+- [x] **H-02 — Route every fault through the primitive layer.**
       `linearizability_register.py` and `correctness_lite.py` now inject nothing
       directly: their partition, latency, loss, asymmetric-partition, and scrub
       paths call `fault_primitives.py`, which verifies its own effect and resolves
