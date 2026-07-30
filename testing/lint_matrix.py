@@ -378,7 +378,10 @@ def check_fault_injection_confined() -> None:
     that churns on unrelated edits without saying anything more.
     """
     problems: list[str] = []
-    for path in sorted(TESTING_DIR.glob("*.py")):
+    # Includes package subdirectories: moving an attack into one would otherwise
+    # walk straight out of this check.
+    sources = sorted(TESTING_DIR.glob("*.py")) + sorted(TESTING_DIR.glob("*/*.py"))
+    for path in sources:
         if path.name in FAULT_VERB_SCAN_EXEMPT or path.name.startswith("test_"):
             continue
         injects = bool(count_raw_fault_verbs(path.read_text(encoding="utf-8")))

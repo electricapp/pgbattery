@@ -29,12 +29,10 @@ from linearizability_register import (
     ATTACK_DISPATCH,
     GATEWAY_PORTS,
     SEEDED_ATTACKS,
-    History,
-    Op,
-    _is_linearizable,
-    _is_weakly_consistent,
     next_gateway_port,
 )
+from linreg.checkers import _is_linearizable, _is_weakly_consistent
+from linreg.records import History, Op
 
 Checker = Callable[[list[Op]], tuple[bool, str]]
 

@@ -426,13 +426,21 @@ Nothing else in Wave 1 is safe or cheap until these land.
       of which has run against these changes.
       _Closes_ Class A1 structurally · _Blocks_ H-05…H-09, H-12 · _Effort_ M
 
-- [ ] **H-03 — Split `linearizability_register.py`** (about 1,750 lines) along its
-      natural seams: history and records, the WGL and weak checkers, the workload
-      loops, the attack table.
-      **Done when** a real Elle run passes post-split, not just unit tests — the
-      failure mode is a silently weakened workload, which unit tests do not see.
-      `test_workload_config.py` must still pass unchanged, since it is the guard
-      that the split cannot reintroduce a stale-default read.
+- [ ] **H-03 — Split `linearizability_register.py`.** Two seams extracted, two to
+      go. `linreg/records.py` holds `Op`, `JepsenRecord`, and `History`;
+      `linreg/checkers.py` holds the WGL and weak checkers with their op cap. The
+      entrypoint keeps the CLI and drops from 1,821 to 1,472 lines.
+
+      Tests import from the package directly rather than through re-exports, so
+      the module boundary is real. The `global` guard now scans `linreg/*.py` as
+      well and fails if the package is missing, so it cannot pass vacuously; the
+      `lint_matrix` fault-verb scan gained `*/*.py` for the same reason —
+      otherwise moving an attack into the package would walk straight out of the
+      confinement check. Verified by planting a fault verb in `records.py`.
+
+      **Remaining:** the workload loops and the attack table, then a real Elle run
+      — the failure mode is a silently weakened workload, which unit tests do not
+      see.
       _Blocked by_ H-01 (done) · _Effort_ M
 
 - [ ] **H-04 — Build the 5-node topology.** `five_node_suite.py` is a skeleton

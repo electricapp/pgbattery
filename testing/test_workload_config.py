@@ -32,10 +32,12 @@ import threading
 import unittest
 from dataclasses import FrozenInstanceError, fields
 from inspect import signature
+from pathlib import Path
 from typing import Final
 from unittest import mock
 
 import linearizability_register as lr
+from linreg.records import History
 
 RETIRED_GLOBALS: Final[tuple[str, ...]] = (
     "NUM_WORKERS",
@@ -99,7 +101,7 @@ def drive_register_worker(cfg: lr.WorkloadConfig, iterations: int, seed: int = 1
         return True
 
     with mock.patch.multiple(lr, do_read=stub_read, do_write=stub_write, do_cas=stub_cas):
-        lr.worker_loop(0, lr.History(), stop, random.Random(seed), cfg)
+        lr.worker_loop(0, History(), stop, random.Random(seed), cfg)
     return keys_seen
 
 
@@ -130,15 +132,23 @@ class TestNoConfigGlobalsRemain(unittest.TestCase):
                     "module would read it instead of the CLI value",
                 )
 
-    def test_module_declares_no_global_config_statement(self) -> None:
-        source = lr.__file__
-        with open(source, encoding="utf-8") as fh:
-            offenders = [
-                (n, line.rstrip())
-                for n, line in enumerate(fh, start=1)
-                if line.lstrip().startswith("global ")
-            ]
-        self.assertEqual(offenders, [], f"`global` reappeared in {source}")
+    def test_no_module_declares_a_global_statement(self) -> None:
+        """Covers the package too, not just the entrypoint.
+
+        A `global` inside `linreg/` is worse than one in the entrypoint: it
+        rebinds only within its own module, so the CLI value never reaches it and
+        the harness reports on a workload nobody asked for.
+        """
+        entrypoint = Path(lr.__file__)
+        sources = [entrypoint, *sorted((entrypoint.parent / "linreg").glob("*.py"))]
+        offenders: list[str] = []
+        for source in sources:
+            for n, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+                if line.lstrip().startswith("global "):
+                    offenders.append(f"{source.name}:{n}: {line.strip()}")
+        self.assertEqual(offenders, [], "`global` reappeared")
+        # The scan is only meaningful if it actually found the package.
+        self.assertGreater(len(sources), 1, "linreg package not found; scan was vacuous")
 
 
 class TestConfigObject(unittest.TestCase):
@@ -175,7 +185,7 @@ class TestWorkerLoopsTakeConfig(unittest.TestCase):
     reports PASS on an empty history."""
 
     def test_thread_arg_tuple_binds_to_every_loop(self) -> None:
-        args = (0, lr.History(), threading.Event(), random.Random(0), lr.WorkloadConfig())
+        args = (0, History(), threading.Event(), random.Random(0), lr.WorkloadConfig())
         for name in WORKER_LOOPS:
             with self.subTest(loop=name):
                 signature(getattr(lr, name)).bind(*args)
@@ -219,7 +229,7 @@ class TestKeysGovernsBehaviour(unittest.TestCase):
                 stop = threading.Event()
                 with mock.patch.object(lr, "PsycopgWorkerClient", _StubClient):
                     getattr(lr, name)(
-                        0, lr.History(), stop, random.Random(0), lr.WorkloadConfig(keys=1)
+                        0, History(), stop, random.Random(0), lr.WorkloadConfig(keys=1)
                     )
 
 
@@ -227,11 +237,11 @@ class TestPerKeyTakesCountExplicitly(unittest.TestCase):
     def test_per_key_has_no_default_count(self) -> None:
         """A default would let a checker in another module bucket by the wrong
         keyspace and silently drop keys from the report."""
-        param = signature(lr.History.per_key).parameters["num_keys"]
+        param = signature(History.per_key).parameters["num_keys"]
         self.assertIs(param.default, param.empty)
 
     def test_per_key_buckets_every_requested_key(self) -> None:
-        buckets = lr.History().per_key(5)
+        buckets = History().per_key(5)
         self.assertEqual(sorted(buckets), [0, 1, 2, 3, 4])
 
 
