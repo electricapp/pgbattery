@@ -111,16 +111,16 @@ GATEWAY_PORTS: Final[list[int]] = [5432, 5433, 5434]
 MGMT_PORTS: Final[list[int]] = [9081, 9082, 9083]
 NODES: Final[list[str]] = ["node1", "node2", "node3"]
 
-NUM_KEYS: int = 3
+DEFAULT_NUM_KEYS: Final[int] = 3
 """Independent register keys. Each is checked separately."""
 
-NUM_WORKERS: int = 2
+DEFAULT_NUM_WORKERS: Final[int] = 2
 """Concurrent client threads."""
 
-WORKLOAD_DURATION_SECONDS: float = 6.0
+DEFAULT_WORKLOAD_DURATION_SECONDS: Final[float] = 6.0
 """Total wall-clock time the workload runs."""
 
-KILL_LEADER_AFTER_SECONDS: float = 2.0
+DEFAULT_KILL_LEADER_AFTER_SECONDS: Final[float] = 2.0
 """When (relative to workload start) to inject the failover."""
 
 GATEWAY_RETRY_BACKOFF_BASE: Final[float] = 0.05
@@ -131,12 +131,7 @@ GATEWAY_RETRY_BACKOFF_MAX: Final[float] = 0.5
 its own recovery."""
 
 CHAOS_STORM_DURATION: Final[float] = 25.0
-"""Window the `chaos_storm` attack spreads its 3-5 faults across.
-
-`Final` because nothing reassigns it. The four knobs above are deliberately NOT
-`Final`: `run()` rebinds them as globals so worker threads see the CLI's values
-(see the `global` statement in `run`), and `Final` would make that assignment a
-type error."""
+"""Window the `chaos_storm` attack spreads its 3-5 faults across."""
 
 PSQL_TIMEOUT_SECONDS: Final[int] = 4
 
@@ -145,12 +140,27 @@ PSQL_TIMEOUT_SECONDS: Final[int] = 4
 # Register ops each fork a fresh `psql`, so per-op cost is dominated by
 # process spawn plus a full TCP + auth + startup handshake — ~25-35 ms, on
 # the order of 30 ops/sec per worker (see db_clients.py for the measured
-# comparison against a held psycopg connection). The defaults
-# (NUM_WORKERS=2 for WORKLOAD_DURATION_SECONDS=6 spread over NUM_KEYS=3)
-# therefore land near 100 ops/key, comfortably unwindowed; ops that hit
-# PSQL_TIMEOUT_SECONDS during the fault window cost 4 s each and push the
-# rate lower still.
+# comparison against a held psycopg connection). The defaults (2 workers for
+# 6 seconds spread over 3 keys) therefore land near 100 ops/key, comfortably
+# unwindowed; ops that hit PSQL_TIMEOUT_SECONDS during the fault window cost
+# 4 s each and push the rate lower still.
 WGL_OPS_PER_KEY_CAP: Final[int] = 2000
+
+
+@dataclass(frozen=True)
+class WorkloadConfig:
+    """Run configuration, resolved once from the CLI and passed explicitly.
+
+    Explicit rather than module-global because `global` rebinds a name only in
+    the module that defines it. A worker or checker living in another module
+    would keep reading the defaults and silently ignore every CLI flag, so the
+    harness would report on a workload nobody asked for.
+    """
+
+    workers: int = DEFAULT_NUM_WORKERS
+    keys: int = DEFAULT_NUM_KEYS
+    duration_s: float = DEFAULT_WORKLOAD_DURATION_SECONDS
+    fault_at: float = DEFAULT_KILL_LEADER_AFTER_SECONDS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,8 +303,8 @@ class History:
         with self._lock:
             self.jepsen.append(record)
 
-    def per_key(self) -> dict[int, list[Op]]:
-        out: dict[int, list[Op]] = {k: [] for k in range(NUM_KEYS)}
+    def per_key(self, num_keys: int) -> dict[int, list[Op]]:
+        out: dict[int, list[Op]] = {k: [] for k in range(num_keys)}
         for op in self.ops:
             out.setdefault(op.key, []).append(op)
         return out
@@ -344,15 +354,15 @@ def wait_cluster_healthy(timeout: int = 60) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def setup_table() -> bool:
-    """Create the linreg table seeded with key in [0, NUM_KEYS), val = 0.
+def setup_table(num_keys: int) -> bool:
+    """Create the linreg table seeded with key in [0, num_keys), val = 0.
 
-    Returns True iff the table exists with NUM_KEYS rows post-setup.
+    Returns True iff the table exists with num_keys rows post-setup.
     """
     setup_sql = (
         "DROP TABLE IF EXISTS linreg; "
         "CREATE TABLE linreg (key INTEGER PRIMARY KEY, val INTEGER NOT NULL); "
-        f"INSERT INTO linreg SELECT generate_series(0, {NUM_KEYS - 1}), 0;"
+        f"INSERT INTO linreg SELECT generate_series(0, {num_keys - 1}), 0;"
     )
     for port in GATEWAY_PORTS:
         rc, _, _ = run_cmd(
@@ -364,7 +374,7 @@ def setup_table() -> bool:
     return False
 
 
-def setup_list_append_table() -> bool:
+def setup_list_append_table(num_keys: int) -> bool:
     """Create the linappend table for the list-append workload.
 
     Each row's val is a comma-separated decimal int list, starting empty.
@@ -372,7 +382,7 @@ def setup_list_append_table() -> bool:
     setup_sql = (
         "DROP TABLE IF EXISTS linappend; "
         "CREATE TABLE linappend (key INTEGER PRIMARY KEY, val TEXT NOT NULL DEFAULT ''); "
-        f"INSERT INTO linappend SELECT generate_series(0, {NUM_KEYS - 1}), '';"
+        f"INSERT INTO linappend SELECT generate_series(0, {num_keys - 1}), '';"
     )
     for port in GATEWAY_PORTS:
         rc, _, _ = run_cmd(
@@ -452,6 +462,7 @@ def txn_worker_loop(
     history: History,
     stop_event: threading.Event,
     rng: random.Random,
+    cfg: WorkloadConfig,
 ) -> None:
     """2-key SERIALIZABLE rw-register transactions, emitting Jepsen-format
     records directly.
@@ -465,9 +476,9 @@ def txn_worker_loop(
     consecutive_indeterminate = 0
     try:
         while not stop_event.is_set():
-            if NUM_KEYS < 2:
+            if cfg.keys < 2:
                 return
-            k1, k2 = rng.sample(range(NUM_KEYS), 2)
+            k1, k2 = rng.sample(range(cfg.keys), 2)
             # Write values come from the global counter so every version of
             # every key is distinct. Elle infers rw-register version order
             # from which value a read observed; two writes of the same value
@@ -572,6 +583,7 @@ def list_append_worker_loop(
     history: History,
     stop_event: threading.Event,
     rng: random.Random,
+    cfg: WorkloadConfig,
 ) -> None:
     """2-key SERIALIZABLE list-append transactions, emitting Jepsen records
     directly. Each txn appends a globally-unique tag (the worker's local
@@ -581,9 +593,9 @@ def list_append_worker_loop(
     consecutive_indeterminate = 0
     try:
         while not stop_event.is_set():
-            if NUM_KEYS < 2:
+            if cfg.keys < 2:
                 return
-            k1, k2 = rng.sample(range(NUM_KEYS), 2)
+            k1, k2 = rng.sample(range(cfg.keys), 2)
             tag = history.next_id()
             invoke_value: list[list[object]] = [
                 ["r", k1, None],
@@ -657,6 +669,7 @@ def worker_loop(
     history: History,
     stop_event: threading.Event,
     rng: random.Random,
+    cfg: WorkloadConfig,
 ) -> None:
     """Issue ops at high rate until stop_event is set.
 
@@ -671,7 +684,7 @@ def worker_loop(
     while not stop_event.is_set():
         port = GATEWAY_PORTS[port_cycle_index % len(GATEWAY_PORTS)]
         port_cycle_index += 1
-        key = rng.randrange(NUM_KEYS)
+        key = rng.randrange(cfg.keys)
         choice = rng.random()
         op = Op(
             op_id=history.next_id(),
@@ -1553,34 +1566,29 @@ def run(
         help="'register' = single-op reads/writes/CAS (default); "
         "'txn' = 2-key SERIALIZABLE multi-statement transactions (for Elle).",
     ),
-    workers: int = typer.Option(NUM_WORKERS, "--workers", help="Concurrent client threads."),
-    keys: int = typer.Option(NUM_KEYS, "--keys", help="Number of register keys."),
+    workers: int = typer.Option(
+        DEFAULT_NUM_WORKERS, "--workers", help="Concurrent client threads."
+    ),
+    keys: int = typer.Option(DEFAULT_NUM_KEYS, "--keys", help="Number of register keys."),
     duration: float = typer.Option(
-        WORKLOAD_DURATION_SECONDS, "--duration", help="Workload runtime (s)."
+        DEFAULT_WORKLOAD_DURATION_SECONDS, "--duration", help="Workload runtime (s)."
     ),
     fault_at: float = typer.Option(
-        KILL_LEADER_AFTER_SECONDS, "--fault-at", help="When to inject the fault (s)."
+        DEFAULT_KILL_LEADER_AFTER_SECONDS, "--fault-at", help="When to inject the fault (s)."
     ),
 ) -> None:
     """Run a concurrent register workload with leader-kill mid-flight.
 
-    Spawns NUM_WORKERS threads issuing reads / writes / CAS across NUM_KEYS
-    keys. Kills the leader after KILL_LEADER_AFTER_SECONDS. After
-    WORKLOAD_DURATION_SECONDS total, stops workers, waits for cluster
-    recovery, then checks each key's op history for linearizability.
+    Spawns `--workers` threads issuing reads / writes / CAS across `--keys`
+    keys. Kills the leader at `--fault-at`. After `--duration` total, stops
+    workers, waits for cluster recovery, then checks each key's op history for
+    linearizability.
     """
     artifact_path = Path(artifact_dir)
     artifact_path.mkdir(parents=True, exist_ok=True)
 
     actual_seed = seed if seed != 0 else int(time.time())
-    # Override module globals so worker_loop, setup_table, History.per_key all
-    # see the same configuration. Test-script-grade mutation; production
-    # code would inject these.
-    global NUM_WORKERS, NUM_KEYS, WORKLOAD_DURATION_SECONDS, KILL_LEADER_AFTER_SECONDS
-    NUM_WORKERS = workers
-    NUM_KEYS = keys
-    WORKLOAD_DURATION_SECONDS = duration
-    KILL_LEADER_AFTER_SECONDS = fault_at
+    cfg = WorkloadConfig(workers=workers, keys=keys, duration_s=duration, fault_at=fault_at)
     # Validate workload / check combo before the run kicks off.
     valid_workloads = {"register", "txn", "list-append"}
     valid_checks = {"wgl", "weak", "elle"}
@@ -1609,7 +1617,9 @@ def run(
     if not wait_cluster_healthy(timeout=120):
         console.print("[bold red]FATAL:[/] cluster not healthy after 120s")
         raise typer.Exit(code=2)
-    table_setup_ok = setup_list_append_table() if workload == "list-append" else setup_table()
+    table_setup_ok = (
+        setup_list_append_table(cfg.keys) if workload == "list-append" else setup_table(cfg.keys)
+    )
     if not table_setup_ok:
         table_name = "linappend" if workload == "list-append" else "linreg"
         console.print(f"[bold red]FATAL:[/] could not create {table_name} table")
@@ -1623,11 +1633,11 @@ def run(
         "txn": txn_worker_loop,
         "list-append": list_append_worker_loop,
     }[workload]
-    for i in range(NUM_WORKERS):
+    for i in range(cfg.workers):
         wrng = random.Random(actual_seed + i)
         t = threading.Thread(
             target=worker_fn,
-            args=(i, history, stop_event, wrng),
+            args=(i, history, stop_event, wrng, cfg),
             name=f"linreg-w{i}",
             daemon=True,
         )
@@ -1650,9 +1660,9 @@ def run(
     # the run's seed it falls back to wall-clock time, so replaying a failure
     # with the recorded seed would reproduce the workload but not the fault
     # schedule. Attacks that take no seed keep the plain (delay,) signature.
-    injector_args: tuple[object, ...] = (KILL_LEADER_AFTER_SECONDS,)
+    injector_args: tuple[object, ...] = (cfg.fault_at,)
     if attack in SEEDED_ATTACKS:
-        injector_args = (KILL_LEADER_AFTER_SECONDS, CHAOS_STORM_DURATION, actual_seed)
+        injector_args = (cfg.fault_at, CHAOS_STORM_DURATION, actual_seed)
     killer = threading.Thread(
         target=ATTACK_DISPATCH[attack],
         args=injector_args,
@@ -1664,11 +1674,11 @@ def run(
         t.start()
 
     console.print(
-        f"Running workload for {WORKLOAD_DURATION_SECONDS:.0f}s "
-        f"({NUM_WORKERS} workers, {NUM_KEYS} keys, "
-        f"leader-kill at {KILL_LEADER_AFTER_SECONDS:.0f}s)..."
+        f"Running workload for {cfg.duration_s:.0f}s "
+        f"({cfg.workers} workers, {cfg.keys} keys, "
+        f"leader-kill at {cfg.fault_at:.0f}s)..."
     )
-    time.sleep(WORKLOAD_DURATION_SECONDS)
+    time.sleep(cfg.duration_s)
     stop_event.set()
     for t in worker_threads:
         t.join(timeout=10)
@@ -1756,7 +1766,7 @@ def run(
         }
     else:
         # ── Per-key WGL or weak check ────────────────────────────────────────
-        per_key = history.per_key()
+        per_key = history.per_key(cfg.keys)
         checker = _is_weakly_consistent if check == "weak" else _is_linearizable
         for key, ops in per_key.items():
             ok, reason = checker(ops)
@@ -1786,9 +1796,9 @@ def run(
         json.dumps(
             {
                 "seed": actual_seed,
-                "workers": NUM_WORKERS,
-                "keys": NUM_KEYS,
-                "duration_s": WORKLOAD_DURATION_SECONDS,
+                "workers": cfg.workers,
+                "keys": cfg.keys,
+                "duration_s": cfg.duration_s,
                 "workload": workload,
                 "check": check,
                 "attack": attack,
