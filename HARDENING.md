@@ -598,7 +598,7 @@ Nothing else in Wave 1 is safe or cheap until these land.
 
 No new infrastructure. Highest confidence per unit of effort.
 
-- [ ] **H-05 — Port-granular partitions.** Primitive done and live-validated;
+- [x] **H-05 — Port-granular partitions.** Primitive done and live-validated;
       matrix cases remain. `partition_channel(target, peers, Channel)` severs one
       protocol port and leaves the others up, verifying the rules are present
       _and_ that packets hit them, and failing if a DROP survives the heal.
@@ -620,8 +620,34 @@ No new infrastructure. Highest confidence per unit of effort.
       "fix" for either is `require_traffic=False`, which restores exactly the
       vacuous case the check exists to prevent.
 
-      **Remaining:** matrix cases that sever replication while Raft stays healthy
-      and assert the leader notices, plus the inverse.
+      **Matrix cases landed**, both passing live. `channel_partition` /
+      `channel_heal` step types install both direction rules and verify the
+      rules exist *and* matched packets, reusing the primitive's own
+      `channel_side_hint` so a zero-packet failure gives the same guidance in
+      both places rather than a second copy that drifts.
+
+      - `replication-severed-raft-healthy` — severs only replication between
+        node2 and the leader. Raft is untouched, so the leader must not change,
+        and the case asserts **write availability returns without healing the
+        partition**: node2 is the `FIRST` sync standby, so commits block until
+        its walsender times out and node3 takes the sync slot. Quorum is
+        provably retained throughout, which is what makes a mid-fault acked
+        batch legitimate here rather than indeterminate.
+      - `raft-severed-replication-healthy` — the inverse. The leader loses
+        quorum while its standbys still receive WAL, so nothing in the
+        replication topology signals the fault and only the lease can stop it
+        accepting writes. The dual-writability prober runs across the window.
+
+      Three corrections came out of running them, none visible to a unit test:
+      the first write failed on a `NOT NULL` column because I hand-wrote an
+      INSERT instead of using the existing `chaos-oracle-mid.sql`, whose own
+      docstring restricts it to exactly this quorum-retained shape; the cleanup
+      heal failed because `iptables -D` exits 1 on an absent rule, so
+      `channel_heal` now tolerates it while still asserting absence — the same
+      strict-add/idempotent-delete asymmetry netem uses; and the chaos-oracle
+      drop addressed node1 literally, which fails read-only in the case that
+      moves leadership by design, so it now runs on `"leader"` via
+      `chaos-oracle-cleanup.sql`.
       _Closes_ RW-6, RW-11 reachability · _Blocked by_ H-02 · _Effort_ M
 
 - [ ] **H-06 — Partition shapes beyond node-vs-rest.** Majority-side isolation

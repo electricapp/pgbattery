@@ -972,6 +972,15 @@ def iptables_port_drop_cmd(peer_ip: str, port: int, *, insert: bool, from_listen
     return f"iptables {action} INPUT -p tcp -s {peer_ip} {match} -j DROP"
 
 
+def channel_side_hint(channel: Channel) -> str:
+    """Why this channel might match zero packets, if there is a known reason.
+
+    Shared with `ci_runner` so the matrix steps fail with the same guidance the
+    context-manager primitive gives, rather than a second copy that drifts.
+    """
+    return _CHANNEL_SIDE_HINT.get(channel, "")
+
+
 def iptables_peer_drop_cmd(peer_ip: str, *, insert: bool, chain: str = "INPUT") -> str:
     """Add or remove a DROP for every packet from `peer_ip`, any port.
 

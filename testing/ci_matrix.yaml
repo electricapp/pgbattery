@@ -132,7 +132,9 @@
         "dual-writability-quorum-loss",
         "promotion-holddown-clock-step",
         "network-loss-stability",
-        "disk-full-wal-pressure"
+        "disk-full-wal-pressure",
+        "replication-severed-raft-healthy",
+        "raft-severed-replication-healthy"
       ]
     }
   },
@@ -5000,6 +5002,205 @@
           "node": 1,
           "direct": true,
           "comment": "drop only the slot this case made, never a managed one"
+        }
+      ]
+    },
+    {
+      "id": "replication-severed-raft-healthy",
+      "tests_md_ref": "Control Plane 20. Replication severed, Raft intact [W1, R2]",
+      "contracts": [
+        "W1",
+        "R2"
+      ],
+      "description": "Severs ONLY the replication channel between node2 and the leader, leaving Raft healthy. A whole-peer partition cannot express this: it takes consensus down with replication, so the leader reacts to losing quorum rather than to losing a standby. Here the leader keeps its quorum and must notice the standby is gone -- the RW-11 shape, where replicated SetSyncMode state and the live GUC can disagree. node2 is the FIRST sync standby, so commits block until its walsender times out and node3 takes the sync slot; the case asserts write availability returns without healing the partition. Rules go on the standby because the leader streams, and the step fails if they match zero packets.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "channel_partition",
+          "comment": "standby side, so the leader's stream hits the rules",
+          "node": 2,
+          "from_node": 1,
+          "channel": "replication"
+        },
+        {
+          "type": "wait_cluster",
+          "comment": "Raft is untouched, so the leader must not change. require_replication_health off: node2 is intentionally not streaming.",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 1,
+          "require_replication_health": false,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-mid.sql",
+          "node": "leader",
+          "shell_timeout_sec": 180,
+          "comment": "Writes resume without healing: node2 is the FIRST sync standby, so commits block until its walsender times out and node3 takes the sync slot. Quorum is provably retained throughout \u2014 Raft is untouched \u2014 which is what makes a mid-fault acked batch legitimate here rather than indeterminate."
+        },
+        {
+          "type": "channel_heal",
+          "node": 2,
+          "from_node": 1,
+          "channel": "replication"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 90
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-full.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "channel_heal",
+          "node": 2,
+          "from_node": 1,
+          "channel": "replication",
+          "comment": "idempotent: heal again in case the case failed mid-partition"
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-cleanup.sql",
+          "node": "leader",
+          "comment": "leader, not node1: this case may have moved leadership"
+        }
+      ]
+    },
+    {
+      "id": "raft-severed-replication-healthy",
+      "tests_md_ref": "Control Plane 21. Raft severed, replication intact [L1, W1]",
+      "contracts": [
+        "L1",
+        "W1"
+      ],
+      "description": "The inverse: severs ONLY the Raft channel from node2 and node3 to the leader, leaving the replication stream up. The leader loses quorum while its standbys are still receiving WAL, so nothing about the replication topology signals the fault -- only the lease can stop it accepting writes. That is contract L1 with the fencing path isolated from every other signal. The dual-writability prober runs across the window and at most one node may accept a write.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "channel_partition",
+          "node": 1,
+          "from_node": 2,
+          "channel": "raft"
+        },
+        {
+          "type": "channel_partition",
+          "node": 1,
+          "from_node": 3,
+          "channel": "raft"
+        },
+        {
+          "type": "cmd",
+          "comment": "L1 across the whole window: concurrent real writes to all three internal PG ports, at most one may be accepted.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-raft-severed && ./testing/dual_writability_prober.py --duration 25 --json testing/artifacts/dual-writability-raft-severed/result.json"
+        },
+        {
+          "type": "channel_heal",
+          "node": 1,
+          "from_node": 2,
+          "channel": "raft"
+        },
+        {
+          "type": "channel_heal",
+          "node": 1,
+          "from_node": 3,
+          "channel": "raft"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "channel_heal",
+          "node": 1,
+          "from_node": 2,
+          "channel": "raft"
+        },
+        {
+          "type": "channel_heal",
+          "node": 1,
+          "from_node": 3,
+          "channel": "raft"
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-cleanup.sql",
+          "node": "leader",
+          "comment": "leader, not node1: this case may have moved leadership"
         }
       ]
     }

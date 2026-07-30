@@ -94,6 +94,14 @@ class StepType(StrEnum):
             peer using iptables (requires ``NET_ADMIN`` capability).
         ASYMMETRIC_HEAL: Remove the iptables DROP rule added by
             ``ASYMMETRIC_PARTITION``.
+        CHANNEL_PARTITION: Sever ONE protocol port between a node and a peer,
+            leaving the others up — Raft without replication, or replication
+            without Raft. Whole-peer partitions cannot express this, and it is
+            the shape RW-6 and RW-11 live in. Installs both ``--dport`` and
+            ``--sport``: only one side of a TCP channel listens on the service
+            port, so matching one direction alone silently catches nothing.
+        CHANNEL_HEAL: Remove the rules added by ``CHANNEL_PARTITION`` and
+            assert none survives.
         CLOCK_SKEW: Write a libfaketime offset to ``/tmp/faketime`` on a node,
             shifting its apparent clock by ``seconds`` (requires
             ``LD_PRELOAD=libfaketime.so.1`` and ``FAKETIME_TIMESTAMP_FILE``
@@ -137,6 +145,8 @@ class StepType(StrEnum):
     SQL = "sql"
     ASYMMETRIC_PARTITION = "asymmetric_partition"
     ASYMMETRIC_HEAL = "asymmetric_heal"
+    CHANNEL_PARTITION = "channel_partition"
+    CHANNEL_HEAL = "channel_heal"
     CLOCK_SKEW = "clock_skew"
     CLOCK_HEAL = "clock_heal"
     WAIT_SYNC = "wait_sync"
@@ -2494,6 +2504,58 @@ class CIRunner:
             timeout_sec=5.0,
         )
 
+    def _verify_channel_drop(
+        self,
+        service: str,
+        src_ip: str,
+        channel: fp.Channel,
+        present: bool,
+        step_log: Path,
+    ) -> None:
+        """Assert both direction rules for `channel` are (or are no longer) there.
+
+        On injection this also requires the rules to have *matched packets*. A
+        rule that exists but has caught nothing is indistinguishable from no
+        partition at all, and the two ways to get there are both real: the
+        replication channel needs the rule on the standby with write load in
+        flight, and an idle cluster generates no WAL to sever. Failing here with
+        that hint is the point — the tempting fix is to stop checking.
+        """
+        prefix = container_exec_prefix(service, privileged=True)
+        probe = f'{prefix} sh -c "{fp.iptables_rules_cmd()}"'
+
+        def check(result: ProbeResult) -> str | None:
+            if result.exit_code != 0 and not result.stdout.strip():
+                return f"could not read the INPUT chain on {service}: {result.combined.strip()}"
+            for from_listener in (False, True):
+                found = fp.parse_port_drop_rule(
+                    result.stdout, src_ip, channel.port, from_listener=from_listener
+                )
+                if found is not present:
+                    direction = "sport" if from_listener else "dport"
+                    verb = "missing after injection" if present else "still present after heal"
+                    return (
+                        f"{channel} DROP ({direction} {channel.port}) for {src_ip} "
+                        f"on {service} {verb}"
+                    )
+            if not present:
+                return None
+            matched = fp.parse_port_drop_packets(result.stdout, src_ip, channel.port)
+            if matched == 0:
+                return (
+                    f"{channel} rules on {service} matched 0 packets: the partition "
+                    f"exists but severed nothing. {fp.channel_side_hint(channel)}"
+                )
+            return None
+
+        self._await_probe(
+            probe,
+            check,
+            self._verify_log(step_log, f"channel-{channel}-{src_ip}"),
+            "FAULT NOT VERIFIED" if present else "HEAL NOT VERIFIED",
+            timeout_sec=20.0,
+        )
+
     def _verify_netem(self, service: str, expected_delay_ms: int | None, step_log: Path) -> None:
         """Assert the eth0 netem qdisc matches expectation.
 
@@ -3118,6 +3180,43 @@ class CIRunner:
                 cmd = f"{prefix} {fp.iptables_peer_drop_cmd(src_ip, insert=False)}"
                 self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
                 self._verify_iptables_drop(node_name, src_ip, present=False, step_log=step_log)
+
+            case StepType.CHANNEL_PARTITION | StepType.CHANNEL_HEAL:
+                inject = step["type"] == StepType.CHANNEL_PARTITION
+                node_id = int(step["node"])
+                from_id = int(step["from_node"])
+                node_name = f"node{node_id}"
+                src_ip = _NODE_IPS.get(from_id)
+                if not src_ip:
+                    raise RunnerError(f"Unknown from_node {from_id} for {step['type']}.")
+                channel = fp.Channel(str(step["channel"]))
+                if inject:
+                    self._require_container_binary(node_name, "iptables", step_log)
+                prefix = container_exec_prefix(node_name, privileged=True)
+                # Both directions. Only one side of a TCP channel listens on the
+                # service port: requests arrive at the listener with --dport P,
+                # replies at the initiator with --sport P and an ephemeral
+                # destination. Matching one alone catches nothing whenever the
+                # traffic happens to flow the other way.
+                for from_listener in (False, True):
+                    rule = fp.iptables_port_drop_cmd(
+                        src_ip, channel.port, insert=inject, from_listener=from_listener
+                    )
+                    # Strict add, idempotent delete — the same asymmetry netem
+                    # uses. `iptables -D` exits 1 on a rule that is not there,
+                    # but "the rule is gone" is the state a heal asks for, and a
+                    # cleanup heal after an in-case heal is the normal path. The
+                    # verification below still asserts absence, so tolerating the
+                    # exit code costs no strictness.
+                    shell = (
+                        f"{prefix} {rule}"
+                        if inject
+                        else f'{prefix} sh -c "{rule} 2>/dev/null; true"'
+                    )
+                    self._run_shell(shell, step_log, timeout_sec=resolve_shell_timeout(step))
+                self._verify_channel_drop(
+                    node_name, src_ip, channel, present=inject, step_log=step_log
+                )
 
             case StepType.CLOCK_SKEW:
                 self._apply_faketime(
