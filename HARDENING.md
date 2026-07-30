@@ -426,10 +426,13 @@ Nothing else in Wave 1 is safe or cheap until these land.
       of which has run against these changes.
       _Closes_ Class A1 structurally · _Blocks_ H-05…H-09, H-12 · _Effort_ M
 
-- [ ] **H-03 — Split `linearizability_register.py`.** Two seams extracted, two to
-      go. `linreg/records.py` holds `Op`, `JepsenRecord`, and `History`;
-      `linreg/checkers.py` holds the WGL and weak checkers with their op cap. The
-      entrypoint keeps the CLI and drops from 1,821 to 1,472 lines.
+- [ ] **H-03 — Split `linearizability_register.py`.** Three seams extracted, two
+      to go. `linreg/records.py` holds `Op`, `JepsenRecord`, and `History`;
+      `linreg/checkers.py` the WGL and weak checkers with their op cap;
+      `linreg/cluster.py` the shell and leader-discovery helpers plus the topology
+      constants, which had briefly been defined in both files — one source of
+      truth, so they cannot drift. The entrypoint keeps the CLI and is down from
+      1,821 to 1,440 lines.
 
       Tests import from the package directly rather than through re-exports, so
       the module boundary is real. The `global` guard now scans `linreg/*.py` as

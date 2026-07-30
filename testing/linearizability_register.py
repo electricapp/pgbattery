@@ -88,7 +88,6 @@ import contextlib
 import json
 import random
 import re
-import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -106,15 +105,22 @@ from linreg.checkers import (
     _is_linearizable,
     _is_weakly_consistent,
 )
+from linreg.cluster import (
+    GATEWAY_PORTS,
+    MGMT_PORTS,
+    NODES,
+    find_leader,
+    run_cmd,
+    wait_cluster_healthy,
+)
 from linreg.records import History, JepsenRecord, Op
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-GATEWAY_PORTS: Final[list[int]] = [5432, 5433, 5434]
-MGMT_PORTS: Final[list[int]] = [9081, 9082, 9083]
-NODES: Final[list[str]] = ["node1", "node2", "node3"]
+# Topology constants live in `linreg.cluster` (imported above): one source of
+# truth, so the two cannot drift.
 
 DEFAULT_NUM_KEYS: Final[int] = 3
 """Independent register keys. Each is checked separately."""
@@ -166,40 +172,7 @@ class WorkloadConfig:
 # Shell helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def run_cmd(cmd: str, timeout: int = 30) -> tuple[int, str, str]:
-    """Run a shell command, return (rc, stdout, stderr). -1 rc on timeout."""
-    try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-    return r.returncode, r.stdout, r.stderr
-
-
-def find_leader() -> tuple[str | None, int | None]:
-    """Return (node_name, gateway_port) for the current leader, or (None, None)."""
-    for port in MGMT_PORTS:
-        rc, out, _ = run_cmd(
-            f"curl -sf --max-time 2 http://localhost:{port}/api/v1/cluster/leader",
-            timeout=4,
-        )
-        if rc == 0:
-            with contextlib.suppress(Exception):
-                lid = json.loads(out).get("leader_id")
-                if lid is not None and 1 <= lid <= len(NODES):
-                    return NODES[lid - 1], GATEWAY_PORTS[lid - 1]
-    return None, None
-
-
-def wait_cluster_healthy(timeout: int = 60) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        leader, _ = find_leader()
-        if leader is not None:
-            return True
-        time.sleep(2)
-    return False
-
+# Cluster helpers live in `linreg.cluster`; re-exported below.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Workload

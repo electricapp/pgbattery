@@ -25,13 +25,9 @@ from collections.abc import Callable
 from inspect import signature
 from typing import Final
 
-from linearizability_register import (
-    ATTACK_DISPATCH,
-    GATEWAY_PORTS,
-    SEEDED_ATTACKS,
-    next_gateway_port,
-)
+from linearizability_register import ATTACK_DISPATCH, SEEDED_ATTACKS, next_gateway_port
 from linreg.checkers import _is_linearizable, _is_weakly_consistent
+from linreg.cluster import GATEWAY_PORTS
 from linreg.records import History, Op
 
 Checker = Callable[[list[Op]], tuple[bool, str]]
