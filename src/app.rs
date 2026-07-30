@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use std::error::Error as StdError;
@@ -540,7 +540,7 @@ impl App {
             transfer_lock: tokio::sync::Mutex::new(()),
             membership_lock: tokio::sync::Mutex::new(()),
             backup_lock: tokio::sync::Mutex::new(()),
-            auth_failures: parking_lot::Mutex::new((std::time::Instant::now(), 0)),
+            auth_failures: parking_lot::Mutex::new((Instant::now(), 0)),
         });
         // Also clone the token into an owned String copy for the CLI-style
         // HTTP client used by the auto-promotion path, below.
@@ -1032,27 +1032,22 @@ impl App {
             return;
         }
 
-        let failover_started_ms = cluster_state.read().failover_started_at_unix_ms;
+        let failover_started_at = cluster_state.read().failover_started_at;
 
-        // Lease hold-down: the deposed leader's lease is anchored at its last
-        // quorum acknowledgement, which cannot be later than the instant this
-        // node observed the cluster leaderless (failover_started_at_unix_ms,
-        // written locally by the governor on the leader→none edge). One full
-        // lease duration after that instant the old lease has provably
-        // expired, so its gateway has stopped admitting writes. Winning the
-        // election is NOT proof of that: the election timeout is shorter than
-        // the lease, so an unguarded promote here makes both primaries
-        // writable simultaneously. No sleep — the lease is the time-based
-        // truth source, and the reconcile loop re-attempts promotion within
-        // its 2 s cadence.
-        let lease_ms =
-            u64::try_from(crate::governor::DEFAULT_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX);
-        if let Some(elapsed_ms) =
-            promotion_lease_holddown(failover_started_ms, unix_now_ms(), lease_ms)
+        // Lease hold-down: the deposed leader's lease anchors at its last
+        // quorum ack, which cannot be later than the instant this node observed
+        // the cluster leaderless. One lease duration after that instant the old
+        // lease has provably expired. Winning the election is not proof of that
+        // — the election timeout is shorter than the lease — so an unguarded
+        // promote here makes both primaries writable. No sleep: the reconcile
+        // loop re-checks the gate on its 2 s cadence.
+        let lease = crate::governor::DEFAULT_LEASE_DURATION;
+        if let Some(elapsed) = promotion_lease_holddown(failover_started_at, Instant::now(), lease)
         {
             info!(
-                elapsed_ms,
-                lease_ms, "Holding promotion until the deposed leader's lease has expired"
+                elapsed_ms = elapsed.as_millis(),
+                lease_ms = lease.as_millis(),
+                "Holding promotion until the deposed leader's lease has expired"
             );
             metrics::counter!("pgbattery_promotion_lease_holddowns").increment(1);
             return;
@@ -1060,17 +1055,11 @@ impl App {
 
         match pg.promote().await {
             Ok(()) => {
-                if let Some(started_ms) = failover_started_ms {
-                    // Clamp to zero against backwards clock skew between nodes.
-                    let elapsed_ms = unix_now_ms().saturating_sub(started_ms);
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "elapsed millis since startup fits in f64 mantissa"
-                    )]
-                    let total_secs = elapsed_ms as f64 / 1_000.0;
+                if let Some(started_at) = failover_started_at {
+                    let total_secs = started_at.elapsed().as_secs_f64();
                     metrics::histogram!("pgbattery_failover_total_seconds").record(total_secs);
                     tracing::info!(total_secs, "Failover total duration recorded");
-                    cluster_state.write().failover_started_at_unix_ms = None;
+                    cluster_state.write().failover_started_at = None;
                 }
             }
             Err(e) => {
@@ -2332,33 +2321,21 @@ impl App {
 /// lease may still be valid, `None` once it has provably expired (or no
 /// failover is being tracked, e.g. bootstrap promotion of a fresh cluster).
 ///
-/// `failover_started_ms` is the wall-clock instant this node observed the
-/// cluster leaderless; the old leader's lease anchors at its last quorum
-/// ack, which cannot be later than that, so `lease_ms` elapsed from it
-/// guarantees expiry. `saturating_sub` clamps a future `failover_started_ms`
-/// (cross-node clock skew via snapshot install) to zero elapsed, which only
-/// defers promotion — never promotes early.
+/// `Some(elapsed)` while promotion must wait, `None` once it may proceed.
+///
+/// Both inputs must come from the same monotonic clock as the lease they guard;
+/// a wall-clock source would let a forward time adjustment satisfy the gate
+/// while the deposed leader's lease is still valid. An anchor in the future
+/// clamps to zero elapsed, which only defers promotion.
 fn promotion_lease_holddown(
-    failover_started_ms: Option<u64>,
-    now_ms: u64,
-    lease_ms: u64,
-) -> Option<u64> {
-    let elapsed_ms = now_ms.saturating_sub(failover_started_ms?);
-    (elapsed_ms < lease_ms).then_some(elapsed_ms)
-}
-
-/// Wall-clock Unix milliseconds, saturating on clock anomalies (pre-epoch
-/// clocks yield 0; overflow yields `u64::MAX`). Callers compare against
-/// other Unix-ms values with `saturating_sub`, so both extremes fail toward
-/// "no time has elapsed", which defers rather than rushes decisions.
-fn unix_now_ms() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
+    failover_started_at: Option<Instant>,
+    now: Instant,
+    lease: Duration,
+) -> Option<Duration> {
+    let elapsed = now
+        .checked_duration_since(failover_started_at?)
+        .unwrap_or(Duration::ZERO);
+    (elapsed < lease).then_some(elapsed)
 }
 
 /// Check if two paths are on the same filesystem mount point.
@@ -2413,45 +2390,58 @@ fn are_paths_on_same_mount(_path1: &PathBuf, _path2: &PathBuf) -> Result<bool> {
 )]
 mod tests {
     use super::promotion_lease_holddown;
+    use std::time::{Duration, Instant};
 
-    const LEASE_MS: u64 = 2000;
+    const LEASE: Duration = Duration::from_secs(2);
 
-    /// No tracked failover (bootstrap promotion, or the marker was already
-    /// cleared) → nothing to wait out.
+    /// No tracked failover (bootstrap, or already consumed) → nothing to wait out.
     #[test]
     fn test_holddown_without_tracked_failover() {
-        assert_eq!(promotion_lease_holddown(None, 10_000, LEASE_MS), None);
+        assert_eq!(promotion_lease_holddown(None, Instant::now(), LEASE), None);
     }
 
-    /// Within one lease duration of observing leader loss the deposed
-    /// leader's lease may still be valid — promotion must wait. At exactly
-    /// one lease duration the old lease has provably expired (it anchors at
-    /// a quorum ack no later than the loss observation) — promotion proceeds.
+    /// Within one lease duration of the leader-loss observation the deposed
+    /// leader's lease may still be valid; at exactly one lease duration it has
+    /// provably expired.
     #[test]
     fn test_holddown_releases_exactly_at_lease_duration() {
-        let started = 10_000;
+        let started = Instant::now();
+        let just_short = LEASE.saturating_sub(Duration::from_millis(1));
         assert_eq!(
-            promotion_lease_holddown(Some(started), started, LEASE_MS),
-            Some(0)
+            promotion_lease_holddown(Some(started), started, LEASE),
+            Some(Duration::ZERO)
         );
         assert_eq!(
-            promotion_lease_holddown(Some(started), started + LEASE_MS - 1, LEASE_MS),
-            Some(LEASE_MS - 1)
+            promotion_lease_holddown(Some(started), started + just_short, LEASE),
+            Some(just_short)
         );
         assert_eq!(
-            promotion_lease_holddown(Some(started), started + LEASE_MS, LEASE_MS),
+            promotion_lease_holddown(Some(started), started + LEASE, LEASE),
             None
         );
     }
 
-    /// A `failover_started_ms` in this node's future (cross-node clock skew
-    /// via snapshot install) clamps elapsed to zero: the hold-down defers a
-    /// full lease duration rather than promoting early.
+    /// An anchor in the future clamps to zero elapsed, deferring promotion
+    /// rather than releasing it.
     #[test]
     fn test_holddown_clamps_future_start_to_defer() {
+        let now = Instant::now();
         assert_eq!(
-            promotion_lease_holddown(Some(50_000), 10_000, LEASE_MS),
-            Some(0)
+            promotion_lease_holddown(Some(now + Duration::from_secs(40)), now, LEASE),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// The gate measures the same monotonic clock the lease expires on, so a
+    /// wall-clock step cannot reach it. With 100 ms elapsed the gate holds
+    /// regardless of what `settimeofday` did.
+    #[test]
+    fn test_holddown_measures_monotonic_time_only() {
+        let now = Instant::now();
+        let started = now.checked_sub(Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            promotion_lease_holddown(Some(started), now, LEASE),
+            Some(Duration::from_millis(100))
         );
     }
 

@@ -167,6 +167,9 @@ semver = "1"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# Property-based tests over the pure safety-decision functions (LSN election
+# gate, sync-standby quorum intersection).
+proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 # ServiceExt::oneshot for exercising axum routers in tests. Already present
 # transitively via axum/tower-http.

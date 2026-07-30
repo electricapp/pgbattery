@@ -10,12 +10,22 @@ on:
     paths-ignore:
       - '**/*.md'
   schedule:
-    # Nightly 03:00 UTC — full 7-attack matrix.
+    # Nightly 03:00 UTC — full 16-attack matrix, `full` density, a fresh random
+    # seed per attack. Seeds are recorded in every artifact so any failure is
+    # replayable; see testing/run_elle_matrix.sh.
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       attacks:
-        description: "Space-separated list of attacks (default: all)"
+        description: "Space-separated list of attacks (default: the full matrix)"
+        required: false
+        default: ""
+      profile:
+        description: "Density profile: full (nightly) or smoke (fast)"
+        required: false
+        default: "full"
+      seed:
+        description: "Pin ELLE_SEED to replay a nightly failure (default: random per attack)"
         required: false
         default: ""
 
@@ -27,6 +37,72 @@ concurrency:
 permissions: {}
 
 jobs:
+  plan:
+    name: Plan matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      attacks: ${{ steps.plan.outputs.attacks }}
+      profile: ${{ steps.plan.outputs.profile }}
+      seed: ${{ steps.plan.outputs.seed }}
+      shards: ${{ steps.plan.outputs.shards }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+    steps:
+      - name: Decide attacks, density, and shard count
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_ATTACKS: ${{ inputs.attacks }}
+          IN_PROFILE: ${{ inputs.profile }}
+          IN_SEED: ${{ inputs.seed }}
+        run: |
+          # PR and push-to-main run the `kill` smoke at `smoke` density: one
+          # fault, 30 s of workload, ~45 s end to end. Nothing here may grow
+          # PR latency.
+          #
+          # Everything else (nightly, manual dispatch) runs the full matrix at
+          # `full` density. Budget, from the timings of run 30495947519
+          # (bring-up 550 s, one `kill` attack at 30 s workload = 43 s):
+          #   per attack, full density ~= 90 s workload + ~50 s setup, recovery,
+          #     scrub and Elle = ~140 s; hard cap ELLE_TIMEOUT=600 s.
+          #   one job, 16 attacks: 550 + 16*140 = 2790 s (46 min) typical, but
+          #     550 + 16*600 = 169 min worst case — past the 60 min job timeout,
+          #     which would kill the job mid-matrix and silently skip attacks.
+          #   4 shards of 4: 550 + 4*140 = 19 min typical and 550 + 4*600 =
+          #     49 min worst case, so even an all-timeouts nightly finishes and
+          #     reports instead of being cut off. Shards run in parallel, so
+          #     wall clock stays where it is today at 4x the per-attack depth.
+          if [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "push" ]; then
+            attacks="kill"
+            profile="smoke"
+            seed=""
+            shards="[1]"
+            shard_count=1
+          else
+            attacks="$IN_ATTACKS"
+            profile="${IN_PROFILE:-full}"
+            seed="$IN_SEED"
+            if [ -n "$attacks" ]; then
+              # An explicit attack list is small by definition — one shard.
+              shards="[1]"
+              shard_count=1
+            else
+              shards="[1, 2, 3, 4]"
+              shard_count=4
+            fi
+          fi
+          {
+            echo "attacks=$attacks"
+            echo "profile=$profile"
+            echo "seed=$seed"
+            echo "shards=$shards"
+            echo "shard_count=$shard_count"
+          } >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT attacks='${attacks:-<full matrix>}' profile=$profile" \
+            "shards=$shards seed='${seed:-<random per attack>}'"
+
   build-elle-jar:
     name: Build Elle uberjar
     runs-on: ubuntu-latest
@@ -90,15 +166,31 @@ jobs:
           retention-days: 14
 
   elle-matrix:
-    name: Elle × Attack Matrix
-    needs: build-elle-jar
+    name: Elle × Attacks (shard ${{ matrix.shard }})
+    needs: [plan, build-elle-jar]
     runs-on: ubuntu-latest
+    # Sized against the worst case computed in the `plan` job: 4 attacks that
+    # each burn the full ELLE_TIMEOUT still leave 10 minutes of slack.
     timeout-minutes: 60
+    strategy:
+      # One shard's failure must not cancel the others: partial coverage would
+      # hide which attacks were never tried.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     env:
-      # PR + push to main run only the `kill` smoke (~90 s). The nightly
-      # schedule and manual dispatch run the full attack matrix.
-      ATTACKS: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 'kill' || (github.event.inputs.attacks || '') }}
-      COMPOSE_PROJECT_NAME: pgbha_elle_${{ github.run_id }}_${{ github.run_attempt }}
+      ATTACKS: ${{ needs.plan.outputs.attacks }}
+      ELLE_PROFILE: ${{ needs.plan.outputs.profile }}
+      ELLE_SEED: ${{ needs.plan.outputs.seed }}
+      ELLE_SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.shard_count }}
+      # MUST be the compose file's own project name. The harness addresses
+      # docker objects by literal name for the network faults
+      # (`docker network disconnect pgbattery_raft_net pgbattery-node1-1` in
+      # partition_leader_after / flap_partition_after), and those commands are
+      # best-effort — a per-run project name makes them fail silently, so the
+      # partition attacks degrade to no-ops. Every job here gets its own
+      # ephemeral runner, so a fixed name cannot collide.
+      COMPOSE_PROJECT_NAME: pgbattery
       PGBATTERY_MANAGEMENT_API_TOKEN: ci-elle-token-${{ github.run_id }}
       # This job downloads the prebuilt uberjar artifact and has no lein/JDK
       # build toolchain — trust the jar, don't let run_elle_matrix.sh rebuild.
@@ -129,6 +221,13 @@ jobs:
       - name: Show Docker Compose version
         run: docker compose version
 
+      - name: Write .env for the harness's management-API calls
+        # The `transfer` attack reads the token out of .env
+        # (transfer_leader_after in linearizability_register.py) rather than the
+        # environment, so without this file its POST is unauthenticated and the
+        # attack silently transfers nothing. Same value compose already uses.
+        run: echo "PGBATTERY_MANAGEMENT_API_TOKEN=$PGBATTERY_MANAGEMENT_API_TOKEN" > .env
+
       - name: Bring up pgbattery cluster
         run: |
           docker compose up -d --build
@@ -150,6 +249,9 @@ jobs:
       - name: Run Elle matrix
         run: |
           if [ -n "$ATTACKS" ]; then
+            # An explicit list overrides sharding; drop ELLE_SHARD so the
+            # script doesn't have to warn about the contradiction.
+            unset ELLE_SHARD
             # ATTACKS is a space-separated attack list; word-splitting is intended.
             # shellcheck disable=SC2086
             ./testing/run_elle_matrix.sh $ATTACKS
@@ -157,24 +259,99 @@ jobs:
             ./testing/run_elle_matrix.sh
           fi
 
-      - name: Upload elle artifacts
+      - name: Upload elle results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: elle-results-${{ github.run_id }}-${{ github.run_attempt }}
-          path: testing/artifacts/elle-*/
-          if-no-files-found: ignore
+          # Seeds (matrix_meta.json), fault-wave evidence, per-attack verdicts
+          # and the history's record-type counts. Small, always kept, and what
+          # the verdict job re-aggregates. Raw histories are excluded here and
+          # uploaded separately on failure — at full density they are hundreds
+          # of MB per attack.
+          name: elle-results-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard }}
+          path: |
+            testing/artifacts/elle-*/
+            !testing/artifacts/elle-*/history.elle.json
+            !testing/artifacts/elle-*/history.json
+          if-no-files-found: warn
           retention-days: 14
 
-      - name: Upload elle summary
+      - name: Upload elle histories (failure only)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # The raw history is what you re-run Elle against when reproducing a
+          # nightly anomaly, so it travels whenever something went wrong.
+          name: elle-histories-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard }}
+          path: |
+            testing/artifacts/elle-*/history.elle.json
+            testing/artifacts/elle-*/history.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Tear down cluster
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
+  elle-verdict:
+    name: Elle verdict
+    needs: [plan, elle-matrix]
+    # Runs even when a shard failed or was cancelled, so the verdict reflects
+    # what actually happened instead of disappearing with the shard.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Download shard results
+        # Tolerated failure: if no shard uploaded anything, the aggregator below
+        # is the one that reports it — as an ERROR row per expected attack,
+        # which is louder and more specific than a download failure.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: elle-results-${{ github.run_id }}-${{ github.run_attempt }}-shard*
+          path: testing/artifacts
+          merge-multiple: true
+
+      - name: Aggregate every shard into one verdict
+        env:
+          EXPECT_ATTACKS: ${{ needs.plan.outputs.attacks }}
+          ELLE_EXPECT_PROFILE: ${{ needs.plan.outputs.profile }}
+        run: |
+          # With no explicit list the run was the whole matrix, so the expected
+          # attacks are the script's own ALL_ATTACKS — asked for rather than
+          # duplicated here, where it could drift. Any attack whose shard never
+          # reported becomes an ERROR row, so a lost shard cannot pass as
+          # reduced coverage.
+          if [ -z "$EXPECT_ATTACKS" ]; then
+            EXPECT_ATTACKS="$(./testing/run_elle_matrix.sh --list-attacks | tr '\n' ' ')"
+          fi
+          export ELLE_EXPECT_ATTACKS="$EXPECT_ATTACKS"
+          echo "expecting: $ELLE_EXPECT_ATTACKS"
+          uv run --project testing testing/aggregate_elle_results.py
+
+      - name: Upload merged summary
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: elle-summary-${{ github.run_id }}-${{ github.run_attempt }}
           path: testing/artifacts/elle-summary.md
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 30
 
-      - name: Tear down cluster
-        if: always()
-        run: docker compose down -v --remove-orphans || true
+      - name: Fail if any shard did not finish
+        if: always() && needs.elle-matrix.result != 'success'
+        run: |
+          echo "::error::Elle matrix did not complete: shards reported" \
+            "'${{ needs.elle-matrix.result }}'. Coverage is incomplete."
+          exit 1

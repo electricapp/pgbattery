@@ -4,7 +4,7 @@ Raft-based HA manager for PostgreSQL. Rust binary (`pgbattery`) that manages a 3
 
 ## Correctness is Paramount
 
-This is a distributed database system. If you observe inconsistent state (split-brain, lost writes, stuck replication, missing slots), **STOP** and investigate to root cause. Once the root cause is clear, prefer fixing it immediately over writing it up. `BUGS.md` is only for deferred fixes and unclear root causes — not a changelog of bugs that were found and fixed in the same session.
+This is a distributed database system. If you observe inconsistent state (split-brain, lost writes, stuck replication, missing slots), **STOP** and investigate to root cause. Once the root cause is clear, prefer fixing it immediately over writing it up. `BUGS.md` (create it if absent) is only for deferred fixes and unclear root causes — not a changelog of bugs that were found and fixed in the same session.
 
 ## State machines: `docs/STATE_MACHINE.md` is canonical
 
@@ -76,21 +76,50 @@ All on port 9091 internally (mapped to 9081/9082/9083).
 - `POST /api/v1/backup/create`, `/restore?filename=...`
 - `GET /api/v1/backup/list` — read-only but gated: it leaks filesystem paths, sizes, and the backup schedule, and drives a stat walk of every backup tree
 
-## Testing
+## Verification layers
 
-All test scripts use uv shebang (`#!/usr/bin/env -S uv run --project testing python`). Dependencies in `testing/pyproject.toml`.
+Independent layers. Know which one covers a change before adding another. For current counts, ask the tools (`./testing/ci_runner.py --list`, `cargo test --workspace`) rather than trusting a number written here.
 
-| File                        | Purpose                                                        |
-| --------------------------- | -------------------------------------------------------------- |
-| `testing/ci_runner.py`      | YAML-driven CI test orchestrator (Pydantic + Rich)             |
-| `testing/ci_matrix.yaml`    | 25 step types, 20 test cases across 4 suites                   |
-| `testing/overnight_test.py` | 8hr randomized chaos (10 scenarios, Rich UI)                   |
-| `testing/jepsen_lite.py`    | Simple Jepsen-style correctness test (~250 lines, stdlib only) |
+| Layer                  | Where                                        | What it checks                                                                                                                           |
+| ---------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust unit tests        | inline `mod tests`                           | Pure decision functions. Densest in `process.rs`, `gateway/handlers`, `state_machine.rs`.                                                |
+| Property tests         | `proptest!` blocks in the modules they cover | LSN election/promotion gate, `rewind_divergence_decision`, sync-standby quorum intersection over all voter-set sizes.                    |
+| Storage conformance    | `openraft::testing::Suite` in `storage.rs`   | The real `LogStorageAdapter` / `StateMachineStore` against openraft's own suite, plus crash-recovery and durability-pin tests.           |
+| TLA+ model checking    | `tla/` (`make check`)                        | `lease_fencing` (one write authority), `raft_lsn` (election safety, LSN gate can't deadlock), `commit_probing`, `timeline_verification`. |
+| Fuzzing                | `fuzz/` (`cargo fuzz`)                       | PG wire protocol (startup/framing/extended), query analysis into libpg_query, Raft RPC frames, snapshot decode, LSN parsing.             |
+| Docker HA matrix       | `testing/ci_runner.py` + `ci_matrix.yaml`    | Real 3-node cluster, real faults, effect-verified. Every case declares its contract IDs; `lint_matrix.py` enforces it.                   |
+| Transactional anomaly  | `testing/linearizability_register.py` + Elle | Elle (list-append / rw-register) asserting strict serializability; plus an in-tree WGL per-key linearizability checker.                  |
+| Durability/split-brain | `testing/correctness_lite.py`                | History invariants (lost acks, phantom writes, dual leadership, quorum-loss fencing, bank ledger) + log-grep checks.                     |
+| Single-writer oracle   | `testing/dual_writability_prober.py`         | Contract L1 directly: concurrent real writes to all three internal PG ports, at most one may be accepted.                                |
+| Harness self-tests     | `testing/test_*.py`                          | The checkers, oracles, and fault primitives themselves — including that each can actually fail.                                          |
 
-CI workflows in `.github/workflows/`:
+Contracts live in `docs/CONTRACTS.md` (W1-W3, L1-L3, V1-V2, S1-S2, R1-R2). FATAL contract violations are release-blocking.
 
-- `ha-ci.yml` — sequential + parallel HA suites (push/PR/nightly)
-- `jepsen-lite.yml` — weekly correctness chaos test
+All Python test scripts use a uv shebang (`#!/usr/bin/env -S uv run --project testing python`); deps in `testing/pyproject.toml`.
+
+### CI gating
+
+| Workflow                                               | On PR / push                                                                                                   | Nightly                                                        |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `ha-ci.yml`                                            | harness lint + self-tests, `ha-sequential`, `ha-parallel` (matrixed), `ha-controlplane-pr`, `ha-assert-sanity` | `ha-controlplane-nightly` at 04:15 UTC                         |
+| `elle.yml`                                             | `kill` attack only (~90 s smoke)                                                                               | full attack matrix, sharded, random seed per run, at 03:00 UTC |
+| `tla.yml`                                              | all 4 specs                                                                                                    | —                                                              |
+| `correctness-lite.yml`, `fuzz.yml`, `supply-chain.yml` | see workflow                                                                                                   | —                                                              |
+
+Run locally: `./testing/ci_runner.py --suite <suite> [--case <id>]`, `testing/run_elle_matrix.sh [attack...]`, `cd tla && make check`.
+
+### Known-incomplete harnesses
+
+Deliberate skeletons that raise rather than silently pass. Do not treat their absence as coverage:
+
+- `testing/five_node_suite.py` — no 5-node topology is tested anywhere (BI1). Quorum arithmetic beyond 3 nodes and dual-fault tolerance are unexercised.
+- `fsync_drop` / `bit_flip` attacks in `linearizability_register.py` — need image changes (LazyFS or libeatmydata; dm-flakey); excluded from `ALL_ATTACKS` and `chaos_storm`.
+
+Every fault currently injected is a _clean_ fault (SIGKILL, container stop, network disconnect, SIGSTOP). `docker kill` leaves the host page cache intact, so **nothing yet proves fsync is honored** or that torn writes are detected — W1 and R2 rest on construction, not evidence. See `HARDENING.md`.
+
+### Faults must verify their own effect
+
+A fault that silently fails to inject is worse than no test, because it reads as coverage. This has bitten five times: `iptables` missing from the image; every fault `exec` running as unprivileged `postgres` (the image ends `USER postgres`, so `NET_ADMIN` on the container does not reach the process — privileged operations need `--user root`); and three cases addressing docker objects by literal name while CI sets a per-run `COMPOSE_PROJECT_NAME`. Derive container and network names from the active compose project, never hardcode them, and assert the fault landed. `HARDENING.md` has the full list.
 
 ## Testing Philosophy
 
@@ -98,9 +127,13 @@ CI workflows in `.github/workflows/`:
 - Check replication state (SYNC/ASYNC) after failover
 - Verify data integrity after leadership changes
 - Investigate failures — don't restart to "fix" them
+- A fault that cannot fail is worse than no test: prefer a loud `NotImplementedError` over an assertion that passes vacuously
 
 ## Key Docs
 
-- `BUGS.md` — bug/anomaly tracker
-- `TESTS.md` — test results
-- `MEMBERSHIP.md` — cluster membership operations
+- `docs/STATE_MACHINE.md` — canonical state machines and truth sources
+- `docs/CONTRACTS.md` — correctness contracts (referenced by test cases)
+- `docs/MEMBERSHIP.md` — cluster membership operations
+- `docs/RUNBOOK.md`, `docs/DEPLOYMENT.md`, `docs/RELEASING.md` — operations
+- `tla/README.md` — what each spec proves, and what it deliberately does not
+- `HARDENING.md` — what the verification layers cannot catch, and the scoped work to close it

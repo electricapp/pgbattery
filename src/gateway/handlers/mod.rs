@@ -44,11 +44,12 @@ use crate::governor::raft::FenceState;
 /// gone or hostile, so the connection is severed.
 const PROXY_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Maximum startup-packet length accepted, matching libpq's
-/// `PQ_MAX_STARTUP_PACKET_LENGTH`. The startup packet carries every connection
-/// parameter; the server itself rejects anything larger, so this is the same
-/// ceiling rather than an arbitrary gateway limit.
-const MAX_STARTUP_PACKET_LEN: usize = 10_000;
+/// Maximum startup-packet length accepted.
+///
+/// Matches libpq's `PQ_MAX_STARTUP_PACKET_LENGTH`. The startup packet carries
+/// every connection parameter; the server itself rejects anything larger, so
+/// this is the same ceiling rather than an arbitrary gateway limit.
+pub const MAX_STARTUP_PACKET_LEN: usize = 10_000;
 
 /// Shared HTTP client for the commit-recovery probes (leader discovery +
 /// txid-status). Building a `reqwest::Client` sets up a connection pool and TLS
@@ -207,6 +208,10 @@ const fn simple_commit_probe_is_safe(
 /// over the query bytes answers every full-text prefilter the per-message
 /// path needs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one independent flag per keyword group the single scan answers"
+)]
 pub struct QueryKeywordFlags {
     /// `commit` or `end` token present (word-boundary, case-insensitive).
     pub commit: bool,
@@ -214,11 +219,21 @@ pub struct QueryKeywordFlags {
     pub subscription: bool,
     /// A session-state function call is present: `set_config` or the
     /// session-scoped advisory-lock family (`pg_advisory_lock`,
-    /// `pg_advisory_lock_shared`). `pg_advisory_xact_lock*` never matches —
-    /// it releases at transaction end and cannot survive to an Idle
+    /// `pg_advisory_lock_shared`, and their `pg_try_advisory_lock*`
+    /// spellings). The `*_xact_*` variants never match — they release at
+    /// transaction end and cannot survive to an Idle
     /// migration point. Conservative by design: a match inside a string
     /// literal also fires, and severing on failover is the safe direction.
     pub function_state: bool,
+    /// A `temp`, `temporary`, or `pg_temp` token is present, so the statement
+    /// may name an object in the session's temp schema. Unlike the flags
+    /// above this one does not classify anything on its own — it routes the
+    /// query to the analyzer (`select`-leading shapes such as
+    /// `SELECT … INTO TEMP` are otherwise never parsed) and arms the
+    /// unmodeled-statement fallback in `accumulate_query_analysis`. Word
+    /// boundaries keep `temp_c` and `temp_buffers` from matching, so an
+    /// ordinary column named `temp` costs one parse and stays migratable.
+    pub temp_object: bool,
 }
 
 /// Leading keyword of the first statement in `query`: skips whitespace,
@@ -547,12 +562,30 @@ enum SessionChange {
     /// and unlistens every channel, so the tracked state must follow.
     DiscardAll,
     /// A statement leaving backend-local session state the gateway cannot
-    /// reconstruct on a migrated backend (temp table, SQL `PREPARE`, `WITH
-    /// HOLD` cursor, session advisory lock, `set_config(..., false)`). The
-    /// `&'static str` is the reason, for logging. Marks the connection
+    /// reconstruct on a migrated backend (temp table / view / sequence, SQL
+    /// `PREPARE`, `WITH HOLD` cursor, session advisory lock,
+    /// `set_config(..., false)`, a `DO` block whose body cannot be inspected).
+    /// The `&'static str` is the reason, for logging. Marks the connection
     /// non-migratable so failover severs (08006) instead of silently losing
     /// the state.
     NonMigratable(&'static str),
+}
+
+/// How much the analyzer knows about one parsed statement.
+///
+/// The analyzer is a **deny-list**: it has arms for the statement types it has
+/// been taught, and `PostgreSQL` has roughly two hundred more that it has not.
+/// `Unmodeled` therefore means "not examined", never "leaves no session
+/// state" — see `ConnectionHandler::classify_statement`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum StatementClass {
+    /// The node type has an arm and that arm reached a verdict: `Some` is the
+    /// session state the statement leaves behind, `None` means the arm looked
+    /// and found none (permanent DDL, `SET LOCAL`, plain DML, a non-HOLD
+    /// cursor).
+    Modeled(Option<SessionChange>),
+    /// No arm for this node type; its effect on session state is unknown.
+    Unmodeled,
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -1575,8 +1608,11 @@ impl ConnectionHandler {
                 // token) and stays separate.
                 let flags = Self::query_keyword_flags(&query_text);
                 let needs_subscription_analysis = flags.subscription;
+                // A temp-schema token is a parse trigger in its own right: the
+                // leading-keyword scan excludes `select` / `with`, which is
+                // where `SELECT … INTO TEMP` hides.
                 let needs_session_state_analysis =
-                    Self::might_contain_session_state_command(&query_text);
+                    Self::might_contain_session_state_command(&query_text) || flags.temp_object;
 
                 // Function-call session state (set_config / advisory locks) is
                 // not a statement-leading keyword, so it needs no parse — the
@@ -1681,7 +1717,13 @@ impl ConnectionHandler {
     /// leader change severs it (08006) rather than migrating state we cannot
     /// reconstruct. The full AST analysis still runs so state-free statements
     /// that merely share a keyword (`CREATE TABLE`, a `listen` column) do not
-    /// over-fence. See `docs/STATE_MACHINE.md` section 6.
+    /// over-fence.
+    ///
+    /// What this does NOT guarantee: the analysis is a deny-list
+    /// (`classify_statement`), so a statement type with no arm there — and no
+    /// temp-schema token to arm the fallback — is treated as migratable
+    /// without having been examined. Migration is only as safe as that list is
+    /// complete. See `docs/STATE_MACHINE.md` section 6.
     async fn observe_parse_message(&mut self, msg: &BytesMut) -> Result<()> {
         let Some((stmt_name, query)) = ExtendedCommitTracker::parse_names(msg) else {
             return Ok(());
@@ -1711,7 +1753,10 @@ impl ConnectionHandler {
         if flags.function_state {
             self.mark_session_non_migratable("session function state (set_config / advisory lock)");
         }
-        if Self::might_contain_session_state_command(query) || flags.subscription {
+        if Self::might_contain_session_state_command(query)
+            || flags.subscription
+            || flags.temp_object
+        {
             let query_owned = query.to_owned();
             let analysis = tokio::task::spawn_blocking(move || Self::analyze_query(&query_owned))
                 .await
@@ -1894,10 +1939,15 @@ impl ConnectionHandler {
 
     /// Prefilter for statements that mutate tracked session state: session
     /// GUCs (`SET`/`RESET`), the prepared-statement replay set
-    /// (`DEALLOCATE`/`DISCARD`/`PREPARE`), backend-local temp tables
-    /// (`CREATE TEMP`), and `WITH HOLD` cursors (`DECLARE`). All are
-    /// statement-leading keywords, so the leading-keyword scan keeps
-    /// `UPDATE t SET …` / `SELECT …` — the hot shapes — away from the C parser.
+    /// (`DEALLOCATE`/`DISCARD`/`PREPARE`), backend-local temp objects
+    /// (`CREATE TEMP`), `WITH HOLD` cursors (`DECLARE`), and anonymous blocks
+    /// whose body the analyzer cannot see (`DO`). All are statement-leading
+    /// keywords, so the leading-keyword scan keeps `UPDATE t SET …` /
+    /// `SELECT …` — the hot shapes — away from the C parser.
+    ///
+    /// Not exhaustive on its own: `select`-leading statements can still leave
+    /// session state (`SELECT … INTO TEMP`), so the callers OR this with the
+    /// `temp_object` and `subscription` token flags before deciding to parse.
     #[inline]
     fn might_contain_session_state_command(query: &str) -> bool {
         leading_statement_keyword_matches(
@@ -1910,8 +1960,18 @@ impl ConnectionHandler {
                 "create",
                 "prepare",
                 "declare",
+                "do",
             ],
         )
+    }
+
+    /// Single-flag view of the fused scan (see `QueryKeywordFlags`): the query
+    /// carries a `temp` / `temporary` / `pg_temp` token, so it may name an
+    /// object in the session's temp schema and must reach the analyzer even
+    /// when its leading keyword is not a session-state keyword.
+    #[cfg(test)]
+    fn might_reference_temp_scoped_object(query: &str) -> bool {
+        Self::query_keyword_flags(query).temp_object
     }
 
     /// Single-flag view of the fused scan (see `QueryKeywordFlags`): session
@@ -1924,8 +1984,9 @@ impl ConnectionHandler {
     }
 
     /// Single-pass scan for every keyword the per-query hot path needs:
-    /// COMMIT/END, LISTEN/UNLISTEN, and the session-state function calls
-    /// (`set_config`, `pg_advisory_lock`, `pg_advisory_lock_shared`).
+    /// COMMIT/END, LISTEN/UNLISTEN, the session-state function calls
+    /// (`set_config`, the `pg_advisory_lock` / `pg_try_advisory_lock`
+    /// families), and the temp-schema tokens (`temp`, `temporary`, `pg_temp`).
     ///
     /// Scanning once per keyword group would walk the query bytes several
     /// times per message; this makes one pass and sets all flags.
@@ -1936,12 +1997,20 @@ impl ConnectionHandler {
         // Keywords as byte slices — checked longest-first at each position so
         // "unlisten" is not double-counted as "listen" and
         // "pg_advisory_lock_shared" wins over its "pg_advisory_lock" prefix.
+        // The `pg_try_advisory_*` spellings need their own tokens: they share
+        // no substring with `pg_advisory_lock` ("pg_" + "try_" splits it), so
+        // the non-try tokens cannot match them.
+        const PG_TRY_ADVISORY_LOCK_SHARED: &[u8] = b"pg_try_advisory_lock_shared"; // 27
         const PG_ADVISORY_LOCK_SHARED: &[u8] = b"pg_advisory_lock_shared"; // 23
+        const PG_TRY_ADVISORY_LOCK: &[u8] = b"pg_try_advisory_lock"; // 20
         const PG_ADVISORY_LOCK: &[u8] = b"pg_advisory_lock"; // 16
         const SET_CONFIG: &[u8] = b"set_config"; // 10
+        const TEMPORARY: &[u8] = b"temporary"; // 9
         const UNLISTEN: &[u8] = b"unlisten"; // 8
+        const PG_TEMP: &[u8] = b"pg_temp"; // 7
         const COMMIT: &[u8] = b"commit"; // 6
         const LISTEN: &[u8] = b"listen"; // 6
+        const TEMP: &[u8] = b"temp"; // 4
         const END: &[u8] = b"end"; // 3
 
         let qb = query.as_bytes();
@@ -1967,24 +2036,39 @@ impl ConnectionHandler {
 
         let mut i = 0usize;
         while i < len {
-            if matches_at(i, PG_ADVISORY_LOCK_SHARED) {
+            if matches_at(i, PG_TRY_ADVISORY_LOCK_SHARED) {
+                flags.function_state = true;
+                i += PG_TRY_ADVISORY_LOCK_SHARED.len();
+            } else if matches_at(i, PG_ADVISORY_LOCK_SHARED) {
                 flags.function_state = true;
                 i += PG_ADVISORY_LOCK_SHARED.len();
+            } else if matches_at(i, PG_TRY_ADVISORY_LOCK) {
+                flags.function_state = true;
+                i += PG_TRY_ADVISORY_LOCK.len();
             } else if matches_at(i, PG_ADVISORY_LOCK) {
                 flags.function_state = true;
                 i += PG_ADVISORY_LOCK.len();
             } else if matches_at(i, SET_CONFIG) {
                 flags.function_state = true;
                 i += SET_CONFIG.len();
+            } else if matches_at(i, TEMPORARY) {
+                flags.temp_object = true;
+                i += TEMPORARY.len();
             } else if matches_at(i, UNLISTEN) {
                 flags.subscription = true;
                 i += UNLISTEN.len();
+            } else if matches_at(i, PG_TEMP) {
+                flags.temp_object = true;
+                i += PG_TEMP.len();
             } else if matches_at(i, COMMIT) {
                 flags.commit = true;
                 i += COMMIT.len();
             } else if matches_at(i, LISTEN) {
                 flags.subscription = true;
                 i += LISTEN.len();
+            } else if matches_at(i, TEMP) {
+                flags.temp_object = true;
+                i += TEMP.len();
             } else if matches_at(i, END) {
                 flags.commit = true;
                 i += END.len();
@@ -2732,30 +2816,46 @@ impl ConnectionHandler {
     }
 
     fn analyze_query(query: &str) -> QueryAnalysis {
+        // Derived here rather than taken from the caller's scan: the unmodeled
+        // fallback in `accumulate_query_analysis` is only sound when this flag
+        // describes the same text that was parsed.
         if let Ok(parsed) = pg_query::parse(query) {
-            return Self::analyze_parse_result(&parsed.protobuf);
+            return Self::analyze_parse_result(
+                &parsed.protobuf,
+                Self::query_keyword_flags(query).temp_object,
+            );
         }
 
         let mut analysis = QueryAnalysis::default();
         if let Ok(statements) = pg_query::split_with_scanner(query) {
             for statement in statements {
                 if let Ok(parsed) = pg_query::parse(statement) {
-                    Self::accumulate_query_analysis(&mut analysis, &parsed.protobuf);
+                    Self::accumulate_query_analysis(
+                        &mut analysis,
+                        &parsed.protobuf,
+                        Self::query_keyword_flags(statement).temp_object,
+                    );
                 }
             }
         }
         analysis
     }
 
-    fn analyze_parse_result(result: &pg_query::protobuf::ParseResult) -> QueryAnalysis {
+    fn analyze_parse_result(
+        result: &pg_query::protobuf::ParseResult,
+        names_temp_object: bool,
+    ) -> QueryAnalysis {
         let mut analysis = QueryAnalysis::default();
-        Self::accumulate_query_analysis(&mut analysis, result);
+        Self::accumulate_query_analysis(&mut analysis, result, names_temp_object);
         analysis
     }
 
+    /// `names_temp_object` is the temp-schema token flag for the text `result`
+    /// was parsed from; it arms the unmodeled-statement fallback below.
     fn accumulate_query_analysis(
         analysis: &mut QueryAnalysis,
         result: &pg_query::protobuf::ParseResult,
+        names_temp_object: bool,
     ) {
         for raw_stmt in &result.stmts {
             let Some(stmt_node) = raw_stmt.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) else {
@@ -2766,8 +2866,21 @@ impl ConnectionHandler {
                 analysis.contains_commit = true;
             }
 
-            if let Some(change) = Self::session_change_from_statement(stmt_node) {
-                analysis.session_changes.push(change);
+            match Self::classify_statement(stmt_node) {
+                StatementClass::Modeled(Some(change)) => analysis.session_changes.push(change),
+                // Narrow fail-safe: an unexamined statement only severs when
+                // the text also names a temp-scoped object — what
+                // `EXPLAIN ANALYZE CREATE TEMP TABLE …` and
+                // `CREATE FUNCTION pg_temp.f()` have in common. The token flag
+                // covers the whole parsed text, not the individual statement,
+                // so one temp-naming statement arms the fallback for its
+                // siblings in the same batch.
+                StatementClass::Unmodeled if names_temp_object => {
+                    analysis.session_changes.push(SessionChange::NonMigratable(
+                        "unmodeled statement naming a temp-scoped object",
+                    ));
+                }
+                StatementClass::Modeled(None) | StatementClass::Unmodeled => {}
             }
         }
     }
@@ -2782,87 +2895,159 @@ impl ConnectionHandler {
         }
     }
 
-    fn session_change_from_statement(
-        stmt: &pg_query::protobuf::node::Node,
-    ) -> Option<SessionChange> {
+    /// Classify one parsed statement's effect on session state.
+    ///
+    /// A deny-list, not a positive safety proof: only the node types with an
+    /// arm below are examined, and `_ => Unmodeled` catches every other
+    /// statement `PostgreSQL` can parse. An `Unmodeled` statement is migrated
+    /// unless the query text also names a temp-scoped object (see
+    /// `accumulate_query_analysis`), so any construct that leaves session
+    /// state *without* naming `temp`/`temporary`/`pg_temp` needs its own arm
+    /// here — that is the only way it can ever be severed.
+    ///
+    /// The plain DML and transaction-control node types are modeled
+    /// explicitly, returning `Modeled(None)`, rather than being left to `_`:
+    /// they are the hot shapes, and a column or alias named `temp` must not
+    /// reach the fallback and sever them.
+    fn classify_statement(stmt: &pg_query::protobuf::node::Node) -> StatementClass {
         match stmt {
-            pg_query::protobuf::node::Node::ListenStmt(listen_stmt) => {
+            pg_query::protobuf::node::Node::ListenStmt(listen_stmt) => StatementClass::Modeled(
                 Self::normalize_condition_name(&listen_stmt.conditionname)
-                    .map(SessionChange::Listen)
-            }
+                    .map(SessionChange::Listen),
+            ),
             pg_query::protobuf::node::Node::UnlistenStmt(unlisten_stmt) => {
                 let condition = unlisten_stmt.conditionname.trim();
-                if condition.is_empty() || condition == "*" {
-                    Some(SessionChange::UnlistenAll)
+                StatementClass::Modeled(Some(if condition.is_empty() || condition == "*" {
+                    SessionChange::UnlistenAll
                 } else {
-                    Some(SessionChange::Unlisten(condition.to_string()))
-                }
+                    SessionChange::Unlisten(condition.to_string())
+                }))
             }
-            // A session-scoped SET/RESET (not SET LOCAL) leaves GUCs we
-            // don't reconstruct on a new backend.
-            pg_query::protobuf::node::Node::VariableSetStmt(set_stmt) if !set_stmt.is_local => {
-                Some(SessionChange::SetSessionVar)
-            }
+            // A session-scoped SET/RESET leaves GUCs we don't reconstruct on a
+            // new backend. SET LOCAL is transaction-scoped and stays
+            // migratable.
+            pg_query::protobuf::node::Node::VariableSetStmt(set_stmt) => StatementClass::Modeled(
+                (!set_stmt.is_local).then_some(SessionChange::SetSessionVar),
+            ),
             pg_query::protobuf::node::Node::DeallocateStmt(dealloc) => {
-                if dealloc.isall {
+                StatementClass::Modeled(if dealloc.isall {
                     Some(SessionChange::DeallocateAll)
                 } else if dealloc.name.is_empty() {
                     None
                 } else {
                     Some(SessionChange::Deallocate(dealloc.name.clone()))
-                }
+                })
             }
             pg_query::protobuf::node::Node::DiscardStmt(discard) => {
                 // Only DISCARD ALL touches state the gateway tracks; PLANS /
                 // SEQUENCES / TEMP leave prepared statements and LISTEN
-                // registrations intact.
-                matches!(
-                    pg_query::protobuf::DiscardMode::try_from(discard.target),
-                    Ok(pg_query::protobuf::DiscardMode::DiscardAll)
+                // registrations intact, and none of them *create* state.
+                StatementClass::Modeled(
+                    matches!(
+                        pg_query::protobuf::DiscardMode::try_from(discard.target),
+                        Ok(pg_query::protobuf::DiscardMode::DiscardAll)
+                    )
+                    .then_some(SessionChange::DiscardAll),
                 )
-                .then_some(SessionChange::DiscardAll)
             }
             // CREATE TEMP/TEMPORARY TABLE leaves a backend-local temporary
             // relation. `relpersistence == "t"` is the temp marker ("p" =
             // permanent, "u" = unlogged, both of which survive a migrated
             // backend).
-            pg_query::protobuf::node::Node::CreateStmt(create_stmt) => create_stmt
-                .relation
-                .as_ref()
-                .is_some_and(|r| r.relpersistence == "t")
-                .then_some(SessionChange::NonMigratable("temp table")),
+            pg_query::protobuf::node::Node::CreateStmt(create_stmt) => StatementClass::Modeled(
+                create_stmt
+                    .relation
+                    .as_ref()
+                    .is_some_and(|r| r.relpersistence == "t")
+                    .then_some(SessionChange::NonMigratable("temp table")),
+            ),
             // `CREATE TEMP TABLE … AS SELECT` parses to `CreateTableAsStmt`,
             // not `CreateStmt`; the temp relation it leaves behind is just as
-            // unreconstructable on a migrated backend. Legacy
-            // `SELECT … INTO TEMP` is a known, narrow gap on two counts: the
-            // session-state prefilter deliberately excludes leading `select`
-            // (keeping the read hot path off libpg_query), and in the RAW
-            // parse tree libpg_query returns it stays a `SelectStmt` with an
-            // `into_clause` — the `CreateTableAsStmt` conversion happens in
-            // parse analysis, which libpg_query does not run — so this arm
-            // would not catch it even if the prefilter let it through.
-            pg_query::protobuf::node::Node::CreateTableAsStmt(create_as) => create_as
-                .into
-                .as_ref()
-                .and_then(|into_clause| into_clause.rel.as_ref())
-                .is_some_and(|r| r.relpersistence == "t")
-                .then_some(SessionChange::NonMigratable("temp table (CREATE TABLE AS)")),
+            // unreconstructable on a migrated backend.
+            pg_query::protobuf::node::Node::CreateTableAsStmt(create_as) => {
+                StatementClass::Modeled(
+                    create_as
+                        .into
+                        .as_ref()
+                        .and_then(|into_clause| into_clause.rel.as_ref())
+                        .is_some_and(|r| r.relpersistence == "t")
+                        .then_some(SessionChange::NonMigratable("temp table (CREATE TABLE AS)")),
+                )
+            }
+            // A temp view and a temp sequence live in the same session-local
+            // `pg_temp` schema as a temp table and die with the backend, but
+            // each carries its own `RangeVar`, so the temp-table arms above
+            // cannot see them.
+            pg_query::protobuf::node::Node::ViewStmt(view_stmt) => StatementClass::Modeled(
+                view_stmt
+                    .view
+                    .as_ref()
+                    .is_some_and(|r| r.relpersistence == "t")
+                    .then_some(SessionChange::NonMigratable("temp view")),
+            ),
+            pg_query::protobuf::node::Node::CreateSeqStmt(seq_stmt) => StatementClass::Modeled(
+                seq_stmt
+                    .sequence
+                    .as_ref()
+                    .is_some_and(|r| r.relpersistence == "t")
+                    .then_some(SessionChange::NonMigratable("temp sequence")),
+            ),
+            // Legacy `SELECT … INTO TEMP` leaves the same relation as
+            // `CREATE TEMP TABLE … AS`, but in the RAW tree libpg_query
+            // returns it stays a `SelectStmt` with an `into_clause` — the
+            // `CreateTableAsStmt` rewrite happens in parse analysis, which
+            // libpg_query does not run.
+            pg_query::protobuf::node::Node::SelectStmt(select) => StatementClass::Modeled(
+                select
+                    .into_clause
+                    .as_ref()
+                    .and_then(|into_clause| into_clause.rel.as_ref())
+                    .is_some_and(|r| r.relpersistence == "t")
+                    .then_some(SessionChange::NonMigratable("temp table (SELECT INTO)")),
+            ),
             // SQL-level PREPARE: only extended-protocol Parse statements are
             // captured for replay, so a migrated backend would answer a later
             // EXECUTE with "prepared statement does not exist".
             pg_query::protobuf::node::Node::PrepareStmt(_) => {
-                Some(SessionChange::NonMigratable("SQL PREPARE"))
+                StatementClass::Modeled(Some(SessionChange::NonMigratable("SQL PREPARE")))
             }
+            // A `DO` block body is procedural-language source that libpg_query
+            // does not parse — `DoStmt` carries it as one opaque string — so a
+            // block that creates a temp table, takes a session advisory lock,
+            // or sets a session GUC is indistinguishable here from one that
+            // leaves nothing behind.
+            pg_query::protobuf::node::Node::DoStmt(_) => StatementClass::Modeled(Some(
+                SessionChange::NonMigratable("DO block (opaque body)"),
+            )),
             // DECLARE ... CURSOR WITH HOLD persists past its transaction; a
             // migrated backend would not have it. Non-HOLD cursors die at
             // transaction end and can never reach an Idle migration point.
             pg_query::protobuf::node::Node::DeclareCursorStmt(decl) => {
                 // `CURSOR_OPT_HOLD` bit (PostgreSQL `parsenodes.h`).
                 const CURSOR_OPT_HOLD: i32 = 0x0020;
-                (decl.options & CURSOR_OPT_HOLD != 0)
-                    .then_some(SessionChange::NonMigratable("WITH HOLD cursor"))
+                StatementClass::Modeled(
+                    (decl.options & CURSOR_OPT_HOLD != 0)
+                        .then_some(SessionChange::NonMigratable("WITH HOLD cursor")),
+                )
             }
-            _ => None,
+            // Nothing here survives to an Idle migration point. Plain DML
+            // leaves no session state at all (a `set_config` or advisory-lock
+            // call inside one is caught by the token prefilter, which needs no
+            // parse); transaction control, cursor stepping and table locks are
+            // transaction-scoped; SHOW is read-only; and the SQL `PREPARE` an
+            // EXECUTE names already ratcheted the session when it was issued.
+            pg_query::protobuf::node::Node::InsertStmt(_)
+            | pg_query::protobuf::node::Node::UpdateStmt(_)
+            | pg_query::protobuf::node::Node::DeleteStmt(_)
+            | pg_query::protobuf::node::Node::MergeStmt(_)
+            | pg_query::protobuf::node::Node::CopyStmt(_)
+            | pg_query::protobuf::node::Node::TransactionStmt(_)
+            | pg_query::protobuf::node::Node::FetchStmt(_)
+            | pg_query::protobuf::node::Node::ClosePortalStmt(_)
+            | pg_query::protobuf::node::Node::LockStmt(_)
+            | pg_query::protobuf::node::Node::ExecuteStmt(_)
+            | pg_query::protobuf::node::Node::VariableShowStmt(_) => StatementClass::Modeled(None),
+            _ => StatementClass::Unmodeled,
         }
     }
 
@@ -3340,6 +3525,131 @@ mod tests {
         assert!(!marks_non_migratable("SELECT 1"));
     }
 
+    /// A temp table is not the only object that lives in the session's
+    /// `pg_temp` schema and dies with the backend. A temp view and a temp
+    /// sequence each parse to their own node type (`ViewStmt`,
+    /// `CreateSeqStmt`), which the temp-*table* arms cannot see.
+    #[test]
+    fn test_analyze_query_flags_temp_views_and_sequences() {
+        assert!(marks_non_migratable("CREATE TEMP VIEW v AS SELECT 1"));
+        assert!(marks_non_migratable("CREATE TEMPORARY VIEW v AS SELECT 1"));
+        assert!(marks_non_migratable("CREATE TEMP SEQUENCE s"));
+        assert!(marks_non_migratable("CREATE TEMPORARY SEQUENCE s START 5"));
+
+        // The permanent spellings are shared objects that exist on the new
+        // leader, so they must stay migratable.
+        assert!(!marks_non_migratable("CREATE VIEW v AS SELECT 1"));
+        assert!(!marks_non_migratable("CREATE SEQUENCE s"));
+        // UNLOGGED is a durability choice for a *shared* relation, not a
+        // session-scoped one: the relation exists for every session on the new
+        // leader, so it is not state the gateway would be hiding.
+        assert!(!marks_non_migratable("CREATE UNLOGGED TABLE t (id int)"));
+    }
+
+    /// Legacy `SELECT … INTO TEMP` leaves the same backend-local relation as
+    /// `CREATE TEMP TABLE … AS`. In the RAW parse tree it stays a `SelectStmt`
+    /// carrying an `into_clause` — the `CreateTableAsStmt` rewrite happens in
+    /// parse analysis, which `libpg_query` does not run — and `select` is
+    /// deliberately absent from the leading-keyword prefilter, so this shape
+    /// has to reach the parser by another route.
+    #[test]
+    fn test_analyze_query_flags_select_into_temp() {
+        assert!(marks_non_migratable("SELECT id INTO TEMP t FROM src"));
+        assert!(marks_non_migratable("SELECT id INTO TEMPORARY t FROM src"));
+        assert!(marks_non_migratable("SELECT id INTO TEMP TABLE t FROM src"));
+        assert!(marks_non_migratable(
+            "WITH s AS (SELECT 1 AS id) SELECT id INTO TEMP t FROM s"
+        ));
+
+        // `SELECT … INTO` a permanent or unlogged table is shared DDL.
+        assert!(!marks_non_migratable("SELECT id INTO t FROM src"));
+        assert!(!marks_non_migratable("SELECT id INTO UNLOGGED t FROM src"));
+        // A column named `temp` is not a temp object.
+        assert!(!marks_non_migratable("SELECT temp FROM readings"));
+        assert!(!marks_non_migratable(
+            "UPDATE readings SET temp = 21.5 WHERE id = 1"
+        ));
+    }
+
+    /// A `DO` block body is procedural-language source that `libpg_query` does
+    /// not parse: `DoStmt` carries it as one opaque string. Any DO block can
+    /// therefore create a temp table, take a session advisory lock, or set a
+    /// session GUC with nothing visible in the parse tree, so the only sound
+    /// classification is non-migratable.
+    #[test]
+    fn test_analyze_query_flags_do_blocks() {
+        assert!(marks_non_migratable(
+            "DO $$ BEGIN CREATE TEMP TABLE t (id int); END $$"
+        ));
+        assert!(marks_non_migratable(
+            "DO $$ BEGIN PERFORM pg_advisory_lock(1); END $$"
+        ));
+        // A state-free body is indistinguishable from a stateful one here.
+        assert!(marks_non_migratable("DO $$ BEGIN PERFORM 1; END $$"));
+        assert!(marks_non_migratable(
+            "DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$"
+        ));
+    }
+
+    /// The analyzer is a deny-list: a node type it has no arm for is
+    /// *unexamined*, not proven state-free. When such a statement also names a
+    /// temp-scoped object the fallback must ratchet rather than migrate.
+    #[test]
+    fn test_analyze_query_flags_unmodeled_statements_naming_temp_objects() {
+        // EXPLAIN ANALYZE executes its inner statement, so this really does
+        // leave a temp table behind; `ExplainStmt` has no arm.
+        assert!(marks_non_migratable(
+            "EXPLAIN ANALYZE CREATE TEMP TABLE t AS SELECT 1"
+        ));
+        // A function created in the session's temp schema dies with the
+        // backend; `CreateFunctionStmt` has no arm.
+        assert!(marks_non_migratable(
+            "CREATE FUNCTION pg_temp.f() RETURNS int AS 'SELECT 1' LANGUAGE sql"
+        ));
+
+        // Ordinary DML and reads are modeled arms, so a column named `temp`
+        // cannot reach the fallback and sever them.
+        assert!(!marks_non_migratable("UPDATE readings SET temp = 1"));
+        assert!(!marks_non_migratable(
+            "INSERT INTO readings (temp) VALUES (1)"
+        ));
+        assert!(!marks_non_migratable(
+            "DELETE FROM readings WHERE temp > 30"
+        ));
+        assert!(!marks_non_migratable("SELECT avg(temp) FROM readings"));
+        assert!(!marks_non_migratable("SELECT temp AS temp FROM readings"));
+        // `DISCARD TEMP` drops temp objects; it cannot create any.
+        assert!(!marks_non_migratable("DISCARD TEMP"));
+        // Transaction-scoped statements naming a temp relation stay migratable
+        // (the CREATE that made the relation already ratcheted the session).
+        assert!(!marks_non_migratable("LOCK TABLE temp IN SHARE MODE"));
+    }
+
+    /// Server-side large object descriptors are transaction-scoped, not
+    /// session-scoped: `PostgreSQL` closes every descriptor still open at
+    /// transaction end, so an Idle connection — the only state the gateway
+    /// ever migrates from — holds none. The large object itself is a shared,
+    /// WAL-logged relation. Opening or creating one must therefore NOT sever
+    /// the session.
+    #[test]
+    fn test_large_object_calls_stay_migratable() {
+        for query in [
+            "SELECT lo_open(16384, 262144)",
+            "SELECT lo_creat(-1)",
+            "SELECT lo_create(0)",
+            "SELECT lo_import('/srv/x.bin')",
+            "SELECT lo_export(16384, '/srv/x.bin')",
+            "SELECT lo_get(16384)",
+            "SELECT loread(0, 32)",
+        ] {
+            assert!(
+                !ConnectionHandler::might_leave_unmigratable_function_state(query),
+                "`{query}` opens no session-scoped state and must stay migratable"
+            );
+            assert!(!marks_non_migratable(query));
+        }
+    }
+
     /// Build a `ConnectionHandler` over a connected socket pair, returning
     /// the peer end so a test can read exactly what the handler forwarded to
     /// its client. Tests that never touch the socket just drop the peer.
@@ -3410,6 +3720,10 @@ mod tests {
         for query in [
             "SELECT pg_advisory_lock(1)",
             "CREATE TEMP TABLE t AS SELECT 1",
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TEMP SEQUENCE s",
+            "SELECT id INTO TEMP t FROM src",
+            "DO $$ BEGIN CREATE TEMP TABLE t (id int); END $$",
             "PREPARE p AS SELECT 1",
             "DECLARE c CURSOR WITH HOLD FOR SELECT 1",
             "SET search_path = myschema",
@@ -3426,14 +3740,92 @@ mod tests {
             );
         }
 
-        // A plain read must leave the connection migratable.
-        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-        let mut handler = test_handler(state.clone()).await;
-        handler
-            .observe_parse_message(&parse_message("s1", "SELECT id FROM t WHERE id = 1"))
-            .await
-            .unwrap();
-        assert!(!state.read().not_migratable);
+        // Plain reads and writes must leave the connection migratable, a
+        // column named `temp` included.
+        for query in [
+            "SELECT id FROM t WHERE id = 1",
+            "SELECT temp FROM readings",
+            "UPDATE readings SET temp = 21.5 WHERE id = 1",
+        ] {
+            let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+            let mut handler = test_handler(state.clone()).await;
+            handler
+                .observe_parse_message(&parse_message("s1", query))
+                .await
+                .unwrap();
+            assert!(
+                !state.read().not_migratable,
+                "extended-protocol Parse of `{query}` must stay migratable"
+            );
+        }
+    }
+
+    /// The simple-query path has its own prefilter gate, so the constructs the
+    /// extended-protocol test covers must be pinned here too: a `psql` client
+    /// (or any driver on simple query) reaches this code and no other.
+    #[tokio::test]
+    async fn simple_query_marks_unmigratable_session_state() {
+        use crate::gateway::connection::ConnectionState;
+
+        // A connected socket standing in for the backend. Nothing is written to
+        // it: the txid probe only fires for an in-transaction trivial COMMIT,
+        // and these sessions are Idle.
+        async fn backend_socket() -> TcpStream {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (backend, _accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            backend.unwrap()
+        }
+
+        for query in [
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TEMP SEQUENCE s",
+            "SELECT id INTO TEMP t FROM src",
+            "DO $$ BEGIN CREATE TEMP TABLE t (id int); END $$",
+            "EXPLAIN ANALYZE CREATE TEMP TABLE t AS SELECT 1",
+        ] {
+            let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+            let mut handler = test_handler(state.clone()).await;
+            let mut backend = backend_socket().await;
+            handler
+                .handle_query_message(
+                    MessageType::Query,
+                    &ConnectionHandler::build_query_message(query),
+                    &mut backend,
+                    &BytesMut::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                state.read().not_migratable,
+                "simple query `{query}` must mark the connection non-migratable"
+            );
+        }
+
+        // Reads and writes over a column named `temp` reach the parser through
+        // the temp-object token but must stay migratable.
+        for query in [
+            "SELECT temp FROM readings",
+            "UPDATE readings SET temp = 21.5 WHERE id = 1",
+            "DISCARD TEMP",
+        ] {
+            let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+            let mut handler = test_handler(state.clone()).await;
+            let mut backend = backend_socket().await;
+            handler
+                .handle_query_message(
+                    MessageType::Query,
+                    &ConnectionHandler::build_query_message(query),
+                    &mut backend,
+                    &BytesMut::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !state.read().not_migratable,
+                "simple query `{query}` must stay migratable"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3684,6 +4076,25 @@ mod tests {
         ));
     }
 
+    /// The `pg_try_advisory_lock` family is session-scoped exactly like
+    /// `pg_advisory_lock` — it differs only in returning false instead of
+    /// blocking. A caller that acquires one holds a lock the gateway cannot
+    /// reconstruct on a migrated backend, so it must mark the session
+    /// non-migratable. Only the `_xact_` variants release at commit.
+    #[test]
+    fn test_function_state_prefilter_detects_try_advisory_locks() {
+        assert!(ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT pg_try_advisory_lock(42)"
+        ));
+        assert!(ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT pg_try_advisory_lock_shared(42)"
+        ));
+        // Transaction-scoped `try` variants still release at commit.
+        assert!(!ConnectionHandler::might_leave_unmigratable_function_state(
+            "SELECT pg_try_advisory_xact_lock(42)"
+        ));
+    }
+
     #[test]
     fn test_analyze_query_deallocate_and_discard() {
         assert_eq!(
@@ -3789,6 +4200,43 @@ mod tests {
         // Identifier prefixes don't count as the keyword.
         assert!(!ConnectionHandler::might_contain_session_state_command(
             "settings_lookup('a')"
+        ));
+    }
+
+    #[test]
+    fn test_session_state_prefilter_reaches_do_blocks_and_temp_targets() {
+        // `DO` is statement-leading and its body is opaque to the parser, so
+        // the statement itself must reach the analyzer.
+        assert!(ConnectionHandler::might_contain_session_state_command(
+            "DO $$ BEGIN PERFORM 1; END $$"
+        ));
+        assert!(ConnectionHandler::might_contain_session_state_command(
+            "select 1; do $$ begin perform 1; end $$"
+        ));
+
+        // `select` / `with` stay off the leading-keyword list (the read hot
+        // path must not pay for the C parser), so a temp-object token is what
+        // routes `SELECT … INTO TEMP` to the analyzer.
+        assert!(ConnectionHandler::might_reference_temp_scoped_object(
+            "SELECT id INTO TEMP t FROM src"
+        ));
+        assert!(ConnectionHandler::might_reference_temp_scoped_object(
+            "SELECT id INTO TEMPORARY TABLE t FROM src"
+        ));
+        assert!(ConnectionHandler::might_reference_temp_scoped_object(
+            "CREATE FUNCTION pg_temp.f() RETURNS int AS 'SELECT 1' LANGUAGE sql"
+        ));
+
+        // Identifiers that merely embed the token do not match, so the read
+        // hot path keeps away from the parser.
+        assert!(!ConnectionHandler::might_reference_temp_scoped_object(
+            "SELECT temp_c FROM readings"
+        ));
+        assert!(!ConnectionHandler::might_reference_temp_scoped_object(
+            "SET LOCAL temp_buffers = '8MB'"
+        ));
+        assert!(!ConnectionHandler::might_reference_temp_scoped_object(
+            "UPDATE t SET x = 1"
         ));
     }
 

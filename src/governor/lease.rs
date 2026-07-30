@@ -106,6 +106,18 @@ impl LeaseState {
         self.is_leader && self.clock.now() < self.expires_at
     }
 
+    /// This lease's monotonic now.
+    ///
+    /// Exposed so the promotion hold-down anchor is stamped from the *same*
+    /// clock the lease expires on. Reading `Instant::now()` at the stamp site
+    /// instead would leave that agreement incidental rather than structural,
+    /// and would leave the anchor lifecycle undrivable by a `ManualClock`.
+    #[inline]
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
     /// Renew the lease (called when Raft confirms leadership with quorum).
     ///
     /// `quorum_ack_age` is how long ago the most recent quorum acknowledgment

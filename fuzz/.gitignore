@@ -1,3 +1,15 @@
 target/
+# libFuzzer's working corpus: grows by thousands of files per run, all
+# machine-generated. The committed inputs live in seed_corpus/ instead, which
+# CI passes as an additional read-only corpus directory so a run starts warm
+# without generated inputs ever landing in git.
 corpus/
 artifacts/
+
+# seed_corpus/ holds those committed inputs. The repo-root .gitignore excludes
+# `*.bin` globally, which would silently swallow any corpus file named that
+# way; a subdirectory .gitignore takes precedence, so re-include the seed tree
+# explicitly. Scoped to seed_corpus/ only — nothing else under fuzz/ is
+# un-ignored by this.
+!seed_corpus/
+!seed_corpus/**

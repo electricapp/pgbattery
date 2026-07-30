@@ -204,10 +204,12 @@ brew install uv                                       # or: pipx install uv
 ./testing/ci_runner.py --suite ha-sequential          # full sequential suite
 ```
 
-- Matrix lives in `testing/ci_matrix.yaml` (25 step types, ~20 cases across 4 suites).
-- `testing/jepsen_lite.py` — stdlib-only Jepsen-style register linearisability check.
-- `testing/repro_two_sync*.sh` reproduce the OPEN metric-staleness anomaly tracked in `BUGS.md`.
-- CI workflows in `.github/workflows/` — `ha-ci.yml` (push/PR/nightly) and `jepsen-lite.yml` (weekly).
+- Matrix lives in `testing/ci_matrix.yaml`, driven by `testing/ci_runner.py`.
+- `testing/linearizability_register.py` — transactional anomaly checking via [Elle](https://github.com/jepsen-io/elle) (list-append / rw-register) plus an in-tree per-key linearizability checker.
+- `testing/correctness_lite.py` — durability and split-brain history invariants.
+- `testing/dual_writability_prober.py` — continuous direct oracle for contract L1 (at most one node accepting writes).
+- `tla/` — four TLA+ specs (`make -C tla check`).
+- CI workflows in `.github/workflows/`: `ha-ci.yml` (push/PR/nightly), `elle.yml` (PR smoke, nightly matrix), `correctness-lite.yml` and `fuzz.yml` (weekly), `tla.yml`.
 
 ## Reliability Status
 
@@ -216,9 +218,19 @@ brew install uv                                       # or: pipx install uv
 ### What Works
 
 - Leader failure: idle connections see a <100 ms blip and keep their connection; a COMMIT in flight is resolved as committed-or-error, other in-flight statements get a retryable error
-- Network partition: multi-layer fencing prevents split-brain
-- Connection migration: idle transactions survive failover
+- Network partition: layered fencing (Raft CheckQuorum, lease expiry, gateway routing, PG read-only + backend termination) keeps writes on one node
+- Connection migration: idle transactions survive failover; sessions carrying backend-local state are severed with SQLSTATE 08006 rather than silently migrated
 - Data integrity: synchronous replication, LSN-aware elections, and timeline verification
+
+### Known Limits
+
+Stated explicitly because they bound what the contracts above guarantee:
+
+- **Fencing is SQL-level.** A deposed primary is fenced by `default_transaction_read_only` plus termination of client backends, which requires PostgreSQL to still answer its supervisor. A wedged postmaster escalates to process exit and container restart; the container runtime is the backstop, not pgbattery.
+- **The internal PostgreSQL port trusts the cluster network.** Managed `pg_hba` uses `trust`, so the fencing perimeter assumes only the gateway and cluster peers reach port 5434. Firewall it in production.
+- **A deposed leader that retains a quorum excluding the election winner** is the one split-brain window the promotion hold-down does not close; safety there rests on the quorum-loss self-fence and synchronous replication refusing un-acked commits. See `docs/STATE_MACHINE.md` §2 and `tla/lease_fencing.tla`, which documents that it does not model partial-quorum dynamics.
+- **Async fallback trades RPO for availability.** With no healthy standby for 30 s the leader drops to asynchronous replication and the published RPO becomes non-zero (up to the 16 MB election/rewind threshold).
+- **Durability under power loss is asserted, not yet demonstrated.** Every fault the harness injects is a clean fault; nothing proves `fsync` is honored. See `HARDENING.md`.
 
 ### Manual Recovery Required
 
@@ -231,6 +243,7 @@ This is intentional: fully automatic recovery in this scenario risks silent data
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — system design and component details
 - [STATE_MACHINE.md](docs/STATE_MACHINE.md) — canonical state-machine truth sources (Raft, lease, replication, gateway routing)
 - [CONTRACTS.md](docs/CONTRACTS.md) — correctness contracts (W1–W3, L1–L3, S1, R1–R2)
+- [HARDENING.md](HARDENING.md) — what the verification layers cannot catch, and the roadmap to close it
 - [DEPLOYMENT.md](docs/DEPLOYMENT.md) — bootstrap, join, TLS, Prometheus alerts
 - [RUNBOOK.md](docs/RUNBOOK.md) — incident response checklists
 - [MEMBERSHIP.md](docs/MEMBERSHIP.md) — voter/learner topology operations

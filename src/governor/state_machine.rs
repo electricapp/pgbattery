@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Instant;
 
 /// Node identifier type.
 pub type NodeId = u64;
@@ -81,18 +82,20 @@ pub struct ClusterState {
     /// Used as advisory input for leader election decisions.
     pub max_cluster_lsn: u64,
 
-    /// Wall-clock Unix-milliseconds at which *this node* last observed the
-    /// cluster losing its leader. `None` outside of an active failover.
+    /// Monotonic instant at which *this node* last observed the cluster losing
+    /// its leader. `None` outside an active failover.
     ///
-    /// Local projection, not replicated state: written by the governor on the
-    /// locally-observed leader→none edge and cleared by the app after promotion.
-    /// `serde(skip)` keeps it out of snapshots — like `leader_id`/`leader_addr`
-    /// — so an installed snapshot can't inject *another* node's wall clock and
-    /// shorten this node's promotion hold-down across clock skew. A node that
-    /// installs a snapshot mid-failover re-stamps it from its own clock on the
-    /// next leader→none edge it observes.
+    /// Monotonic because it anchors the promotion hold-down guarding the
+    /// deposed leader's lease, and that lease expires on monotonic time — a
+    /// wall-clock anchor would let a forward clock step release the gate while
+    /// the old lease is still valid.
+    ///
+    /// Local projection, not replicated: written by the governor on the
+    /// locally-observed leader→none edge, cleared by the app after promotion.
+    /// `serde(skip)` because an `Instant` is meaningless off the node that
+    /// produced it.
     #[serde(skip)]
-    pub failover_started_at_unix_ms: Option<u64>,
+    pub failover_started_at: Option<Instant>,
 
     /// Whether the leader currently has `synchronous_standby_names` set to a
     /// non-empty value, i.e. recent writes are protected by sync replication.
@@ -1046,6 +1049,304 @@ mod tests {
         assert!(!state.nodes.contains_key(&1));
         // Remaining node is unaffected.
         assert!(state.nodes.contains_key(&2));
+    }
+
+    /// Property tests over the pure election/promotion LSN gate.
+    ///
+    /// Timestamps are built relative to the real `unix_now_secs()` the gate
+    /// itself reads, so generated ages deliberately avoid a band around
+    /// `LSN_STALENESS_THRESHOLD_SECS`: a one-second tick between building the
+    /// state and evaluating it must not flip an entry across the freshness
+    /// boundary and turn a passing property into a false counterexample.
+    mod props {
+        use super::*;
+        use crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        /// Node id used for the candidate under test. Disjoint from the peer
+        /// id range so a generated peer never aliases the candidate's entry.
+        const CANDIDATE: NodeId = 99;
+        /// Peer id used by the fixed-topology boundary properties.
+        const PEER: NodeId = 1;
+
+        /// `(node_id, lsn, age_secs)`. A negative age is a future-skewed
+        /// timestamp, which the gate must clamp to age 0 rather than drop.
+        type LsnRow = (NodeId, u64, i64);
+
+        fn now_secs() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        }
+
+        fn age_strategy() -> impl Strategy<Value = i64> {
+            let staleness = i64::try_from(LSN_STALENESS_THRESHOLD_SECS).unwrap_or(30);
+            prop_oneof![
+                // Future skew.
+                -10i64..0,
+                // Comfortably fresh.
+                0i64..staleness - 10,
+                // Comfortably stale.
+                staleness + 10..staleness + 600,
+            ]
+        }
+
+        fn lsn_rows() -> impl Strategy<Value = Vec<LsnRow>> {
+            proptest::collection::vec((1u64..=8u64, 0u64..500_000_000u64, age_strategy()), 0..6)
+        }
+
+        fn sync_mode() -> impl Strategy<Value = Option<bool>> {
+            prop_oneof![Just(None), Just(Some(true)), Just(Some(false))]
+        }
+
+        fn state_from(rows: &[LsnRow], sync: Option<bool>) -> ClusterState {
+            let now = i64::try_from(now_secs()).unwrap_or(i64::MAX);
+            let mut state = ClusterState::new();
+            state.sync_replication_active = sync;
+            for &(id, lsn, age) in rows {
+                let ts = u64::try_from(now.saturating_sub(age)).unwrap_or(0);
+                state.node_lsns.insert(id, (lsn, ts));
+            }
+            state
+        }
+
+        /// Independent oracle for the staleness filter: last row wins per id
+        /// (matching `HashMap::insert`), future skew counts as age 0.
+        fn oracle_fresh_max(rows: &[LsnRow]) -> u64 {
+            let mut by_id: BTreeMap<NodeId, (u64, i64)> = BTreeMap::new();
+            for &(id, lsn, age) in rows {
+                by_id.insert(id, (lsn, age));
+            }
+            let staleness = i64::try_from(LSN_STALENESS_THRESHOLD_SECS).unwrap_or(30);
+            by_id
+                .values()
+                .filter(|&&(_, age)| age.max(0) < staleness)
+                .map(|(lsn, _)| *lsn)
+                .max()
+                .unwrap_or(0)
+        }
+
+        proptest! {
+            /// Raising a candidate's own reported LSN can only ever help it.
+            /// If the gate were non-monotone, a replica could lose a vote it
+            /// would have won by streaming *more* WAL.
+            ///
+            /// Applies to votes arriving over the network
+            /// (`governor::network::process_request`); a candidate's own
+            /// self-vote is issued inside openraft and never consults the gate.
+            #[test]
+            fn prop_election_gate_monotone_in_candidate_lsn(
+                peers in lsn_rows(),
+                lower in 0u64..500_000_000u64,
+                delta in 0u64..500_000_000u64,
+                sync in sync_mode(),
+            ) {
+                let higher = lower.saturating_add(delta);
+                let now = now_secs();
+                let mut state = state_from(&peers, sync);
+
+                state.node_lsns.insert(CANDIDATE, (lower, now));
+                let (low_ok, _) = state.is_lsn_acceptable_for_election(CANDIDATE);
+                state.node_lsns.insert(CANDIDATE, (higher, now));
+                let (high_ok, high_reason) = state.is_lsn_acceptable_for_election(CANDIDATE);
+
+                prop_assert!(
+                    !low_ok || high_ok,
+                    "lsn {lower} accepted but higher lsn {higher} rejected: {high_reason}"
+                );
+            }
+
+            /// Within one state, acceptance is upward-closed in LSN across
+            /// fresh-reporting nodes: the lower-LSN node being acceptable
+            /// implies the higher-LSN node is too, all else equal.
+            #[test]
+            fn prop_election_gate_upward_closed_among_fresh_peers(
+                lsns in proptest::collection::vec(0u64..500_000_000u64, 2..6),
+                sync in sync_mode(),
+            ) {
+                let now = now_secs();
+                let mut state = ClusterState::new();
+                state.sync_replication_active = sync;
+                for (i, &lsn) in lsns.iter().enumerate() {
+                    let id = u64::try_from(i).unwrap_or(0).saturating_add(1);
+                    state.node_lsns.insert(id, (lsn, now));
+                }
+
+                for (i, &lsn_i) in lsns.iter().enumerate() {
+                    for (j, &lsn_j) in lsns.iter().enumerate() {
+                        if lsn_i > lsn_j {
+                            continue;
+                        }
+                        let id_i = u64::try_from(i).unwrap_or(0).saturating_add(1);
+                        let id_j = u64::try_from(j).unwrap_or(0).saturating_add(1);
+                        let (ok_i, _) = state.is_lsn_acceptable_for_election(id_i);
+                        let (ok_j, reason_j) = state.is_lsn_acceptable_for_election(id_j);
+                        prop_assert!(
+                            !ok_i || ok_j,
+                            "node {id_i} (lsn {lsn_i}) accepted but node {id_j} \
+                             (lsn {lsn_j}) rejected: {reason_j}"
+                        );
+                    }
+                }
+            }
+
+            /// Tri-state fail-safe: an unknown sync mode must never pick a
+            /// threshold looser than known-sync, and must never accept a
+            /// candidate that known-sync would reject. Known-async is the only
+            /// mode allowed to be looser.
+            #[test]
+            fn prop_unknown_sync_mode_never_looser_than_sync(
+                rows in lsn_rows(),
+                candidate_lsn in 0u64..500_000_000u64,
+            ) {
+                let now = now_secs();
+                let build = |sync: Option<bool>| {
+                    let mut state = state_from(&rows, sync);
+                    state.node_lsns.insert(CANDIDATE, (candidate_lsn, now));
+                    state
+                };
+                let unknown = build(None);
+                let known_sync = build(Some(true));
+                let known_async = build(Some(false));
+
+                prop_assert_eq!(
+                    unknown.lsn_catchup_threshold_bytes(),
+                    known_sync.lsn_catchup_threshold_bytes(),
+                    "unknown sync mode must use the tight (sync) threshold"
+                );
+                prop_assert!(
+                    known_sync.lsn_catchup_threshold_bytes()
+                        <= known_async.lsn_catchup_threshold_bytes(),
+                    "sync threshold must not exceed the async threshold"
+                );
+
+                let (unknown_ok, unknown_reason) =
+                    unknown.is_lsn_acceptable_for_election(CANDIDATE);
+                let (sync_ok, _) = known_sync.is_lsn_acceptable_for_election(CANDIDATE);
+                prop_assert!(
+                    !unknown_ok || sync_ok,
+                    "unknown mode accepted what sync mode rejects: {unknown_reason}"
+                );
+            }
+
+            /// The documented boundary rule is inclusive: a candidate exactly
+            /// `threshold` bytes behind the fresh cluster max is accepted
+            /// (`>` not `>=`), one byte further is rejected. Holds for every
+            /// sync mode, i.e. for both threshold values.
+            #[test]
+            fn prop_threshold_boundary_is_inclusive(
+                peers_max in 20_000_000u64..1_000_000_000u64,
+                sync in sync_mode(),
+            ) {
+                let now = now_secs();
+                let mut state = ClusterState::new();
+                state.sync_replication_active = sync;
+                state.node_lsns.insert(PEER, (peers_max, now));
+                let threshold = state.lsn_catchup_threshold_bytes();
+
+                state
+                    .node_lsns
+                    .insert(CANDIDATE, (peers_max - threshold, now));
+                let (at_ok, at_reason) = state.is_lsn_acceptable_for_election(CANDIDATE);
+                prop_assert!(at_ok, "exactly at threshold must be accepted: {at_reason}");
+
+                state
+                    .node_lsns
+                    .insert(CANDIDATE, (peers_max - threshold - 1, now));
+                let (over_ok, _) = state.is_lsn_acceptable_for_election(CANDIDATE);
+                prop_assert!(!over_ok, "one byte beyond threshold must be rejected");
+            }
+
+            /// Staleness filtering can only ever remove entries: `fresh_max_lsn`
+            /// equals the max over fresh entries and never exceeds the max over
+            /// all stored entries, so a dropped peer cannot inflate the bar a
+            /// candidate must clear.
+            #[test]
+            fn prop_fresh_max_lsn_matches_fresh_entries(rows in lsn_rows()) {
+                let state = state_from(&rows, None);
+                let all_max = rows.iter().map(|&(_, lsn, _)| lsn).max().unwrap_or(0);
+
+                prop_assert_eq!(state.fresh_max_lsn(), oracle_fresh_max(&rows));
+                prop_assert!(state.fresh_max_lsn() <= all_max);
+            }
+
+            /// A future-skewed timestamp is clamped to age 0, not treated as an
+            /// arbitrarily large freshness credit: the result is identical to
+            /// the same entry stamped `now`, and still bounded by a real stored
+            /// LSN.
+            #[test]
+            fn prop_future_skew_clamps_rather_than_inflates(rows in lsn_rows()) {
+                let clamped: Vec<LsnRow> = rows
+                    .iter()
+                    .map(|&(id, lsn, age)| (id, lsn, age.max(0)))
+                    .collect();
+
+                let skewed_state = state_from(&rows, None);
+                let clamped_state = state_from(&clamped, None);
+
+                prop_assert_eq!(skewed_state.fresh_max_lsn(), clamped_state.fresh_max_lsn());
+                let all_max = rows.iter().map(|&(_, lsn, _)| lsn).max().unwrap_or(0);
+                prop_assert!(skewed_state.fresh_max_lsn() <= all_max);
+            }
+
+            /// Cross-check on the fresh-max computation duplicated between
+            /// `fresh_max_lsn` and `evaluate_lsn_acceptable`: a candidate
+            /// sitting exactly at `fresh_max_lsn()` with a fresh heartbeat has
+            /// zero lag and must pass both gates. A disagreement between the
+            /// two derivations shows up here as a rejection.
+            #[test]
+            fn prop_candidate_at_fresh_max_is_accepted(
+                rows in lsn_rows(),
+                sync in sync_mode(),
+            ) {
+                let now = now_secs();
+                let mut state = state_from(&rows, sync);
+                let max = state.fresh_max_lsn();
+                state.node_lsns.insert(CANDIDATE, (max, now));
+
+                let (election_ok, election_reason) =
+                    state.is_lsn_acceptable_for_election(CANDIDATE);
+                let (promotion_ok, promotion_reason) =
+                    state.is_lsn_acceptable_for_promotion(CANDIDATE);
+                prop_assert!(election_ok, "candidate at fresh max rejected: {election_reason}");
+                prop_assert!(promotion_ok, "candidate at fresh max rejected: {promotion_reason}");
+            }
+
+            /// The promotion gate is documented as the strictly stronger
+            /// sibling of the election gate (it additionally fails closed on a
+            /// candidate with no fresh report), so anything it accepts the
+            /// election gate must accept too.
+            #[test]
+            fn prop_promotion_gate_never_looser_than_election(
+                rows in lsn_rows(),
+                sync in sync_mode(),
+                candidate in 1u64..=10u64,
+            ) {
+                let state = state_from(&rows, sync);
+                let (promotion_ok, _) = state.is_lsn_acceptable_for_promotion(candidate);
+                let (election_ok, election_reason) =
+                    state.is_lsn_acceptable_for_election(candidate);
+                prop_assert!(
+                    !promotion_ok || election_ok,
+                    "promotion accepted node {candidate} but election rejected it: \
+                     {election_reason}"
+                );
+            }
+
+            /// `parse_lsn` round-trips PostgreSQL's `upper/lower` hex encoding
+            /// for every 64-bit position, and never panics on arbitrary input.
+            #[test]
+            fn prop_parse_lsn_round_trips(lsn: u64) {
+                let rendered = format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF);
+                prop_assert_eq!(parse_lsn(&rendered), Some(lsn));
+            }
+
+            #[test]
+            fn prop_parse_lsn_never_panics(s in ".*") {
+                let _ = parse_lsn(&s);
+            }
+        }
     }
 
     #[test]

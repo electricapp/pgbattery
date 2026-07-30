@@ -645,7 +645,8 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
-        reason = "test assertions on fixtures; unwrap/expect pinpoint the failing case"
+        clippy::panic,
+        reason = "test assertions on fixtures; unwrap/expect/panic pinpoint the failing case"
     )]
 
     use super::*;
@@ -739,13 +740,17 @@ mod tests {
     // ── Fixture-backed end-to-end parse/identity tests ──
     //
     // These exercise the cert-parsing + identity/issuer logic against a real
-    // Fulcio-shaped certificate (URI SAN + OIDC-issuer extension) generated at
-    // build time under `tests/fixtures/cosign/`. The chain check is covered by
-    // a self-issued root in the same fixture set; see `verify_blob_with_roots`
-    // integration in tests/ when fixtures are present.
+    // Fulcio-shaped certificate (URI SAN + OIDC-issuer extension) checked into
+    // git under `tests/fixtures/cosign/`. The chain check is covered by a
+    // self-issued root in the same fixture set.
     //
-    // Fixtures are optional: when absent (e.g. a minimal checkout), these tests
-    // skip rather than fail, so `cargo test` stays green without network/openssl.
+    // Fixtures are REQUIRED: a missing fixture panics the test instead of
+    // skipping it. These tests are the only evidence that signature, chain,
+    // identity, and Rekor-inclusion verification actually reject bad inputs —
+    // a silent skip is indistinguishable from a pass, so losing the fixture
+    // directory would disable the whole upgrade-verification test wall without
+    // failing CI. The single exception is `release.bundle` (see
+    // `optional_fixture`), which cannot exist in the repo.
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -753,45 +758,67 @@ mod tests {
             .join(name)
     }
 
-    fn fixture(name: &str) -> Option<String> {
-        std::fs::read_to_string(fixture_path(name)).ok()
+    fn fixture(name: &str) -> String {
+        let path = fixture_path(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "required cosign fixture {} is missing or unreadable ({e}); the fixtures are \
+                 checked into git — restore them or regenerate per tests/fixtures/cosign/README.md",
+                path.display()
+            )
+        })
     }
 
-    fn fixture_bytes(name: &str) -> Option<Vec<u8>> {
-        std::fs::read(fixture_path(name)).ok()
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        let path = fixture_path(name);
+        std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "required cosign fixture {} is missing or unreadable ({e}); the fixtures are \
+                 checked into git — restore them or regenerate per tests/fixtures/cosign/README.md",
+                path.display()
+            )
+        })
+    }
+
+    /// Read a fixture that is legitimately absent from the repository.
+    ///
+    /// ONLY for artifacts that cannot be checked in: `release.bundle` carries a
+    /// Rekor SET signed by Rekor's private key, so it can only be captured from
+    /// a genuine signing run (see `tests/fixtures/cosign/README.md`). Every
+    /// checked-in fixture must go through [`fixture`]/[`fixture_bytes`], which
+    /// hard-fail on absence.
+    fn optional_fixture(name: &str) -> Option<String> {
+        std::fs::read_to_string(fixture_path(name)).ok()
     }
 
     /// The fixture's self-signed CA, used in place of the real Fulcio roots so
     /// the chain check runs offline. Loads `root.pem` into a DER trust anchor.
-    fn fixture_roots() -> Option<Vec<pki_types::CertificateDer<'static>>> {
-        let pem = fixture("root.pem")?;
+    fn fixture_roots() -> Vec<pki_types::CertificateDer<'static>> {
+        let pem = fixture("root.pem");
         let cert = X509Certificate::from_pem(pem.as_bytes()).expect("root.pem parses");
         let der = cert.to_der().expect("root re-encodes");
-        Some(vec![pki_types::CertificateDer::from(der)])
+        vec![pki_types::CertificateDer::from(der)]
     }
 
-    /// Load the full fixture set (blob, signature, leaf cert, roots). Returns
-    /// `None` (test skips) if any piece is missing.
-    fn full_fixture() -> Option<(
+    /// Load the full fixture set (blob, signature, leaf cert, roots). Panics
+    /// with the missing piece's path if any is absent.
+    fn full_fixture() -> (
         Vec<u8>,
         String,
         String,
         Vec<pki_types::CertificateDer<'static>>,
-    )> {
-        Some((
-            fixture_bytes("blob.bin")?,
-            fixture("blob.sig")?,
-            fixture("leaf.pem")?,
-            fixture_roots()?,
-        ))
+    ) {
+        (
+            fixture_bytes("blob.bin"),
+            fixture("blob.sig"),
+            fixture("leaf.pem"),
+            fixture_roots(),
+        )
     }
 
     #[test]
     fn extracts_issuer_and_san_from_fixture_cert() {
-        let Some(pem) = fixture("leaf.pem") else {
-            eprintln!("skipping: tests/fixtures/cosign/leaf.pem not present");
-            return;
-        };
+        let pem = fixture("leaf.pem");
         let leaf = parse_leaf_pem(&pem).expect("fixture leaf parses");
         let issuer = extract_oidc_issuer(&leaf).expect("fixture has issuer ext");
         assert_eq!(issuer, "https://token.actions.githubusercontent.com");
@@ -804,10 +831,7 @@ mod tests {
 
     #[test]
     fn verifies_full_fixture_signature_chain_and_identity() {
-        let Some((blob, sig, cert, roots)) = full_fixture() else {
-            eprintln!("skipping: cosign fixtures not present");
-            return;
-        };
+        let (blob, sig, cert, roots) = full_fixture();
         let v = CosignVerifier::new(
             "https://token.actions.githubusercontent.com",
             DEFAULT_IDENTITY_REGEX,
@@ -819,9 +843,7 @@ mod tests {
 
     #[test]
     fn rejects_tampered_blob() {
-        let Some((mut blob, sig, cert, roots)) = full_fixture() else {
-            return;
-        };
+        let (mut blob, sig, cert, roots) = full_fixture();
         blob.push(b'!'); // flip the payload
         let v = CosignVerifier::new(
             "https://token.actions.githubusercontent.com",
@@ -836,9 +858,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_issuer() {
-        let Some((blob, sig, cert, roots)) = full_fixture() else {
-            return;
-        };
+        let (blob, sig, cert, roots) = full_fixture();
         let v = CosignVerifier::new("https://accounts.google.com", DEFAULT_IDENTITY_REGEX).unwrap();
         let err = v
             .verify_blob_with_roots(&blob, sig.trim(), &cert, &roots)
@@ -848,9 +868,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_identity() {
-        let Some((blob, sig, cert, roots)) = full_fixture() else {
-            return;
-        };
+        let (blob, sig, cert, roots) = full_fixture();
         let v = CosignVerifier::new(
             "https://token.actions.githubusercontent.com",
             r"^https://github\.com/someone/else/.*$",
@@ -865,9 +883,7 @@ mod tests {
     #[test]
     fn rejects_untrusted_root() {
         // Verify against an empty root set: the leaf cannot chain to Fulcio.
-        let Some((blob, sig, cert, _roots)) = full_fixture() else {
-            return;
-        };
+        let (blob, sig, cert, _roots) = full_fixture();
         let v = CosignVerifier::new(
             "https://token.actions.githubusercontent.com",
             DEFAULT_IDENTITY_REGEX,
@@ -904,9 +920,9 @@ mod tests {
     /// (`rekor_pub.pem` + `rekor_key_id.txt`). This is the *actual* Sigstore
     /// Rekor key used to sign the bundle fixture's SET, captured from upstream
     /// sigstore-rs test vectors so the SET check runs offline + deterministically.
-    fn fixture_rekor_keys() -> Option<BTreeMap<String, CosignVerificationKey>> {
-        let pem = fixture("rekor_pub.pem")?;
-        let key_id = fixture("rekor_key_id.txt")?.trim().to_string();
+    fn fixture_rekor_keys() -> BTreeMap<String, CosignVerificationKey> {
+        let pem = fixture("rekor_pub.pem");
+        let key_id = fixture("rekor_key_id.txt").trim().to_string();
         // try_from_pem mirrors how the trust root's DER key is parsed; from_pem
         // here matches the PEM fixture form.
         let key = CosignVerificationKey::from_pem(
@@ -914,7 +930,7 @@ mod tests {
             &sigstore::crypto::SigningScheme::default(),
         )
         .expect("rekor_pub.pem parses");
-        Some(BTreeMap::from([(key_id, key)]))
+        BTreeMap::from([(key_id, key)])
     }
 
     /// The Rekor inclusion check is REAL, not a no-op: a bundle whose SET
@@ -929,12 +945,8 @@ mod tests {
     /// chain to our fixture Fulcio root and signs a blob we do not ship).
     #[test]
     fn rekor_set_inclusion_is_actually_verified() {
-        let (Some(bundle_json), Some(good_keys)) =
-            (fixture("rekor_valid.bundle"), fixture_rekor_keys())
-        else {
-            eprintln!("skipping: rekor_valid.bundle / rekor_pub.pem not present");
-            return;
-        };
+        let bundle_json = fixture("rekor_valid.bundle");
+        let good_keys = fixture_rekor_keys();
 
         // Valid SET against the real Rekor key: new_verified succeeds and the
         // parsed bundle reports the expected log index.
@@ -956,7 +968,7 @@ mod tests {
             &sigstore::crypto::SigningScheme::default(),
         )
         .expect("wrong key parses");
-        let key_id = fixture("rekor_key_id.txt").unwrap().trim().to_string();
+        let key_id = fixture("rekor_key_id.txt").trim().to_string();
         let wrong_keys = BTreeMap::from([(key_id, wrong_key)]);
         assert!(
             SignedArtifactBundle::new_verified(bundle_json.trim(), &wrong_keys).is_err(),
@@ -968,9 +980,7 @@ mod tests {
     /// in the trust material (otherwise the SET could not be checked at all).
     #[test]
     fn verify_bundle_refuses_without_rekor_key() {
-        let Some(bundle_json) = fixture("rekor_valid.bundle") else {
-            return;
-        };
+        let bundle_json = fixture("rekor_valid.bundle");
         let v = CosignVerifier::new(
             "https://token.actions.githubusercontent.com",
             DEFAULT_IDENTITY_REGEX,
@@ -989,21 +999,20 @@ mod tests {
     /// Full offline bundle path against a *self-consistent* release-shaped
     /// fixture: `release.bundle` (a bundle whose cert is our fixture leaf and
     /// whose SET verifies against `rekor_pub.pem`), `blob.bin` it signs, our
-    /// fixture Fulcio root, and the real Rekor key. Skips if absent — a real
-    /// Rekor SET is signed by Rekor's private key and cannot be synthesised
-    /// offline, so this fixture must be captured from a genuine signing run.
-    /// See `tests/fixtures/cosign/README` for how to (re)generate it.
+    /// fixture Fulcio root, and the real Rekor key. Skips if `release.bundle`
+    /// is absent — a real Rekor SET is signed by Rekor's private key and cannot
+    /// be synthesised offline, so that one fixture must be captured from a
+    /// genuine signing run (see `tests/fixtures/cosign/README`). The checked-in
+    /// pieces (`blob.bin`, roots, Rekor key) still hard-fail if missing.
     #[test]
     fn verifies_full_release_bundle_when_fixture_present() {
-        let (Some(blob), Some(bundle_json), Some(roots), Some(rekor_keys)) = (
-            fixture_bytes("blob.bin"),
-            fixture("release.bundle"),
-            fixture_roots(),
-            fixture_rekor_keys(),
-        ) else {
+        let Some(bundle_json) = optional_fixture("release.bundle") else {
             eprintln!("skipping: release.bundle e2e fixture not present (see fixtures README)");
             return;
         };
+        let blob = fixture_bytes("blob.bin");
+        let roots = fixture_roots();
+        let rekor_keys = fixture_rekor_keys();
         let v = CosignVerifier::new(
             "https://token.actions.githubusercontent.com",
             DEFAULT_IDENTITY_REGEX,
@@ -1025,10 +1034,7 @@ mod tests {
         use base64::engine::general_purpose::STANDARD;
         use sigstore::cosign::bundle::{Bundle, Payload};
 
-        let Some(leaf_pem) = fixture("leaf.pem") else {
-            eprintln!("skipping: tests/fixtures/cosign/leaf.pem not present");
-            return;
-        };
+        let leaf_pem = fixture("leaf.pem");
 
         let blob: &[u8] = b"the exact bytes this entry attests to";
         let sig = "c2lnbmF0dXJlLWJhc2U2NA=="; // arbitrary; binding only compares strings

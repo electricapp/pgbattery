@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --project testing python
 """Correctness Lite: history-based durability + split-brain checker for pgbattery.
 
-⚠ SCOPE — READ THIS FIRST ⚠
+SCOPE — READ THIS FIRST
 This is **NOT** Jepsen. It does not run a linearizability checker, does not
 generate a concurrent operation DAG, and does not detect transactional
 anomalies (read-skew, write-skew, lost-update, phantom-read). It is a
@@ -16,9 +16,11 @@ What this file DOES verify:
 - Writes during quorum-loss windows are properly fenced (no ghost writes — I5).
 - No two nodes claim leadership in the same 0.5 s poll round (no split-brain — I4).
 - A bank-transfer workload conserves total balance (B1/B2 — single-object
-  multi-write consistency under failover).
-- Optional: concurrent same-row hammer (3 writers contending on 3 keys with
-  CAS-style UPDATE … WHERE; verifies "no lost update" — C1).
+  multi-write consistency under failover) and applies every uniquely-identified
+  transfer at most once, exactly once if acked (B3/B4).
+- Optional: concurrent same-row hammer (3 writers contending on 3 keys with a
+  blind read-modify-write `UPDATE counters SET val = val + 1 WHERE id = k`,
+  which PostgreSQL serialises per row; verifies "no lost update" — C1).
 - Optional: monotonic-read session test (a value visible from a session must
   not regress after failover on that same logical session — M1).
 
@@ -30,9 +32,17 @@ What this file does NOT verify:
 
 Every write attempt is logged with monotonic timestamps.  A background thread
 continuously samples leader status across all three nodes in parallel.  Fault
-windows are recorded precisely (open/close).  After the fault schedule, seven
-invariants are checked against the *complete* operation history — not just a
-single point-in-time snapshot.
+windows are recorded precisely (open/close).  After the fault schedule the
+invariants below are checked against the *complete* operation history — not
+just a single point-in-time snapshot.
+
+Outcome taxonomy (`classify_attempt`) is the foundation everything else rests
+on.  "acked" requires psql exit status 0 and nothing else; a *recognised*
+definite refusal is "rejected"; anything else — including an error string we
+have never seen before — is "indeterminate".  Falling back to "rejected" for an
+unrecognised error would let a write that really did commit be counted as a
+definite non-commit, which turns I2 / C1 / B3 into false-positive generators.
+Indeterminate merely widens the permitted bound, so unknown always maps there.
 
 ════════════════════════════════════════════════════════════════════════════════
 LAYER 1 — POLLING-BASED INVARIANTS  I1-I7  (all FATAL)
@@ -62,6 +72,12 @@ I5  NO_ACKS_DURING_QUORUM_LOSS
     No write whose entire lifespan [start_ts, end_ts] is strictly inside a
     recorded quorum-loss fault window was acked.
     Violation = lease-fencing mechanism failed to block writes under majority loss.
+    This is the exact letter of contract L2 in docs/CONTRACTS.md, so strict
+    containment stays the FATAL case.  An acked write that *overlaps* a window
+    but crosses one of its boundaries cannot be judged against L2 — our fault
+    open/close timestamps are wall-clock-adjacent to the real outage, not
+    identical to it — so those are reported separately as I5-WARN observations
+    rather than dropped on the floor.
 
 I6  INTERMEDIATE_READ_CONSISTENCY
     Each post-recovery snapshot must contain every value that was in acked_set
@@ -76,14 +92,20 @@ I7  CAUSAL_MONOTONICITY
     strictly later write that had not yet started survived.
 
 ════════════════════════════════════════════════════════════════════════════════
-
-Exit codes:
-    0 — all invariants hold (PASS)
-════════════════════════════════════════════════════════════════════════════════
-LAYER 2 — LOG GREP CHECKS  L2-L3  (all FATAL, defense in depth)
+LAYER 2 — LOG GREP CHECKS  L0, L2-L3  (FATAL, defense in depth)
 Checked against the collected container log file after the fault schedule.
-Simple substring presence — no regex parsing, no format fragility.
+Simple substring presence — no regex parsing, no format fragility.  Every
+substring below is emitted verbatim by the Rust source (`src/app.rs`);
+`testing/test_correctness_lite_invariants.py` greps the tree to prove they
+still exist, so a reworded log line breaks the unit test instead of silently
+turning a grep into a no-op.
 ════════════════════════════════════════════════════════════════════════════════
+
+L0  LOG_CORPUS_VALID
+    The collected log must be readable and must contain at least one known
+    pgbattery startup marker.  L2/L3 are absence/conditional greps: over a
+    missing, empty, or non-pgbattery log they match nothing and would read as
+    a pass.  L0 makes that vacuity a loud FATAL instead.
 
 L2  NO_EXPLICIT_SPLIT_BRAIN_SIGNALS
     Zero occurrences of "potential split-brain", "FAILED TO FENCE", or
@@ -97,8 +119,33 @@ L3  FENCE_CONFIRMED_AFTER_EMERGENCY
     "PostgreSQL fenced (read-only)" line must also exist.
     A fence that fires without a subsequent confirmation means writes may
     have been accepted on a node that had already lost quorum.
+    If a quorum-loss window was injected but the log carries no fence trace at
+    all, L3 had nothing to check: reported as an L3-WARN observation, because
+    the lease may legitimately have been surrendered through the ordinary
+    step-down path instead of the emergency fence.
 
 ════════════════════════════════════════════════════════════════════════════════
+LAYER 3 — WORKLOAD INVARIANTS  B1-B4, C1, M1  (all FATAL)
+Checked against the workload tables plus the in-memory attempt records.
+════════════════════════════════════════════════════════════════════════════════
+
+B1  BANK_TOTAL_CONSERVED           SUM(balance) == BANK_TOTAL.
+B2  NO_NEGATIVE_BALANCE            MIN(balance) >= 0.
+B3  TRANSFER_APPLIED_AT_MOST_ONCE  Every attempted transfer id appears at most
+                                   once in the ledger, exactly once if acked,
+                                   and never if definitely rejected.
+B4  BANK_LEDGER_RECONCILED         Every balance equals the initial balance
+                                   plus the credits minus the debits recorded
+                                   in the ledger.  B1 is algebraically blind to
+                                   double application (applying a transfer
+                                   twice still conserves the sum); B4 is not.
+C1  NO_LOST_UPDATE                 acked <= db_val <= acked + indeterminate.
+M1  NO_READ_REGRESSION             observed MAX(val) never decreases.
+
+════════════════════════════════════════════════════════════════════════════════
+
+Findings are either FATAL (an invariant violation, drives the exit code) or
+WARN (a labelled observation that is reported but does not fail the run).
 
 Exit codes:
     0 — all invariants hold (PASS)
@@ -110,6 +157,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import random
 import subprocess
 import threading
@@ -153,6 +201,9 @@ PSQL_TIMEOUT: Final[int] = 5
 LEADER_POLL_INTERVAL: Final[float] = 0.5
 """Seconds between background leader-poll rounds."""
 
+BANK_LEDGER_TABLE: Final[str] = "bank_ledger"
+"""Table recording one row per *applied* transfer, keyed by transfer id."""
+
 REJECTION_PATTERNS: Final[list[str]] = [
     "read-only",
     "cannot execute",
@@ -160,7 +211,25 @@ REJECTION_PATTERNS: Final[list[str]] = [
     "not accept",
     "read_only",
 ]
-"""Output substrings that indicate a clear, unambiguous write rejection."""
+"""Substrings proving the write never reached a committing backend.
+
+These are routing-level refusals: the node we hit is a standby, is fenced, or
+is not listening at all. Nothing was committed, and *another* gateway port may
+still be able to serve the write, so the caller may move on to the next port.
+"""
+
+SERVER_REJECTION_PATTERNS: Final[list[str]] = [
+    "violates check constraint",
+    "violates unique constraint",
+    "duplicate key value",
+    "current transaction is aborted",
+    "syntax error at or near",
+]
+"""Substrings proving the server parsed the statement and aborted the transaction.
+
+Also a definite non-commit, but unlike REJECTION_PATTERNS it is a semantic
+refusal: every other port would answer identically, so retrying is pointless.
+"""
 
 INDETERMINATE_PATTERNS: Final[list[str]] = [
     "connection",
@@ -169,8 +238,113 @@ INDETERMINATE_PATTERNS: Final[list[str]] = [
     "reset by peer",
     "broken pipe",
     "unexpected eof",
+    "eof detected",
+    "ssl syscall error",
+    "could not receive data",
+    "terminating connection",
+    "no connection to the server",
 ]
-"""Output substrings that indicate the write fate is unknown."""
+"""Output substrings that indicate the write fate is unknown.
+
+Every entry here describes a connection that died at an unknown point in the
+protocol: an in-flight COMMIT may or may not have been made durable. This list
+is documentation of the *recognised* unknown-fate errors, not a gate — an
+unrecognised error is also treated as indeterminate (see `classify_attempt`),
+it is merely reported with reason "unclassified" so taxonomy gaps stay visible.
+"""
+
+LOG_LIVENESS_MARKERS: Final[tuple[str, ...]] = (
+    "Starting pgbattery in DATA mode",
+    "pgbattery DATA node is running (lease fencing enabled)",
+    "Opened Raft storage",
+    "This node is now the leader",
+)
+"""Log lines proving the collected corpus really contains pgbattery output."""
+
+LOG_SPLIT_BRAIN_SIGNALS: Final[tuple[str, ...]] = (
+    "potential split-brain",
+    "FAILED TO FENCE",
+    "Promotion safety check failed",
+)
+"""Self-reported unsafe-state markers; any occurrence is an L2 violation."""
+
+LOG_FENCE_MARKERS: Final[tuple[str, ...]] = (
+    "EMERGENCY FENCE",
+    "Lease expired",
+)
+"""Markers proving the emergency-fence path was reached at least once."""
+
+LOG_FENCE_CONFIRMED: Final[str] = "PostgreSQL fenced (read-only)"
+"""Confirmation that a fired fence actually made PostgreSQL read-only."""
+
+ATTEMPT_ACKED: Final[str] = "acked"
+"""psql exited 0: the write is committed and durable from the client's view."""
+
+ATTEMPT_ROUTING_REJECTED: Final[str] = "routing_rejected"
+"""Definite non-commit at this port; another port may still accept the write."""
+
+ATTEMPT_REJECTED: Final[str] = "rejected"
+"""Definite non-commit, refused by the server itself; retrying cannot help."""
+
+ATTEMPT_INDETERMINATE: Final[str] = "indeterminate"
+"""Fate unknown: the write may or may not have committed. Never retry these."""
+
+SEVERITY_FATAL: Final[str] = "FATAL"
+"""Finding that violates an invariant and fails the run."""
+
+SEVERITY_WARN: Final[str] = "WARN"
+"""Labelled observation: reported in full, but does not fail the run."""
+
+ACK_CONTAINED: Final[str] = "contained"
+"""Acked write whose whole lifespan lies inside a quorum-loss window."""
+
+ACK_STRADDLING: Final[str] = "straddling"
+"""Acked write overlapping a quorum-loss window but crossing a boundary."""
+
+ACK_OUTSIDE: Final[str] = "outside"
+"""Acked write with no overlap against any quorum-loss window."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outcome taxonomy
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class AttemptClass:
+    """Classification of one psql attempt, with the evidence that produced it."""
+
+    outcome: str  # ATTEMPT_* constant
+    reason: str  # matched pattern, "exit-0", or "unclassified"
+
+
+def classify_attempt(returncode: int, output: str) -> AttemptClass:
+    """Classify a psql invocation from its exit status and combined output.
+
+    Order matters. "acked" is granted only on exit status 0. A recognised
+    server-side abort or routing refusal is a *definite* non-commit. Everything
+    else — including an error nobody has catalogued yet — is indeterminate,
+    because the sound failure direction is to widen the permitted bound rather
+    than to assert a non-commit we cannot prove.
+
+    *output* must include stderr: `run_cmd` reports its own timeout as
+    ``(-1, "", "timeout")``, so a caller that inspects stdout alone sees an
+    empty string and would classify a timed-out COMMIT as unclassified.
+    """
+    if returncode == 0:
+        return AttemptClass(ATTEMPT_ACKED, "exit-0")
+    lower = output.lower()
+    for pattern in SERVER_REJECTION_PATTERNS:
+        if pattern in lower:
+            return AttemptClass(ATTEMPT_REJECTED, pattern)
+    for pattern in REJECTION_PATTERNS:
+        if pattern in lower:
+            return AttemptClass(ATTEMPT_ROUTING_REJECTED, pattern)
+    for pattern in INDETERMINATE_PATTERNS:
+        if pattern in lower:
+            return AttemptClass(ATTEMPT_INDETERMINATE, pattern)
+    return AttemptClass(ATTEMPT_INDETERMINATE, "unclassified")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # History data model
@@ -234,12 +408,48 @@ class SnapshotRecord:
 
 
 @dataclass
-class Violation:
-    """A confirmed invariant violation."""
+class TransferRecord:
+    """A single bank-transfer attempt, identified by a unique transfer id.
 
-    invariant: str  # "I1"-"I7" (polling) or "L2"-"L3" (log grep)
+    The id is what makes double application detectable: the transfer writes its
+    own id into `bank_ledger` inside the same transaction that moves the money,
+    so the checker can count applications instead of only conserving a sum.
+    """
+
+    transfer_id: int
+    from_id: int
+    to_id: int
+    amount: int
+    start_ts: float  # time.monotonic() when the attempt started
+    end_ts: float  # time.monotonic() when the attempt completed
+    outcome: str  # "acked" | "rejected" | "indeterminate"
+    port: int  # gateway port that produced this outcome
+    reason: str = ""  # AttemptClass.reason that produced the outcome
+
+
+@dataclass(frozen=True)
+class LedgerRow:
+    """One applied transfer as read back from the `bank_ledger` table."""
+
+    transfer_id: int
+    from_id: int
+    to_id: int
+    amount: int
+
+
+@dataclass
+class Violation:
+    """A finding produced by the checker.
+
+    FATAL findings are invariant violations and drive the exit code. WARN
+    findings are labelled observations: surfaced in the summary, the detail
+    section and the artifact, but they do not fail the run.
+    """
+
+    invariant: str  # "I1"-"I7", "L0"/"L2"/"L3", "B1"-"B4", "C1", "M1", or an "-WARN" variant
     message: str
     evidence: object = None  # supporting detail (sorted lists, counts, etc.)
+    severity: str = SEVERITY_FATAL
 
 
 @dataclass
@@ -250,10 +460,19 @@ class History:
     faults: list[FaultWindow] = field(default_factory=list)
     leader_polls: list[LeaderPollRound] = field(default_factory=list)
     snapshots: list[SnapshotRecord] = field(default_factory=list)
+    transfers: list[TransferRecord] = field(default_factory=list)
 
     acked_set: set[int] = field(default_factory=set)
     errored_set: set[int] = field(default_factory=set)
     indeterminate_set: set[int] = field(default_factory=set)
+
+    unclassified_attempts: int = 0
+    """Insert / transfer attempts whose error matched no known pattern.
+
+    A non-zero count is not a violation — those attempts were counted as
+    indeterminate, which is sound — but it means the outcome taxonomy has a gap
+    worth a new entry in INDETERMINATE_PATTERNS or SERVER_REJECTION_PATTERNS.
+    """
 
     _counter: int = field(default=0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -272,6 +491,14 @@ class History:
                 self.errored_set.add(op.value)
             else:
                 self.indeterminate_set.add(op.value)
+
+    def record_transfer(self, transfer: TransferRecord) -> None:
+        with self._lock:
+            self.transfers.append(transfer)
+
+    def note_unclassified(self) -> None:
+        with self._lock:
+            self.unclassified_attempts += 1
 
     def record_poll(self, round_: LeaderPollRound) -> None:
         with self._lock:
@@ -293,6 +520,17 @@ class History:
     @property
     def total_attempted(self) -> int:
         return self._counter
+
+
+_LAST_HISTORY: History | None = None
+"""The History built by the current `run()`.
+
+The post-recovery checkers (`check_bank_invariants`, `check_contention_invariant`,
+`check_monotonic_read_invariant`) read the in-memory attempt records from here so
+they can keep the same no-argument shape as the DB-reading helpers around them.
+The pure comparison functions they delegate to take their inputs explicitly and
+are unit-tested without a cluster.
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,6 +614,38 @@ def docker_compose(*args: str) -> tuple[int, str, str]:
     return run_cmd("docker compose " + " ".join(args), timeout=60)
 
 
+def compose_project() -> str:
+    """Active compose project name.
+
+    ``docker-compose.yml`` sets ``name: pgbattery``, but ``COMPOSE_PROJECT_NAME``
+    overrides it and every CI workflow sets a per-run value. Literal
+    ``pgbattery-node1-1`` / ``pgbattery_raft_net`` names therefore do not exist
+    in CI, which silently turned the partition fault into a no-op.
+    """
+    return os.environ.get("COMPOSE_PROJECT_NAME", "pgbattery")
+
+
+def container_name(service: str) -> str:
+    """Resolve a compose service to its container name.
+
+    Asks docker rather than string-building, so a change to compose's naming
+    convention cannot silently reintroduce an unresolvable name.
+    """
+    rc, out, err = docker_compose("ps", "-q", service)
+    cid = out.strip().split("\n")[-1].strip() if rc == 0 else ""
+    if not cid:
+        raise RuntimeError(
+            f"cannot resolve container for service {service!r} in project "
+            f"{compose_project()!r}: {err.strip() or 'no container id'}"
+        )
+    return cid
+
+
+def raft_network_name() -> str:
+    """Resolve the cluster network name for the active project."""
+    return f"{compose_project()}_raft_net"
+
+
 def find_leader() -> tuple[str | None, int | None]:
     """Return (node_name, gateway_port) for the current leader, or (None, None)."""
     for port in MGMT_PORTS:
@@ -423,13 +693,24 @@ def wait_cluster_healthy(timeout: int = 60) -> bool:
 def try_insert(value: int, history: History) -> str:
     """Attempt INSERT of *value*, classify the outcome, and record to history.
 
-    Tries each gateway port in order.  Returns "acked", "errored", or
-    "indeterminate" — and appends an OpRecord with monotonic timestamps.
+    Moves on to the next gateway port only while the outcome is a *definite*
+    non-commit at that port.  An indeterminate outcome ends the attempt
+    immediately: the INSERT may already be durable, so re-issuing it would make
+    the recorded history a lie about what was attempted once.
+
+    Returns "acked", "errored", or "indeterminate" — and appends exactly one
+    OpRecord with monotonic timestamps.
     """
     seq = history.next_seq()
     start_ts = time.monotonic()
     wall_start = time.time()
     sql = f"INSERT INTO jepsen(id) VALUES ({value})"
+
+    def record(outcome: str, port: int) -> str:
+        history.record_op(
+            OpRecord(seq, value, start_ts, time.monotonic(), wall_start, outcome, port)
+        )
+        return outcome
 
     last_port = GATEWAY_PORTS[-1]
     for port in GATEWAY_PORTS:
@@ -443,29 +724,19 @@ def try_insert(value: int, history: History) -> str:
                 text=True,
                 timeout=PSQL_TIMEOUT,
             )
-            output = r.stdout + r.stderr
-            lower = output.lower()
-            if r.returncode == 0:
-                op = OpRecord(seq, value, start_ts, time.monotonic(), wall_start, "acked", port)
-                history.record_op(op)
-                return "acked"
-            if any(s in lower for s in REJECTION_PATTERNS):
-                continue  # try next port
-            if any(s in lower for s in INDETERMINATE_PATTERNS):
-                op = OpRecord(
-                    seq, value, start_ts, time.monotonic(), wall_start, "indeterminate", port
-                )
-                history.record_op(op)
-                return "indeterminate"
-            continue
         except subprocess.TimeoutExpired:
-            op = OpRecord(seq, value, start_ts, time.monotonic(), wall_start, "indeterminate", port)
-            history.record_op(op)
-            return "indeterminate"
+            return record("indeterminate", port)
+        cls = classify_attempt(r.returncode, r.stdout + r.stderr)
+        if cls.reason == "unclassified":
+            history.note_unclassified()
+        if cls.outcome == ATTEMPT_ACKED:
+            return record("acked", port)
+        if cls.outcome == ATTEMPT_INDETERMINATE:
+            return record("indeterminate", port)
+        if cls.outcome == ATTEMPT_REJECTED:
+            return record("errored", port)  # the server itself refused; no port will differ
 
-    op = OpRecord(seq, value, start_ts, time.monotonic(), wall_start, "errored", last_port)
-    history.record_op(op)
-    return "errored"
+    return record("errored", last_port)
 
 
 def do_inserts(n: int, history: History, console: Console) -> None:
@@ -535,70 +806,256 @@ def take_snapshot(history: History, after_fault: str, console: Console) -> None:
         )
 
 
-def bank_transfer(from_id: int, to_id: int, amount: int) -> bool:
-    """Attempt a bank transfer. Returns True if committed, False otherwise.
+def bank_transfer(transfer_id: int, from_id: int, to_id: int, amount: int) -> TransferRecord:
+    """Attempt one uniquely-identified bank transfer; return what happened.
 
-    Uses CHECK (balance >= 0) enforcement on the server side so a
-    transfer that would overdraw is automatically rolled back.
+    The transaction stamps *transfer_id* into `bank_ledger` alongside the two
+    balance updates, so a transfer that gets applied twice is visible to B3/B4
+    instead of hiding behind B1's sum conservation. The ledger primary key also
+    makes the transfer idempotent on the server side.
+
+    Retry discipline: another gateway port is tried only after a *definite*
+    non-commit that a different port might route past. A timeout — or any other
+    unknown-fate error — returns "indeterminate" without re-running anything: a
+    COMMIT that timed out may already be durable, and re-issuing it is exactly
+    how a checker ends up double-applying a transfer it believes it applied once.
+
+    Server-side CHECK (balance >= 0) enforcement rolls back an overdrawing
+    transfer, which classifies as a definite rejection.
     """
     sql = (
         f"BEGIN; "
+        f"INSERT INTO {BANK_LEDGER_TABLE}(transfer_id, from_id, to_id, amount) "
+        f"VALUES ({transfer_id}, {from_id}, {to_id}, {amount}); "
         f"UPDATE bank_accounts SET balance = balance - {amount} WHERE id = {from_id}; "
         f"UPDATE bank_accounts SET balance = balance + {amount} WHERE id = {to_id}; "
         f"COMMIT;"
     )
+    start_ts = time.monotonic()
+
+    def record(outcome: str, port: int, reason: str) -> TransferRecord:
+        return TransferRecord(
+            transfer_id=transfer_id,
+            from_id=from_id,
+            to_id=to_id,
+            amount=amount,
+            start_ts=start_ts,
+            end_ts=time.monotonic(),
+            outcome=outcome,
+            port=port,
+            reason=reason,
+        )
+
+    last_port = GATEWAY_PORTS[-1]
+    last_reason = "no-attempt"
     for port in GATEWAY_PORTS:
-        rc, out, _ = run_cmd(
+        last_port = port
+        rc, out, err = run_cmd(
             f'psql -h localhost -p {port} -U postgres -v ON_ERROR_STOP=1 -c "{sql}" 2>&1',
             timeout=PSQL_TIMEOUT,
         )
+        # stderr matters: run_cmd reports its own timeout as (-1, "", "timeout"),
+        # and an empty stdout matches no pattern at all.
+        cls = classify_attempt(rc, out + err)
+        last_reason = cls.reason
+        if cls.outcome == ATTEMPT_ACKED:
+            return record("acked", port, cls.reason)
+        if cls.outcome == ATTEMPT_INDETERMINATE:
+            return record("indeterminate", port, cls.reason)
+        if cls.outcome == ATTEMPT_REJECTED:
+            return record("rejected", port, cls.reason)
+    return record("rejected", last_port, last_reason)
+
+
+def read_bank_balances() -> dict[int, int] | None:
+    """Read every account balance via any available gateway port."""
+    for port in GATEWAY_PORTS:
+        rc, out, _ = run_cmd(
+            f"psql -h localhost -p {port} -U postgres -t -A "
+            f"-c 'SELECT id, balance FROM bank_accounts ORDER BY id'",
+            timeout=10,
+        )
+        if rc == 0 and out.strip():
+            balances: dict[int, int] = {}
+            for line in out.strip().splitlines():
+                parts = line.strip().split("|")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].lstrip("-").isdigit():
+                    balances[int(parts[0])] = int(parts[1])
+            if balances:
+                return balances
+    return None
+
+
+def read_bank_ledger() -> list[LedgerRow] | None:
+    """Read every applied transfer from `bank_ledger` via any gateway port."""
+    for port in GATEWAY_PORTS:
+        rc, out, _ = run_cmd(
+            f"psql -h localhost -p {port} -U postgres -t -A "
+            f"-c 'SELECT transfer_id, from_id, to_id, amount FROM {BANK_LEDGER_TABLE} "
+            f"ORDER BY transfer_id'",
+            timeout=10,
+        )
         if rc == 0:
-            return True
-        lower = out.lower()
-        if any(s in lower for s in REJECTION_PATTERNS):
-            continue  # try next port
-    return False
+            rows: list[LedgerRow] = []
+            for line in out.strip().splitlines():
+                parts = line.strip().split("|")
+                if len(parts) == 4 and all(p.strip().lstrip("-").isdigit() for p in parts):
+                    rows.append(
+                        LedgerRow(
+                            transfer_id=int(parts[0]),
+                            from_id=int(parts[1]),
+                            to_id=int(parts[2]),
+                            amount=int(parts[3]),
+                        )
+                    )
+            return rows
+    return None
 
 
 def check_bank_invariants() -> list[Violation]:
-    """B1-B2: conservation of total balance and no negative balances.
+    """B1-B4: read the bank tables, then compare them against the attempts."""
+    balances = read_bank_balances()
+    if balances is None:
+        return [Violation("B1", "Could not read bank_accounts after recovery", None)]
+    ledger = read_bank_ledger()
+    transfers = list(_LAST_HISTORY.transfers) if _LAST_HISTORY is not None else []
+    if ledger is None:
+        if not transfers:
+            # No transfer was ever attempted, so there is nothing the ledger
+            # could bound. B1/B2 still apply to whatever the accounts hold.
+            return _check_bank_against_db(balances, [], [])
+        return [
+            Violation(
+                "B3",
+                f"Could not read {BANK_LEDGER_TABLE} after recovery — "
+                f"{len(transfers)} transfer attempt(s) are unbounded",
+                {"attempted": len(transfers)},
+            )
+        ]
+    return _check_bank_against_db(balances, ledger, transfers)
+
+
+def _check_bank_against_db(
+    balances: dict[int, int],
+    ledger: list[LedgerRow],
+    transfers: list[TransferRecord],
+) -> list[Violation]:
+    """Compare the bank tables against the recorded transfer attempts.
 
     B1  BANK_TOTAL_CONSERVED
         SUM(balance) must equal BANK_TOTAL after all transfers.
     B2  NO_NEGATIVE_BALANCE
-        MIN(balance) must be >= 0 (enforced by DB CHECK constraint; a
+        MIN(balance) must be >= 0 (enforced by a DB CHECK constraint; a
         violation here means the constraint was bypassed somehow).
+    B3  TRANSFER_APPLIED_AT_MOST_ONCE
+        Each attempted transfer id appears at most once in the ledger, exactly
+        once if it was acked, and not at all if it was definitely rejected.
+        No ledger row may carry an id we never attempted.
+    B4  BANK_LEDGER_RECONCILED
+        Every balance equals its initial balance plus ledger credits minus
+        ledger debits. B1 cannot see a transfer applied twice — the sum is
+        still conserved — whereas the per-account reconciliation can.
     """
     violations: list[Violation] = []
-    for port in GATEWAY_PORTS:
-        rc, out, _ = run_cmd(
-            f"psql -h localhost -p {port} -U postgres -t -A "
-            f"-c 'SELECT SUM(balance), MIN(balance) FROM bank_accounts'",
-            timeout=10,
+
+    total = sum(balances.values())
+    if total != BANK_TOTAL:
+        violations.append(
+            Violation(
+                "B1",
+                f"Bank balance sum violated: expected {BANK_TOTAL}, got {total}",
+                {"expected": BANK_TOTAL, "actual": total, "accounts": len(balances)},
+            )
         )
-        if rc == 0 and out.strip():
-            parts = out.strip().split("|")
-            if len(parts) == 2:
-                total = int(parts[0])
-                minimum = int(parts[1])
-                if total != BANK_TOTAL:
-                    violations.append(
-                        Violation(
-                            "B1",
-                            f"Bank balance sum violated: expected {BANK_TOTAL}, got {total}",
-                            {"expected": BANK_TOTAL, "actual": total},
-                        )
-                    )
-                if minimum < 0:
-                    violations.append(
-                        Violation(
-                            "B2",
-                            f"Negative balance found (CHECK constraint bypassed): min={minimum}",
-                            {"min_balance": minimum},
-                        )
-                    )
-                return violations
-    violations.append(Violation("B1", "Could not read bank_accounts after recovery", None))
+    minimum = min(balances.values(), default=0)
+    if minimum < 0:
+        violations.append(
+            Violation(
+                "B2",
+                f"Negative balance found (CHECK constraint bypassed): min={minimum}",
+                {"min_balance": minimum},
+            )
+        )
+
+    if not transfers:
+        return violations  # the bank step recorded nothing; B3/B4 have no bound
+
+    applied_count: dict[int, int] = {}
+    for row in ledger:
+        applied_count[row.transfer_id] = applied_count.get(row.transfer_id, 0) + 1
+
+    attempted = {t.transfer_id: t for t in transfers}
+
+    duplicated = {tid: n for tid, n in applied_count.items() if n > 1}
+    if duplicated:
+        violations.append(
+            Violation(
+                "B3",
+                f"{len(duplicated)} transfer(s) applied more than once "
+                f"(ledger holds duplicate transfer ids)",
+                sorted(duplicated.items())[:10],
+            )
+        )
+
+    missing_acked = sorted(
+        tid for tid, t in attempted.items() if t.outcome == "acked" and tid not in applied_count
+    )
+    if missing_acked:
+        violations.append(
+            Violation(
+                "B3",
+                f"{len(missing_acked)} acked transfer(s) absent from the ledger (lost commit)",
+                missing_acked[:10],
+            )
+        )
+
+    applied_but_refused = sorted(
+        tid for tid in applied_count if tid in attempted and attempted[tid].outcome == "rejected"
+    )
+    if applied_but_refused:
+        violations.append(
+            Violation(
+                "B3",
+                f"{len(applied_but_refused)} definitely-rejected transfer(s) present "
+                f"in the ledger (phantom transfer)",
+                applied_but_refused[:10],
+            )
+        )
+
+    never_attempted = sorted(tid for tid in applied_count if tid not in attempted)
+    if never_attempted:
+        violations.append(
+            Violation(
+                "B3",
+                f"{len(never_attempted)} ledger transfer id(s) were never attempted",
+                never_attempted[:10],
+            )
+        )
+
+    # Reconcile against distinct ledger ids so B4 is an independent statement
+    # about the balances: duplicated ledger rows are B3's business.
+    distinct_rows = {row.transfer_id: row for row in ledger}
+    expected: dict[int, int] = dict.fromkeys(balances, BANK_INITIAL_BALANCE)
+    for row in distinct_rows.values():
+        if row.from_id in expected:
+            expected[row.from_id] -= row.amount
+        if row.to_id in expected:
+            expected[row.to_id] += row.amount
+    mismatched = [
+        (acct, expected[acct], balances[acct])
+        for acct in sorted(balances)
+        if expected[acct] != balances[acct]
+    ]
+    if mismatched:
+        violations.append(
+            Violation(
+                "B4",
+                f"{len(mismatched)} account balance(s) do not match the ledger "
+                f"(transfer applied a number of times the ledger does not record)",
+                [{"account": a, "expected": e, "observed": o} for a, e, o in mismatched[:10]],
+            )
+        )
+
     return violations
 
 
@@ -615,20 +1072,40 @@ def _kill_leader_now() -> str | None:
     return leader
 
 
+def _has_cluster_address(service: str) -> bool:
+    """Report whether ``service``'s container still holds a cluster-network IP."""
+    rc, out, _ = run_cmd(
+        f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}} "
+        f"{{{{end}}}}' {container_name(service)}",
+        timeout=10,
+    )
+    return rc == 0 and "172.28." in out
+
+
 def _partition_leader_now(heal_after: float = 4.0) -> str | None:
     leader, _ = find_leader()
     if leader is None:
         return None
     idx = NODES.index(leader) + 1
-    run_cmd(
-        f"docker network disconnect pgbattery_raft_net pgbattery-{leader}-1",
-        timeout=10,
-    )
+    net = raft_network_name()
+    cid = container_name(leader)
+    # Fail loudly: a disconnect that silently no-ops leaves an empty fault
+    # window, and an empty window reads as "no violations during the partition"
+    # rather than "the partition never happened".
+    rc, _, err = run_cmd(f"docker network disconnect {net} {cid}", timeout=10)
+    if rc != 0:
+        raise RuntimeError(
+            f"failed to partition {leader} from {net}: {err.strip() or f'exit {rc}'}"
+        )
+    if _has_cluster_address(leader):
+        raise RuntimeError(
+            f"partition of {leader} did not take effect: still holds a 172.28.x address"
+        )
 
     def _heal() -> None:
         time.sleep(heal_after)
         run_cmd(
-            f"docker network connect --ip 172.28.0.1{idx} pgbattery_raft_net pgbattery-{leader}-1",
+            f"docker network connect --ip 172.28.0.1{idx} {net} {cid}",
             timeout=10,
         )
 
@@ -852,23 +1329,31 @@ def step_bank_transfer(
     attack: str = "kill",
     num_transfers: int = 40,
 ) -> None:
-    """Step 8: bank transfer workload — total balance must be conserved (B1-B2).
+    """Step 8: bank transfer workload — B1-B4.
 
-    Creates BANK_ACCOUNTS accounts, runs `num_transfers` transfer attempts
-    while injecting the named `attack` mid-workload. The B1/B2 invariant
-    check (SUM(balances) and per-account >=0) runs after all steps in run().
+    Creates BANK_ACCOUNTS accounts plus the transfer ledger, then runs
+    `num_transfers` uniquely-identified transfer attempts while injecting the
+    named `attack` mid-workload. Every attempt is recorded on the history with
+    its outcome, so the post-recovery checks in run() can bound the ledger:
+    conservation (B1), non-negativity (B2), at-most-once application (B3) and
+    balance/ledger reconciliation (B4).
 
     `attack` is one of: kill, partition, freeze, transfer, cascade,
     quorum_loss, chaos_storm — see `_FAULT_DISPATCH`.
     """
     console.print(
-        f"[bold]Step 8:[/] bank transfer workload (attack={attack}, B1-B2 total must equal 10 000)"
+        f"[bold]Step 8:[/] bank transfer workload (attack={attack}, "
+        f"B1-B4, total must equal {BANK_TOTAL})"
     )
 
     setup_sql = (
         "DROP TABLE IF EXISTS bank_accounts; "
+        f"DROP TABLE IF EXISTS {BANK_LEDGER_TABLE}; "
         "CREATE TABLE bank_accounts "
         "(id INTEGER PRIMARY KEY, balance INTEGER NOT NULL CHECK (balance >= 0)); "
+        f"CREATE TABLE {BANK_LEDGER_TABLE} "
+        f"(transfer_id INTEGER PRIMARY KEY, from_id INTEGER NOT NULL, "
+        f"to_id INTEGER NOT NULL, amount INTEGER NOT NULL); "
         f"INSERT INTO bank_accounts "
         f"SELECT generate_series(1, {BANK_ACCOUNTS}), {BANK_INITIAL_BALANCE};"
     )
@@ -883,7 +1368,8 @@ def step_bank_transfer(
             break
     if not setup_ok:
         console.print(
-            "  [yellow]WARNING:[/] could not create bank_accounts - skipping bank workload"
+            f"  [yellow]WARNING:[/] could not create bank_accounts / {BANK_LEDGER_TABLE} "
+            f"- skipping bank workload"
         )
         return
 
@@ -895,7 +1381,7 @@ def step_bank_transfer(
     # before and during the fault.
     kickoff_at = max(2, num_transfers // 4)
     fw: FaultWindow | None = None
-    committed = 0
+    tally: dict[str, int] = {"acked": 0, "rejected": 0, "indeterminate": 0}
     fired_leader: str | None = None
     for i in range(num_transfers):
         if i == kickoff_at:
@@ -906,8 +1392,13 @@ def step_bank_transfer(
             fired_leader = _FAULT_DISPATCH[attack]()
         ids = random.sample(range(1, BANK_ACCOUNTS + 1), 2)
         amount = random.randint(1, 100)
-        if bank_transfer(ids[0], ids[1], amount):
-            committed += 1
+        # Transfer ids are 1-based and unique per attempt: they are the key the
+        # ledger and B3/B4 count applications by.
+        record = bank_transfer(i + 1, ids[0], ids[1], amount)
+        history.record_transfer(record)
+        if record.reason == "unclassified":
+            history.note_unclassified()
+        tally[record.outcome] += 1
         time.sleep(0.05)
 
     # Restore any nodes that may still be down; the dispatch's auto-heal
@@ -919,7 +1410,9 @@ def step_bank_transfer(
         history.close_fault(fw)
 
     console.print(
-        f"  {committed}/{num_transfers} transfers committed"
+        f"  {tally['acked']}/{num_transfers} transfers acked, "
+        f"{tally['rejected']} rejected, {tally['indeterminate']} indeterminate "
+        f"(indeterminate transfers are never retried)"
         + (f" (attack fired against {fired_leader})" if fired_leader else "")
     )
 
@@ -950,9 +1443,11 @@ class IncrementOp:
 def _try_increment(port: int, key: int) -> str:
     """UPDATE counters SET val = val + 1 WHERE id = key.
 
-    Classifies the outcome strictly: "acked" on success, "rejected" on
-    explicit refusal (read-only / cannot execute), "indeterminate" on
-    timeout / connection failure (write may or may not have landed).
+    Returns "acked" (exit status 0), "rejected" (a *recognised* definite
+    refusal), or "indeterminate" (timeout, connection failure, or any error we
+    cannot classify). An unrecognised error must land in "indeterminate":
+    counting it as rejected would tighten C1's upper bound past what we can
+    prove and turn a committed increment into a fake ghost-increment report.
     """
     cmd = (
         f"psql -h localhost -p {port} -U postgres -v ON_ERROR_STOP=1 "
@@ -962,12 +1457,10 @@ def _try_increment(port: int, key: int) -> str:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=PSQL_TIMEOUT)
     except subprocess.TimeoutExpired:
         return "indeterminate"
-    output = (r.stdout + r.stderr).lower()
-    if r.returncode == 0:
+    cls = classify_attempt(r.returncode, r.stdout + r.stderr)
+    if cls.outcome == ATTEMPT_ACKED:
         return "acked"
-    if any(s in output for s in REJECTION_PATTERNS):
-        return "rejected"
-    if any(s in output for s in INDETERMINATE_PATTERNS):
+    if cls.outcome == ATTEMPT_INDETERMINATE:
         return "indeterminate"
     return "rejected"
 
@@ -997,8 +1490,11 @@ def step_concurrent_contention(history: History, console: Console) -> None:
     """Step 9: concurrent same-row contention — verify C1 (NO_LOST_UPDATE).
 
     Spawns CONTENTION_WORKERS threads hammering CONTENTION_KEYS shared rows
-    with UPDATE counters SET val = val + 1 WHERE id = key. Kills the leader
-    mid-flight. Verifies per-key that:
+    with UPDATE counters SET val = val + 1 WHERE id = key — a blind
+    read-modify-write, not a compare-and-set: there is no expected-value
+    predicate, and correctness under contention comes from PostgreSQL taking a
+    row lock for the duration of the statement. Kills the leader mid-flight.
+    Verifies per-key that:
 
         acked_count[key] <= db_val[key] <= acked_count[key] + indeterminate_count[key]
 
@@ -1136,12 +1632,6 @@ def _check_contention_against_db(db_val: dict[int, int]) -> list[Violation]:
     return violations
 
 
-# `_LAST_HISTORY` is set in `run()` so `check_contention_invariant` can read the
-# per-key counts without taking the History as a parameter (matches the shape
-# of `check_bank_invariants` which queries the DB directly).
-_LAST_HISTORY: History | None = None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 10 — monotonic-read session (M1: NO_READ_REGRESSION_ACROSS_FAILOVER)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1154,9 +1644,12 @@ MONOTONIC_KILL_AT: Final[int] = 15
 
 
 def _try_write_monotonic(value: int) -> str:
-    """Write `value` via any gateway. Returns "acked" | "rejected" | "indeterminate"."""
+    """Write `value` via any gateway. Returns "acked" | "rejected" | "indeterminate".
+
+    Only a definite non-commit at the current port advances to the next one;
+    an unknown fate ends the attempt, since the row may already be durable.
+    """
     sql = f"INSERT INTO monotonic(val) VALUES ({value})"
-    last_outcome = "rejected"
     for port in GATEWAY_PORTS:
         cmd = f'psql -h localhost -p {port} -U postgres -v ON_ERROR_STOP=1 -c "{sql}" 2>&1'
         try:
@@ -1165,15 +1658,14 @@ def _try_write_monotonic(value: int) -> str:
             )
         except subprocess.TimeoutExpired:
             return "indeterminate"
-        out = (r.stdout + r.stderr).lower()
-        if r.returncode == 0:
+        cls = classify_attempt(r.returncode, r.stdout + r.stderr)
+        if cls.outcome == ATTEMPT_ACKED:
             return "acked"
-        if any(s in out for s in REJECTION_PATTERNS):
-            last_outcome = "rejected"
-            continue
-        if any(s in out for s in INDETERMINATE_PATTERNS):
+        if cls.outcome == ATTEMPT_INDETERMINATE:
             return "indeterminate"
-    return last_outcome
+        if cls.outcome == ATTEMPT_REJECTED:
+            return "rejected"
+    return "rejected"
 
 
 def _try_read_max_monotonic() -> int | None:
@@ -1312,15 +1804,44 @@ def check_monotonic_read_invariant() -> list[Violation]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def classify_ack_vs_quorum_loss(
+    op: OpRecord, quorum_windows: list[FaultWindow]
+) -> tuple[str, FaultWindow | None]:
+    """Position one acked write against the recorded quorum-loss windows.
+
+    ACK_CONTAINED   [start_ts, end_ts] lies entirely inside a window. This is
+                    the exact shape contract L2 forbids: FATAL.
+    ACK_STRADDLING  Overlaps a window but crosses one of its boundaries. L2 has
+                    nothing to say about it — the ack may have completed before
+                    the majority actually went away, or after it came back, and
+                    our window edges are only approximations of the real outage
+                    — so it is surfaced as a labelled observation.
+    ACK_OUTSIDE     No overlap with any window.
+
+    Containment beats straddling: if any window contains the write, that is the
+    verdict, no matter how many other windows it merely overlaps.
+    """
+    straddled: FaultWindow | None = None
+    for fw in quorum_windows:
+        if fw.start_ts <= op.start_ts and op.end_ts <= fw.end_ts:
+            return ACK_CONTAINED, fw
+        if op.start_ts < fw.end_ts and op.end_ts > fw.start_ts:
+            straddled = straddled or fw
+    if straddled is not None:
+        return ACK_STRADDLING, straddled
+    return ACK_OUTSIDE, None
+
+
 def check_invariants(
     history: History,
     db_final: set[int],
     db_total: int | None,
     db_distinct: int | None,
 ) -> list[Violation]:
-    """Check all 7 invariants against the complete history.
+    """Check invariants I1-I7 against the complete history.
 
-    Returns a (possibly empty) list of Violation objects.
+    Returns a (possibly empty) list of findings: FATAL violations plus any
+    labelled WARN observations (currently I5-WARN).
     """
     violations: list[Violation] = []
 
@@ -1371,19 +1892,41 @@ def check_invariants(
     # I5: NO_ACKS_DURING_QUORUM_LOSS
     quorum_windows = [fw for fw in history.faults if fw.is_quorum_loss and fw.end_ts > 0]
     bad_acks: list[int] = []
+    straddling_acks: list[dict[str, object]] = []
     for op in history.ops:
         if op.outcome != "acked":
             continue
-        for fw in quorum_windows:
-            if fw.start_ts <= op.start_ts and op.end_ts <= fw.end_ts:
-                bad_acks.append(op.value)
-                break
+        position, fw = classify_ack_vs_quorum_loss(op, quorum_windows)
+        if position == ACK_CONTAINED:
+            bad_acks.append(op.value)
+        elif position == ACK_STRADDLING and fw is not None:
+            straddling_acks.append(
+                {
+                    "value": op.value,
+                    "fault": fw.kind,
+                    "ack_span_s": round(op.end_ts - op.start_ts, 3),
+                    # How far the ack reached outside the window on each side;
+                    # 0.0 means that edge of the ack was inside the window.
+                    "began_before_window_s": max(0.0, round(fw.start_ts - op.start_ts, 3)),
+                    "ended_after_window_s": max(0.0, round(op.end_ts - fw.end_ts, 3)),
+                }
+            )
     if bad_acks:
         violations.append(
             Violation(
                 "I5",
                 f"{len(bad_acks)} write(s) acked while quorum was lost (fencing failure)",
                 bad_acks,
+            )
+        )
+    if straddling_acks:
+        violations.append(
+            Violation(
+                "I5-WARN",
+                f"{len(straddling_acks)} acked write(s) overlap a quorum-loss window without "
+                f"being contained by it — outside contract L2's letter, reported for review",
+                straddling_acks[:10],
+                severity=SEVERITY_WARN,
             )
         )
 
@@ -1424,25 +1967,50 @@ def check_invariants(
     return violations
 
 
-def _check_log_grep(logs_path: Path) -> list[Violation]:
-    """L2-L3: substring presence checks on the collected container log file.
+def _check_log_grep(logs_path: Path, quorum_loss_windows: int = 0) -> list[Violation]:
+    """L0/L2-L3: substring presence checks on the collected container log file.
 
-    No regex parsing — just plain ``in`` membership tests.  Unaffected by
-    tracing format changes or docker compose log prefix variations.
+    No regex parsing — just plain ``in`` membership tests, so tracing format
+    changes and docker compose log prefixes do not matter. What *does* matter is
+    that the substrings still exist in the Rust source; they are held in the
+    LOG_* constants and `testing/test_correctness_lite_invariants.py` greps the
+    tree to prove a reworded log line breaks a test rather than silently
+    disabling a grep here.
+
+    L2 and L3 are absence/conditional greps, which means a missing or truncated
+    log would satisfy both by matching nothing. L0 closes that: the corpus must
+    be readable and must actually contain pgbattery output, or the whole layer
+    is declared invalid rather than passed.
     """
     violations: list[Violation] = []
     try:
         log_text = logs_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return violations
+    except OSError as exc:
+        return [
+            Violation(
+                "L0",
+                f"Could not read collected log {logs_path} ({exc.__class__.__name__}) — "
+                f"L2/L3 could not be evaluated",
+                {"path": str(logs_path)},
+            )
+        ]
+
+    # L0: LOG_CORPUS_VALID
+    # Markers are info level, so this also fires when RUST_LOG is turned down
+    # far enough to erase them — in which case L2/L3 really are vacuous.
+    liveness = [m for m in LOG_LIVENESS_MARKERS if m in log_text]
+    if not liveness:
+        return [
+            Violation(
+                "L0",
+                f"Collected log ({len(log_text)} bytes) contains none of the expected pgbattery "
+                f"startup markers — L2/L3 would match nothing and read as a false pass",
+                {"expected_any_of": list(LOG_LIVENESS_MARKERS), "bytes": len(log_text)},
+            )
+        ]
 
     # L2: NO_EXPLICIT_SPLIT_BRAIN_SIGNALS
-    l2_signals = [
-        "potential split-brain",
-        "FAILED TO FENCE",
-        "Promotion safety check failed",
-    ]
-    found = [s for s in l2_signals if s in log_text]
+    found = [s for s in LOG_SPLIT_BRAIN_SIGNALS if s in log_text]
     if found:
         violations.append(
             Violation(
@@ -1453,12 +2021,28 @@ def _check_log_grep(logs_path: Path) -> list[Violation]:
         )
 
     # L3: FENCE_CONFIRMED_AFTER_EMERGENCY
-    if "EMERGENCY FENCE" in log_text and "PostgreSQL fenced (read-only)" not in log_text:
+    fence_markers = [m for m in LOG_FENCE_MARKERS if m in log_text]
+    if "EMERGENCY FENCE" in log_text and LOG_FENCE_CONFIRMED not in log_text:
         violations.append(
             Violation(
                 "L3",
-                "EMERGENCY FENCE fired but no 'PostgreSQL fenced (read-only)' confirmation in logs",
+                f"EMERGENCY FENCE fired but no '{LOG_FENCE_CONFIRMED}' confirmation in logs",
                 None,
+            )
+        )
+    elif quorum_loss_windows > 0 and not fence_markers and LOG_FENCE_CONFIRMED not in log_text:
+        # The scenario removed a majority, yet the log carries no trace of the
+        # fence path at all, so L3 checked nothing. That is not automatically a
+        # violation — the lease can also be surrendered through the ordinary
+        # step-down path — but it must not pass silently either.
+        violations.append(
+            Violation(
+                "L3-WARN",
+                f"{quorum_loss_windows} quorum-loss window(s) were injected but the log holds "
+                f"no fence trace ({list(LOG_FENCE_MARKERS)}, '{LOG_FENCE_CONFIRMED}') — "
+                f"L3 was vacuous",
+                {"quorum_loss_windows": quorum_loss_windows},
+                severity=SEVERITY_WARN,
             )
         )
 
@@ -1488,7 +2072,7 @@ def run(
         False,
         "--bank-only",
         help="Skip steps 1-7 and 9-10; run only the bank-transfer step "
-        "(useful for sweeping attack modes against the B1/B2 invariant).",
+        "(useful for sweeping attack modes against the B1-B4 invariants).",
     ),
     attack: str = typer.Option(
         "kill",
@@ -1504,11 +2088,15 @@ def run(
 ) -> None:
     """Execute the fault schedule, record full history, check all invariants.
 
-    Runs 8 fault injection steps (~360 write attempts, ~3-5 min wall clock).
+    Runs 10 fault injection steps (~360 write attempts, ~3-5 min wall clock).
     Layer 1 (I1-I7): checked against the timestamped operation history and
     background leader polls (0.5s granularity).
-    Layer 2 (L2-L3): substring presence checks on the collected container log.
-    Layer 3 (B1-B2): bank transfer total-balance conservation invariant.
+    Layer 2 (L0, L2-L3): substring presence checks on the collected container log.
+    Layer 3 (B1-B4, C1, M1): workload invariants over the bank, counter and
+    monotonic tables.
+
+    Exits 1 if any FATAL finding was produced. WARN observations are printed
+    and written to the artifact but do not change the exit code.
     """
     artifact_path = Path(artifact_dir)
     artifact_path.mkdir(parents=True, exist_ok=True)
@@ -1567,14 +2155,14 @@ def run(
     if bank_only:
         # In bank-only mode the `jepsen` table is empty, so the regular
         # post-recovery read would falsely return None. We only care about
-        # B1/B2, which queries `bank_accounts` directly. Provide empty
-        # stubs for the jepsen-derived layers so the summary table still
+        # B1-B4, which query `bank_accounts` and the ledger directly. Provide
+        # empty stubs for the jepsen-derived layers so the summary table still
         # renders cleanly and we skip irrelevant invariant checks.
         db_final: set[int] = set()
         db_total: int | None = 0
         db_distinct: int | None = 0
-        violations: list[Violation] = []
-        violations.extend(check_bank_invariants())
+        findings: list[Violation] = []
+        findings.extend(check_bank_invariants())
         logs_path = artifact_path / "docker-compose.log"
         run_cmd(f"docker compose logs --no-color > {logs_path} 2>&1", timeout=30)
         console.print(f"Logs written to {logs_path}")
@@ -1590,22 +2178,30 @@ def run(
 
         db_total, db_distinct = check_duplicates()
 
-        violations = check_invariants(history, db_final, db_total, db_distinct)
+        findings = check_invariants(history, db_final, db_total, db_distinct)
 
-        # ── Layer 2: log grep checks (L2-L3) ────────────────────────────────
+        # ── Layer 2: log grep checks (L0, L2-L3) ────────────────────────────
         logs_path = artifact_path / "docker-compose.log"
         run_cmd(f"docker compose logs --no-color > {logs_path} 2>&1", timeout=30)
         console.print(f"Logs written to {logs_path}")
-        violations.extend(_check_log_grep(logs_path))
+        findings.extend(
+            _check_log_grep(
+                logs_path,
+                quorum_loss_windows=sum(1 for fw in history.faults if fw.is_quorum_loss),
+            )
+        )
 
-        # ── Layer 3: bank transfer invariants (B1-B2) ───────────────────────
-        violations.extend(check_bank_invariants())
+        # ── Layer 3: bank transfer invariants (B1-B4) ───────────────────────
+        findings.extend(check_bank_invariants())
 
         # ── Layer 4: concurrent same-row contention invariant (C1) ──────────
-        violations.extend(check_contention_invariant())
+        findings.extend(check_contention_invariant())
 
         # ── Layer 5: monotonic-read session invariant (M1) ──────────────────
-        violations.extend(check_monotonic_read_invariant())
+        findings.extend(check_monotonic_read_invariant())
+
+    violations = [f for f in findings if f.severity == SEVERITY_FATAL]
+    observations = [f for f in findings if f.severity == SEVERITY_WARN]
 
     # ── Summary table ────────────────────────────────────────────────────────
     console.print()
@@ -1619,6 +2215,13 @@ def run(
     t.add_row("Indeterminate", str(len(history.indeterminate_set)))
     t.add_row("In DB (final)", str(len(db_final)))
     t.add_row("Indeterminate→committed", str(len(db_final & history.indeterminate_set)))
+    t.add_row("Unclassified errors (insert/transfer)", str(history.unclassified_attempts))
+    t.add_row("Transfers attempted", str(len(history.transfers)))
+    t.add_row(
+        "Transfers acked / indeterminate",
+        f"{sum(1 for tr in history.transfers if tr.outcome == 'acked')} / "
+        f"{sum(1 for tr in history.transfers if tr.outcome == 'indeterminate')}",
+    )
     t.add_row("Leader poll rounds", str(len(history.leader_polls)))
     t.add_row("Split-brain rounds", str(sum(1 for r in history.leader_polls if r.is_split_brain)))
     t.add_row("Fault windows", str(len(history.faults)))
@@ -1626,18 +2229,44 @@ def run(
     t.add_row("Wall clock", f"{elapsed:.0f}s")
 
     inv_ids: tuple[str, ...]
+    warn_ids: tuple[str, ...]
     if bank_only:
         # Only the bank invariants were actually evaluated; anything else
         # would be a misleading green check.
-        inv_ids = ("B1", "B2")
+        inv_ids = ("B1", "B2", "B3", "B4")
+        warn_ids = ()
     else:
-        inv_ids = ("I1", "I2", "I3", "I4", "I5", "I6", "I7", "L2", "L3", "B1", "B2", "C1", "M1")
+        inv_ids = (
+            "I1",
+            "I2",
+            "I3",
+            "I4",
+            "I5",
+            "I6",
+            "I7",
+            "L0",
+            "L2",
+            "L3",
+            "B1",
+            "B2",
+            "B3",
+            "B4",
+            "C1",
+            "M1",
+        )
+        warn_ids = ("I5-WARN", "L3-WARN")
     for inv_id in inv_ids:
         v = next((vv for vv in violations if vv.invariant == inv_id), None)
         if v is None:
             t.add_row(inv_id, "[green]PASS ✓[/]")
         else:
             t.add_row(inv_id, f"[red]FAIL ✗  {v.message}[/]")
+    for warn_id in warn_ids:
+        o = next((oo for oo in observations if oo.invariant == warn_id), None)
+        if o is None:
+            t.add_row(warn_id, "[green]none[/]")
+        else:
+            t.add_row(warn_id, f"[yellow]WARN  {o.message}[/]")
 
     verdict = "PASS" if not violations else "FAIL"
     verdict_style = "[bold green]PASS[/]" if not violations else "[bold red]FAIL[/]"
@@ -1646,11 +2275,20 @@ def run(
     console.print()
 
     if violations:
-        console.print("[bold red]INVARIANT VIOLATIONS DETAIL:[/]")
+        console.print("[bold red]INVARIANT VIOLATIONS DETAIL (FATAL):[/]")
         for v in violations:
             console.print(f"  [{v.invariant}] {v.message}")
             if v.evidence is not None:
                 console.print(f"       evidence: {v.evidence}")
+
+    if observations:
+        console.print(
+            "[bold yellow]OBSERVATIONS (WARN — reported, does not affect the verdict):[/]"
+        )
+        for o in observations:
+            console.print(f"  [{o.invariant}] {o.message}")
+            if o.evidence is not None:
+                console.print(f"       evidence: {o.evidence}")
 
     # ── Artifact dump ────────────────────────────────────────────────────────
     results = {
@@ -1660,10 +2298,27 @@ def run(
         "errored": len(history.errored_set),
         "indeterminate": len(history.indeterminate_set),
         "in_db_final": len(db_final),
+        "unclassified_errors": history.unclassified_attempts,
         "elapsed_seconds": round(elapsed, 1),
         "violations": [
             {"invariant": v.invariant, "message": v.message, "evidence": str(v.evidence)}
             for v in violations
+        ],
+        "observations": [
+            {"invariant": o.invariant, "message": o.message, "evidence": str(o.evidence)}
+            for o in observations
+        ],
+        "transfers": [
+            {
+                "transfer_id": tr.transfer_id,
+                "from_id": tr.from_id,
+                "to_id": tr.to_id,
+                "amount": tr.amount,
+                "outcome": tr.outcome,
+                "reason": tr.reason,
+                "port": tr.port,
+            }
+            for tr in history.transfers
         ],
         "leader_poll_rounds": len(history.leader_polls),
         "split_brain_rounds": sum(1 for r in history.leader_polls if r.is_split_brain),

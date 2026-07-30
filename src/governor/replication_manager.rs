@@ -1278,6 +1278,107 @@ mod tests {
         }
     }
 
+    /// Property tests over the sync-standby quorum arithmetic.
+    ///
+    /// `required_sync_standbys` and `plan_sync_replication` are keyed by the
+    /// OTHER-voter count, so the cluster size is `others + 1`. The W1/R2
+    /// guarantee (an acknowledged write is held by at least one member of any
+    /// quorum that could elect the next leader) rests entirely on the write set
+    /// intersecting every Raft majority, which is what these pin — for every
+    /// cluster size rather than the handful the fixed cases cover.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Raft majority for a voter set of size `n`.
+        const fn majority(n: usize) -> usize {
+            n / 2 + 1
+        }
+
+        fn voter_names(count: usize) -> Vec<String> {
+            (0..count)
+                .map(|i| format!("pgbattery_node_{}", i + 2))
+                .collect()
+        }
+
+        proptest! {
+            /// For every cluster size, leader + `k` synchronous acks intersects
+            /// every Raft majority: the two set sizes must sum to more than the
+            /// voter count. This is the invariant that makes a committed-and-
+            /// acked write survive any failover.
+            #[test]
+            fn prop_write_set_intersects_every_majority(n in 1usize..=1024) {
+                let k = ReplicationManager::required_sync_standbys(n - 1);
+                let write_set = k + 1;
+                prop_assert!(
+                    write_set + majority(n) > n,
+                    "N={n}: write set {write_set} + majority {} must exceed {n}",
+                    majority(n)
+                );
+            }
+
+            /// `k` is the SMALLEST count with that property. Over-requiring acks
+            /// costs availability for no durability gain, so the intersection
+            /// must fail at `k - 1`.
+            #[test]
+            fn prop_required_sync_standbys_is_minimal(n in 1usize..=1024) {
+                let k = ReplicationManager::required_sync_standbys(n - 1);
+                if k > 0 {
+                    prop_assert!(
+                        k + majority(n) <= n,
+                        "N={n}: k={k} is not minimal — {} acks would already intersect",
+                        k - 1
+                    );
+                }
+            }
+
+            /// The planned GUC either names exactly
+            /// `required_sync_standbys(others)` standbys out of the full voter
+            /// list — in which case its write set intersects every majority — or
+            /// it is the empty async list, in which case the degraded (RPO>0)
+            /// flag must be raised whenever there was a voter peer to ack.
+            #[test]
+            fn prop_plan_sync_replication_never_understates_quorum(
+                others in 0usize..=64,
+                healthy in 0usize..=64,
+                has_quorum: bool,
+                in_leader_grace: bool,
+            ) {
+                let names = voter_names(others);
+                let (plan, degraded) = ReplicationManager::plan_sync_replication(
+                    &names,
+                    healthy,
+                    has_quorum,
+                    in_leader_grace,
+                );
+                let n = others + 1;
+                let required = ReplicationManager::required_sync_standbys(others);
+
+                if plan.is_empty() {
+                    prop_assert!(
+                        required == 0 || (healthy == 0 && has_quorum && !in_leader_grace),
+                        "N={n}: empty sync list without either a zero requirement \
+                         or the async fallback"
+                    );
+                } else {
+                    prop_assert_eq!(
+                        &plan,
+                        &format!("FIRST {required} ({})", names.join(", ")),
+                        "N={} plan must name every voter with the required count",
+                        n
+                    );
+                    prop_assert!(required + 1 + majority(n) > n);
+                }
+
+                prop_assert_eq!(
+                    degraded,
+                    healthy == 0 && has_quorum && !in_leader_grace && !names.is_empty(),
+                    "the degraded flag must track exactly the async fallback"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_sync_state_confirmed() {
         let expected = [

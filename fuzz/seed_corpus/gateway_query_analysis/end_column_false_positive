@@ -1,0 +1,1 @@
+commitSELECT end_time FROM events WHERE id = $1

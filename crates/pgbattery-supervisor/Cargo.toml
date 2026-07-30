@@ -19,6 +19,8 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# Property-based tests over the pure pg_rewind divergence gate.
+proptest = "1"
 
 [lints]
 workspace = true

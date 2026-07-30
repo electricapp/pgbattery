@@ -199,17 +199,8 @@ impl Governor {
 
         replay_applied_entries(&storage, &mut restored, replay_from)?;
         let state = Arc::new(RwLock::new(restored));
-        let state_machine = StateMachineStore {
-            state: state.clone(),
-            storage: storage.clone(),
-            applied_end: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
-        };
-
-        // Create log storage adapter
-        let log_storage = LogStorageAdapter {
-            storage: storage.clone(),
-        };
+        let state_machine = StateMachineStore::new(state.clone(), storage.clone());
+        let log_storage = LogStorageAdapter::new(storage.clone());
 
         // Create network factory (with optional TLS)
         let network_factory = tls_config.map_or_else(
@@ -336,9 +327,12 @@ impl Governor {
         // Track when leader is lost and when a new leader is elected.
         let tracking_election = runtime.leader_lost_at.is_some();
         if runtime.prev_leader_id.is_some() && leader_id.is_none() && !tracking_election {
-            // Leader just disappeared — start the election timer.
-            runtime.leader_lost_at = Some(Instant::now());
-            self.state.write().failover_started_at_unix_ms = Some(Self::unix_now_ms());
+            // Leader just disappeared — start the election timer. Stamped from
+            // the lease's clock so the hold-down and the lease it guards can
+            // never measure different time sources.
+            let lost_at = self.lease.read().now();
+            runtime.leader_lost_at = Some(lost_at);
+            self.state.write().failover_started_at = Some(lost_at);
         } else if leader_id.is_some() && tracking_election {
             // A new leader appeared while we were tracking an election.
             if let Some(lost_at) = runtime.leader_lost_at.take() {
@@ -359,23 +353,24 @@ impl Governor {
         // the coalesced re-anchor below (see `should_clear_stale_failover_anchor`).
         // Only take the write lock when there is actually something to clear.
         if Self::should_clear_stale_failover_anchor(leader_id, is_leader)
-            && self.state.read().failover_started_at_unix_ms.is_some()
+            && self.state.read().failover_started_at.is_some()
         {
-            self.state.write().failover_started_at_unix_ms = None;
+            self.state.write().failover_started_at = None;
         }
 
         // The watch can coalesce Leader(other) → None → Leader(self), dropping
-        // the leader→none edge that stamps `failover_started_at_unix_ms` and
-        // skipping the promotion hold-down (split-brain risk). Re-stamp on the
+        // the leader→none edge that stamps `failover_started_at` and skipping
+        // the promotion hold-down (split-brain risk). Re-stamp on the
         // leader-acquisition edge of a real failover; `now` is later than the
         // missed edge, so we only ever wait longer (the safe direction).
         if Self::should_anchor_coalesced_failover(
             runtime.prev_leader_id,
             is_leader,
             self.node_id,
-            self.state.read().failover_started_at_unix_ms.is_some(),
+            self.state.read().failover_started_at.is_some(),
         ) {
-            self.state.write().failover_started_at_unix_ms = Some(Self::unix_now_ms());
+            let anchor = self.lease.read().now();
+            self.state.write().failover_started_at = Some(anchor);
         }
 
         let has_quorum = Self::has_quorum(metrics, is_leader);
@@ -493,7 +488,7 @@ impl Governor {
     /// Whether a stale promotion-hold-down anchor must be cleared this tick.
     ///
     /// True when a *different* node is the stable leader. The anchor
-    /// (`failover_started_at_unix_ms`) is stamped on the locally-observed
+    /// (`failover_started_at`) is stamped on the locally-observed
     /// leader→none edge, but it is only meaningful for a failover *this* node
     /// goes on to win — it is consumed and cleared by `promote_local_postgres`.
     /// If this node witnesses a failover it does not win, the anchor would
@@ -510,18 +505,6 @@ impl Governor {
         is_leader: bool,
     ) -> bool {
         leader_id.is_some() && !is_leader
-    }
-
-    /// Wall-clock Unix milliseconds, saturating on clock anomalies. Callers use
-    /// `saturating_sub`, so extremes fail toward "no time elapsed" (defer).
-    fn unix_now_ms() -> u64 {
-        u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX)
     }
 
     fn update_fencing_state(
@@ -966,6 +949,17 @@ pub struct LogStorageAdapter {
     storage: RedbLogStorage,
 }
 
+impl LogStorageAdapter {
+    /// Wrap a log store.
+    ///
+    /// Exists so `openraft::testing::Suite` can run against this adapter rather
+    /// than a hand-mirrored copy of its delegation — a conformance violation in
+    /// the adapter itself is only reachable through the real type.
+    pub(crate) const fn new(storage: RedbLogStorage) -> Self {
+        Self { storage }
+    }
+}
+
 impl RaftLogReader<TypeConfig> for LogStorageAdapter {
     async fn try_get_log_entries<
         RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
@@ -1230,6 +1224,23 @@ pub struct StateMachineStore {
     /// updates state *before* redb, so the builder only ever sees data at or
     /// ahead of meta (safe — `ClusterCommand` re-application is idempotent).
     snapshot_consistency: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl StateMachineStore {
+    /// Build a state machine over `state` and `storage`.
+    ///
+    /// `applied_end` starts at 0 (nothing applied); openraft calls
+    /// `applied_state` before any `apply`, which seeds it from redb. Exists so
+    /// `openraft::testing::Suite` can exercise this type rather than a mirror of
+    /// it — notably including the `snapshot_consistency` lock.
+    pub(crate) fn new(state: Arc<RwLock<ClusterState>>, storage: RedbLogStorage) -> Self {
+        Self {
+            state,
+            storage,
+            applied_end: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
 }
 
 impl RaftStateMachine<TypeConfig> for StateMachineStore {

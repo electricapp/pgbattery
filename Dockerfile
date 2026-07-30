@@ -26,7 +26,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM postgres:18
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y tini libfaketime iproute2 procps curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl && rm -rf /var/lib/apt/lists/*
+
+# Chaos faults need these in-container: iproute2 for `tc netem` (latency, loss),
+# iptables for asymmetric partitions (one-directional DROP). Absent, the fault
+# step exits 127 and the case still passes — a partition test that partitions
+# nothing. Verified at build time for the same reason as libfaketime below.
+RUN command -v tc && command -v iptables
 
 # libfaketime installs at /usr/lib/<arch>-linux-gnu/faketime/libfaketime.so.1.
 # On amd64 that's /usr/lib/x86_64-linux-gnu/...; on arm64 (Docker Desktop on

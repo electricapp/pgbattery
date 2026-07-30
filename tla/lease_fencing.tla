@@ -38,7 +38,7 @@
  *
  *   2. Promotion hold-down.
  *      CODE: app.rs promotion_lease_holddown(); governor/raft.rs
- *      failover_started_at_unix_ms; docs/STATE_MACHINE.md §2.
+ *      failover_started_at; docs/STATE_MACHINE.md §2.
  *      Here: ElectFailoverLeader sets holdDownRemaining = HoldDown, and
  *      EnablePgWrites is gated on holdDownRemaining = 0. With HoldDown >=
  *      LeaseDuration, the new leader cannot become writable until any prior

@@ -34,14 +34,20 @@ SCOPE & LIMITATIONS
     register; cross-key invariants (e.g. SUM(values) conservation) are
     out of scope. Use correctness_lite's bank-transfer step for that.
 
-  - **WGL is exponential in the worst case.** This file caps operations
-    per key to roughly 100; beyond that, runtime blows up.  Real Jepsen
-    uses Knossos/Elle which have better-than-WGL constants and can also
-    verify transactional histories. We do not.
+  - **WGL is exponential in the worst case.** `WGL_OPS_PER_KEY_CAP` bounds
+    the per-key op count actually searched. A longer history is reduced to
+    one contiguous window of that size centred near the median return time,
+    with the register's starting value inferred from the discarded prefix;
+    ops outside the window are not checked. Real Jepsen uses Knossos/Elle
+    which have better-than-WGL constants and can also verify transactional
+    histories. We do not.
 
-  - **Indeterminate operations are encoded as "pending" with both possible
-    outcomes considered.** A write that timed out could have committed or
-    not — WGL handles this natively.
+  - **Indeterminate operations are encoded as "pending"** (`return_ts is
+    None`, `result is None`) and both possible outcomes are considered: a
+    write that timed out could have committed or not. Distinct from a
+    **definite rejection** (`result is False` — PG refused the statement),
+    which provably never reached the register and is therefore modelled as
+    a no-op; a later read of its value is an anomaly, not a normal write.
 
 ═══════════════════════════════════════════════════════════════════════════
 ALGORITHM (Wing-Gong-Lowe, register specialisation)
@@ -66,8 +72,12 @@ Search:
     captures the entire search state.
   - If recursion exhausts the frontier, history is linearizable.
 
-For "pending" ops (indeterminate outcome), we try both "this op happened"
-and "this op didn't happen" branches.
+A pending op has no return time, so it is treated as returning at +inf: it
+stays eligible at every step and can always be deferred to the tail of the
+order, where nothing observes it. Applying it earlier is the "this op
+happened" branch; deferring it to the tail is "this op didn't happen". The
+search needs no separate branch for the two. A definitely-rejected op is an
+identity transition, so placing it is always legal and constrains nothing.
 
 ═══════════════════════════════════════════════════════════════════════════
 """
@@ -113,11 +123,33 @@ WORKLOAD_DURATION_SECONDS: float = 6.0
 KILL_LEADER_AFTER_SECONDS: float = 2.0
 """When (relative to workload start) to inject the failover."""
 
+GATEWAY_RETRY_BACKOFF_BASE: Final[float] = 0.05
+"""Per-consecutive-failure backoff after an indeterminate op, in seconds."""
+
+GATEWAY_RETRY_BACKOFF_MAX: Final[float] = 0.5
+"""Cap on that backoff, so a fully-down cluster neither spins nor sleeps past
+its own recovery."""
+
+CHAOS_STORM_DURATION: Final[float] = 25.0
+"""Window the `chaos_storm` attack spreads its 3-5 faults across.
+
+`Final` because nothing reassigns it. The four knobs above are deliberately NOT
+`Final`: `run()` rebinds them as globals so worker threads see the CLI's values
+(see the `global` statement in `run`), and `Final` would make that assignment a
+type error."""
+
 PSQL_TIMEOUT_SECONDS: Final[int] = 4
 
-# Cap per-key op count to keep WGL tractable. With NUM_WORKERS=2 doing ~5
-# ops/sec each across NUM_KEYS=3, expected per-key ops is ~20 — well under
-# the cap, so we get unsampled checks.
+# Bound on the per-key op count WGL searches; a longer per-key history is
+# reduced to one contiguous window of this size (see `_is_linearizable`).
+# Register ops each fork a fresh `psql`, so per-op cost is dominated by
+# process spawn plus a full TCP + auth + startup handshake — ~25-35 ms, on
+# the order of 30 ops/sec per worker (see db_clients.py for the measured
+# comparison against a held psycopg connection). The defaults
+# (NUM_WORKERS=2 for WORKLOAD_DURATION_SECONDS=6 spread over NUM_KEYS=3)
+# therefore land near 100 ops/key, comfortably unwindowed; ops that hit
+# PSQL_TIMEOUT_SECONDS during the fault window cost 4 s each and push the
+# rate lower still.
 WGL_OPS_PER_KEY_CAP: Final[int] = 2000
 
 
@@ -232,6 +264,7 @@ class History:
 
     ops: list[Op] = field(default_factory=list)
     jepsen: list[JepsenRecord] = field(default_factory=list)
+    gateway_switches: int = 0
     _counter: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -239,6 +272,16 @@ class History:
         with self._lock:
             self._counter += 1
             return self._counter
+
+    def record_gateway_switch(self) -> None:
+        """Count a worker rebinding to a different gateway.
+
+        Surfaced in the run summary: a high count means the workload spent time
+        chasing the leader rather than committing, which is the difference
+        between a dense history and one dominated by connection noise.
+        """
+        with self._lock:
+            self.gateway_switches += 1
 
     def append(self, op: Op) -> None:
         with self._lock:
@@ -419,13 +462,20 @@ def txn_worker_loop(
     """
     port = GATEWAY_PORTS[worker_id % len(GATEWAY_PORTS)]
     client = PsycopgWorkerClient(port=port)
+    consecutive_indeterminate = 0
     try:
         while not stop_event.is_set():
             if NUM_KEYS < 2:
                 return
             k1, k2 = rng.sample(range(NUM_KEYS), 2)
-            new1 = rng.randint(1, 1_000_000)
-            new2 = rng.randint(1, 1_000_000)
+            # Write values come from the global counter so every version of
+            # every key is distinct. Elle infers rw-register version order
+            # from which value a read observed; two writes of the same value
+            # to one key make that inference ambiguous, which costs real
+            # dependency edges and turns anomalies into `:unknown`. The
+            # counter starts at 1, so no write collides with the seeded 0.
+            new1 = history.next_id()
+            new2 = history.next_id()
             # Invoke: reads pending, writes declared.
             invoke_value: list[list[object]] = [
                 ["r", k1, None],
@@ -461,6 +511,7 @@ def txn_worker_loop(
                         value=ok_value,
                     )
                 )
+                consecutive_indeterminate = 0
             elif outcome.committed is False:
                 # Definite rollback: txn had no effect. Same value as invoke.
                 history.append_jepsen(
@@ -472,10 +523,33 @@ def txn_worker_loop(
                         value=invoke_value,
                     )
                 )
+                # A definite rollback means the gateway answered, so the
+                # connection is healthy; only indeterminate outcomes indicate a
+                # dead gateway.
+                consecutive_indeterminate = 0
             else:
-                # Pending: connection broke / timed out. We don't know if
-                # the cluster committed. :info releases the process and
-                # tells Elle "could have happened any time in [invoke, info]".
+                # Pending: connection broke / timed out. We don't know if the
+                # cluster committed, so the txn closes as :info. An :info op
+                # is never "completed" for ordering purposes: its effect
+                # window is [invoke, end-of-history], not [invoke, info], and
+                # it contributes no outgoing realtime edge. The `time` on the
+                # record is only when we gave up waiting.
+                #
+                # Process reuse: Jepsen's generator retires the process of a
+                # crashed (:info) op and remaps the thread to a fresh process
+                # number, exactly because that process may still be in flight
+                # forever. `jepsen.history` does no such thing, and neither do
+                # we — both worker loops keep emitting under the same
+                # `process=worker_id` after an :info. That is sound for the
+                # only model the shim checks, :strict-serializable (see
+                # elle_shim/src/pgbattery_elle_shim/core.clj): the :info op
+                # takes no realtime completion edge, and process order is not
+                # one of that model's graphs. It would be UNSOUND for
+                # :sequential or any other process-order model, which derives
+                # edges between consecutive ops of one process and would order
+                # the possibly-still-running :info op before every later op of
+                # the reused id. Adding such a model requires retiring the
+                # process id here first.
                 history.append_jepsen(
                     JepsenRecord(
                         type="info",
@@ -485,6 +559,10 @@ def txn_worker_loop(
                         value=invoke_value,
                     )
                 )
+                # Recover only after the op is recorded, so chasing the leader
+                # never changes what the history says happened.
+                consecutive_indeterminate += 1
+                rebind_after_indeterminate(client, history, consecutive_indeterminate)
     finally:
         client.close()
 
@@ -500,6 +578,7 @@ def list_append_worker_loop(
     counter combined with worker_id) to both keys."""
     port = GATEWAY_PORTS[worker_id % len(GATEWAY_PORTS)]
     client = PsycopgWorkerClient(port=port)
+    consecutive_indeterminate = 0
     try:
         while not stop_event.is_set():
             if NUM_KEYS < 2:
@@ -540,6 +619,7 @@ def list_append_worker_loop(
                         value=ok_value,
                     )
                 )
+                consecutive_indeterminate = 0
             elif outcome.committed is False:
                 history.append_jepsen(
                     JepsenRecord(
@@ -550,6 +630,10 @@ def list_append_worker_loop(
                         value=invoke_value,
                     )
                 )
+                # A definite rollback means the gateway answered, so the
+                # connection is healthy; only indeterminate outcomes indicate a
+                # dead gateway.
+                consecutive_indeterminate = 0
             else:
                 history.append_jepsen(
                     JepsenRecord(
@@ -560,6 +644,10 @@ def list_append_worker_loop(
                         value=invoke_value,
                     )
                 )
+                # Recover only after the op is recorded, so chasing the leader
+                # never changes what the history says happened.
+                consecutive_indeterminate += 1
+                rebind_after_indeterminate(client, history, consecutive_indeterminate)
     finally:
         client.close()
 
@@ -1053,9 +1141,39 @@ def bit_flip_after(delay: float, hold: float = 2.0) -> None:
     raise NotImplementedError(_BIT_FLIP_PRECONDITION)
 
 
+def next_gateway_port(current: int) -> int:
+    """Next gateway port to try after a connection-level failure.
+
+    Every gateway proxies to the current leader, so any live one will do; the
+    dead one is the node whose container just died. Workers that stay pinned to
+    it spin on connection-refused for the rest of the run — measured at ~2800
+    attempts/second, which produced 56,600 of 56,665 `:info` records in one CI
+    run while two surviving workers committed every real transaction.
+    """
+    idx = GATEWAY_PORTS.index(current) if current in GATEWAY_PORTS else -1
+    return GATEWAY_PORTS[(idx + 1) % len(GATEWAY_PORTS)]
+
+
+def rebind_after_indeterminate(
+    client: PsycopgWorkerClient,
+    history: History,
+    consecutive: int,
+) -> None:
+    """Rotate `client` to another gateway and back off, after an `:info`.
+
+    Called only once the op has been recorded, so recovery never changes what
+    the history says. Backoff is capped so a fully-down cluster does not spin
+    either, and is bounded well under the workload duration so a recovered
+    cluster is picked up promptly.
+    """
+    history.record_gateway_switch()
+    client.switch_port(next_gateway_port(client.port))
+    time.sleep(min(GATEWAY_RETRY_BACKOFF_BASE * consecutive, GATEWAY_RETRY_BACKOFF_MAX))
+
+
 def chaos_storm_after(
     delay: float,
-    duration: float = 25.0,
+    duration: float = CHAOS_STORM_DURATION,
     seed: int | None = None,
 ) -> None:
     """Fire 3-5 random faults at random times within `duration` seconds.
@@ -1149,23 +1267,46 @@ def _apply_op_to_register(op: Op, current: int) -> tuple[bool, int]:
 
     Returns (matches_observed_result, new_value).
 
-    For a pending op (no completion), the caller treats it as if it had
-    succeeded with whatever value the kind implies (read returns `current`,
-    write succeeds, cas commits iff old == current).
+    `op.result` carries the outcome the client actually observed and drives
+    the transition for every kind:
+
+      - `True`  — acked. The op definitely took effect: a write installs
+        `write_val`, a CAS installs it iff the witness matches `current`.
+      - `False` — definitely rejected (PG refused the statement on a
+        read-only / recovering node, or the CAS witness did not match). The
+        op provably never reached the register, so it is an identity
+        transition: placing it in the total order is always legal and never
+        changes what a later read may observe. Modelling a rejection as a
+        committed write would let a value that only a fenced node ever wrote
+        be explained away as an ordinary write, which is the one anomaly
+        class this checker must never miss.
+      - `None`  — pending (timed out, connection died) or, for a read, an
+        answer we never saw. A pending write may or may not have landed, so
+        it is applied as if it committed; because pending ops carry
+        `return_ts = None` (treated as +inf) the search can equally defer
+        them to the end of the order, where nothing observes them. Those two
+        placements are the "it happened" / "it didn't happen" branches.
+
+    Known imprecision: `do_cas` reports both a witness mismatch and a
+    fencing rejection as `False`. When such a CAS's witness happens to equal
+    the register value at that point, the CAS branch below calls it a
+    contradiction. That is a false positive, not a masked anomaly, and it
+    needs a random witness to collide with the live value to occur.
     """
     if op.kind == "read":
         observed = op.result
         if observed is None:
-            # Pending read — always consistent with the current state.
+            # No value observed (pending, or a definite reject that carries
+            # no value) — consistent with any current state.
             return True, current
         return observed == current, current
     if op.kind == "write":
-        # A pending write may or may not have landed. The caller decides via
-        # the "completed = succeeded" branching; if we get here, treat as
-        # having committed.
         new_val = op.write_val
         if new_val is None:
             return False, current
+        if op.result is False:
+            # Definitely rejected: no-op transition.
+            return True, current
         return True, new_val
     if op.kind == "cas":
         old = op.cas_old
@@ -1207,38 +1348,52 @@ def _infer_register_value_at(ops_sorted: list[Op], at_ts: float) -> int:
 def _is_weakly_consistent(ops: list[Op]) -> tuple[bool, str]:
     """Fast structural check that runs in O(n) on histories of any size.
 
+    A value is *installable* if it is the initial 0 or the target of a write
+    or CAS that could have reached the register: acked (`result is True`) or
+    pending (`result is None` — timed out or the connection died, so it may
+    have landed). A definitely-rejected op (`result is False`) is excluded:
+    PG refused the statement, or the CAS witness did not match, so that value
+    never entered the register through any legitimate path.
+
+    Excluding rejected values cannot produce a false positive from value
+    collisions: the installable set is a union, so a value written by both a
+    rejected and an acked/pending op stays in it. It only drops out when NO
+    op that could have taken effect ever wrote it.
+
     Verifies two properties:
 
-      W-1 (no phantom reads): every value returned by a successful read was
-          the target of SOME write or CAS op (acked, rejected, or pending).
-          A read returning a value no client ever wrote indicates split-brain
-          or memory corruption.
+      W-1 (no phantom reads): every value returned by a successful read is
+          installable. A read returning a value no client could have written
+          indicates split-brain, a fenced node still serving writes, or
+          memory corruption.
 
-      W-2 (no impossible CAS commit): every committed CAS observed a witness
-          value that was the target of SOME write or CAS op (or the initial
-          value 0). If a CAS commits on a witness no one ever wrote, the
-          cluster fabricated the witness.
+      W-2 (no impossible CAS commit): every committed CAS observed an
+          installable witness. If a CAS commits on a witness nothing could
+          have installed, the cluster fabricated the witness.
 
     Weaker than WGL (doesn't check real-time ordering), but tractable at
     any scale and catches the loudest split-brain symptoms.
     """
     legit_values = {0}
     for op in ops:
-        if op.write_val is not None:
+        if op.write_val is not None and op.result is not False:
             legit_values.add(op.write_val)
 
     for op in ops:
         if op.kind == "read" and op.result is not None and op.result not in legit_values:
-            return False, f"phantom read: value {op.result!r} never written by any client"
+            return False, (
+                f"phantom read: value {op.result!r} is not installable "
+                "(no acked or pending write ever wrote it)"
+            )
         if (
             op.kind == "cas"
             and op.result is True
             and op.cas_old is not None
             and op.cas_old not in legit_values
         ):
-            return False, f"impossible CAS commit on witness {op.cas_old!r}"
+            return False, f"impossible CAS commit on witness {op.cas_old!r} (not installable)"
 
-    return True, f"weakly-consistent ({len(legit_values)} distinct values)"
+    return True, f"weakly-consistent ({len(legit_values)} installable values)"
 
 
 def _is_linearizable(ops: list[Op]) -> tuple[bool, str]:
@@ -1358,6 +1513,12 @@ SCAFFOLD_ATTACKS: set[str] = {"fsync_drop", "bit_flip"}
 one of these raises NotImplementedError with the prereq doc. The CLI also
 checks this set before launching the injector thread so the user gets a
 clear failure instead of a silent daemon-thread death."""
+
+
+SEEDED_ATTACKS: Final[frozenset[str]] = frozenset({"chaos_storm"})
+"""Attacks whose fault schedule comes from an RNG and so must receive the run's
+seed to be replayable. The injector passes `(delay, duration, seed)` for these
+and `(delay,)` for everything else."""
 
 
 @app.command()
@@ -1485,9 +1646,16 @@ def run(
             console.print(f"[bold red]{attack} is a scaffold attack:[/]\n{e}")
             raise typer.Exit(code=2) from e
     console.print(f"[dim]Attack mode: {attack}[/]")
+    # chaos_storm picks its faults, ordering, and offsets from an RNG. Without
+    # the run's seed it falls back to wall-clock time, so replaying a failure
+    # with the recorded seed would reproduce the workload but not the fault
+    # schedule. Attacks that take no seed keep the plain (delay,) signature.
+    injector_args: tuple[object, ...] = (KILL_LEADER_AFTER_SECONDS,)
+    if attack in SEEDED_ATTACKS:
+        injector_args = (KILL_LEADER_AFTER_SECONDS, CHAOS_STORM_DURATION, actual_seed)
     killer = threading.Thread(
         target=ATTACK_DISPATCH[attack],
-        args=(KILL_LEADER_AFTER_SECONDS,),
+        args=injector_args,
         daemon=True,
         name="injector",
     )

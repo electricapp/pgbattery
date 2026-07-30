@@ -46,7 +46,6 @@
         "management-api",
         "observability-sanity",
         "backup-corrupt-restore",
-        "gateway-connection-survival",
         "backup-restore-valid",
         "leaderless-wedge-recovery",
         "restart-budget-sustained-pg-death",
@@ -75,7 +74,8 @@
         "concurrent-writes-failover",
         "async-degraded-durability",
         "ddl-failover",
-        "lsn-over-report-rejected"
+        "lsn-over-report-rejected",
+        "gateway-connection-survival"
       ]
     },
     "ha-assert-sanity": {
@@ -84,7 +84,12 @@
       "cases": [
         "assert-sanity-acked",
         "assert-sanity-concurrent",
-        "assert-sanity-diverged"
+        "assert-sanity-diverged",
+        "assert-sanity-chaos-oracle",
+        "assert-sanity-chaos-oracle-post",
+        "assert-sanity-chaos-oracle-full",
+        "assert-sanity-cascade-atomicity",
+        "assert-sanity-gateway-migration"
       ]
     },
     "ha-controlplane-nightly": {
@@ -116,7 +121,14 @@
         "partition-plus-crash",
         "skew-plus-restart",
         "double-failover-partition",
-        "sync-standby-livelock"
+        "sync-standby-livelock",
+        "dual-writability-baseline",
+        "dual-writability-leader-kill",
+        "dual-writability-network-partition",
+        "dual-writability-quorum-loss",
+        "promotion-holddown-clock-step",
+        "network-loss-stability",
+        "disk-full-wal-pressure"
       ]
     }
   },
@@ -124,7 +136,8 @@
     {
       "id": "leader-crash",
       "tests_md_ref": "1. Leader Crash (SIGKILL) [V1]",
-      "description": "Kill leader container and verify failover converges to exactly one leader, AND that an acknowledged write made before the kill survived the failover. Pre-fix, the case only verified liveness ('cluster came back'); the data-integrity oracle (see CLAUDE.md: 'Verify data integrity after leadership changes') catches a regression where the new leader promotes from a behind / divergent replica.",
+      "contracts": ["W1", "V1"],
+      "description": "Kill leader container and verify failover converges to exactly one leader, AND that an acknowledged write made before the kill survived the failover. The data-integrity oracle (see CLAUDE.md: 'Verify data integrity after leadership changes') catches a regression where the new leader promotes from a behind / divergent replica — a liveness-only check ('the cluster came back') passes straight through that bug.",
       "actions": [
         {
           "type": "record_leader",
@@ -188,6 +201,7 @@
     {
       "id": "sync-replica-failure",
       "tests_md_ref": "2. Sync Replica Failure [R2, V1]",
+      "contracts": ["V1"],
       "description": "Kill a follower and verify the leader stays stable and the cluster recovers.  The sleep between kill and wait_cluster guarantees the disruption actually registers (raft heartbeat timeout ~1s + Docker restart kick-off); without it, wait_cluster can observe a pre-kill healthy snapshot on its very first poll and report a false-positive 0.1s pass.  Target node is chosen at runtime so the test is deterministic regardless of which node is leader from prior cases.",
       "actions": [
         {
@@ -227,8 +241,15 @@
     {
       "id": "leader-network-partition",
       "tests_md_ref": "3. Leader Network Partition [V1]",
-      "description": "SIGSTOP/SIGCONT node1 process to simulate hang and verify cluster reconverges.",
+      "contracts": ["W1", "V1"],
+      "description": "SIGSTOP/SIGCONT node1's pgbattery to simulate a hang, and verify the cluster reconverges to exactly one leader with no data damage: the 100 rows acknowledged before the freeze are all still present exactly once, and the healed cluster commits a fresh batch. Reconvergence alone would also be reported by a cluster that promoted a replica missing the pre-freeze writes.",
       "actions": [
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the freeze — all must survive it",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
         {
           "type": "cmd",
           "cmd": "docker compose exec -T node1 pkill -STOP pgbattery"
@@ -246,6 +267,12 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "comment": "Full replication health was demanded above, so this commit must not block on a lagging standby.",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -257,14 +284,26 @@
         {
           "type": "metric_leader_count",
           "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ]
     },
     {
       "id": "cluster-restart",
       "tests_md_ref": "5. Cluster-Wide Restart [V1]",
-      "description": "Restart all compose services and verify one-leader reconvergence.",
+      "contracts": ["W1", "V1"],
+      "description": "Restart all compose services and verify one-leader reconvergence AND that the restart was durable: the 100 rows acknowledged before the restart are all present exactly once afterwards, and the restarted cluster commits a fresh batch. A simultaneous whole-cluster restart is the cheapest possible test of fsync-before-ack, and topology-only assertions cannot see a lost commit.",
       "actions": [
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the whole-cluster restart",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
         {
           "type": "cmd",
           "cmd": "docker compose restart"
@@ -275,6 +314,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -282,12 +326,18 @@
           "type": "cluster_topology",
           "nodes": 3,
           "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ]
     },
     {
       "id": "rapid-leadership-transfer-cascade",
       "tests_md_ref": "Chaos: rapid back-to-back leadership transfers",
+      "contracts": ["V1"],
       "description": "Chain five leadership transfers across all voters with concurrent writes.  Exercises the lease-drain + catch-up-tolerance + transfer-mutex fixes: previously, the second transfer would wedge the cluster leaderless because openraft's CheckQuorum kept followers loyal to the old leader and the target burned its term for nothing.  Now each transfer is bracketed by a >lease-duration heartbeat pause and a target-catch-up check, so all five should land.",
       "actions": [
         {
@@ -367,6 +417,7 @@
     {
       "id": "postgres-kill-auto-restart",
       "tests_md_ref": "Chaos: internal-failure shutdown produces non-zero exit + Docker restart",
+      "contracts": ["V1"],
       "description": "pkill -9 postgres on a follower and verify the follower's pgbattery process exits non-zero (so Docker's restart: on-failure policy relaunches it) and the node rejoins as a healthy follower.  Regression guard for the 'zombie leader' bug where pgbattery kept running after PG died, still serving 'I am leader' from the management API, AND for the 'clean-exit ignored by Docker' regression where an internal-failure shutdown returned 0 and Docker's on-failure restart policy left the container dead.",
       "actions": [
         {
@@ -406,11 +457,18 @@
     {
       "id": "leaderless-wedge-recovery",
       "tests_md_ref": "BUGS.md: SIGSTOP leader + kill sync wedge (openraft 0.9 PreVote)",
-      "description": "Reproduces the leaderless-wedge bug: SIGSTOP the leader so quorum is impossible while node1 (sync replica) is killed; SIGCONT, restart node1, and verify the cluster recovers a leader within the leaderless-recovery-watchdog budget. Without the watchdog this cluster stays leaderless for minutes — openraft 0.9 has no PreVote, so persisted-but-undelivered T+1 votes wedge the term. With the watchdog (Governor::run_leaderless_watchdog) each voter force-triggers an election after a staggered threshold (8s + (node_id-1)*2s) to advance the term. Recovery budget = max stagger + safety = ~30s.",
+      "contracts": ["W1", "V1"],
+      "description": "Reproduces the leaderless-wedge bug: SIGSTOP the leader so quorum is impossible while node1 (sync replica) is killed; SIGCONT, restart node1, and verify the cluster recovers a leader within the leaderless-recovery-watchdog budget. Without the watchdog this cluster stays leaderless for minutes — openraft 0.9 has no PreVote, so persisted-but-undelivered T+1 votes wedge the term. With the watchdog (Governor::run_leaderless_watchdog) each voter force-triggers an election after a staggered threshold (8s + (node_id-1)*2s) to advance the term. Recovery budget = max stagger + safety = ~30s. The data oracle additionally requires the 100 rows acked before the wedge to be readable exactly once on whichever node ends up leading: recovering a leader by promoting a node that lost acked writes is not a recovery. No post-recovery write batch here — this case deliberately stops at leader recovery with a trailing replica still catching up, so a commit would block on sync replication.",
       "actions": [
         {
           "type": "record_leader",
           "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the wedge; every one must survive it",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
         },
         {
           "type": "cmd",
@@ -455,12 +513,19 @@
           "nodes": 3,
           "leaders": 1,
           "comment": "exactly one leader after recovery — no split term, no wedge"
+        },
+        {
+          "type": "sql",
+          "comment": "Read through the recovered leader's gateway: the pre-wedge acked rows must all be there, exactly once.",
+          "file": "chaos-oracle-assert-survived.sql",
+          "node": "leader"
         }
       ]
     },
     {
       "id": "restart-budget-sustained-pg-death",
       "tests_md_ref": "BUGS.md: Docker restart budget exhaustion under sustained PG death",
+      "contracts": ["V1"],
       "description": "Kill PG repeatedly on a follower (6 times, > the old `on-failure:5` cap) and verify the container's pgbattery process is still responsive at the end. Without `restart: unless-stopped` Docker stops restarting after 5 failures, leaving the container Exited and the cluster permanently one node short. We probe by curling the mgmt port (port 9082 for node2, 9083 for node3) with retries — if the container is up at all, that port responds within ~30s. If Docker abandoned the container, the port stays dead.",
       "actions": [
         {
@@ -499,6 +564,7 @@
     {
       "id": "mgmt-api-no-stale-leader-after-pg-death",
       "tests_md_ref": "BUGS.md: management API serves stale leader after PG death (zombie leader, root cause #5)",
+      "contracts": ["L1", "V1"],
       "description": "Kill PG on the leader; immediately query the leader's management API. The /cluster/leader endpoint must NOT continue to report this dead node as leader after RaftCore has shut down. The old implementation read `cluster_state.leader_id` (the Raft-log-applied mirror) which persists across RaftCore shutdown — fixed by reading `RaftMetrics::current_leader` (live truth source) instead. We poll the leader's own mgmt port immediately after the kill; if it lies, this assertion fails.",
       "actions": [
         {
@@ -539,6 +605,7 @@
     {
       "id": "hung-postmaster-failover",
       "tests_md_ref": "BUGS.md: hung postmaster wedges leader silently",
+      "contracts": ["V1"],
       "description": "SIGSTOP the leader's postgres postmaster (process alive, unresponsive). Liveness based on process-existence (`is_alive`) would report healthy. Cluster must detect query-unresponsiveness and fail over within the probe-failure threshold + graceful-shutdown timeout. Without the fix: writes hang forever, no failover. With the fix: a new leader is elected on a healthy node within ~90s (5×2s probe failures = 10s + 5s graceful pg.stop timeout + Docker restart + Raft election).",
       "actions": [
         {
@@ -581,12 +648,19 @@
     {
       "id": "cascade-double-failover-wedge",
       "tests_md_ref": "BUGS.md: cluster wedges when chaos arrives faster than node recovery",
-      "description": "Kill the leader THREE times in close succession under sustained concurrent write load. Each kill happens BEFORE the previous killed node has fully completed pg_basebackup. The interleaving leaves only one voter healthy at the moment of kill #3 → no quorum → the cluster's only path back is the leaderless watchdog forcing an election once the recovering nodes' Raft comes back. Without the widened watchdog stagger, multiple voters' forced elections collide (term tangle) and the cluster stays wedged for minutes. With fix: lowest-id voter elects cleanly and cluster recovers within 90s.",
+      "contracts": ["W1", "W2", "V1"],
+      "description": "Kill the leader THREE times in close succession under sustained concurrent write load. Each kill happens BEFORE the previous killed node has fully completed pg_basebackup. The interleaving leaves only one voter healthy at the moment of kill #3 → no quorum → the cluster's only path back is the leaderless watchdog forcing an election once the recovering nodes' Raft comes back. Without the widened watchdog stagger, multiple voters' forced elections collide (term tangle) and the cluster stays wedged for minutes. With fix: lowest-id voter elects cleanly and cluster recovers within 90s. Two data oracles run on top of that liveness check, because this is the heaviest fault pressure in the matrix and it must yield a correctness signal, not just a heartbeat: the 100 rows acked before the cascade must be present exactly once on the recovered leader, and every 200-row worker batch that materialised at all must be complete — a batch is one statement, hence one transaction, so 1..199 rows is a lost-atomicity violation and >200 is a duplicate replay. Whether a given batch was acked is genuinely indeterminate here, so per-batch atomicity is the strongest non-flaky property available (same precedent as concurrent-writes-failover).",
       "actions": [
         {
           "type": "sql",
           "file": "concurrent-writes-setup.sql",
           "node": 1
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before any kill. These are not indeterminate — the step fails if the commit is not acknowledged — so they must survive all three kills.",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
         },
         {
           "type": "cmd",
@@ -665,6 +739,18 @@
           "type": "cluster_topology",
           "nodes": 3,
           "leaders": 1
+        },
+        {
+          "type": "sql",
+          "comment": "Acked-before-the-cascade rows must be readable exactly once on the recovered leader.",
+          "file": "chaos-oracle-assert-survived.sql",
+          "node": "leader"
+        },
+        {
+          "type": "sql",
+          "comment": "Per-batch atomicity for the three background workers' ~60,000 rows, which were previously discarded in cleanup without ever being read.",
+          "file": "cascade-write-atomicity-assert.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
@@ -678,8 +764,15 @@
     {
       "id": "pgbattery-sigkill-recovery",
       "tests_md_ref": "BUGS.md: abruptly-killed pgbattery leaves PG zombie",
-      "description": "SIGKILL pgbattery (NOT postgres) on a node. The child postgres is orphaned and eventually becomes a zombie. Without the fix, the new pgbattery boots, reads postmaster.pid, sees the zombie's PID, refuses to start a fresh postgres → infinite crash loop. With the fix (cleanup_stale_postgres on supervisor start): the new pgbattery cleans the stale postmaster.pid and starts fresh PG. We don't require a leadership change — Docker's restart is fast enough that node1 often resumes leadership; the test instead asserts that all 3 nodes are alive + writeable within the budget.",
+      "contracts": ["W1", "V1"],
+      "description": "SIGKILL pgbattery (NOT postgres) on a node. The child postgres is orphaned and eventually becomes a zombie. Without the fix, the new pgbattery boots, reads postmaster.pid, sees the zombie's PID, refuses to start a fresh postgres → infinite crash loop. With the fix (cleanup_stale_postgres on supervisor start): the new pgbattery cleans the stale postmaster.pid and starts fresh PG. We don't require a leadership change — Docker's restart is fast enough that node1 often resumes leadership; the case instead asserts all 3 nodes are alive, the 100 rows acked before the SIGKILL survived exactly once, and the recovered cluster commits a fresh 50-row batch. The post-kill commit is what actually distinguishes 'PG came back' from 'PG came back writable': a node stuck on the zombie postmaster.pid leaves sync replication at 0 replicas and every commit blocks.",
       "actions": [
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the SIGKILL",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
         {
           "type": "cmd",
           "comment": "SIGKILL pgbattery on the LEADER",
@@ -691,6 +784,11 @@
           "leaders": 1,
           "timeout_sec": 90,
           "comment": "Cluster converges back to a single leader. Without fix: the killed node's PG is wedged on the zombie postmaster.pid and never comes back, so sync_replicas stays at 0."
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -698,24 +796,31 @@
           "type": "cluster_topology",
           "nodes": 3,
           "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ]
     },
     {
       "id": "faketime-shift-active",
       "tests_md_ref": "BUGS.md: libfaketime not actually installed in container",
-      "description": "Verifies that the FAKETIME LD_PRELOAD machinery actually works. Every other chaos test that depends on time manipulation is silently no-op'd if this doesn't pass. Writes +30s to /tmp/faketime, then runs `date` and asserts the time shifted by 25–35s (loose bound for clock drift between the two `date` calls).",
+      "contracts": ["L1"],
+      "description": "Precondition oracle for every clock-skew case, and therefore a coverage guard on L1 rather than a direct L1 measurement: it pins down WHAT the FAKETIME LD_PRELOAD machinery injects, in both directions. (1) Writing +30s to /tmp/faketime must move CLOCK_REALTIME by 25–35s — if it does not, every skew case is a silent no-op and their L1 coverage has evaporated. (2) The same write must leave CLOCK_MONOTONIC within a few seconds of real elapsed time, because the split between the two clocks is the entire mechanism promotion-holddown-clock-step depends on: a wall-clock-only step is what separates a hold-down measured on SystemTime from a lease measured on Instant. FAKETIME_DONT_FAKE_MONOTONIC is not set in docker-compose.yml, so monotonic invariance is a property of the installed libfaketime rather than of our configuration — this assertion is what notices if a rebuild changes it. Both clocks are sampled from one in-container perl process so they share a single faketime view.",
       "actions": [],
       "assertions": [
         {
           "type": "cmd",
-          "cmd": "BEFORE=$(docker compose exec -T node1 date +%s | tr -d '[:space:]'); docker compose exec -T node1 bash -c 'echo +30s > /tmp/faketime'; sleep 1; AFTER=$(docker compose exec -T node1 date +%s | tr -d '[:space:]'); DIFF=$((AFTER - BEFORE)); docker compose exec -T node1 bash -c 'echo +0s > /tmp/faketime'; echo \"diff=$DIFF\"; [ \"$DIFF\" -ge 25 ] && [ \"$DIFF\" -le 35 ]"
+          "cmd": "docker compose exec -T node1 sh -c 'echo \"+0s\" > /tmp/faketime; sleep 1; set -- $(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC,CLOCK_REALTIME -e \"printf(qq{%d %d}, clock_gettime(CLOCK_REALTIME), clock_gettime(CLOCK_MONOTONIC))\"); R0=$1; M0=$2; echo \"+30s\" > /tmp/faketime; sleep 1; set -- $(perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC,CLOCK_REALTIME -e \"printf(qq{%d %d}, clock_gettime(CLOCK_REALTIME), clock_gettime(CLOCK_MONOTONIC))\"); R1=$1; M1=$2; echo \"+0s\" > /tmp/faketime; RD=$((R1-R0)); MD=$((M1-M0)); echo \"realtime_delta=${RD}s monotonic_delta=${MD}s\"; [ \"$RD\" -ge 25 ] && [ \"$RD\" -le 35 ] || { echo \"FAIL: faketime did not move CLOCK_REALTIME by ~+30s — every clock-skew case is a no-op\"; exit 1; }; [ \"$MD\" -ge 0 ] && [ \"$MD\" -le 5 ] || { echo \"FAIL: faketime moved CLOCK_MONOTONIC by ${MD}s — wall-clock-only skew is not injectable, so promotion-holddown-clock-step no longer discriminates\"; exit 1; }'"
         }
       ]
     },
     {
       "id": "majority-loss",
       "tests_md_ref": "4. Majority Loss [L2]",
+      "contracts": ["L2"],
       "description": "Stop two nodes and verify quorum loss and write fencing behavior.",
       "actions": [
         {
@@ -760,6 +865,7 @@
     {
       "id": "leadership-transfer",
       "tests_md_ref": "7. Manual Promotion (modeled as leadership transfer) [V1]",
+      "contracts": ["W1", "V1"],
       "description": "Transfer leadership to node2 and verify (a) the new leader is stable AND (b) an acknowledged write made before the transfer survived. A graceful transfer must preserve all acknowledged writes — otherwise the target was promoted before catching up.",
       "actions": [
         {
@@ -805,7 +911,8 @@
     {
       "id": "management-api",
       "tests_md_ref": "10. Management API",
-      "description": "Validate key management API endpoints return JSON payloads.",
+      "contracts": ["V1"],
+      "description": "Validate that the leader-discovery and lag endpoints return the JSON payloads every other case depends on. This is a substrate check rather than a direct correctness measurement: /cluster/leader is the surface through which V1 (a writable leader within the recovery budget) is defined and observed, and every wait_cluster step in the matrix polls it, so a shape change here silently degrades the whole suite into vacuous passes.",
       "actions": [],
       "assertions": [
         {
@@ -841,7 +948,8 @@
     {
       "id": "observability-sanity",
       "tests_md_ref": "11. Observability Sanity",
-      "description": "Ensure metrics endpoints expose expected HA signals and exactly one leader.",
+      "contracts": ["L1"],
+      "description": "Ensure metrics endpoints expose the expected HA signals, and that exactly one node reports pgbattery_raft_is_leader=1 across all three. The leader-count assertion is a direct steady-state L1 measurement read from an independent source (Prometheus, not the management API): two nodes claiming leadership simultaneously is a split-brain signal regardless of what /cluster/leader says.",
       "actions": [],
       "assertions": [
         {
@@ -873,6 +981,7 @@
     {
       "id": "backup-corrupt-restore",
       "tests_md_ref": "14a. Corrupt Backup",
+      "contracts": ["V2"],
       "description": "Create a full backup on the leader, demote that node to a standby (a full restore is refused with 409 on the live leader because it overwrites the primary's data dir), corrupt the archive, and verify the restore fails with a clear 500 error.",
       "actions": [
         {
@@ -940,6 +1049,7 @@
     {
       "id": "acked-write-durability",
       "tests_md_ref": "Control Plane 1. Acked Write Durability Invariant [W1, R2]",
+      "contracts": ["W1", "R2"],
       "description": "Writes unique acknowledged operations before/after failover and verifies no loss or duplicates.",
       "actions": [
         {
@@ -994,6 +1104,7 @@
     {
       "id": "stale-leader-fencing",
       "tests_md_ref": "Control Plane 2. Stale Leader Fencing Under Asymmetric Partition [L1]",
+      "contracts": ["L1", "L2"],
       "description": "Forces leader quorum loss while leader stays reachable; verifies write fencing and no quorum signal.",
       "actions": [
         {
@@ -1048,6 +1159,7 @@
     {
       "id": "failover-commit-boundary",
       "tests_md_ref": "Control Plane 3. Failover During In-Flight Transaction Matrix [W1, S1]",
+      "contracts": ["W1", "S1"],
       "description": "Kills leader during transaction sleep and verifies committed state is explicit and bounded.",
       "actions": [
         {
@@ -1100,6 +1212,7 @@
     {
       "id": "repeated-failover-load",
       "tests_md_ref": "Control Plane 4. Repeated Failover Under Sustained Write Load [W1, V1]",
+      "contracts": ["W1", "V1"],
       "description": "Performs deterministic write batches with repeated leader kills and validates no acknowledged-write loss.",
       "actions": [
         {
@@ -1204,6 +1317,7 @@
     {
       "id": "diverged-node-rejoin",
       "tests_md_ref": "Control Plane 5. Diverged Node Rejoin Correctness [V2]",
+      "contracts": ["V2"],
       "description": "Stops a follower, advances writes, rejoins follower, and verifies lag convergence and replicated data.",
       "actions": [
         {
@@ -1250,6 +1364,7 @@
     {
       "id": "restart-permutations",
       "tests_md_ref": "Control Plane 6. Cluster Restart Liveness Permutations [V1]",
+      "contracts": ["W1", "V1"],
       "description": "Restarts all nodes in two explicit start-order permutations and verifies write liveness each time.",
       "actions": [
         {
@@ -1335,6 +1450,7 @@
     {
       "id": "leadership-churn-livelock",
       "tests_md_ref": "Control Plane 7. Leadership Churn Livelock Test [V1]",
+      "contracts": ["V1"],
       "description": "Rapidly transfers leadership among voters and verifies the cluster still converges and accepts writes.",
       "actions": [
         {
@@ -1414,6 +1530,7 @@
     {
       "id": "backup-consistency-under-load",
       "tests_md_ref": "Control Plane 8. Backup Consistency Under Concurrent Writes [W1]",
+      "contracts": ["W1"],
       "description": "Creates backup during active writes and verifies backup artifact is present and cluster remains writable.",
       "actions": [
         {
@@ -1472,6 +1589,7 @@
     {
       "id": "prepared-transaction-semantics",
       "tests_md_ref": "Control Plane 9. Prepared Transaction Semantics (2PC) [S1]",
+      "contracts": ["S1"],
       "description": "Validates prepared transaction behavior across failover, or exits cleanly when disabled.",
       "actions": [
         {
@@ -1523,6 +1641,7 @@
     {
       "id": "session-semantics-contract",
       "tests_md_ref": "Control Plane 10. Session Semantics Contract (Locks/Temp Objects) [S2]",
+      "contracts": ["S1", "S2"],
       "description": "Holds advisory lock in long session, triggers failover, and verifies lock is released post-failover.",
       "actions": [
         {
@@ -1564,6 +1683,7 @@
     {
       "id": "leader-network-partition-real",
       "tests_md_ref": "Control Plane 11. Real Network Partition (docker network disconnect) [V1]",
+      "contracts": ["L1", "V1"],
       "description": "Severs node1 from the overlay network (not a process pause) and verifies fencing and election. Unlike SIGSTOP, the node cannot communicate with peers at all \u2014 tests the true split-brain path.",
       "actions": [
         {
@@ -1635,6 +1755,7 @@
     {
       "id": "concurrent-writes-failover",
       "tests_md_ref": "Control Plane 12. Concurrent Writes During Failover [W2]",
+      "contracts": ["W2"],
       "description": "Starts 3 concurrent large INSERT batches against the leader PG, kills pgbattery mid-write, and verifies each batch is either fully present or fully absent (atomicity). Detects partial write bugs.",
       "actions": [
         {
@@ -1681,7 +1802,8 @@
     {
       "id": "gateway-connection-survival",
       "tests_md_ref": "Control Plane 13. Gateway Connection Migration [S2]",
-      "description": "Opens idle connections through a follower gateway (proxying to leader), kills the leader, and verifies pgbattery_connections_migrated is incremented \u2014 confirming the gateway migrates connections rather than just dropping them.",
+      "contracts": ["S2"],
+      "description": "Verifies connection migration, the gateway's headline behaviour, with two independent oracles instead of a metric-presence check. Three GENUINELY IDLE sessions are held open through node2's gateway (which proxies to leader node1); idleness is load-bearing, because ConnectionState::is_migratable requires tx_status Idle with no response pending \u2014 a session parked inside `SELECT pg_sleep(...)` has a response outstanding and is severed by design, so a case built on one would be asserting the wrong branch. The case therefore polls node2's pgbattery_connections_idle until it reports the 3 held sessions before injecting any fault. Node1 is then killed and (1) node2's pgbattery_connections_migrated counter must rise above zero, and (2) at least one of the held sessions must complete an INSERT on its ORIGINAL client connection after the new leader is elected. The 1-of-3 lower bound is what S2 actually guarantees: severing is permitted (if the new leader's PostgreSQL is not accepting yet, the reconnect fails and the session gets SQLSTATE 08006), zero migrations is not. Note that pgbattery_connections_migrated is a describe_counter!, so the Prometheus exporter emits no line for it at all until the first increment \u2014 an absent line is read as 0 rather than as a missing metric.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -1694,9 +1816,20 @@
           "timeout_sec": 60
         },
         {
+          "type": "sql",
+          "comment": "Landing table for the post-failover writes the held sessions make.",
+          "file": "gateway-migration-setup.sql",
+          "node": 1
+        },
+        {
           "type": "cmd",
-          "comment": "open 2 idle connections through node2 gateway (which proxies to node1)",
-          "cmd": "docker compose exec -T node2 sh -lc \"(psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -c 'SELECT pg_sleep(8);' 2>/dev/null &); (psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -c 'SELECT pg_sleep(8);' 2>/dev/null &); sleep 1\""
+          "comment": "Hold 3 idle sessions through node2's gateway. Each runs one SELECT, goes idle for 25s (long enough that its next statement lands after a single-node-kill failover has completed), then writes its own row on the same connection. Feeding psql from a brace group keeps the session parked at ReadyForQuery with nothing outstanding \u2014 the only state the gateway will migrate.",
+          "cmd": "docker compose exec -T node2 sh -lc 'for i in 1 2 3; do ( { printf \"SELECT 1;\\n\"; sleep 25; printf \"INSERT INTO ci_gateway_migration(session_id) VALUES (%s);\\n\" \"$i\"; sleep 5; } | psql -U postgres -h 127.0.0.1 -p 5432 -d postgres >/tmp/ci_gw_idle_$i.out 2>&1 & ); done; sleep 2; echo held'"
+        },
+        {
+          "type": "cmd",
+          "comment": "Gate on node2 reporting 3 idle gateway connections before any fault. Without this the kill could land while a session is still authenticating or still awaiting its first ReadyForQuery, which is a severing path, not a migration path.",
+          "cmd": "for i in $(seq 1 20); do IDLE=$(curl -s http://localhost:9092/metrics | awk '/^pgbattery_connections_idle/{print $2}' | head -1); IDLE=${IDLE:-0}; IDLE=${IDLE%%.*}; echo \"attempt $i: node2 idle=$IDLE\"; [ \"$IDLE\" -ge 3 ] && exit 0; sleep 1; done; echo 'FAIL: node2 never reported 3 idle gateway connections \u2014 nothing migratable is being held'; curl -s http://localhost:9092/metrics | grep -E '^pgbattery_connections'; exit 1"
         },
         {
           "type": "record_leader",
@@ -1716,6 +1849,16 @@
         },
         {
           "type": "cmd",
+          "comment": "Direct migration oracle: node2's gateway must report at least one migrated connection. Absent counter line == 0 increments == the gateway dropped every idle session. Severed is printed for diagnosis but not gated on, since S2 permits severing.",
+          "cmd": "for i in $(seq 1 30); do MIG=$(curl -s http://localhost:9092/metrics | awk '/^pgbattery_connections_migrated/{print $2}' | head -1); MIG=${MIG:-0}; MIG=${MIG%%.*}; if [ \"$MIG\" -ge 1 ]; then echo \"node2 migrated=$MIG after ${i}s\"; curl -s http://localhost:9092/metrics | grep -E '^pgbattery_connections_(migrated|severed)'; exit 0; fi; sleep 1; done; echo 'FAIL: pgbattery_connections_migrated never incremented on node2 \u2014 connection migration did not happen'; curl -s http://localhost:9092/metrics | grep -E '^pgbattery_connections'; exit 1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Wait for the held sessions' post-failover INSERT statements (issued 25s after they were opened) to land, so the SQL oracle below reads a settled table rather than racing the sessions.",
+          "cmd": "for i in $(seq 1 60); do N=$(docker compose exec -T node2 psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -tAc 'SELECT count(*) FROM ci_gateway_migration;' 2>/dev/null | tr -d '[:space:]'); echo \"attempt $i: rows=${N:-unreadable}\"; [ \"${N:-0}\" -ge 1 ] && exit 0; sleep 1; done; echo 'no post-failover row from any held session yet'; docker compose exec -T node2 sh -lc 'for f in /tmp/ci_gw_idle_*.out; do echo \"--- $f\"; cat $f; done' || true; exit 1"
+        },
+        {
+          "type": "cmd",
           "cmd": "docker compose start node1"
         },
         {
@@ -1727,9 +1870,10 @@
       ],
       "assertions": [
         {
-          "type": "metric_exists",
-          "node_id": 2,
-          "metric": "pgbattery_connections_total"
+          "type": "sql",
+          "comment": "End-to-end oracle: how many held sessions wrote on their original connection after the leader changed.",
+          "file": "gateway-migration-assert.sql",
+          "node": "leader"
         },
         {
           "type": "cluster_topology",
@@ -1741,6 +1885,7 @@
     {
       "id": "replication-slot-no-leak",
       "tests_md_ref": "Control Plane 14. Replication Slot Leak After Repeated Failovers [R1]",
+      "contracts": ["R1"],
       "description": "Forces two successive pgbattery kills and verifies no inactive physical replication slots remain on any node's primary. Stale slots block WAL cleanup and cause unbounded disk growth.",
       "actions": [
         {
@@ -1803,8 +1948,26 @@
     {
       "id": "clock-skew-resilience",
       "tests_md_ref": "Control Plane 15. NTP Clock Skew Resilience [V1]",
-      "description": "Jumps node2 clock forward 5 minutes via libfaketime then back, verifying the cluster remains stable. Uses LD_PRELOAD faketime (no SYS_TIME capability needed). Tests Raft lease and heartbeat timing under clock skew.",
+      "contracts": ["L1", "W1"],
+      "description": "Follower clock skew with a live write workload and a continuous split-brain oracle. Node2's wall clock is jumped +5 minutes via libfaketime (LD_PRELOAD, no SYS_TIME capability needed) while node1 holds leadership and node3 stays healthy, so quorum is retained for the whole window and a mid-skew commit is expected to be acknowledged rather than indeterminate. Two things are checked that a stability-only assertion cannot see: a 25-row batch acked while node2's clock is 5 minutes ahead must still be there at the end (any wall-clock-derived fencing decision on node2 that dropped or duplicated replicated data shows up here), and the dual-writability prober attempts a real write against all three internal PostgreSQL ports every 50 ms for the entire skew window, so a skewed follower that mistakenly considered itself lease-holding and unfenced is caught within one 50 ms round rather than being invisible between matrix steps. Skew magnitude arithmetic: 300 s is 150x DEFAULT_LEASE_DURATION (2 s) and 300x DEFAULT_ELECTION_TIMEOUT_MS (1000 ms), so every wall-clock deadline node2 could be holding is unambiguously in its own past.",
       "actions": [
+        {
+          "type": "transfer_leadership",
+          "comment": "Pin leadership on node1 so the skewed node is a follower and a promotion candidate, not the leader (leader-clock-skew covers the leader case).",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before any skew",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
         {
           "type": "clock_skew",
           "comment": "jump node2 clock +5min via libfaketime; no SYS_TIME cap required",
@@ -1812,9 +1975,16 @@
           "seconds": 300
         },
         {
-          "type": "sleep",
-          "seconds": 10,
-          "comment": "longer than the lease interval so any mis-timed lease expiry would trigger"
+          "type": "sql",
+          "comment": "25 rows acked WHILE node2's clock is 5 minutes ahead. Quorum is intact (node1 leader + node3 healthy), so this commit is required to succeed, not merely allowed to. shell_timeout_sec is tightened from the 600s default because a sync-replicated 25-row commit through a healthy node3 is a sub-second operation: if it has not returned in 120s the leader is blocked waiting on the skewed replica, and that is the failure this step exists to surface — 600s would just make it a slower hang.",
+          "file": "chaos-oracle-mid.sql",
+          "node": "leader",
+          "shell_timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "comment": "Continuous L1 oracle across the skew window. 12s spans 6 lease durations at a 50 ms round period, which is below the 100 ms fence-enforcement tick in src/app.rs, so no single-tick dual-write window can fall between rounds. Exit 1 from the prober means two nodes confirmed a write in the same round; exit 3 means the run was too blind to trust.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-clock-skew-resilience && ./testing/dual_writability_prober.py --duration 12 --json testing/artifacts/dual-writability-clock-skew-resilience/result.json"
         },
         {
           "type": "clock_heal",
@@ -1826,6 +1996,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -1837,6 +2012,11 @@
         {
           "type": "metric_leader_count",
           "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-full.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
@@ -1850,7 +2030,8 @@
     {
       "id": "asymmetric-leader-partition",
       "tests_md_ref": "Control Plane 13. Asymmetric Partition (leader inbound blocked) [L1]",
-      "description": "Blocks inbound Raft traffic to the leader while leaving outbound intact. The leader keeps sending heartbeats so followers never time out on their own \u2014 only lease expiry and fencing on the leader side can resolve this. Verifies the cluster eventually elects a new leader and recovers cleanly.",
+      "contracts": ["L1", "W1", "V1"],
+      "description": "Blocks inbound Raft traffic to the leader while leaving outbound intact. The leader keeps sending heartbeats so followers never time out on their own \u2014 only lease expiry and fencing on the leader side can resolve this, which makes it the single most dangerous split-brain shape in the matrix: the isolated node1 still has a live, unfenced PostgreSQL while node2/node3 elect a replacement. The dual-writability prober runs for the whole partition window, attempting a real write against all three internal PostgreSQL ports every 50 ms, so a window where both the isolated ex-leader and the new leader accept a write is caught even if it lasts one fence-enforcement tick. The prober reaches PostgreSQL from the host, not from node2/node3, so the iptables DROP rules do not blind it. Data oracle on top: the 100 rows acked before the partition must survive exactly once, and the healed cluster must commit a fresh batch.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -1867,6 +2048,12 @@
           "var": "leader_before"
         },
         {
+          "type": "sql",
+          "comment": "100 acked rows before the partition",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
           "type": "asymmetric_partition",
           "comment": "Drop all inbound to node1 from node2 and node3 \u2014 node1 cannot hear follower ACKs or votes",
           "node": 1,
@@ -1878,10 +2065,17 @@
           "from_node": 3
         },
         {
+          "type": "cmd",
+          "comment": "L1 oracle across the whole partition window. 25s covers follower election timeout (1000-2000 ms), the winner's promotion, and the deposed leader's lease expiry plus fencing, with ~10x margin. All three containers stay up so the prober is not blind: only Raft inbound to node1 is dropped.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-asymmetric-partition && ./testing/dual_writability_prober.py --duration 25 --json testing/artifacts/dual-writability-asymmetric-partition/result.json"
+        },
+        {
           "type": "wait_cluster",
+          "comment": "require_replication_health must be off while the partition is still up. It defaults ON for a 3-node/1-leader wait, and it cannot be satisfied mid-partition: the new leader keeps the isolated node1 in pg_stat_replication as a lagging/async standby until wal_sender_timeout (~60s) elapses, so the strict '1 Sync + 1 Potential, 0 Async' shape races that timeout. Only topology plus 'leadership moved off node1' is checked here; the post-heal wait below re-asserts full health.",
           "nodes": 3,
           "leaders": 1,
           "leader_not_var": "leader_before",
+          "require_replication_health": false,
           "timeout_sec": 60
         },
         {
@@ -1900,6 +2094,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -1907,18 +2106,18 @@
           "type": "cluster_topology",
           "nodes": 3,
           "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
         {
           "type": "cmd",
-          "comment": "remove iptables rules if still present; ignore exit code if already removed",
-          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null || true",
-          "expect_exit": null
-        },
-        {
-          "type": "cmd",
-          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null || true",
+          "comment": "Drain every matching DROP rule on node1, not just one. --user root because the image sets USER postgres and iptables needs CAP_NET_ADMIN/CAP_NET_RAW, which a non-root process does not hold; the while loop because -D removes a single instance and a re-applied fault can leave duplicates that would keep node1 partitioned for every later case. Bounded by the loop terminating as soon as -D fails.",
+          "cmd": "for ip in 172.28.0.12 172.28.0.13; do while docker compose exec -T --user root node1 iptables -D INPUT -s $ip -j DROP 2>/dev/null; do echo \"removed DROP from $ip\"; done; done; docker compose exec -T --user root node1 iptables -S INPUT 2>/dev/null || true",
           "expect_exit": null
         }
       ]
@@ -1926,7 +2125,8 @@
     {
       "id": "leader-clock-skew",
       "tests_md_ref": "Control Plane 16. Leader Clock Skew [V1]",
-      "description": "Shifts the current leader's (node1) clock +5 minutes via libfaketime. The leader may self-step-down when its own Raft lease expires early. Verifies a stable cluster with exactly one leader after healing.",
+      "contracts": ["L1", "W1"],
+      "description": "Skew applied to the node that is losing leadership — the combination that matters. Node1 is made leader, then its wall clock jumps +5 minutes while the dual-writability prober is already running. A +300 s step is 150 lease durations, so any wall-clock-derived expiry check on node1 fires immediately and it self-steps-down while node2/node3 elect a replacement; the danger is a window where the stepped-down node1 has not yet been fenced but the replacement is already writable. The prober attempts a real write against all three internal PostgreSQL ports every 50 ms across the whole window, which is the only way that window is observable: it can be shorter than the 100 ms fence-enforcement tick, let alone shorter than a gap between matrix steps. The 100 rows acked before the skew must also survive exactly once, and the healed cluster must commit a fresh batch. No mid-skew batch here: node1 may be mid-step-down for the whole window, so a commit at that moment is legitimately indeterminate and asserting on it would flake (clock-skew-resilience covers the mid-fault-write case, where quorum is provably retained).",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -1943,16 +2143,15 @@
           "var": "leader_before"
         },
         {
-          "type": "clock_skew",
-          "comment": "jump leader clock +5min; it may see its own lease expire and step down",
-          "node": 1,
-          "seconds": 300
+          "type": "sql",
+          "comment": "100 acked rows on the soon-to-be-skewed leader",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
         },
         {
-          "type": "wait_cluster",
-          "nodes": 3,
-          "leaders": 1,
-          "timeout_sec": 60
+          "type": "cmd",
+          "comment": "Arm the skew 3s into the prober window and probe for 30s total. Backgrounding the injector (with its output redirected so it does not hold the step's stdout pipe open) and keeping the prober in the FOREGROUND makes the prober's exit code the assertion — each cmd step is its own shell, so a backgrounded prober's status could not be recovered by a later step. 3s of pre-skew baseline proves the prober sees exactly one writable node before the fault; the remaining 27s covers step-down, election, promotion, and fencing with ~13x the 2s lease as margin.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-leader-clock-skew && ( sleep 3; docker compose exec -T node1 sh -c \"echo '+300s' > /tmp/faketime\" ) >/tmp/ci_leader_skew_inject.log 2>&1 & ./testing/dual_writability_prober.py --duration 30 --json testing/artifacts/dual-writability-leader-clock-skew/result.json"
         },
         {
           "type": "clock_heal",
@@ -1963,7 +2162,12 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 60
+          "timeout_sec": 90
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -1975,6 +2179,11 @@
         {
           "type": "metric_leader_count",
           "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
@@ -1982,12 +2191,19 @@
           "type": "clock_heal",
           "comment": "restore if test failed before heal step",
           "node": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
         }
       ]
     },
     {
       "id": "async-degraded-durability",
       "tests_md_ref": "Control Plane 17. Write Durability Under Async Degradation [L2]",
+      "contracts": ["L2", "W1"],
       "description": "Writes 30 rows sync-replicated to all three nodes, kills node3, writes 10 more rows sync-replicated to node2, then kills node2 (quorum lost). Verifies writes are fenced with no quorum and all 40 pre-quorum-loss rows survive full cluster recovery.",
       "actions": [
         {
@@ -2084,7 +2300,8 @@
     {
       "id": "membership-remove-rejoin",
       "tests_md_ref": "Control Plane 18. Membership Remove and Rejoin [V2]",
-      "description": "Removes node3 from Raft membership via the management API, stops the container, verifies the 2-node cluster stays stable with a leader, then restarts node3 (which auto-rejoins via its configured join command) and verifies the full 3-node cluster reforms.",
+      "contracts": ["W1", "V2"],
+      "description": "Removes node3 from Raft membership via the management API, stops the container, verifies the 2-node cluster stays stable with a leader, then restarts node3 (which auto-rejoins via its configured join command) and verifies the full 3-node cluster reforms. A membership change must not cost data: the 100 rows acked before node3 was removed must be present exactly once after it rejoins, and the reformed cluster must commit a fresh batch — the reformed-membership assertion below only proves the members list is the right shape, not that the shape is backed by usable data.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -2095,6 +2312,12 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the membership change",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
         },
         {
           "type": "http",
@@ -2125,6 +2348,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -2141,6 +2369,11 @@
           "json_fields": [
             "members"
           ]
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
@@ -2159,6 +2392,7 @@
     {
       "id": "backup-restore-valid",
       "tests_md_ref": "14b. Valid Backup Restore",
+      "contracts": ["V2"],
       "description": "Creates a valid backup with 3 seed rows, inserts additional post-backup rows, restores the backup, and verifies the cluster returns to the exact pre-insert snapshot (3 rows only, no post-backup rows).",
       "actions": [
         {
@@ -2222,6 +2456,7 @@
     {
       "id": "concurrent-backup-failover",
       "tests_md_ref": "Control Plane 19. Concurrent Backup and Leader Failover [W1]",
+      "contracts": ["V1"],
       "description": "Starts a pg_basebackup in the background (curl &), waits 1s, kills the leader mid-backup, waits for cluster reconvergence, and verifies either a clean backup result or a clean error \u2014 not a hang or corrupt state.",
       "actions": [
         {
@@ -2264,6 +2499,7 @@
     {
       "id": "network-latency-stability",
       "tests_md_ref": "Control Plane 20. Network Latency Stability [V1]",
+      "contracts": ["V1"],
       "description": "Adds 150ms\u00b140ms outbound latency on node2 and node3 via tc netem, writes data through the leader, asserts replication sync and data integrity under high RTT, then removes the delay.",
       "actions": [
         {
@@ -2347,6 +2583,7 @@
     {
       "id": "follower-one-peer-partition",
       "tests_md_ref": "Control Plane 21. Follower Inter-Peer Partition [V1]",
+      "contracts": ["V1"],
       "description": "Partitions node2 and node3 from each other (bidirectional DROP) while both can still reach the leader (node1). Raft quorum is preserved via node1. Verifies no leader change occurs, writes succeed, and the cluster heals cleanly.",
       "actions": [
         {
@@ -2428,13 +2665,8 @@
       "cleanup": [
         {
           "type": "cmd",
-          "comment": "remove iptables rules if still present",
-          "cmd": "docker compose exec -T node2 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null || true",
-          "expect_exit": null
-        },
-        {
-          "type": "cmd",
-          "cmd": "docker compose exec -T node3 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null || true",
+          "comment": "Drain the inter-follower DROP rules in both directions. --user root because the image sets USER postgres and iptables needs CAP_NET_ADMIN/CAP_NET_RAW; the while loop because -D removes one instance at a time and a leftover rule would silently partition the followers for every later case in the suite.",
+          "cmd": "while docker compose exec -T --user root node2 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null; do echo 'removed node2 DROP from node3'; done; while docker compose exec -T --user root node3 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null; do echo 'removed node3 DROP from node2'; done; true",
           "expect_exit": null
         }
       ]
@@ -2442,6 +2674,7 @@
     {
       "id": "rolling-upgrade",
       "tests_md_ref": "Control Plane 22. Rolling Upgrade [V1]",
+      "contracts": ["W1", "V1"],
       "description": "Simulates a rolling upgrade by restarting each node one at a time while the cluster continuously serves writes. Verifies no write loss and no downtime window longer than a single election timeout. In CI both restarts use the same binary; the test validates the upgrade procedure.",
       "actions": [
         {
@@ -2544,6 +2777,7 @@
     {
       "id": "wal-hole-resync",
       "tests_md_ref": "Control Plane 23. WAL-Hole Full Resync [V2]",
+      "contracts": ["V2"],
       "description": "Stops node3, advances the leader's WAL far enough that old segments may be recycled (80,000 rows + CHECKPOINT + pg_switch_wal twice), then restarts node3. If WAL replay is not possible pgbattery must trigger a full pg_basebackup resync. Verifies all 80,000 rows are present on node3 after convergence.",
       "actions": [
         {
@@ -2620,6 +2854,7 @@
     {
       "id": "ddl-failover",
       "tests_md_ref": "Control Plane 24. DDL Atomicity During Failover [W3]",
+      "contracts": ["W3"],
       "description": "Runs CREATE TABLE + CREATE INDEX inside a background psql session, kills the leader 300ms into the DDL, then waits for failover. Verifies the schema is either fully committed or fully absent \u2014 no partial DDL (table without its PK, or orphaned index).",
       "actions": [
         {
@@ -2665,6 +2900,7 @@
     {
       "id": "rogue-pg-promote",
       "tests_md_ref": "Control Plane 25. Rogue pg_ctl Promote Split-Brain Detection [W2, L1]",
+      "contracts": ["L1", "W2"],
       "description": "Calls pg_ctl promote directly on node2 (a follower) bypassing pgbattery, creating a rogue primary. pgbattery should detect that pg_is_in_recovery() is false on a non-leader node and fence/restart it. Verifies the cluster converges to a single leader and no data is duplicated.",
       "actions": [
         {
@@ -2722,6 +2958,7 @@
     {
       "id": "correctness-lite-invariants",
       "tests_md_ref": "Control Plane 26. Correctness Lite — Durability + Split-Brain (I1\u2013I7 + L2\u2013L3 + B1\u2013B2) [W1, W2, L1, L2]",
+      "contracts": ["W1", "W2", "L1", "L2"],
       "description": "Runs correctness_lite.py against the live cluster: 8 fault-injection steps (~360 writes), checks I1-NO_LOST_ACKS, I2-NO_PHANTOM_WRITES, I3-NO_DUPLICATES, I4-SINGLE_LEADER, I5-NO_ACKS_DURING_QUORUM_LOSS, I6-INTERMEDIATE_READ_CONSISTENCY, I7-CAUSAL_MONOTONICITY, plus log-grep checks L2-L3 and bank-transfer invariants B1-B2. NOTE: This is durability + split-brain coverage, not linearizability — see the linearizability-register case for that.",
       "actions": [
         {
@@ -2736,7 +2973,8 @@
     {
       "id": "linearizability-register",
       "tests_md_ref": "Control Plane 26b. Linearizability — single-register CAS history (WGL)",
-      "description": "Runs linearizability_register.py against the live cluster: spawns 3 concurrent clients issuing reads / writes / CAS against a shared register, kills the leader mid-run, then verifies the recorded operation history is linearizable via the Wing-Gong-Lowe algorithm. Catches transactional anomalies (lost-update, stale-read, write-skew on the single key) that correctness_lite cannot.",
+      "contracts": ["W1", "W2", "L1"],
+      "description": "Runs linearizability_register.py against the live cluster with the script's own defaults: 2 concurrent client threads (NUM_WORKERS) issuing reads / writes / CAS across 3 independent register keys (NUM_KEYS), leader killed mid-run, then each key's operation history checked for linearizability via the Wing-Gong-Lowe algorithm. Catches single-object anomalies that correctness_lite cannot express — lost updates and stale reads. It cannot catch write skew: write skew is a multi-object anomaly, and each key here is modelled and checked as an independent single register, so no history recorded by this workload can exhibit it. Multi-object transactional anomaly classes are the Elle path (--workload txn --check elle), not this case.",
       "actions": [
         {
           "type": "cmd",
@@ -2750,7 +2988,8 @@
     {
       "id": "witness-topology",
       "tests_md_ref": "Control Plane 27. Witness Node 2+1 Topology",
-      "description": "Starts the witness learner node (node4, profiles=[witness]), verifies it joins the cluster, then kills node3 to simulate a 2+1 scenario. The two remaining voters plus the witness should maintain cluster health. Cleans up by stopping the witness.",
+      "contracts": ["W1", "V1"],
+      "description": "Starts the witness learner node (node4, profiles=[witness]), verifies it joins the cluster, then kills node3 to simulate a 2+1 scenario. The two remaining voters plus the witness should maintain cluster health. A learner joining and a voter dying must not cost data or writability: the 100 rows acked before the witness joined must be present exactly once at the end, and the 2+1 cluster must commit a fresh batch — a witness that was mistakenly counted as a sync standby would leave commits blocking while topology still read as healthy. Cleans up by stopping the witness.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -2761,6 +3000,12 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the witness joins",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
         },
         {
           "type": "cmd",
@@ -2802,6 +3047,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -2809,6 +3059,11 @@
           "type": "cluster_topology",
           "nodes": 3,
           "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
@@ -2822,6 +3077,7 @@
     {
       "id": "assert-sanity-acked",
       "tests_md_ref": "Assert Sanity 1. acked-write-durability assertion fires on bad data [W1]",
+      "contracts": ["W1"],
       "description": "Seeds ci_ack_durability with 5 rows (expected 60) then confirms the assertion raises \u2014 verifying the assert SQL cannot pass silently on wrong data.",
       "actions": [
         {
@@ -2865,6 +3121,7 @@
     {
       "id": "assert-sanity-concurrent",
       "tests_md_ref": "Assert Sanity 2. concurrent-writes assertion fires on partial batch [W2]",
+      "contracts": ["W2"],
       "description": "Seeds ci_concurrent_writes with worker_id=7 having 500 rows (not 1000) then confirms the assertion raises.",
       "actions": [
         {
@@ -2902,6 +3159,7 @@
     {
       "id": "assert-sanity-diverged",
       "tests_md_ref": "Assert Sanity 3. diverged-node-rejoin assertion fires on wrong row count [V2]",
+      "contracts": ["V2"],
       "description": "Seeds ci_rejoin with 10 rows (expected 25) then confirms the assertion raises.",
       "actions": [
         {
@@ -2939,6 +3197,7 @@
     {
       "id": "storage-fault-recovery",
       "tests_md_ref": "Control Plane V2. Storage Fault Recovery (pg_control corruption) [V2]",
+      "contracts": ["V2"],
       "description": "Stops node3, corrupts its pg_control file (simulating storage fault), restarts node3, and verifies pgbattery automatically resync'd via pg_basebackup and the node rejoins the cluster with consistent data. Tests contract V2.",
       "actions": [
         {
@@ -3004,7 +3263,8 @@
     {
       "id": "perf-baseline",
       "tests_md_ref": "Performance 1. pgbench TPS Regression Gate",
-      "description": "Runs pgbench (4 clients, 10s) against the leader's internal PostgreSQL port and asserts TPS >= 100. Acts as a performance regression floor \u2014 a 10x throughput regression will fail this gate even if all correctness tests pass.",
+      "contracts": ["V1"],
+      "description": "Runs pgbench (4 clients, 10s) against the leader's internal PostgreSQL port and asserts TPS >= 100. Acts as a performance regression floor \u2014 a 10x throughput regression will fail this gate even if all correctness tests pass. This is a throughput floor, not a correctness oracle: the only contract it bears on is liveness, in the weak sense that a cluster which cannot sustain 100 TPS of committed writes is not usefully writable. It proves nothing about durability or leadership.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -3039,7 +3299,8 @@
     {
       "id": "partition-plus-crash",
       "tests_md_ref": "Control Plane 18. Compound: Asymmetric Partition + Leader Crash [L1, V1]",
-      "description": "Simultaneously applies an inbound iptables drop on the leader AND kills the leader container. Tests that followers elect a new leader when the old one is both isolated and dead \u2014 a scenario that could confuse fencing state if the two fault layers interact badly.",
+      "contracts": ["L1", "W1", "V1"],
+      "description": "Simultaneously applies an inbound iptables drop on the leader AND kills the leader container. Tests that followers elect a new leader when the old one is both isolated and dead \u2014 a scenario that could confuse fencing state if the two fault layers interact badly. The data oracle makes the confusion visible rather than merely survivable: the 100 rows acked before the compound fault must be present exactly once on the new leader, and the reconverged cluster must commit a fresh batch. A fencing-state tangle that promoted a replica missing the pre-fault writes still reports one leader.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -3054,6 +3315,12 @@
         {
           "type": "record_leader",
           "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the compound partition + kill",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
         },
         {
           "type": "asymmetric_partition",
@@ -3088,6 +3355,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -3099,18 +3371,18 @@
           "type": "cluster_topology",
           "nodes": 3,
           "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
         {
           "type": "cmd",
-          "comment": "Remove any residual iptables rules on node1 (no-op if container was restarted)",
-          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.12 -j DROP 2>/dev/null || true",
-          "expect_exit": null
-        },
-        {
-          "type": "cmd",
-          "cmd": "docker compose exec -T node1 iptables -D INPUT -s 172.28.0.13 -j DROP 2>/dev/null || true",
+          "comment": "Drain any residual DROP rules on node1. Normally a no-op because the container was killed and restarted, which resets its netfilter tables; it matters on the path where the kill did not happen. --user root because the image sets USER postgres and iptables needs CAP_NET_ADMIN/CAP_NET_RAW.",
+          "cmd": "for ip in 172.28.0.12 172.28.0.13; do while docker compose exec -T --user root node1 iptables -D INPUT -s $ip -j DROP 2>/dev/null; do echo \"removed DROP from $ip\"; done; done; true",
           "expect_exit": null
         },
         {
@@ -3129,7 +3401,8 @@
     {
       "id": "skew-plus-restart",
       "tests_md_ref": "Control Plane 19. Compound: Clock Skew + Node Restart [V1]",
-      "description": "Applies a +5 minute clock skew to node2 while simultaneously restarting node3. Tests that the cluster remains stable when a follower has a skewed clock and another follower is mid-restart \u2014 two stressors that individually are handled but could interact on election timing.",
+      "contracts": ["L1", "W1", "V1"],
+      "description": "Compound skew + leadership loss aimed at ONE state machine. Node2 is given a steady +5 minute clock offset and then the LEADER (node1) is restarted, so the skewed node is a live promotion candidate at the moment the promotion path runs: hold-down, lease, and LSN-staleness decisions are all evaluated on node2's shifted wall clock while it campaigns. Skewing a follower and restarting a different follower would leave the two stressors touching nothing in common. The offset here is steady rather than stepped: it is already in place when node2 stamps its leader-loss anchor AND when it later checks the hold-down, so both reads see the same offset and the difference stays honest \u2014 this case therefore exercises cross-node skew (node2's stamps vs node1's and node3's), while promotion-holddown-clock-step is the case that separates the stamp from the check. The prober covers the whole restart window as the L1 oracle, and the chaos oracle requires the pre-fault acked rows to survive and the healed cluster to commit.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -3142,21 +3415,27 @@
           "timeout_sec": 60
         },
         {
+          "type": "sql",
+          "comment": "100 acked rows before the compound fault",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
           "type": "clock_skew",
-          "comment": "Jump node2 clock +5 minutes via libfaketime",
+          "comment": "Jump node2 clock +5 minutes via libfaketime, before it becomes a promotion candidate",
           "node": 2,
           "seconds": 300
         },
         {
           "type": "cmd",
-          "comment": "Restart node3 while node2 has skewed clock \u2014 compound stressor",
-          "cmd": "docker compose restart node3"
+          "comment": "Restart the LEADER 3s into the prober window so the skewed node2 has to participate in (and may win) the election. 35s of probing covers graceful stop, election, promotion, node1's restart and rejoin.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-skew-plus-restart && ( sleep 3; docker compose restart node1 ) >/tmp/ci_skew_restart_inject.log 2>&1 & ./testing/dual_writability_prober.py --duration 35 --json testing/artifacts/dual-writability-skew-plus-restart/result.json"
         },
         {
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 90
+          "timeout_sec": 120
         },
         {
           "type": "clock_heal",
@@ -3168,6 +3447,11 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
         }
       ],
       "assertions": [
@@ -3179,6 +3463,11 @@
         {
           "type": "metric_leader_count",
           "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
         }
       ],
       "cleanup": [
@@ -3198,6 +3487,7 @@
     {
       "id": "double-failover-partition",
       "tests_md_ref": "Control Plane 19. Double Failover with Network Partition [V1]",
+      "contracts": ["W1", "V2"],
       "description": "Kill leader, let it rejoin, then pause the NEW leader. Verifies that after two rapid timeline changes every follower pg_rewinds correctly, resumes streaming, and joins the sync standby list. This is the exact sequence that previously left followers wedged with stale min_recovery_end_timeline.",
       "actions": [
         {
@@ -3244,8 +3534,8 @@
         },
         {
           "type": "cmd",
-          "comment": "Pause the current leader — triggers second failover (TL N+2)",
-          "cmd": "docker pause pgbattery-node{{ second_leader }}-1"
+          "comment": "Pause the current leader — triggers second failover (TL N+2). Addressed by compose SERVICE name, not by container name: CI sets COMPOSE_PROJECT_NAME per run (pgbha_cpnightly_...), so any literal pgbattery-nodeN-1 container name cannot resolve there.",
+          "cmd": "docker compose pause node{{ second_leader }}"
         },
         {
           "type": "sleep",
@@ -3254,7 +3544,7 @@
         {
           "type": "cmd",
           "comment": "Unpause the old leader — it must pg_rewind and rejoin",
-          "cmd": "docker unpause pgbattery-node{{ second_leader }}-1"
+          "cmd": "docker compose unpause node{{ second_leader }}"
         },
         {
           "type": "wait_cluster",
@@ -3294,8 +3584,8 @@
       "cleanup": [
         {
           "type": "cmd",
-          "comment": "Ensure all containers running (unpause any stuck paused)",
-          "cmd": "docker unpause pgbattery-node1-1 pgbattery-node2-1 pgbattery-node3-1 2>/dev/null || true",
+          "comment": "Ensure all containers running (unpause any stuck paused). Service names so this works under any COMPOSE_PROJECT_NAME.",
+          "cmd": "docker compose unpause node1 node2 node3 2>/dev/null || true",
           "expect_exit": null
         },
         {
@@ -3314,6 +3604,7 @@
     {
       "id": "sync-standby-livelock",
       "tests_md_ref": "Control Plane 20. Sync Standby Livelock Prevention [V1]",
+      "contracts": ["R2", "V1"],
       "description": "Disconnects one follower and verifies writes still succeed via the remaining sync replica. Catches the bug where synchronous_standby_names is narrowed to only the currently-streaming replica — if that sole replica then disconnects, writes deadlock because ALTER SYSTEM to fix the list is itself a write.",
       "actions": [
         {
@@ -3400,6 +3691,7 @@
     {
       "id": "lsn-leaderless-livelock-recovery",
       "tests_md_ref": "Audit C3/Liveness: LSN fail-closed leaderless livelock",
+      "contracts": ["V1"],
       "description": "Regression coverage for the LSN-fail-closed leaderless livelock. `max_cluster_lsn` is refreshed only by Raft applies; during a leaderless window exceeding LSN_STALENESS_THRESHOLD_SECS (30s), the cached value stayed non-zero while all stored LSN timestamps aged into staleness. Pre-fix, every voter saw every candidate as stale and refused every vote → election livelock. Post-fix, is_lsn_acceptable_for_election re-derives the fresh max on the fly from node_lsns and falls back to bootstrap-permissive when nothing is fresh. Scenario: kill node1 (leader by default), wait long enough that all surviving nodes' last-seen LSN updates from the dead leader have aged out (45s = staleness + margin), then verify the surviving voters elect a new leader.",
       "actions": [
         {
@@ -3453,6 +3745,7 @@
     {
       "id": "vote-rejection-progresses",
       "tests_md_ref": "Audit C3: Vote rejection returns proper VoteResponse, not transport error",
+      "contracts": ["L3", "V1"],
       "description": "Regression coverage for the vote-rejection-as-Protocol-error bug. The LSN-gate in network.rs used to return Err(Protocol) when rejecting a vote; openraft callers treated that as a transport error and retried forever, while the rejecting side had committed to a no. Post-fix, a rejection emits a proper VoteResponse{vote_granted=false} and the candidate can step down / let another node win. This test rapidly cycles leadership several times: under the pre-fix bug, any LSN-gate rejection would deadlock the cycle. Under the post-fix code, even if some votes are rejected, the cluster keeps making progress.",
       "actions": [
         {
@@ -3512,13 +3805,9 @@
     {
       "id": "rewind-refused-on-data-loss-risk",
       "tests_md_ref": "Rewind data-loss gate — supervisor refuses pg_rewind when local WAL is more than one block ahead of the source",
-      "description": "Regression coverage for the pre-rewind divergence check. pg_rewind aligns local data to the source by discarding any WAL the source doesn't have; if the local node had ack'd commits beyond the source LSN (e.g. an ex-leader rejoining after the cluster promoted a follower that didn't see all writes), the rewind silently erases those commits. The supervisor now queries both LSNs before invoking pg_rewind and refuses with `Error::RewindDataLossRisk` when divergence exceeds `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES` (8 KiB). This case verifies: (1) the metric `pgbattery_pg_rewind_refused_data_loss_risk` is exposed, (2) a healthy leader transfer + rejoin sequence does NOT spuriously trigger the gate (false-positive regression). The positive case (gate actually fires) requires fault injection beyond the standard chaos toolkit and is covered by the supervisor's unit tests (`test_rewind_decision_refuse_beyond_threshold`, etc).",
+      "contracts": ["W1", "V1"],
+      "description": "Regression coverage for the pre-rewind divergence check. pg_rewind aligns local data to the source by discarding any WAL the source doesn't have; if the local node had ack'd commits beyond the source LSN (e.g. an ex-leader rejoining after the cluster promoted a follower that didn't see all writes), the rewind silently erases those commits. The supervisor now queries both LSNs before invoking pg_rewind and refuses with `Error::RewindDataLossRisk` when divergence exceeds `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES` (8 KiB). What this case verifies is exactly one property: a healthy leader transfer + rejoin sequence does NOT spuriously trigger the gate (false-positive regression), because a false positive deadlocks failover. It does NOT verify that the metric is exposed — `pgbattery_pg_rewind_refused_data_loss_risk` is a `describe_counter!`, and the Prometheus exporter emits no HELP or value line for a counter that has never been incremented, so on a healthy cluster the metric is legitimately absent and a presence check would fail while proving nothing about the gate. The assertion below therefore reads an absent line as zero. The positive case (gate actually fires) requires fault injection beyond the standard chaos toolkit and is covered by the supervisor's unit tests (`test_rewind_decision_refuse_beyond_threshold`, etc).",
       "actions": [
-        {
-          "type": "cmd",
-          "comment": "Confirm the gate metric is described and exposed on the current leader. /metrics returns HELP + value lines for described counters even when their value is 0.",
-          "cmd": "LEADER=$(curl -s http://localhost:9081/api/v1/cluster/leader | grep -oE '\"leader_id\":[0-9]+' | cut -d: -f2); LEADER_PORT=$((9090 + LEADER)); BODY=$(curl -s http://localhost:$LEADER_PORT/metrics); echo \"$BODY\" | grep -E '^# HELP pgbattery_pg_rewind_refused_data_loss_risk' || (echo 'metric HELP missing'; exit 1)"
-        },
         {
           "type": "record_leader",
           "var": "rewind_test_initial_leader"
@@ -3563,6 +3852,7 @@
     {
       "id": "stale-sync-metric-after-kill",
       "tests_md_ref": "BUGS.md: pgbattery_replica_is_sync stale-Sync after replica disconnect",
+      "contracts": ["R2", "V1"],
       "description": "After killing a follower's PostgreSQL, the leader's per-replica sync gauge must NOT keep reporting two Sync replicas. PG drops the walsender from pg_stat_replication within ~1s; the gauge must mirror that source-of-truth and not linger on the cached Sync value for `disconnect_timeout`. Pre-fix, replication_manager only flipped sync_state=Async after the grace window; post-fix, it flips immediately on absence from pg_stat_replication.",
       "actions": [
         {
@@ -3610,6 +3900,7 @@
     {
       "id": "lsn-over-report-rejected",
       "tests_md_ref": "Management API: report-lsn over-report guard rejects impossible follower LSNs",
+      "contracts": ["L3"],
       "description": "A forged or buggy follower LSN report far beyond any possible write position must be rejected by the leader before it reaches replicated state. An accepted over-report would inflate max_cluster_lsn and make every legitimate election candidate look 'too far behind', wedging failover. The leader rejects with HTTP 400 — either because the value exceeds its current write position, or (when the write position is momentarily unverifiable) via the implausible-advance clamp — and increments pgbattery_lsn_report_rejected_*. Followers would return 421 (misdirected); only the leader applies the guard.",
       "actions": [
         {
@@ -3627,6 +3918,719 @@
         }
       ],
       "cleanup": []
+    },
+    {
+      "id": "promotion-holddown-clock-step",
+      "tests_md_ref": "Control Plane 28. Promotion Lease Hold-Down vs Forward Wall-Clock Step [L1, W1]",
+      "contracts": ["L1", "W1"],
+      "description": "Targets the one combination the other four skew cases cannot reach: a forward WALL-CLOCK step applied to the node that is about to win an election, landing between that node observing leader-loss and its promote check. EXPECTED OUTCOME: this case PASSES when the promotion hold-down measures elapsed time on the monotonic clock, and FAILS when it measures it on the wall clock — the failure mode is two writable primaries, reported by the prober as two confirmed acceptances in one 50 ms round. TIMING ARITHMETIC, all values read from the source rather than chosen: DEFAULT_LEASE_DURATION is 2000 ms (src/governor/lease.rs) and DEFAULT_ELECTION_TIMEOUT_MS is 1000 ms (src/config/constants.rs), so openraft's election window [1000, 2000] ms can hand a candidate the term up to 1000 ms BEFORE the deposed leader's lease — anchored at its last quorum ack — can be guaranteed expired. Closing that 1000 ms gap is the hold-down's entire job: it holds promotion for one full lease from the local leader-to-none observation. A forward step of at least the lease (2000 ms) landing after the anchor is stamped and before the promote check satisfies a wall-clock hold-down while no real time has passed. The anchor is stamped roughly one election timeout after the kill (heartbeat 250 ms + election timeout 1000 ms), and the promote check runs after the election and on the reconcile loop's 2000 ms cadence, so the window to hit is only about 1.0 s to 4.0 s after the kill and at most ~3 s wide — too narrow for a reliable one-shot injection. The injection is therefore a RAMP: +3s, +6s, +9s ... +60s, one write per second, so every 1 s of real time adds 3 s of apparent time. 3 s is the 2000 ms lease plus 1 s of margin, that margin being one ramp period and the whole-second granularity of the faketime file. Whenever the anchor lands, the next ramp write within 1 s already makes the apparent elapsed time exceed a lease, so a wall-clock hold-down releases roughly 1 s before the deposed leader's monotonic lease can have expired. The ramp runs 20 s, spanning the whole stamp-to-check window with about 5x margin, and is applied to node2 AND node3 because either may win. faketime-shift-active is the precondition guard: it proves the same write moves CLOCK_REALTIME and leaves CLOCK_MONOTONIC alone, which is what makes this a wall-clock-only step rather than a step of both clocks.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "comment": "Pin leadership on node1 so the kill target is deterministic and the two possible election winners are exactly the two nodes being ramped.",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "comment": "100 acked rows before the failover. If a wall-clock-released promotion produces two writable primaries, this is where diverging or lost acked writes surface.",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Start the +3s-per-second ramp on both candidates, detached so the step returns immediately and the ramp keeps running across the kill. 20 iterations at 1s = a 20s ramp ending at +60s.",
+          "cmd": "for n in node2 node3; do docker compose exec -T -d $n sh -c 'for s in $(seq 3 3 60); do echo \"+${s}s\" > /tmp/faketime; sleep 1; done'; done; echo 'ramp armed on node2 and node3'"
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill the leader 2s into the ramp (so the ramp is already climbing when the anchor is stamped ~1s later) and probe for 40s in the foreground. The prober's exit code IS the L1 assertion. 40s exceeds the 20s ramp, so the ramp has provably exited before clock_heal below, which would otherwise be overwritten by a later ramp write. Indeterminate budget: node1 is deliberately dead for ~38 of 40s, which alone is 38/40 of its 1/3 share = 0.32 of all probes, close enough to the prober's 0.4 default to be worth raising; 0.45 leaves room for the winner's brief unavailability during promotion while still failing a run that was blind on two nodes.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-promotion-holddown && ( sleep 2; docker compose kill node1 ) >/tmp/ci_holddown_inject.log 2>&1 & ./testing/dual_writability_prober.py --duration 40 --max-indeterminate-rate 0.45 --json testing/artifacts/dual-writability-promotion-holddown/result.json"
+        },
+        {
+          "type": "clock_heal",
+          "node": 2
+        },
+        {
+          "type": "clock_heal",
+          "node": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "clock_heal",
+          "comment": "Heal both candidates even if the case failed mid-ramp. Runs after the prober step has returned, by which point the 20s ramp has exited, so this write is the last one.",
+          "node": 2
+        },
+        {
+          "type": "clock_heal",
+          "node": 3
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "dual-writability-baseline",
+      "tests_md_ref": "Control Plane 29. Dual-Writability Prober Non-Vacuity Baseline [L1]",
+      "contracts": ["L1"],
+      "description": "Runs the dual-writability prober against a healthy, unfaulted cluster with --min-single-acceptance-rate 0.95, which exits 3 (INCONCLUSIVE) unless at least 95% of rounds observed EXACTLY ONE writable node. This is the prober's own can-it-fail guard, and it belongs in the matrix for the same reason the ha-assert-sanity suite exists: a prober that could never confirm an acceptance — wrong port, wrong transport, unusable probe table, silently swallowed errors — would report no violations forever and every case that leans on it would pass vacuously. A run that is merely quiet is not a run that is watching.",
+      "actions": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 60,
+          "comment": "Baseline demands a fully healthy cluster: the 0.95 single-acceptance floor is only meaningful when every node is reachable and one of them is genuinely writable."
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cmd",
+          "comment": "15s at the default 50 ms round period is ~300 rounds across 3 nodes, enough for the 0.95 floor to be a real measurement rather than a small-sample artifact.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-baseline && ./testing/dual_writability_prober.py --duration 15 --min-single-acceptance-rate 0.95 --json testing/artifacts/dual-writability-baseline/result.json"
+        }
+      ]
+    },
+    {
+      "id": "dual-writability-leader-kill",
+      "tests_md_ref": "Control Plane 30. Dual Writability Across Leader Kill [L1, W1]",
+      "contracts": ["L1", "W1"],
+      "description": "The plain leader-kill failover, watched continuously instead of sampled. leader-crash proves a marker row survives and topology reconverges; neither it nor correctness_lite's I4 (which polls the three management APIs every 500 ms and only checks that they agree on a leader id) can see a window in which the deposed leader's PostgreSQL is still accepting writes while the new leader's already is. That window can be shorter than the 100 ms fence-enforcement tick in src/app.rs, so it is structurally invisible to 500 ms sampling. This case attempts a real write against all three internal PostgreSQL ports every 50 ms for the whole failover and fails on two confirmed acceptances in one round. Indeterminate budget 0.45: node1 is deliberately dead for ~27 of 30s, which is 0.30 of all probes on its own.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill the leader 3s into the prober window; the first 3s are a baseline that proves the prober sees exactly one writable node before the fault.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-leader-kill && ( sleep 3; docker compose kill node1 ) >/tmp/ci_dwp_kill_inject.log 2>&1 & ./testing/dual_writability_prober.py --duration 30 --max-indeterminate-rate 0.45 --json testing/artifacts/dual-writability-leader-kill/result.json"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node1 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "dual-writability-network-partition",
+      "tests_md_ref": "Control Plane 31. Dual Writability Across Real Network Partition [L1, W1]",
+      "contracts": ["L1", "W1"],
+      "description": "The true split-brain shape: node1 is severed from the overlay network while its container, and its PostgreSQL, stay alive and healthy. Unlike a kill, there IS a second candidate primary running for the whole window, so this is where dual writability is most likely to be real rather than theoretical. The prober is pinned to --transport docker-exec: the default direct route to 172.28.0.11:5434 dies with the partition, which would blind the prober on precisely the node under suspicion and turn the measurement into a tautology. docker compose exec does not traverse the bridge network, so visibility into the isolated node is retained. The chaos oracle additionally requires the 100 pre-partition acked rows to survive exactly once and the healed cluster to commit.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before"
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Sever node1 3s into a 35s prober window. 35s covers the followers' election timeout, promotion, and the isolated leader's own lease expiry and self-fencing with wide margin.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-network-partition && ( sleep 3; docker network disconnect \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\" ) >/tmp/ci_dwp_partition_inject.log 2>&1 & ./testing/dual_writability_prober.py --duration 35 --transport docker-exec --json testing/artifacts/dual-writability-network-partition/result.json"
+        },
+        {
+          "type": "cmd",
+          "comment": "Restore connectivity. --ip is mandatory: docker network disconnect destroys the compose-assigned static endpoint and a bare reconnect takes a dynamic IPAM address, so peers keep dialing the membership address 172.28.0.11 into a void and node1 campaigns forever.",
+          "cmd": "docker network connect --ip 172.28.0.11 \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\""
+        },
+        {
+          "type": "cmd",
+          "comment": "Restart node1 so published-port forwarding for 9081/9091 is re-established; disconnect/connect leaves that state stale and host-side requests to localhost:9081 time out even though the container reaches its peers.",
+          "cmd": "docker compose restart node1"
+        },
+        {
+          "type": "wait_cluster",
+          "comment": "stable_for_sec absorbs the one re-election the rejoining ex-leader can force with its bumped term: a brief 1-0-1 leader flicker is normal Raft liveness, a persistent one still fails here.",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2,
+          "stable_for_sec": 10
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker network connect --ip 172.28.0.11 \"${COMPOSE_PROJECT_NAME:-pgbattery}_raft_net\" \"${COMPOSE_PROJECT_NAME:-pgbattery}-node1-1\" 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "dual-writability-quorum-loss",
+      "tests_md_ref": "Control Plane 32. Dual Writability Across Quorum Loss and Restore [L1, W1]",
+      "contracts": ["L1", "W1"],
+      "description": "Watches the un-fencing transition, which is the dangerous half of quorum loss. node2 and node3 are stopped so node1 loses quorum and must fence itself, then both are started again: node1 is now racing to notice quorum is back and lift its fence, while the two returning voters may already have advanced a term and elected between themselves. The prober runs across both edges at 50 ms, so an overlap between a lifting fence and a fresh promotion is caught. Note what this case does NOT claim: the prober's verdict keys on two confirmed acceptances in one round, and with two of three nodes stopped that is arithmetically impossible during the loss window itself, so this is not an L2 (no-acked-write-during-quorum-loss) measurement — majority-loss and async-degraded-durability own that with explicit fenced-write probes. Indeterminate budget 0.5: two of three nodes are deliberately down for ~10 of 35s, which is 2/3 x 10/35 = 0.19 before counting their rejoin time.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Lose quorum at t+3s, hold it lost for 10s (5 lease durations, so node1's fence has provably landed), restore at t+13s, and keep probing to t+35s across the un-fence race.",
+          "cmd": "mkdir -p testing/artifacts/dual-writability-quorum-loss && ( sleep 3; docker compose stop node2 node3; sleep 10; docker compose start node2 node3 ) >/tmp/ci_dwp_quorum_inject.log 2>&1 & ./testing/dual_writability_prober.py --duration 35 --max-indeterminate-rate 0.5 --json testing/artifacts/dual-writability-quorum-loss/result.json"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "metric_leader_count",
+          "expected": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node2 node3 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "network-loss-stability",
+      "tests_md_ref": "Control Plane 33. Packet Loss on a Follower [W1, V1]",
+      "contracts": ["W1", "V1"],
+      "description": "The matrix's only packet-loss fault. Everything else network-shaped here is either binary (iptables DROP, docker network disconnect) or pure added latency (tc netem delay), and lossy links fail differently: retransmit timers, partial Raft frames, and walsender stalls instead of clean unreachability. The Elle harness has had a network_loss attack all along with no counterpart here. 30% egress loss is applied to node3's eth0 only, so node1 keeps a clean path to node2 and quorum is never at risk; a 25-row batch is then acked under the loss and must be intact at the end, and node3 must catch back up to synced once the loss is removed. Leader stability is deliberately NOT asserted: 30% loss on node3's own interface can drop four consecutive 250 ms heartbeats (0.3^4 per election window) often enough over the fault window that node3 legitimately starts and loses an election, so the property being claimed is one leader plus intact data, not the same leader.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "30% egress loss on node3 only, applied with --user root. tc needs CAP_NET_ADMIN and the image sets USER postgres, so `docker compose exec` without --user root gets RTNETLINK 'Operation not permitted' — which is also why this uses a cmd step rather than reaching for a netem step type. The show command afterwards makes the applied qdisc visible in the artifact log, so a silently-unapplied fault is not mistaken for a passing case.",
+          "cmd": "docker compose exec -T --user root node3 sh -c 'tc qdisc del dev eth0 root 2>/dev/null; tc qdisc add dev eth0 root netem loss 30%'; docker compose exec -T --user root node3 tc qdisc show dev eth0 | grep -q 'netem' || { echo 'FAIL: netem loss qdisc not present on node3 — the fault did not apply'; exit 1; }"
+        },
+        {
+          "type": "sql",
+          "comment": "25 rows acked while node3 drops 30% of its packets. Quorum runs through node2, so this commit is required to succeed. shell_timeout_sec is tightened from the 600s default because the commit only needs node2's ack: 120s without a reply means the leader is waiting on the lossy replica instead, which is exactly the sync-list narrowing bug that sync-standby-livelock guards, and a tight bound reports it as a failure rather than a ten-minute stall.",
+          "file": "chaos-oracle-mid.sql",
+          "node": "leader",
+          "shell_timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "comment": "Remove the root qdisc, i.e. the loss rule added above. --user root for the same reason as applying it.",
+          "cmd": "docker compose exec -T --user root node3 sh -c 'tc qdisc del dev eth0 root 2>/dev/null; true'"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        },
+        {
+          "type": "wait_sync",
+          "nodes": [3],
+          "timeout_sec": 90,
+          "comment": "node3 must stream back to zero lag once the loss is gone"
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-full.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "Ensure the loss qdisc is gone even if the case failed mid-fault; leaving it would poison every later case in the suite.",
+          "cmd": "docker compose exec -T --user root node3 sh -c 'tc qdisc del dev eth0 root 2>/dev/null; true' || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "disk-full-wal-pressure",
+      "tests_md_ref": "Control Plane 34. Reachable ENOSPC on a Follower [W1, V1, V2]",
+      "contracts": ["W1", "V1", "V2"],
+      "description": "A disk-full fault that is actually reachable, and that proves it before asserting anything else. REQUIRES the run to select the size-bounded state volumes: docker-compose.yml maps node<N>_state${PGBATTERY_STATE_SUFFIX} and the suffix defaults to empty, i.e. ordinary unbounded named volumes on which ENOSPC is not reachable at all. Run this case with PGBATTERY_STATE_SUFFIX=_bounded (tmpfs, PGBATTERY_BOUNDED_STATE_SIZE, default 4g). The case does not assume that was done: it fills node3's volume and then REQUIRES the filesystem to report under 64 MB available, so an unbounded run fails loudly with that instruction instead of passing while testing nothing. The fill is sized from the reported free space plus a small overshoot, under a hard 5120 MiB ceiling, which bounds the write on an unbounded volume rather than writing until the runner's root filesystem is gone. In bounded mode the volume is RAM-backed tmpfs, so the fill costs memory: exactly one node is filled, and it is freed in cleanup unconditionally. With node3 out of space, the properties under test are that the cluster keeps exactly one leader (V1), that the leader stays writable through a healthy node2 while a follower's storage is exhausted (W1 — the 25-row mid batch must ack), and that node3 resyncs to zero lag on its own once space is returned (V2).",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "comment": "Leadership on node1 and the fault on node3, so the leader always has a healthy sync candidate in node2 and commits are never expected to block.",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-setup.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cmd",
+          "comment": "Fill node3's PostgreSQL volume (mounted at /var/lib/postgresql), sized from its own reported free space so the fill adapts to PGBATTERY_BOUNDED_STATE_SIZE instead of hard-coding it, capped at 5120 MiB so an unbounded volume costs 5 GiB rather than the whole host disk. Then gate on the filesystem actually being full: the `avail < 64 MB` check is the anti-vacuity guard, and it is what turns an unbounded run from a silent pass into a failure.",
+          "cmd": "docker compose exec -T --user root node3 sh -c 'A=$(df -m --output=avail /var/lib/postgresql | tail -1 | tr -d \" \"); N=$((A + 64)); [ \"$N\" -gt 5120 ] && N=5120; echo \"filling ${N}MB of ${A}MB available\"; dd if=/dev/zero of=/var/lib/postgresql/ci_disk_fill bs=1M count=$N 2>&1 | tail -1; sync; df -m /var/lib/postgresql | tail -1'; AVAIL=$(docker compose exec -T node3 sh -c 'df -m --output=avail /var/lib/postgresql | tail -1' | tr -d '[:space:]'); echo \"node3 avail=${AVAIL}MB\"; [ \"${AVAIL:-999999}\" -lt 64 ] || { echo 'FAIL: node3 PostgreSQL volume still has space after the fill — ENOSPC is unreachable and this case would be vacuous. Re-run with PGBATTERY_STATE_SUFFIX=_bounded so docker-compose.yml selects the size-bounded tmpfs volumes.'; exit 1; }"
+        },
+        {
+          "type": "sql",
+          "comment": "25 rows acked while node3 is out of space. Quorum and sync both run through node2, so this must succeed; if it blocks, the leader was waiting on the exhausted replica. shell_timeout_sec is tightened from the 600s default so that blocking is reported promptly: an ENOSPC replica that the leader still counts as a required sync standby stalls commits indefinitely, and the whole point of the case is to catch that, not to wait it out.",
+          "file": "chaos-oracle-mid.sql",
+          "node": "leader",
+          "shell_timeout_sec": 120
+        },
+        {
+          "type": "cmd",
+          "comment": "Return the space. node3's PostgreSQL may have PANICked and be in a Docker restart cycle at this point, which is the expected reaction — the recovery path is what the wait_sync below measures.",
+          "cmd": "docker compose exec -T --user root node3 rm -f /var/lib/postgresql/ci_disk_fill; docker compose exec -T node3 sh -c 'df -m /var/lib/postgresql | tail -1'"
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 180,
+          "comment": "node3 may need a full basebackup resync after ENOSPC damage; 180s matches the storage-fault-recovery budget."
+        },
+        {
+          "type": "wait_sync",
+          "nodes": [3],
+          "timeout_sec": 120,
+          "comment": "V2: node3 rejoins and catches up with no operator intervention."
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-post.sql",
+          "node": "leader"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        },
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-full.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "comment": "Remove the fill file unconditionally: leaving it behind would starve every subsequent case in the suite.",
+          "cmd": "docker compose exec -T --user root node3 rm -f /var/lib/postgresql/ci_disk_fill 2>/dev/null || true",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 180
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-chaos-oracle",
+      "tests_md_ref": "Assert Sanity 4. chaos-oracle survived assertion fires on a short pre batch [W1]",
+      "contracts": ["W1"],
+      "description": "Seeds ci_chaos_oracle with 5 pre rows where chaos-oracle-setup.sql acknowledges 100, then confirms chaos-oracle-assert-survived.sql raises. That assertion is the sole data oracle for leaderless-wedge-recovery and cascade-double-failover-wedge, the two heaviest-fault cases in the matrix, so an oracle that could not fail there would be worse than none.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-chaos-oracle-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_chaos_oracle'"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-chaos-oracle-post",
+      "tests_md_ref": "Assert Sanity 5. chaos-oracle survived-and-writable assertion fires with no post batch [W1]",
+      "contracts": ["W1"],
+      "description": "Seeds ci_chaos_oracle with 5 pre rows and no post batch, then confirms chaos-oracle-assert-survived-and-writable.sql raises. This is the variant used by nine chaos cases, and its post-batch half is what distinguishes a cluster that reports one leader from a cluster that can actually commit — the half most worth proving can fail.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-chaos-oracle-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-survived-and-writable.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_chaos_oracle'"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-chaos-oracle-full",
+      "tests_md_ref": "Assert Sanity 6. chaos-oracle full assertion fires with no mid batch [W1]",
+      "contracts": ["W1"],
+      "description": "Seeds ci_chaos_oracle with 5 pre rows and neither a mid nor a post batch, then confirms chaos-oracle-assert-full.sql raises. That assertion is the three-phase variant used where quorum is provably retained (clock-skew-resilience, network-loss-stability, disk-full-wal-pressure), and its mid-batch clause is the only place the matrix asserts on a write acknowledged WHILE a fault is active.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-chaos-oracle-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "chaos-oracle-assert-full.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_chaos_oracle'"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-cascade-atomicity",
+      "tests_md_ref": "Assert Sanity 7. cascade write-atomicity assertion fires on a partial batch [W2]",
+      "contracts": ["W2"],
+      "description": "Seeds ci_concurrent_writes with a 150-row batch where a complete batch is 200, then confirms cascade-write-atomicity-assert.sql raises. Without this, the ~60,000 rows that cascade-double-failover-wedge drives through three cascading leader kills would be checked by an oracle whose per-batch bound had never been shown to bite.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-cascade-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "cascade-write-atomicity-assert.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_concurrent_writes'"
+        }
+      ]
+    },
+    {
+      "id": "assert-sanity-gateway-migration",
+      "tests_md_ref": "Assert Sanity 8. gateway migration assertion fires when no session survived [S2]",
+      "contracts": ["S2"],
+      "description": "Leaves ci_gateway_migration empty — the exact state the table is in when the gateway severs every idle session instead of migrating one — then confirms gateway-migration-assert.sql raises. The zero-row lower bound is the load-bearing half of that oracle, since an upper bound alone would be satisfied by a cluster that migrated nothing.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "file": "assert-sanity-gateway-migration-bad.sql",
+          "node": 1
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "file": "gateway-migration-assert.sql",
+          "node": 1,
+          "expect_exit": 3,
+          "on_error_stop": true
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -d postgres -c 'DROP TABLE IF EXISTS ci_gateway_migration'"
+        }
+      ]
     }
   ]
 }

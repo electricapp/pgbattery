@@ -18,12 +18,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import traceback
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -31,7 +33,7 @@ from typing import Any, Final
 
 import typer
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 from rich.console import Console
 from rich.table import Table
 
@@ -44,6 +46,16 @@ class StepType(StrEnum):
     """Discriminator for steps in the scenario matrix.
 
     Each value maps 1-to-1 to a handler in ``CIRunner._execute_step``.
+
+    Every step that spawns a shell command is bounded by
+    ``DEFAULT_SHELL_TIMEOUT_SEC``.  Individual steps override that budget with
+    ``shell_timeout_sec`` (``timeout_sec`` is accepted as an alias on steps that
+    do not already use it for polling).  Exceeding the budget kills the command
+    and fails the step.
+
+    Fault-injecting steps verify that the fault actually landed before the step
+    is allowed to succeed; see :meth:`CIRunner._verify_fault_intent` and the
+    ``_verify_*`` helpers.
 
     Attributes:
         CMD: Run an arbitrary shell command with optional exit-code and
@@ -139,6 +151,149 @@ _NODE_IPS: Final[dict[int, str]] = {
     3: "172.28.0.13",
 }
 
+# The raft_net subnet prefix; a container attached to raft_net always holds an
+# address in it, so its presence/absence is the observable effect of
+# ``docker network connect`` / ``docker network disconnect``.
+_RAFT_SUBNET_PREFIX: Final[str] = "172.28."
+
+
+# ---------------------------------------------------------------------------
+# Timeout budgets
+# ---------------------------------------------------------------------------
+
+# Every shell command the runner spawns is bounded.  Without this a single hung
+# `docker compose exec` (e.g. into a container that a previous step paused)
+# blocks the whole suite until the CI job-level timeout kills it, losing all
+# artifacts.
+DEFAULT_SHELL_TIMEOUT_SEC: Final[int] = 600
+# `docker compose up --build` compiles the Rust binary on a cold cargo cache.
+CLUSTER_LIFECYCLE_TIMEOUT_SEC: Final[int] = 1800
+# Snapshots and log dumps are best-effort diagnostics: keep them on a short
+# leash so a wedged docker daemon cannot consume the whole job budget.
+DIAGNOSTIC_TIMEOUT_SEC: Final[int] = 120
+# Fault-effect probes are single short `docker inspect` / `docker exec` calls.
+FAULT_PROBE_TIMEOUT_SEC: Final[int] = 60
+# Per-stream character budget for the partial output reported on a timeout.
+TIMEOUT_OUTPUT_CHARS: Final[int] = 4000
+# How long to wait for the pipes of a killed command to drain.
+TIMEOUT_DRAIN_SEC: Final[int] = 5
+# Slack allowed between the clock shift a libfaketime offset should produce and
+# the shift actually observed across two `docker exec` round-trips.
+FAKETIME_SHIFT_TOLERANCE_SEC: Final[int] = 10
+# Step keys that override the shell timeout, in precedence order.
+SHELL_TIMEOUT_KEYS: Final[tuple[str, ...]] = ("shell_timeout_sec", "timeout_sec")
+
+# User that privileged in-container operations exec as.  See
+# :func:`container_exec_prefix` for why the image's default user cannot be used.
+PRIVILEGED_EXEC_USER: Final[str] = "root"
+
+# Shape of a correctness contract ID as defined by the ``### <ID> — <title>``
+# headings in ``docs/CONTRACTS.md`` (W1, W2, L3, R1, V2, S1, ...).
+CONTRACT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Z]{1,3}[0-9]{1,2}")
+
+
+def validate_timeout_value(raw: Any, key: str) -> int:
+    """Coerce a matrix-supplied timeout to a positive whole number of seconds.
+
+    Args:
+        raw: Raw value from the step dict.
+        key: Step key the value came from (used in the error message).
+
+    Returns:
+        The timeout in seconds.
+
+    Raises:
+        ValueError: If the value is not a positive integer (bools and
+            fractional floats are rejected).
+    """
+    if isinstance(raw, bool):
+        raise ValueError(f"'{key}' must be a positive integer, got {raw!r}")
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            raise ValueError(f"'{key}' must be a whole number of seconds, got {raw!r}")
+        raw = int(raw)
+    if not isinstance(raw, int):
+        raise ValueError(f"'{key}' must be a positive integer, got {raw!r}")
+    if raw <= 0:
+        raise ValueError(f"'{key}' must be > 0, got {raw!r}")
+    return raw
+
+
+def resolve_shell_timeout(
+    step: Mapping[str, Any],
+    default: int = DEFAULT_SHELL_TIMEOUT_SEC,
+) -> int:
+    """Return the shell timeout for a step, honouring per-step overrides.
+
+    Args:
+        step: Step dict from the matrix.
+        default: Budget applied when the step declares no override.
+
+    Returns:
+        Timeout in seconds.
+
+    Raises:
+        RunnerError: If an override is present but is not a positive integer.
+    """
+    for key in SHELL_TIMEOUT_KEYS:
+        if step.get(key) is not None:
+            try:
+                return validate_timeout_value(step[key], key)
+            except ValueError as exc:
+                raise RunnerError(str(exc)) from exc
+    return default
+
+
+def tail_text(text: str | None, limit: int = TIMEOUT_OUTPUT_CHARS) -> str:
+    """Return at most ``limit`` trailing characters of ``text``.
+
+    Args:
+        text: Captured stream contents (``None`` when the stream was empty).
+        limit: Maximum characters to keep.
+
+    Returns:
+        The tail of ``text``, prefixed with a truncation marker when clipped,
+        or ``"<empty>"`` when there is nothing to show.
+    """
+    if not text:
+        return "<empty>"
+    if len(text) <= limit:
+        return text
+    return f"...<truncated {len(text) - limit} chars>...{text[-limit:]}"
+
+
+def format_timeout_failure(
+    command: str,
+    timeout_sec: float,
+    stdout: str | None,
+    stderr: str | None,
+) -> str:
+    """Build the loud failure message for a command that exceeded its budget.
+
+    The message is deliberately verbose: a timeout means the cluster (or the
+    docker daemon) is wedged, and the partial output is usually the only
+    evidence of where it wedged.
+
+    Args:
+        command: The command that was killed.
+        timeout_sec: Budget it exceeded.
+        stdout: Partial stdout captured before the kill, if any.
+        stderr: Partial stderr captured before the kill, if any.
+
+    Returns:
+        Multi-line message beginning with the ``STEP TIMEOUT`` label.
+    """
+    return "\n".join(
+        [
+            f"STEP TIMEOUT: command exceeded {timeout_sec:g}s and was killed",
+            f"$ {command}",
+            "--- partial stdout ---",
+            tail_text(stdout),
+            "--- partial stderr ---",
+            tail_text(stderr),
+        ]
+    )
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models — matrix config & API responses
@@ -199,18 +354,64 @@ class CaseConfig(BaseModel):
         id: Unique identifier referenced by suites.
         description: Human-readable summary.
         tests_md_ref: Cross-reference to the ``TESTS.md`` section.
+        contracts: Correctness contract IDs from ``docs/CONTRACTS.md`` that this
+            case exercises (e.g. ``["W1", "R2"]``).  Optional for the runner so
+            a case without it still parses and executes; ``lint_matrix.py``
+            enforces the "every case declares at least one real contract"
+            policy that ``docs/CONTRACTS.md`` states.
         actions: Steps that mutate cluster state (faults, writes, etc.).
         assertions: Steps that verify invariants after actions complete.
-        cleanup: Steps that restore the cluster for the next case; always
-            executed even if actions/assertions fail.
+        cleanup: Heal steps that restore the cluster for the next case.  Every
+            cleanup step is attempted regardless of the outcome of earlier
+            phases and regardless of earlier cleanup-step failures; failures are
+            aggregated and reported (see :meth:`CIRunner._run_cleanup`).
     """
 
     id: str
     description: str = ""
     tests_md_ref: str = ""
+    contracts: list[str] = []
     actions: list[dict[str, Any]] = []
     assertions: list[dict[str, Any]] = []
     cleanup: list[dict[str, Any]] = []
+
+    @field_validator("contracts")
+    @classmethod
+    def _validate_contracts(cls, value: list[str]) -> list[str]:
+        """Reject malformed contract IDs and duplicates.
+
+        Existence of each ID in ``docs/CONTRACTS.md`` is checked by
+        ``lint_matrix.py``, which owns the doc-parsing side of the policy.
+        """
+        seen: set[str] = set()
+        for raw in value:
+            if not CONTRACT_ID_PATTERN.fullmatch(raw):
+                raise ValueError(
+                    f"malformed contract ID {raw!r}: expected letters followed by digits "
+                    f"(e.g. 'W1', 'L2', 'R1')"
+                )
+            if raw in seen:
+                raise ValueError(f"duplicate contract ID {raw!r}")
+            seen.add(raw)
+        return value
+
+    @field_validator("actions", "assertions", "cleanup")
+    @classmethod
+    def _validate_steps(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Validate the step envelope shared by every step type.
+
+        Checks ``type`` is a non-empty string and that any shell-timeout
+        override is a positive integer, so a typo fails at matrix-parse time
+        rather than mid-suite.
+        """
+        for index, step in enumerate(value):
+            raw_type = step.get("type")
+            if not isinstance(raw_type, str) or not raw_type.strip():
+                raise ValueError(f"step #{index} is missing a non-empty 'type'")
+            for key in SHELL_TIMEOUT_KEYS:
+                if step.get(key) is not None:
+                    validate_timeout_value(step[key], key)
+        return value
 
 
 class MatrixConfig(BaseModel):
@@ -274,11 +475,24 @@ class CaseSummary:
         case_id: The case identifier from the matrix.
         passed: ``True`` if all actions and assertions succeeded.
         detail: Elapsed time on success, or the error message on failure.
+        cleanup_failures: One entry per cleanup step that failed.  A case whose
+            assertions passed but whose cleanup failed is reported as ``ERROR``,
+            never ``PASS``: the residue it leaves behind (a surviving iptables
+            rule, a still-paused container) corrupts every later case in a
+            ``reuse_cluster`` suite.
     """
 
     case_id: str
     passed: bool
     detail: str
+    cleanup_failures: list[str] = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        """Return ``PASS``, ``FAIL``, or ``ERROR`` (assertions passed, cleanup did not)."""
+        if not self.passed:
+            return "FAIL"
+        return "ERROR" if self.cleanup_failures else "PASS"
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +599,536 @@ def get_json_path(data: Any, path: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Fault-effect verification
+#
+# A fault that silently fails to inject turns a scenario into vacuous green:
+# the cluster is never disturbed, every assertion holds, the case passes.  The
+# helpers below parse the output of read-only probes so each fault-injecting
+# step can prove its fault actually landed (and each heal can prove it is
+# actually gone).  They are pure functions of command output so they can be
+# unit-tested without a cluster.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Outcome of a read-only verification probe.
+
+    Attributes:
+        exit_code: Probe process exit status.
+        stdout: Captured stdout.
+        stderr: Captured stderr.
+    """
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
+    @property
+    def combined(self) -> str:
+        """stdout and stderr joined, for probes whose tools log to either."""
+        return f"{self.stdout}\n{self.stderr}" if self.stderr else self.stdout
+
+
+@dataclass(frozen=True)
+class ContainerRunState:
+    """Container liveness identity used to prove a kill/restart happened.
+
+    Attributes:
+        status: Docker state string (``running``, ``paused``, ``exited``, ...).
+        started_at: RFC3339 start timestamp of the current incarnation.
+        restart_count: Number of restart-policy restarts docker has performed.
+    """
+
+    status: str
+    started_at: str
+    restart_count: int
+
+
+def parse_container_runstate(output: str) -> ContainerRunState | None:
+    """Parse ``docker inspect --format '{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}'``.
+
+    Args:
+        output: Probe stdout.
+
+    Returns:
+        The parsed state, or ``None`` if the probe produced no usable line
+        (missing container, docker error, empty output).
+    """
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not parts[2].isdigit():
+            continue
+        return ContainerRunState(status=parts[0], started_at=parts[1], restart_count=int(parts[2]))
+    return None
+
+
+_SERVICE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def parse_compose_services(output: str) -> set[str]:
+    """Parse ``docker compose ps --services`` output into a set of service names.
+
+    Args:
+        output: Probe stdout (one service name per line, possibly with
+            interleaved warning lines).
+
+    Returns:
+        Set of service names.
+    """
+    return {
+        line.strip() for line in output.splitlines() if _SERVICE_NAME_PATTERN.match(line.strip())
+    }
+
+
+def iptables_drop_rule_present(output: str, src_ip: str, chain: str = "INPUT") -> bool:
+    """Report whether ``iptables -S`` output contains a DROP rule for ``src_ip``.
+
+    Tolerates the ``/32`` netmask iptables appends when it prints rules back,
+    and ignores any ``iptables -L -v`` counter output appended to the same
+    probe.
+
+    Args:
+        output: Probe output containing ``-A <chain> ...`` rule lines.
+        src_ip: Source address the rule must match.
+        chain: Chain the rule must live in.
+
+    Returns:
+        ``True`` if a matching DROP rule exists.
+    """
+    rule_pattern = re.compile(
+        rf"^-A\s+{re.escape(chain)}\s+.*-s\s+{re.escape(src_ip)}(?:/\d+)?\s+.*-j\s+DROP\b"
+    )
+    return any(rule_pattern.match(line.strip()) for line in output.splitlines())
+
+
+def netem_present(output: str) -> bool:
+    """Report whether ``tc qdisc show`` output contains a netem qdisc.
+
+    Args:
+        output: Probe output.
+
+    Returns:
+        ``True`` if a netem qdisc is installed.
+    """
+    return any(line.strip().startswith("qdisc netem") for line in output.splitlines())
+
+
+_NETEM_DELAY_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bdelay\s+(\d+(?:\.\d+)?)(us|ms|s)\b")
+_TIME_UNIT_TO_MS: Final[dict[str, float]] = {"us": 0.001, "ms": 1.0, "s": 1000.0}
+
+
+def parse_netem_delay_ms(output: str) -> float | None:
+    """Extract the base netem delay from ``tc qdisc show`` output, in ms.
+
+    Args:
+        output: Probe output (e.g. ``qdisc netem 8001: root refcnt 2 limit 1000
+            delay 200ms 50ms``).
+
+    Returns:
+        The delay in milliseconds, or ``None`` if no netem delay is present.
+    """
+    if not netem_present(output):
+        return None
+    match = _NETEM_DELAY_PATTERN.search(output)
+    if not match:
+        return None
+    return float(match.group(1)) * _TIME_UNIT_TO_MS[match.group(2)]
+
+
+def parse_ps_stat_comm(output: str) -> list[tuple[str, str]]:
+    """Parse ``ps -eo stat=,comm=`` output into ``(stat, comm)`` pairs.
+
+    Args:
+        output: Probe stdout.
+
+    Returns:
+        List of ``(process state code, command name)`` pairs.
+    """
+    pairs: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pairs.append((parts[0].strip(), parts[1].strip()))
+    return pairs
+
+
+def matching_processes(pairs: Sequence[tuple[str, str]], pattern: str) -> list[tuple[str, str]]:
+    """Select the ``(stat, comm)`` pairs whose command name matches ``pattern``.
+
+    ``pkill`` treats its pattern as an extended regular expression over the
+    (15-character-truncated) command name; an unparseable pattern falls back to
+    a substring match.
+
+    Args:
+        pairs: Parsed ``ps`` output.
+        pattern: The pkill pattern.
+
+    Returns:
+        Matching pairs.
+    """
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        return [pair for pair in pairs if pattern in pair[1]]
+    return [pair for pair in pairs if compiled.search(pair[1])]
+
+
+def stopped_processes(pairs: Sequence[tuple[str, str]], pattern: str) -> list[tuple[str, str]]:
+    """Select matching processes that are in the stopped state (``T``).
+
+    Args:
+        pairs: Parsed ``ps`` output.
+        pattern: The pkill pattern.
+
+    Returns:
+        Matching pairs whose state code starts with ``T``.
+    """
+    return [pair for pair in matching_processes(pairs, pattern) if pair[0].startswith("T")]
+
+
+def parse_faketime_probe(output: str) -> tuple[str, int] | None:
+    """Parse the combined ``cat /tmp/faketime; date +%s`` probe output.
+
+    Args:
+        output: Probe stdout — the libfaketime offset on one line, the
+            container's current epoch seconds on the next.
+
+    Returns:
+        ``(offset_text, epoch_seconds)``, or ``None`` if the output is not
+        parseable.
+    """
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) < 2 or not lines[-1].isdigit():
+        return None
+    return lines[-2], int(lines[-1])
+
+
+_FAKETIME_OFFSET_PATTERN: Final[re.Pattern[str]] = re.compile(r"^([+-])(\d+)([smhd])$")
+_OFFSET_UNIT_TO_SEC: Final[dict[str, int]] = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_faketime_offset_seconds(text: str) -> int | None:
+    """Convert a libfaketime relative offset (e.g. ``+300s``) to seconds.
+
+    Args:
+        text: Offset text as written to ``FAKETIME_TIMESTAMP_FILE``.
+
+    Returns:
+        Signed seconds, or ``None`` for absolute/unsupported offset formats.
+    """
+    match = _FAKETIME_OFFSET_PATTERN.match(text.strip())
+    if not match:
+        return None
+    sign = -1 if match.group(1) == "-" else 1
+    return sign * int(match.group(2)) * _OFFSET_UNIT_TO_SEC[match.group(3)]
+
+
+def container_subnet_addresses(json_output: str, prefix: str) -> list[str]:
+    """Extract container IPs matching ``prefix`` from a Networks JSON blob.
+
+    Args:
+        json_output: Output of
+            ``docker inspect --format '{{json .NetworkSettings.Networks}}'``.
+        prefix: Address prefix to select (e.g. ``172.28.``).
+
+    Returns:
+        Matching IP addresses (empty when the container is attached to no
+        matching network, or the blob is ``null`` / unparseable).
+    """
+    try:
+        parsed = json.loads(json_output.strip() or "null")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    found: list[str] = []
+    for value in parsed.values():
+        if not isinstance(value, dict):
+            continue
+        address = value.get("IPAddress")
+        if isinstance(address, str) and address.startswith(prefix):
+            found.append(address)
+    return found
+
+
+# -- Fault-shaped shell command classification -------------------------------
+
+# Shell control operators.  A command containing any of these is not a single
+# invocation we can reason about, so it is never classified.
+_SHELL_METACHARACTERS: Final[tuple[str, ...]] = (";", "&", "|", "`", "$(", ">", "<", "\n")
+
+# Commands that inject a fault.  Used only to decide whether an unclassifiable
+# command deserves an explicit "unverified fault" warning, so that a dynamic
+# one-liner never looks like a verified fault.
+_FAULT_INJECTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\bdocker\s+(compose\s+)?pause\b"),
+    re.compile(r"\bdocker\s+compose\s+(kill|stop)\b"),
+    re.compile(r"\bdocker\s+kill\b"),
+    re.compile(r"\bdocker\s+network\s+disconnect\b"),
+    re.compile(r"\bpkill\b[^|;]*\s-(9|KILL|SIGKILL|STOP|SIGSTOP)\b"),
+    re.compile(r"\bkill\s+-(9|KILL|SIGKILL|STOP|SIGSTOP)\b"),
+    re.compile(r"\biptables\s+-[AI]\b"),
+    re.compile(r"\btc\s+qdisc\s+add\b"),
+    re.compile(r"\bpg_ctl\s+promote\b"),
+    re.compile(r"\bdd\s+if=/dev/urandom\b"),
+    re.compile(r"\bfallocate\b"),
+)
+
+# `docker compose` global flags that consume the following token.
+_COMPOSE_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {"-f", "--file", "-p", "--project-name", "--profile", "--project-directory", "--env-file"}
+)
+# `docker compose exec` flags that consume the following token.
+_EXEC_VALUE_FLAGS: Final[frozenset[str]] = frozenset(
+    {"-e", "--env", "-u", "--user", "-w", "--workdir", "--index"}
+)
+
+_PKILL_STOP_SIGNALS: Final[frozenset[str]] = frozenset({"-STOP", "-SIGSTOP", "-19"})
+_PKILL_CONT_SIGNALS: Final[frozenset[str]] = frozenset({"-CONT", "-SIGCONT", "-18"})
+_PKILL_KILL_SIGNALS: Final[frozenset[str]] = frozenset({"-9", "-KILL", "-SIGKILL"})
+
+
+@dataclass(frozen=True)
+class FaultIntent:
+    """What a fault-shaped shell command claims to do, so it can be verified.
+
+    Attributes:
+        kind: Verification strategy key (see
+            :meth:`CIRunner._verify_fault_intent`).
+        target_kind: ``"service"`` for compose service names, ``"container"``
+            for raw container names.
+        targets: Targets the command names.
+        injects: ``True`` for fault injection (verification failure fails the
+            step), ``False`` for a heal (a target that no longer exists is
+            treated as already healed).
+        pattern: ``pkill`` process pattern, empty for other kinds.
+        needs_prestate: ``True`` when verification compares container liveness
+            identity before and after the command.
+    """
+
+    kind: str
+    target_kind: str
+    targets: tuple[str, ...]
+    injects: bool
+    pattern: str = ""
+    needs_prestate: bool = False
+
+
+def container_exec_prefix(service: str, privileged: bool = False) -> str:
+    """Build the ``docker compose exec`` prefix for a command inside a node.
+
+    The runtime image ends with ``USER postgres`` (``Dockerfile``), and
+    ``docker-compose.yml`` sets no ``user:`` override, so an exec defaults to
+    the unprivileged ``postgres`` user.  ``cap_add: [NET_ADMIN]`` grants the
+    capability to the *container*, but an unprivileged process does not carry it:
+    every ``tc`` / ``iptables`` mutation, and every read of the iptables chain,
+    fails with ``Operation not permitted`` unless the exec asks for root.
+
+    Args:
+        service: Compose service name (e.g. ``node1``).
+        privileged: ``True`` for operations that need ``CAP_NET_ADMIN`` (network
+            stack mutation and inspection).  Everything else — psql, pgbench,
+            ``ps``, the libfaketime offset file — must stay unprivileged so it
+            runs as the same user PostgreSQL and pgbattery run as.
+
+    Returns:
+        The command prefix, ending with the service name.
+    """
+    user = f" --user {PRIVILEGED_EXEC_USER}" if privileged else ""
+    return f"docker compose exec -T{user} {service}"
+
+
+def looks_like_fault_injection(command: str) -> bool:
+    """Report whether ``command`` appears to inject a fault.
+
+    Args:
+        command: Rendered shell command.
+
+    Returns:
+        ``True`` if any known fault-injection verb appears.
+    """
+    return any(pattern.search(command) for pattern in _FAULT_INJECTION_PATTERNS)
+
+
+def is_simple_command(command: str) -> bool:
+    """Report whether ``command`` is one invocation with no shell operators.
+
+    Args:
+        command: Rendered shell command.
+
+    Returns:
+        ``True`` if the command contains no shell control metacharacters.
+    """
+    return not any(meta in command for meta in _SHELL_METACHARACTERS)
+
+
+def _strip_flags(tokens: Sequence[str], value_flags: frozenset[str]) -> list[str]:
+    """Drop leading option tokens, consuming values of known value-flags.
+
+    Args:
+        tokens: Argument tokens.
+        value_flags: Flags whose following token is a value, not a positional.
+
+    Returns:
+        The remaining positional tokens.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("-"):
+            break
+        if token in value_flags and "=" not in token:
+            index += 2
+            continue
+        index += 1
+    return list(tokens[index:])
+
+
+def _classify_pkill(service: str, args: Sequence[str]) -> FaultIntent | None:
+    """Classify a ``pkill`` invocation inside a container.
+
+    Args:
+        service: Compose service the pkill runs in.
+        args: Tokens after the ``pkill`` executable.
+
+    Returns:
+        The intent, or ``None`` when the signal or pattern is not one we can
+        verify (notably ``-f``, whose pattern matches the full command line
+        rather than the process name reported by ``ps -o comm=``).
+    """
+    if "-f" in args:
+        return None
+    signal_tokens = [token for token in args if token.startswith("-")]
+    positional = [token for token in args if not token.startswith("-")]
+    if len(positional) != 1:
+        return None
+    pattern = positional[0]
+    signals = set(signal_tokens)
+    if signals & _PKILL_STOP_SIGNALS:
+        kind, injects, prestate = "pkill_stop", True, False
+    elif signals & _PKILL_CONT_SIGNALS:
+        kind, injects, prestate = "pkill_cont", False, False
+    elif signals & _PKILL_KILL_SIGNALS:
+        kind, injects, prestate = "pkill_kill", True, True
+    else:
+        return None
+    return FaultIntent(
+        kind=kind,
+        target_kind="service",
+        targets=(service,),
+        injects=injects,
+        pattern=pattern,
+        needs_prestate=prestate,
+    )
+
+
+def _classify_compose(tokens: Sequence[str]) -> FaultIntent | None:
+    """Classify a ``docker compose ...`` invocation.
+
+    Args:
+        tokens: Tokens after ``docker compose``.
+
+    Returns:
+        The intent, or ``None`` when the subcommand is not a fault or heal we
+        can verify.
+    """
+    positional = _strip_flags(tokens, _COMPOSE_VALUE_FLAGS)
+    if not positional:
+        return None
+    subcommand, rest = positional[0], positional[1:]
+    if subcommand == "exec":
+        exec_positional = _strip_flags(rest, _EXEC_VALUE_FLAGS)
+        if len(exec_positional) < 2:
+            return None
+        service, executable, args = exec_positional[0], exec_positional[1], exec_positional[2:]
+        if executable == "pkill":
+            return _classify_pkill(service, args)
+        return None
+    services = tuple(_strip_flags(rest, frozenset({"-t", "--timeout", "-s", "--signal"})))
+    if not services:
+        return None
+    match subcommand:
+        case "stop":
+            return FaultIntent("compose_stop", "service", services, injects=True)
+        case "kill":
+            return FaultIntent(
+                "compose_kill", "service", services, injects=True, needs_prestate=True
+            )
+        case "start":
+            return FaultIntent("compose_start", "service", services, injects=False)
+        case "restart":
+            return FaultIntent("compose_restart", "service", services, injects=False)
+        case _:
+            return None
+
+
+def _classify_docker(tokens: Sequence[str]) -> FaultIntent | None:
+    """Classify a plain ``docker ...`` invocation.
+
+    Args:
+        tokens: Tokens after ``docker``.
+
+    Returns:
+        The intent, or ``None`` when the subcommand is not a fault or heal we
+        can verify.
+    """
+    if not tokens:
+        return None
+    subcommand, rest = tokens[0], tokens[1:]
+    if subcommand in {"pause", "unpause"}:
+        containers = tuple(_strip_flags(rest, frozenset()))
+        if not containers:
+            return None
+        return FaultIntent(
+            kind=subcommand,
+            target_kind="container",
+            targets=containers,
+            injects=subcommand == "pause",
+        )
+    if subcommand == "network" and len(rest) >= 3 and rest[0] in {"connect", "disconnect"}:
+        action = rest[0]
+        operands = _strip_flags(rest[1:], frozenset({"--ip", "--ip6", "--alias", "--link"}))
+        if len(operands) != 2:
+            return None
+        return FaultIntent(
+            kind=f"network_{action}",
+            target_kind="container",
+            targets=(operands[1],),
+            injects=action == "disconnect",
+        )
+    return None
+
+
+def classify_fault_command(command: str) -> FaultIntent | None:
+    """Derive a verifiable intent from a fault-shaped shell command.
+
+    Only single, statically analysable invocations are classified.  Compound
+    or dynamic commands (``LEADER=$(...); docker compose kill node$LEADER``)
+    return ``None``; callers pair that with :func:`looks_like_fault_injection`
+    to emit an explicit unverified-fault warning instead of staying silent.
+
+    Args:
+        command: Rendered shell command.
+
+    Returns:
+        The intent, or ``None`` when the command is not a classifiable fault.
+    """
+    if not is_simple_command(command):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] != "docker":
+        return None
+    if len(tokens) > 1 and tokens[1] == "compose":
+        return _classify_compose(tokens[2:])
+    return _classify_docker(tokens[1:])
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -408,6 +1152,13 @@ class CIRunner:
     """
 
     TEMPLATE_PATTERN: re.Pattern[str] = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
+
+    # Fault-verification retry seams.  Post-conditions can take a moment to
+    # appear (docker restarting a killed container, a service reaching
+    # ``running``), so verification polls.  Unit tests drive canned probe output
+    # that never changes and set both to 0 to make verification single-shot.
+    verify_retry_scale: float = 1.0
+    verify_poll_interval_sec: float = 1.0
 
     def __init__(
         self,
@@ -450,6 +1201,10 @@ class CIRunner:
         self.context: dict[str, Any] = {}
         self.summary: list[CaseSummary] = []
         self.failed: bool = False
+        # Fault-shaped commands whose effect the runner could not confirm.
+        # Surfaced in the summary so "no verification" is never mistaken for
+        # "verified".
+        self.unverified_faults: list[str] = []
 
         if self.suite_name not in self.matrix.suites:
             available = ", ".join(sorted(self.matrix.suites.keys()))
@@ -539,28 +1294,64 @@ class CIRunner:
         command: str,
         log_path: Path,
         expect_exit: int | list[int] | None = 0,
+        timeout_sec: int = DEFAULT_SHELL_TIMEOUT_SEC,
+        render: bool = True,
+        stdin_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run a shell command, log output, and optionally assert exit code.
+        """Run a shell command under a timeout, log output, and check exit code.
 
         Args:
             command: Shell command string (may contain ``{{ var }}`` templates).
             log_path: File to write the command, exit code, stdout, and stderr.
             expect_exit: Expected exit code(s).  ``None`` accepts any code.
+            timeout_sec: Wall-clock budget.  Exceeding it kills the command and
+                raises, whatever ``expect_exit`` says — a hang is never a pass.
+            render: Set ``False`` for internally generated commands (probes)
+                that contain Go template braces the ``{{ var }}`` renderer would
+                otherwise try to resolve.
+            stdin_text: Text to feed the command on stdin (used to pipe ``.sql``
+                files into ``psql`` without any shell escaping).
 
         Returns:
             The completed process.
 
         Raises:
-            RunnerError: If the actual exit code is not in ``expect_exit``.
+            RunnerError: If the command exceeds ``timeout_sec``, or the actual
+                exit code is not in ``expect_exit``.
         """
-        rendered = self._render_template(command)
-        proc = subprocess.run(
+        rendered = self._render_template(command) if render else command
+        # Popen rather than subprocess.run: on POSIX, run() discards the output
+        # buffered before a timeout, and that partial output is usually the only
+        # evidence of where the command wedged.
+        with subprocess.Popen(
             rendered,
             shell=True,
             cwd=self.project_root,
             env=self.env,
-            capture_output=True,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
+        ) as handle:
+            try:
+                stdout, stderr = handle.communicate(input=stdin_text, timeout=timeout_sec)
+            except subprocess.TimeoutExpired as exc:
+                handle.kill()
+                try:
+                    # Drain whatever the killed command already wrote.  A
+                    # grandchild that inherited the pipe can hold it open, so
+                    # the drain itself is bounded.
+                    stdout, stderr = handle.communicate(timeout=TIMEOUT_DRAIN_SEC)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = None, "<partial output unavailable: pipe still held open>"
+                message = format_timeout_failure(rendered, timeout_sec, stdout, stderr)
+                self._write_text(log_path, message)
+                self.log(f"    {message.splitlines()[0]}")
+                raise RunnerError(message) from exc
+            returncode = handle.returncode
+
+        proc = subprocess.CompletedProcess(
+            args=rendered, returncode=returncode, stdout=stdout, stderr=stderr
         )
 
         log_text = [
@@ -733,8 +1524,7 @@ class CIRunner:
         which is resolved to the current leader at assertion time.  This lets
         test cases assert on leader-only metrics (``pgbattery_replication_sync``,
         ``pgbattery_sync_replicas``, etc.) without hard-coding a node number
-        that may not actually be the leader after prior failovers — the root
-        cause of the flaky ``sync-replica-failure`` assertion.
+        that may not actually be the leader after prior failovers.
 
         Args:
             ref: Raw value from the step dict.  Usually an ``int`` but may be
@@ -1104,16 +1894,24 @@ class CIRunner:
         snap = self.snapshot_dir / f"{utc_timestamp()}-{safe_name(label)}"
         snap.mkdir(parents=True, exist_ok=True)
 
-        compose_ps = self._run_shell(
-            "docker compose ps",
-            snap / "compose-ps.txt",
-            expect_exit=None,
-        )
-        if compose_ps.returncode != 0:
-            self._write_text(
-                snap / "compose-ps.error.txt",
-                f"docker compose ps failed with {compose_ps.returncode}",
+        # Snapshots are diagnostics, not assertions: a docker daemon that is too
+        # wedged to answer must not abort the case (or mask the real failure),
+        # so a timeout here is recorded and swallowed.
+        try:
+            compose_ps = self._run_shell(
+                "docker compose ps",
+                snap / "compose-ps.txt",
+                expect_exit=None,
+                timeout_sec=DIAGNOSTIC_TIMEOUT_SEC,
             )
+            if compose_ps.returncode != 0:
+                self._write_text(
+                    snap / "compose-ps.error.txt",
+                    f"docker compose ps failed with {compose_ps.returncode}",
+                )
+        except RunnerError as exc:
+            self._write_text(snap / "compose-ps.error.txt", str(exc))
+            self.log(f"    [warn] snapshot 'docker compose ps' did not complete: {exc}")
 
         for node_id in sorted(self.node_map):
             node = self.node_map[node_id]
@@ -1145,16 +1943,21 @@ class CIRunner:
         """
         failure_dir = self._case_dir(case_id) / "failure-logs"
         failure_dir.mkdir(parents=True, exist_ok=True)
-        self._run_shell(
-            "docker compose logs --no-color",
-            failure_dir / "docker-compose.logs.txt",
-            expect_exit=None,
-        )
-        self._run_shell(
-            "docker compose ps -a",
-            failure_dir / "docker-compose.ps-a.txt",
-            expect_exit=None,
-        )
+        for command, filename in [
+            ("docker compose logs --no-color", "docker-compose.logs.txt"),
+            ("docker compose ps -a", "docker-compose.ps-a.txt"),
+        ]:
+            # Best-effort: never let log collection replace the failure that
+            # triggered it.
+            try:
+                self._run_shell(
+                    command,
+                    failure_dir / filename,
+                    expect_exit=None,
+                    timeout_sec=DIAGNOSTIC_TIMEOUT_SEC,
+                )
+            except RunnerError as exc:
+                self.log(f"    [warn] failure-log collection '{command}' did not complete: {exc}")
 
     # -- Cluster lifecycle ---------------------------------------------------
 
@@ -1173,6 +1976,7 @@ class CIRunner:
             "docker compose down -v --remove-orphans",
             self.system_dir / f"{utc_timestamp()}-{safe_name(label)}-down-before.log",
             expect_exit=None,
+            timeout_sec=CLUSTER_LIFECYCLE_TIMEOUT_SEC,
         )
 
         up_cmd = "docker compose up -d --remove-orphans"
@@ -1182,6 +1986,7 @@ class CIRunner:
             up_cmd,
             self.system_dir / f"{utc_timestamp()}-{safe_name(label)}-up.log",
             expect_exit=0,
+            timeout_sec=CLUSTER_LIFECYCLE_TIMEOUT_SEC,
         )
 
         self._wait_for_cluster(
@@ -1203,6 +2008,7 @@ class CIRunner:
             "docker compose down -v --remove-orphans",
             self.system_dir / f"{utc_timestamp()}-{safe_name(label)}-down.log",
             expect_exit=None,
+            timeout_sec=CLUSTER_LIFECYCLE_TIMEOUT_SEC,
         )
 
     # -- Step handlers -------------------------------------------------------
@@ -1343,12 +2149,13 @@ class CIRunner:
             step: Step dict with optional ``node`` (default 1), ``scale``
                 (default 1), ``clients`` (default 4), ``threads`` (default 2),
                 ``duration_sec`` (default 10), ``min_tps`` (default 100.0),
-                ``capture_tps`` (optional context variable name).
+                ``capture_tps`` (optional context variable name),
+                ``shell_timeout_sec`` (default ``duration_sec`` + 60).
             step_log: File to write pgbench stdout/stderr and measured TPS.
 
         Raises:
-            RunnerError: If the node is unknown, pgbench fails to run, or the
-                measured TPS is below ``min_tps``.
+            RunnerError: If the node is unknown, pgbench fails to run or exceeds
+                its timeout, or the measured TPS is below ``min_tps``.
         """
         import re as _re
 
@@ -1364,25 +2171,34 @@ class CIRunner:
         min_tps = float(step.get("min_tps", 100.0))
         pg_bin = "/usr/lib/postgresql/18/bin/pgbench"
         pg_conn = "-U postgres -h localhost -p 5434 -d postgres"
+        timeout_sec = resolve_shell_timeout(step, default=duration_sec + 60)
 
         # Initialise pgbench schema (idempotent: -i drops and recreates tables).
-        init_cmd = f"docker compose exec -T {node.name} {pg_bin} -i -s {scale} {pg_conn}"
-        self._run_shell(init_cmd, step_log)
+        exec_prefix = container_exec_prefix(node.name)
+        init_cmd = f"{exec_prefix} {pg_bin} -i -s {scale} {pg_conn}"
+        self._run_shell(init_cmd, step_log, timeout_sec=timeout_sec)
 
         # Run benchmark.
-        bench_cmd = (
-            f"docker compose exec -T {node.name} "
-            f"{pg_bin} -c {clients} -j {threads} -T {duration_sec} {pg_conn}"
-        )
-        result = subprocess.run(
-            bench_cmd,
-            shell=True,
-            cwd=self.project_root,
-            env=self.env,
-            capture_output=True,
-            text=True,
-            timeout=duration_sec + 30,
-        )
+        bench_cmd = f"{exec_prefix} {pg_bin} -c {clients} -j {threads} -T {duration_sec} {pg_conn}"
+        try:
+            result = subprocess.run(
+                bench_cmd,
+                shell=True,
+                cwd=self.project_root,
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired as exc:
+            message = format_timeout_failure(
+                bench_cmd,
+                timeout_sec,
+                exc.stdout if isinstance(exc.stdout, str) else None,
+                exc.stderr if isinstance(exc.stderr, str) else None,
+            )
+            self._write_text(step_log, message)
+            raise RunnerError(message) from exc
 
         log_text = [
             f"$ {bench_cmd}",
@@ -1426,14 +2242,14 @@ class CIRunner:
         Args:
             step: Step dict with required ``file`` and optional ``node``
                 (default 1), ``direct`` (connect to internal port 5434 instead
-                of gateway 5432), ``on_error_stop`` (default ``True``), and
-                ``expect_exit`` (default 0).
+                of gateway 5432), ``on_error_stop`` (default ``True``),
+                ``expect_exit`` (default 0), and ``shell_timeout_sec``.
             step_log: File to write the SQL content, stdout, stderr, and exit
                 code.
 
         Raises:
-            RunnerError: If the SQL file is missing, the node is unknown, or
-                the exit code is unexpected.
+            RunnerError: If the SQL file is missing, the node is unknown, psql
+                exceeds its timeout, or the exit code is unexpected.
         """
         sql_file = self.project_root / "testing" / "sql" / str(step["file"])
         if not sql_file.exists():
@@ -1457,18 +2273,19 @@ class CIRunner:
         expect_exit = step.get("expect_exit", 0)
 
         cmd = (
-            f"docker compose exec -T {node.name} "
+            f"{container_exec_prefix(node.name)} "
             f"psql -U postgres -h localhost -p {port} -d postgres "
             f"-v ON_ERROR_STOP={on_error_stop}"
         )
-        proc = subprocess.run(
+        # expect_exit=None: the step's own expectation is checked below, after
+        # the fuller log (including the SQL text) has been written.
+        proc = self._run_shell(
             cmd,
-            shell=True,
-            input=sql_content,
-            cwd=self.project_root,
-            env=self.env,
-            capture_output=True,
-            text=True,
+            step_log,
+            expect_exit=None,
+            timeout_sec=resolve_shell_timeout(step),
+            render=False,
+            stdin_text=sql_content,
         )
 
         log_text = [
@@ -1491,6 +2308,439 @@ class CIRunner:
                 f"SQL file {step['file']} failed with exit code {proc.returncode}, "
                 f"expected {expected}"
             )
+
+    # -- Fault-effect verification -------------------------------------------
+
+    def _verify_log(self, step_log: Path, tag: str) -> Path:
+        """Return the log path for a verification probe belonging to a step."""
+        return step_log.with_name(f"{step_log.stem}.{safe_name(tag)}.log")
+
+    def _probe(self, command: str, log_path: Path) -> ProbeResult:
+        """Run a read-only verification probe.
+
+        Args:
+            command: Probe command (never template-rendered: probes embed Go
+                template braces).
+            log_path: File to write the probe transcript to.
+
+        Returns:
+            The probe outcome; a non-zero exit is data for the caller's
+            predicate, not an error.
+
+        Raises:
+            RunnerError: If the probe itself times out.
+        """
+        proc = self._run_shell(
+            command,
+            log_path,
+            expect_exit=None,
+            timeout_sec=FAULT_PROBE_TIMEOUT_SEC,
+            render=False,
+        )
+        return ProbeResult(exit_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    def _await_probe(
+        self,
+        probe: str,
+        check: Callable[[ProbeResult], str | None],
+        log_path: Path,
+        label: str,
+        timeout_sec: float = 15.0,
+    ) -> None:
+        """Poll a probe until its predicate is satisfied, else fail loudly.
+
+        Args:
+            probe: Probe command.
+            check: Predicate returning ``None`` when satisfied, or a
+                human-readable reason why it is not.
+            log_path: File to write the probe transcript to.
+            label: Failure headline (``FAULT NOT VERIFIED`` / ``HEAL NOT
+                VERIFIED``).
+            timeout_sec: How long the post-condition is given to appear.
+
+        Raises:
+            RunnerError: If the predicate is still unsatisfied at the deadline.
+        """
+        deadline = time.monotonic() + timeout_sec * self.verify_retry_scale
+        while True:
+            reason = check(self._probe(probe, log_path))
+            if reason is None:
+                return
+            if time.monotonic() >= deadline:
+                raise RunnerError(f"{label}: {reason}\n$ {probe}")
+            time.sleep(self.verify_poll_interval_sec)
+
+    def _container_state_probe(self, target: str, target_kind: str) -> str:
+        """Build a probe that prints ``status startedAt restartCount`` for a target."""
+        fmt = "{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}"
+        if target_kind == "service":
+            return f'docker inspect --format "{fmt}" "$(docker compose ps -aq {target})"'
+        return f'docker inspect --format "{fmt}" "{target}"'
+
+    def _capture_container_states(
+        self, intent: FaultIntent, step_log: Path
+    ) -> dict[str, ContainerRunState | None]:
+        """Snapshot container liveness identity before a kill-style command.
+
+        A killed container is restarted by the compose ``unless-stopped``
+        policy, so "is it running?" cannot prove the kill landed.  The
+        before/after pair of ``StartedAt`` / ``RestartCount`` can.
+
+        Args:
+            intent: Classified command intent.
+            step_log: Owning step's log path (probe logs derive from it).
+
+        Returns:
+            ``{target: state or None}``.
+        """
+        states: dict[str, ContainerRunState | None] = {}
+        for target in intent.targets:
+            result = self._probe(
+                self._container_state_probe(target, intent.target_kind),
+                self._verify_log(step_log, f"prestate-{target}"),
+            )
+            states[target] = parse_container_runstate(result.stdout)
+        return states
+
+    def _note_unverified_fault(self, command: str, step_log: Path, reason: str) -> None:
+        """Record that a fault-shaped command's effect could not be verified.
+
+        Args:
+            command: The rendered command.
+            step_log: Owning step's log path.
+            reason: Why verification was not possible.
+        """
+        entry = f"{reason}: {command}"
+        self.unverified_faults.append(entry)
+        self.log(f"    [unverified-fault] {entry}")
+        self._write_text(
+            self._verify_log(step_log, "unverified"),
+            f"UNVERIFIED FAULT\nreason: {reason}\n$ {command}\n",
+        )
+
+    def _require_container_binary(self, service: str, binary: str, step_log: Path) -> None:
+        """Fail loudly when a fault depends on a tool the image does not ship.
+
+        The lookup runs as the same user the fault itself runs as, so it
+        resolves against the same ``PATH``: ``tc`` and ``iptables`` live in
+        ``/usr/sbin``, and a lookup performed under a different user would not
+        prove the fault can find them.
+
+        Args:
+            service: Compose service the fault targets.
+            binary: Executable the fault needs (``iptables``, ``tc``).
+            step_log: Owning step's log path.
+
+        Raises:
+            RunnerError: If the binary is absent from the container.
+        """
+        prefix = container_exec_prefix(service, privileged=True)
+        probe = f'{prefix} sh -c "command -v {binary}"'
+        result = self._probe(probe, self._verify_log(step_log, f"which-{binary}"))
+        if result.exit_code != 0 or not result.stdout.strip():
+            raise RunnerError(
+                f"FAULT NOT INJECTABLE: '{binary}' is not available in {service}, so this fault "
+                f"would be a no-op. Install it in the runtime image (Dockerfile) or drop the step."
+            )
+
+    def _verify_iptables_drop(
+        self, service: str, src_ip: str, present: bool, step_log: Path
+    ) -> None:
+        """Assert an INPUT DROP rule for ``src_ip`` is (or is no longer) installed.
+
+        Reading the chain needs ``CAP_NET_ADMIN`` just like writing it, so the
+        probe execs as root; as the image's default unprivileged user every read
+        fails and a successfully injected rule would be misreported as absent.
+
+        Args:
+            service: Compose service whose chain is inspected.
+            src_ip: Source address of the rule.
+            present: Expected presence of the rule.
+            step_log: Owning step's log path.
+
+        Raises:
+            RunnerError: If the chain does not match the expectation.
+        """
+        prefix = container_exec_prefix(service, privileged=True)
+        probe = (
+            f"{prefix} sh -c "
+            f"\"iptables -S INPUT; echo '--- counters ---'; iptables -L INPUT -n -v\""
+        )
+
+        def check(result: ProbeResult) -> str | None:
+            if result.exit_code != 0 and not result.stdout.strip():
+                return f"could not read the INPUT chain on {service}: {result.combined.strip()}"
+            found = iptables_drop_rule_present(result.stdout, src_ip)
+            if found is present:
+                return None
+            if present:
+                return f"no INPUT DROP rule for {src_ip} on {service} after injection"
+            return f"INPUT DROP rule for {src_ip} still present on {service} after heal"
+
+        self._await_probe(
+            probe,
+            check,
+            self._verify_log(step_log, f"iptables-{src_ip}"),
+            "FAULT NOT VERIFIED" if present else "HEAL NOT VERIFIED",
+            timeout_sec=5.0,
+        )
+
+    def _verify_netem(self, service: str, expected_delay_ms: int | None, step_log: Path) -> None:
+        """Assert the eth0 netem qdisc matches expectation.
+
+        Args:
+            service: Compose service whose qdisc is inspected.
+            expected_delay_ms: Delay the qdisc must report, or ``None`` to
+                require that no netem qdisc exists.
+            step_log: Owning step's log path.
+
+        Raises:
+            RunnerError: If the qdisc does not match.
+        """
+        # Reading qdiscs succeeds unprivileged, but this execs as root to match
+        # the user that installs and removes them: one privilege context for the
+        # whole tc lifecycle, so a verification result can never disagree with
+        # the injection for a permission reason.
+        prefix = container_exec_prefix(service, privileged=True)
+        probe = f"{prefix} tc qdisc show dev eth0"
+
+        def check(result: ProbeResult) -> str | None:
+            observed = parse_netem_delay_ms(result.stdout)
+            if expected_delay_ms is None:
+                if netem_present(result.stdout):
+                    return f"netem qdisc still installed on {service}: {result.stdout.strip()}"
+                return None
+            if observed is None:
+                return (
+                    f"no netem delay on {service} after injection: "
+                    f"{result.combined.strip() or '<no output>'}"
+                )
+            tolerance = max(1.0, expected_delay_ms * 0.05)
+            if abs(observed - expected_delay_ms) > tolerance:
+                return (
+                    f"netem delay on {service} is {observed:g}ms, "
+                    f"expected {expected_delay_ms}ms (±{tolerance:g}ms)"
+                )
+            return None
+
+        self._await_probe(
+            probe,
+            check,
+            self._verify_log(step_log, "tc-qdisc"),
+            "FAULT NOT VERIFIED" if expected_delay_ms is not None else "HEAL NOT VERIFIED",
+            timeout_sec=5.0,
+        )
+
+    def _apply_faketime(self, node_id: int, offset_seconds: int, step_log: Path) -> None:
+        """Write a libfaketime offset to a node and verify its clock actually moved.
+
+        Reads the node's current offset and clock, writes the new offset, then
+        re-reads both: the observed clock jump must match the change in offset.
+        This proves the LD_PRELOAD machinery is live, not just that the file was
+        written.
+
+        Args:
+            node_id: Target node.
+            offset_seconds: New offset in seconds (0 restores real time).
+            step_log: Owning step's log path.
+
+        Raises:
+            RunnerError: If the file does not hold the new offset, or the node's
+                clock did not shift by the expected amount.
+        """
+        service = f"node{node_id}"
+        offset_text = f"{offset_seconds:+d}s"
+        exec_prefix = container_exec_prefix(service)
+        probe = f'{exec_prefix} sh -c "cat /tmp/faketime; date +%s"'
+        before = parse_faketime_probe(
+            self._probe(probe, self._verify_log(step_log, "faketime-before")).stdout
+        )
+
+        write_cmd = f"{exec_prefix} sh -c \"echo '{offset_text}' > /tmp/faketime\""
+        self._run_shell(write_cmd, step_log, timeout_sec=FAULT_PROBE_TIMEOUT_SEC)
+
+        after = parse_faketime_probe(
+            self._probe(probe, self._verify_log(step_log, "faketime-after")).stdout
+        )
+        if after is None:
+            raise RunnerError(
+                f"FAULT NOT VERIFIED: could not read /tmp/faketime and clock on {service}"
+            )
+        if after[0] != offset_text:
+            raise RunnerError(
+                f"FAULT NOT VERIFIED: /tmp/faketime on {service} holds {after[0]!r}, "
+                f"expected {offset_text!r}"
+            )
+        if before is None:
+            self._note_unverified_fault(
+                write_cmd, step_log, "clock offset before the write was unreadable"
+            )
+            return
+        previous_offset = parse_faketime_offset_seconds(before[0])
+        if previous_offset is None:
+            self._note_unverified_fault(
+                write_cmd,
+                step_log,
+                f"previous offset {before[0]!r} is not a relative offset, clock shift not checked",
+            )
+            return
+        expected_shift = offset_seconds - previous_offset
+        observed_shift = after[1] - before[1]
+        # The two probes are separate `docker exec` calls, so real time passes
+        # between them; FAKETIME_NO_CACHE=1 makes the offset itself immediate.
+        if abs(observed_shift - expected_shift) > FAKETIME_SHIFT_TOLERANCE_SEC:
+            raise RunnerError(
+                f"FAULT NOT VERIFIED: clock on {service} shifted {observed_shift}s, expected "
+                f"{expected_shift}s (±{FAKETIME_SHIFT_TOLERANCE_SEC}s) after writing {offset_text}"
+            )
+
+    def _verify_fault_intent(
+        self,
+        intent: FaultIntent,
+        prestate: dict[str, ContainerRunState | None],
+        step_log: Path,
+    ) -> None:
+        """Verify every target of a classified fault (or heal) command.
+
+        Args:
+            intent: Classified command intent.
+            prestate: Container states captured before the command, empty when
+                the kind does not need them.
+            step_log: Owning step's log path.
+
+        Raises:
+            RunnerError: If any target's post-condition does not hold.
+        """
+        for target in intent.targets:
+            self._verify_fault_target(intent, target, prestate.get(target), step_log)
+
+    def _verify_fault_target(
+        self,
+        intent: FaultIntent,
+        target: str,
+        prestate: ContainerRunState | None,
+        step_log: Path,
+    ) -> None:
+        """Verify one target's post-condition for a classified command.
+
+        Args:
+            intent: Classified command intent.
+            target: Compose service or container name.
+            prestate: This target's pre-command state, if captured.
+            step_log: Owning step's log path.
+
+        Raises:
+            RunnerError: If the post-condition does not hold.
+        """
+        label = "FAULT NOT VERIFIED" if intent.injects else "HEAL NOT VERIFIED"
+        state_probe = self._container_state_probe(target, intent.target_kind)
+        log_path = self._verify_log(step_log, f"{intent.kind}-{target}")
+
+        match intent.kind:
+            case "pause" | "unpause":
+                expected = "paused" if intent.kind == "pause" else "running"
+
+                def check_status(result: ProbeResult) -> str | None:
+                    state = parse_container_runstate(result.stdout)
+                    if state is None:
+                        if not intent.injects:
+                            # Nothing to unpause: treat a missing container as
+                            # already healed rather than blocking later heals.
+                            return None
+                        return f"container '{target}' state unreadable: {result.combined.strip()}"
+                    if state.status != expected:
+                        return f"container '{target}' status is '{state.status}', want '{expected}'"
+                    return None
+
+                self._await_probe(state_probe, check_status, log_path, label, timeout_sec=10.0)
+
+            case "compose_stop" | "compose_start" | "compose_restart":
+                want_running = intent.kind != "compose_stop"
+                probe = "docker compose ps --services --filter status=running"
+
+                def check_running(result: ProbeResult) -> str | None:
+                    running = parse_compose_services(result.stdout)
+                    if (target in running) is want_running:
+                        return None
+                    if want_running:
+                        return f"service '{target}' is not running after {intent.kind}"
+                    return f"service '{target}' is still running after {intent.kind}"
+
+                self._await_probe(probe, check_running, log_path, label, timeout_sec=20.0)
+
+            case "compose_kill" | "pkill_kill":
+
+                def check_restarted(result: ProbeResult) -> str | None:
+                    state = parse_container_runstate(result.stdout)
+                    if state is None:
+                        # The container is gone entirely: the process it ran
+                        # certainly is too.
+                        return None
+                    if state.status != "running":
+                        return None
+                    if prestate is None:
+                        return (
+                            f"'{target}' is running and its pre-kill state was unreadable, "
+                            f"so the kill cannot be confirmed"
+                        )
+                    if (
+                        state.started_at != prestate.started_at
+                        or state.restart_count != prestate.restart_count
+                    ):
+                        return None
+                    return (
+                        f"'{target}' never went down: still running since {state.started_at} "
+                        f"with restart_count={state.restart_count}"
+                    )
+
+                self._await_probe(state_probe, check_restarted, log_path, label, timeout_sec=30.0)
+
+            case "pkill_stop" | "pkill_cont":
+                want_stopped = intent.kind == "pkill_stop"
+                probe = f"{container_exec_prefix(target)} ps -eo stat=,comm="
+
+                def check_stopped(result: ProbeResult) -> str | None:
+                    pairs = parse_ps_stat_comm(result.stdout)
+                    if not pairs:
+                        return f"could not list processes in '{target}': {result.combined.strip()}"
+                    matched = matching_processes(pairs, intent.pattern)
+                    stopped = stopped_processes(pairs, intent.pattern)
+                    if want_stopped:
+                        if stopped:
+                            return None
+                        return (
+                            f"no process matching '{intent.pattern}' in '{target}' is stopped "
+                            f"(state T); matched={matched or 'nothing'}"
+                        )
+                    if stopped:
+                        return (
+                            f"process matching '{intent.pattern}' in '{target}' is still "
+                            f"stopped: {stopped}"
+                        )
+                    return None
+
+                self._await_probe(probe, check_stopped, log_path, label, timeout_sec=10.0)
+
+            case "network_disconnect" | "network_connect":
+                want_attached = intent.kind == "network_connect"
+                probe = (
+                    f'docker inspect --format "{{{{json .NetworkSettings.Networks}}}}" "{target}"'
+                )
+
+                def check_attached(result: ProbeResult) -> str | None:
+                    addresses = container_subnet_addresses(result.stdout, _RAFT_SUBNET_PREFIX)
+                    if bool(addresses) is want_attached:
+                        return None
+                    if want_attached:
+                        return f"'{target}' has no {_RAFT_SUBNET_PREFIX}x address after reconnect"
+                    return f"'{target}' still holds {_RAFT_SUBNET_PREFIX}x address(es) {addresses}"
+
+                self._await_probe(probe, check_attached, log_path, label, timeout_sec=10.0)
+
+            case _:
+                self._note_unverified_fault(
+                    intent.kind, step_log, "no verification strategy for this fault kind"
+                )
 
     # -- Step dispatcher -----------------------------------------------------
 
@@ -1528,9 +2778,39 @@ class CIRunner:
 
         match step_type:
             case StepType.CMD:
-                command = str(step["cmd"])
+                # Classify before running: kill-style faults need the target's
+                # pre-command liveness identity to prove anything afterwards.
+                command = self._render_template(str(step["cmd"]))
                 expect_exit = step.get("expect_exit", 0)
-                result = self._run_shell(command, step_log, expect_exit=expect_exit)
+                intent = classify_fault_command(command)
+                prestate: dict[str, ContainerRunState | None] = {}
+                if intent is not None and intent.needs_prestate:
+                    prestate = self._capture_container_states(intent, step_log)
+                result = self._run_shell(
+                    command,
+                    step_log,
+                    expect_exit=expect_exit,
+                    timeout_sec=resolve_shell_timeout(step),
+                    render=False,
+                )
+                if intent is not None:
+                    if result.returncode == 0:
+                        self._verify_fault_intent(intent, prestate, step_log)
+                    else:
+                        # The command itself did not run to completion (the case
+                        # declared a non-zero expect_exit), so there is no
+                        # landed effect to verify.
+                        self._note_unverified_fault(
+                            command,
+                            step_log,
+                            f"command exited {result.returncode}, effect not asserted",
+                        )
+                elif looks_like_fault_injection(command):
+                    self._note_unverified_fault(
+                        command,
+                        step_log,
+                        "fault-shaped command is not statically analysable",
+                    )
 
                 stdout_contains = step.get("stdout_contains")
                 stderr_contains = step.get("stderr_contains")
@@ -1812,8 +3092,11 @@ class CIRunner:
                 src_ip = _NODE_IPS.get(from_id)
                 if not src_ip:
                     raise RunnerError(f"Unknown from_node {from_id} for asymmetric_partition.")
-                cmd = f"docker compose exec -T {node_name} iptables -A INPUT -s {src_ip} -j DROP"
-                self._run_shell(cmd, step_log)
+                self._require_container_binary(node_name, "iptables", step_log)
+                prefix = container_exec_prefix(node_name, privileged=True)
+                cmd = f"{prefix} iptables -A INPUT -s {src_ip} -j DROP"
+                self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
+                self._verify_iptables_drop(node_name, src_ip, present=True, step_log=step_log)
 
             case StepType.ASYMMETRIC_HEAL:
                 node_id = int(step["node"])
@@ -1822,24 +3105,24 @@ class CIRunner:
                 src_ip = _NODE_IPS.get(from_id)
                 if not src_ip:
                     raise RunnerError(f"Unknown from_node {from_id} for asymmetric_heal.")
-                cmd = f"docker compose exec -T {node_name} iptables -D INPUT -s {src_ip} -j DROP"
-                self._run_shell(cmd, step_log)
+                prefix = container_exec_prefix(node_name, privileged=True)
+                cmd = f"{prefix} iptables -D INPUT -s {src_ip} -j DROP"
+                self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
+                self._verify_iptables_drop(node_name, src_ip, present=False, step_log=step_log)
 
             case StepType.CLOCK_SKEW:
-                node_id = int(step["node"])
-                offset_seconds = int(step.get("seconds", 300))
-                node_name = f"node{node_id}"
-                cmd = (
-                    f"docker compose exec -T {node_name} "
-                    f"sh -c \"echo '+{offset_seconds}s' > /tmp/faketime\""
+                self._apply_faketime(
+                    node_id=int(step["node"]),
+                    offset_seconds=int(step.get("seconds", 300)),
+                    step_log=step_log,
                 )
-                self._run_shell(cmd, step_log)
 
             case StepType.CLOCK_HEAL:
-                node_id = int(step["node"])
-                node_name = f"node{node_id}"
-                cmd = f"docker compose exec -T {node_name} sh -c \"echo '+0s' > /tmp/faketime\""
-                self._run_shell(cmd, step_log)
+                self._apply_faketime(
+                    node_id=int(step["node"]),
+                    offset_seconds=0,
+                    step_log=step_log,
+                )
 
             case StepType.WAIT_SYNC:
                 check_nodes = step.get("nodes")
@@ -1894,19 +3177,24 @@ class CIRunner:
                 delay_ms = int(step.get("delay_ms", 200))
                 jitter_ms = int(step.get("jitter_ms", 50))
                 node_name = f"node{node_id}"
+                self._require_container_binary(node_name, "tc", step_log)
                 inner = (
                     f"tc qdisc del dev eth0 root 2>/dev/null; "
                     f"tc qdisc add dev eth0 root netem delay {delay_ms}ms {jitter_ms}ms"
                 )
-                cmd = f'docker compose exec -T {node_name} sh -c "{inner}"'
-                self._run_shell(cmd, step_log)
+                prefix = container_exec_prefix(node_name, privileged=True)
+                cmd = f'{prefix} sh -c "{inner}"'
+                self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
+                self._verify_netem(node_name, expected_delay_ms=delay_ms, step_log=step_log)
 
             case StepType.NETWORK_HEAL:
                 node_id = int(step["node"])
                 node_name = f"node{node_id}"
                 inner = "tc qdisc del dev eth0 root 2>/dev/null; true"
-                cmd = f'docker compose exec -T {node_name} sh -c "{inner}"'
-                self._run_shell(cmd, step_log)
+                prefix = container_exec_prefix(node_name, privileged=True)
+                cmd = f'{prefix} sh -c "{inner}"'
+                self._run_shell(cmd, step_log, timeout_sec=resolve_shell_timeout(step))
+                self._verify_netem(node_name, expected_delay_ms=None, step_log=step_log)
 
             case StepType.PGBENCH:
                 self._execute_pgbench_step(step, step_log)
@@ -1918,45 +3206,62 @@ class CIRunner:
         case_id: str,
         phase: str,
         steps: list[dict[str, Any]],
-        continue_on_error: bool = False,
     ) -> None:
-        """Execute a list of steps sequentially.
+        """Execute a list of steps sequentially, failing fast.
+
+        Used for the ``action`` and ``assert`` phases, where a failed step
+        invalidates everything after it.  Cleanup uses :meth:`_run_cleanup`,
+        which must not stop at the first failure.
 
         Args:
             case_id: Owning case ID.
-            phase: Phase label (``action``, ``assert``, or ``cleanup``).
+            phase: Phase label (``action`` or ``assert``).
             steps: Ordered list of step dicts.
-            continue_on_error: If ``True``, collect all failures and raise a
-                combined error at the end instead of failing fast.
 
         Raises:
-            RunnerError: On step failure (immediately if ``continue_on_error``
-                is ``False``, or aggregated at the end).
+            RunnerError: Propagated from the first failing step.
+        """
+        for index, step in enumerate(steps):
+            self._execute_step(step, case_id, phase, index)
+
+    def _run_cleanup(self, case_id: str, steps: list[dict[str, Any]]) -> list[str]:
+        """Attempt every cleanup step, collecting rather than propagating failures.
+
+        Cleanup steps are independent heals (drop an iptables rule, restore the
+        clock, unpause a container, restart a service).  A single failing heal —
+        ``iptables -D`` against a container that restarted and lost the rule, for
+        instance — must not skip the heals that follow it, or the residue leaks
+        into every later case of a ``reuse_cluster`` suite.
+
+        Args:
+            case_id: Owning case ID.
+            steps: Ordered list of cleanup step dicts.
+
+        Returns:
+            One message per failed cleanup step (empty when all succeeded).
         """
         failures: list[str] = []
         for index, step in enumerate(steps):
             try:
-                self._execute_step(step, case_id, phase, index)
+                self._execute_step(step, case_id, "cleanup", index)
             except Exception as exc:
-                if continue_on_error:
-                    failures.append(f"{phase} step {index}: {exc}")
-                    continue
-                raise
-        if failures:
-            joined = "\n".join(failures)
-            raise RunnerError(f"{phase} encountered failures:\n{joined}")
+                step_type = str(step.get("type", "?"))
+                failures.append(f"cleanup step {index:02d} ({step_type}): {exc}")
+                self.log(f"  [cleanup-fail:{index:02d}] {step_type}: {exc}")
+        return failures
 
     def _run_case(self, case_id: str) -> bool:
         """Execute a single test case: actions → assertions → cleanup.
 
-        Collects snapshots before, after, and on failure.  Cleanup runs in the
-        ``finally`` block so it executes regardless of action/assertion outcome.
+        Collects snapshots before, after, and on failure.  Cleanup is attempted
+        in full regardless of the action/assertion outcome; a case whose
+        assertions passed but whose cleanup failed is recorded as ``ERROR``.
 
         Args:
             case_id: Case identifier from the matrix.
 
         Returns:
-            ``True`` if the case passed, ``False`` otherwise.
+            ``True`` only if actions, assertions, and cleanup all succeeded.
         """
         case = self.case_map[case_id]
         self.context = {}
@@ -1965,18 +3270,21 @@ class CIRunner:
         self._collect_snapshot(f"{case_id}-before")
         started = time.time()
 
+        passed = False
+        detail = ""
         try:
             self._execute_step_list(case_id, "action", case.actions)
             self._execute_step_list(case_id, "assert", case.assertions)
             elapsed = time.time() - started
+            passed = True
+            detail = f"{elapsed:.1f}s"
             self._write_text(case_dir / "result.txt", f"PASS ({elapsed:.1f}s)\n")
             self.log(f"[pass] {case_id} ({elapsed:.1f}s)")
-            self.summary.append(CaseSummary(case_id=case_id, passed=True, detail=f"{elapsed:.1f}s"))
             self._collect_snapshot(f"{case_id}-after")
-            return True
         except Exception as exc:
             elapsed = time.time() - started
             self.failed = True
+            detail = str(exc)
             error_text = (
                 f"FAIL ({elapsed:.1f}s)\n\n{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
             )
@@ -1984,38 +3292,58 @@ class CIRunner:
             self._collect_snapshot(f"{case_id}-failed")
             self._collect_failure_logs(case_id)
             self.log(f"[fail] {case_id}: {exc}")
-            self.summary.append(CaseSummary(case_id=case_id, passed=False, detail=str(exc)))
-            return False
         finally:
-            if case.cleanup:
-                try:
-                    self._execute_step_list(
-                        case_id=case_id,
-                        phase="cleanup",
-                        steps=case.cleanup,
-                        continue_on_error=False,
-                    )
-                except Exception as cleanup_exc:
-                    self.failed = True
-                    self.log(f"[warn] cleanup failed for {case_id}: {cleanup_exc}")
-                    self._write_text(
-                        case_dir / "cleanup-error.txt",
-                        f"{cleanup_exc}\n\n{traceback.format_exc()}",
-                    )
+            cleanup_failures = self._run_cleanup(case_id, case.cleanup)
+
+        if cleanup_failures:
+            # A half-cleaned cluster poisons every later case, so the case is
+            # reported as errored and the suite exits non-zero — never a pass.
+            self.failed = True
+            joined = "\n".join(cleanup_failures)
+            self._write_text(case_dir / "cleanup-error.txt", f"{joined}\n")
+            self.log(
+                f"[cleanup-error] {case_id}: {len(cleanup_failures)} cleanup step(s) failed; "
+                f"cluster may hold residue"
+            )
+        self.summary.append(
+            CaseSummary(
+                case_id=case_id,
+                passed=passed,
+                detail=detail,
+                cleanup_failures=cleanup_failures,
+            )
+        )
+        return passed and not cleanup_failures
 
     # -- Summary & top-level execution ---------------------------------------
 
     def _print_summary(self) -> None:
-        """Print a Rich table summarising pass/fail status for all cases."""
+        """Print a Rich table of case outcomes plus any unverified-fault warnings."""
         self.log("")
         table = Table(title="Scenario Summary", show_lines=False)
         table.add_column("Case")
         table.add_column("Status")
         table.add_column("Detail")
+        status_markup = {
+            "PASS": "[green]PASS[/]",
+            "FAIL": "[red]FAIL[/]",
+            "ERROR": "[yellow]ERROR[/]",
+        }
         for entry in self.summary:
-            status = "[green]PASS[/]" if entry.passed else "[red]FAIL[/]"
-            table.add_row(entry.case_id, status, entry.detail)
+            detail = entry.detail
+            if entry.cleanup_failures:
+                joined = "; ".join(entry.cleanup_failures)
+                detail = f"{detail} | CLEANUP FAILED: {joined}" if detail else joined
+            table.add_row(entry.case_id, status_markup[entry.status], detail)
         self.console.print(table)
+
+        if self.unverified_faults:
+            self.console.print(
+                f"[yellow bold]{len(self.unverified_faults)} fault(s) ran without effect "
+                f"verification:[/]"
+            )
+            for warning in self.unverified_faults:
+                self.log(f"  - {warning}")
 
     def run(self) -> int:
         """Execute the selected suite and return an exit code.
@@ -2082,8 +3410,9 @@ class CIRunner:
     def _save_run_summary(self) -> None:
         """Write run_summary.json to the artifact directory.
 
-        Records suite name, cases executed, pass/fail status, and the full
-        case definitions so the exact run can be replayed or analysed offline.
+        Records suite name, cases executed, per-case status (including cleanup
+        failures), unverified faults, and the full case definitions so the exact
+        run can be replayed or analysed offline.
         """
         import datetime
 
@@ -2091,8 +3420,16 @@ class CIRunner:
             "suite": self.suite_name,
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
             "passed": not self.failed,
+            "unverified_faults": list(self.unverified_faults),
             "cases": [
-                {"case_id": s.case_id, "passed": s.passed, "detail": s.detail} for s in self.summary
+                {
+                    "case_id": s.case_id,
+                    "passed": s.passed,
+                    "status": s.status,
+                    "detail": s.detail,
+                    "cleanup_failures": s.cleanup_failures,
+                }
+                for s in self.summary
             ],
             "case_definitions": [
                 self.case_map[s.case_id].model_dump(mode="json")
@@ -2116,10 +3453,44 @@ app = typer.Typer(
 console = Console()
 
 
+def _print_matrix_listing(matrix_path: Path, console: Console) -> None:
+    """Print every suite in a matrix with its cases (no cluster required).
+
+    Args:
+        matrix_path: Absolute path to the matrix file.
+        console: Rich console for output.
+
+    Raises:
+        RunnerError: If the matrix cannot be parsed or fails validation.
+    """
+    matrix = parse_matrix(matrix_path)
+    table = Table(title=f"Suites in {matrix_path.name}", show_lines=False)
+    table.add_column("Suite")
+    table.add_column("Cases", justify="right")
+    table.add_column("reuse_cluster")
+    table.add_column("Description")
+    for name in sorted(matrix.suites):
+        suite_config = matrix.suites[name]
+        table.add_row(
+            name,
+            str(len(suite_config.cases)),
+            "yes" if suite_config.reuse_cluster else "no",
+            suite_config.description,
+        )
+    console.print(table)
+    console.print(f"{len(matrix.cases)} case definitions loaded")
+    for name in sorted(matrix.suites):
+        console.print(f"\n[bold]{name}[/]")
+        for case_id in matrix.suites[name].cases:
+            case = next((c for c in matrix.cases if c.id == case_id), None)
+            contracts = ",".join(case.contracts) if case and case.contracts else "-"
+            console.print(f"  {case_id} [dim]contracts={contracts}[/]")
+
+
 @app.command()
 def run(
     suite: str = typer.Option(
-        ...,
+        "",
         "--suite",
         help="Suite name from testing/ci_matrix.yaml (e.g. ha-sequential, ha-parallel).",
     ),
@@ -2148,11 +3519,28 @@ def run(
         "--keep-cluster-on-failure",
         help="Do not tear down docker compose when a failure occurs (debug only).",
     ),
+    list_suites: bool = typer.Option(
+        False,
+        "--list",
+        help="List suites, cases, and declared contracts from the matrix, then exit.",
+    ),
 ) -> None:
     """Run a scenario suite against a Docker Compose pgbattery cluster."""
     project_root = Path(__file__).resolve().parent.parent
     matrix_path = (project_root / matrix).resolve()
     resolved_artifact_dir = (project_root / artifact_dir).resolve()
+
+    if list_suites:
+        try:
+            _print_matrix_listing(matrix_path, console)
+        except RunnerError as exc:
+            console.print(f"[red]Runner error:[/] {exc}")
+            raise typer.Exit(code=1) from exc
+        raise typer.Exit(code=0)
+
+    if not suite:
+        console.print("[red]Runner error:[/] --suite is required (or pass --list).")
+        raise typer.Exit(code=2)
 
     try:
         runner = CIRunner(

@@ -9,6 +9,15 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `raft_rpc_frame` drives the frame codec, whose seam takes the same
+# `BytesMut` staging buffer the production read loop uses.
+bytes = "1"
+# `raft_record_decode` decodes the same postcard records the storage layer and
+# the snapshot-install path do. Both must stay on the version the root crate
+# uses, or the fuzz target would be exercising a different codec than
+# production.
+postcard = { version = "1.1", features = ["alloc"] }
+serde = "1"
 
 [dependencies.pgbattery]
 path = ".."
@@ -27,5 +36,41 @@ doc = false
 [[bin]]
 name = "cluster_commands"
 path = "fuzz_targets/cluster_commands.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gateway_startup"
+path = "fuzz_targets/gateway_startup.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gateway_framing"
+path = "fuzz_targets/gateway_framing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gateway_extended_protocol"
+path = "fuzz_targets/gateway_extended_protocol.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gateway_query_analysis"
+path = "fuzz_targets/gateway_query_analysis.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "raft_record_decode"
+path = "fuzz_targets/raft_record_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "raft_rpc_frame"
+path = "fuzz_targets/raft_rpc_frame.rs"
 test = false
 doc = false

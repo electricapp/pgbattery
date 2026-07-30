@@ -29,8 +29,13 @@ cluster must hold under all replication paths including split-brain recovery.
 **Violation**: duplicate rows after failover, replication slot replay, or rogue
 promotion.
 
-**Tests**: `concurrent-writes-failover`, `rogue-pg-promote`, I3 in
+**Tests**: `concurrent-writes-failover`, `rogue-pg-promote`, I3 / B3 / B4 in
 `correctness-lite-invariants`.
+
+B3 and B4 are the load-bearing oracles here: a sum-conservation check cannot
+see a transfer applied twice, so B3 asserts each attempted transfer id appears
+at most once (exactly once if acked) in `bank_ledger`, and B4 reconciles every
+balance against the distinct ledger entries.
 
 ---
 
@@ -70,6 +75,10 @@ leader cannot confirm quorum.
 
 **Tests**: `majority-loss`, `async-degraded-durability`, I5 in
 `correctness-lite-invariants`.
+
+An ack whose lifespan only _overlaps_ the quorum-loss window is outside this
+contract's letter and is reported as the non-fatal `I5-WARN` observation rather
+than silently dropped from the analysis.
 
 ---
 
@@ -165,18 +174,18 @@ write ACK until the write has been flushed to the standby's WAL.
 
 ## Contract-to-Test Index
 
-| Contract                          | Severity | Primary Tests                                                                             |
-| --------------------------------- | -------- | ----------------------------------------------------------------------------------------- |
-| W1                                | FATAL    | `acked-write-durability`, `failover-commit-boundary`, `correctness-lite-invariants` I1/I2 |
-| W2                                | FATAL    | `concurrent-writes-failover`, `rogue-pg-promote`, `correctness-lite-invariants` I3        |
-| W3                                | FATAL    | `ddl-failover`                                                                            |
-| L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4              |
-| L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5            |
-| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`                                              |
-| Linearizability (single-register) | FATAL    | `linearizability-register`                                                                |
-| V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                        |
-| V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                       |
-| S1                                | FATAL    | `failover-commit-boundary`, `prepared-transaction-semantics`                              |
-| S2                                | SLO      | `gateway-connection-survival`, `session-semantics-contract`                               |
-| R1                                | FATAL    | `replication-slot-no-leak`                                                                |
-| R2                                | FATAL    | `acked-write-durability` (sync path)                                                      |
+| Contract                          | Severity | Primary Tests                                                                                           |
+| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
+| W1                                | FATAL    | `acked-write-durability`, `failover-commit-boundary`, `correctness-lite-invariants` I1/I2               |
+| W2                                | FATAL    | `concurrent-writes-failover`, `rogue-pg-promote`, `correctness-lite-invariants` I3/B3/B4                |
+| W3                                | FATAL    | `ddl-failover`                                                                                          |
+| L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4, `dual-writability-prober` |
+| L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5                          |
+| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`                                                            |
+| Linearizability (single-register) | FATAL    | `linearizability-register`                                                                              |
+| V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                                      |
+| V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                                     |
+| S1                                | FATAL    | `failover-commit-boundary`, `prepared-transaction-semantics`                                            |
+| S2                                | SLO      | `gateway-connection-survival`, `session-semantics-contract`                                             |
+| R1                                | FATAL    | `replication-slot-no-leak`                                                                              |
+| R2                                | FATAL    | `acked-write-durability` (sync path)                                                                    |

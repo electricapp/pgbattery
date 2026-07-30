@@ -65,6 +65,24 @@ jobs:
       - name: Lint matrix, SQL, and Python scripts
         run: uv run --python 3.14 --script testing/lint_matrix.py
 
+      # Offline unit tests for the harness itself: checker sanity (proves the
+      # consistency checkers can fail), invariant classification, runner
+      # plumbing, fault-primitive parsing. No cluster or Docker required.
+      # A checker that cannot fail is worse than no checker, so these gate CI.
+      - name: Harness unit tests
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(testing/test_*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No testing/test_*.py found — the harness unit tests have vanished."
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "=== $f ==="
+            uv run --project testing python "$f"
+          done
+
   ha-sequential:
     needs: lint-test-harness
     name: HA Sequential

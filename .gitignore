@@ -39,6 +39,10 @@ __pycache__/
 .env
 .env.local
 
+# proptest-regressions/ is deliberately NOT ignored: proptest writes the
+# minimized counterexample there when a property fails, and committing it
+# replays that exact case forever. Ignoring it would discard a found bug.
+
 # Elle build outputs
 testing/third_party/elle/*.jar
 testing/elle_shim/target/

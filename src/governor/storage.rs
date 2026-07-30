@@ -231,14 +231,15 @@ impl RedbLogStorage {
     ///
     /// **Durability invariant.** Raft's safety requires `AppendEntries` to be
     /// fsync'd to disk *before* we respond Ok to the leader. redb 4 defaults
-    /// `WriteTransaction` durability to `Durability::Immediate` (fsync on
-    /// commit) and explicitly disallows reducing it below Immediate, so we
-    /// already satisfy this. We additionally pin it on the Raft-critical
-    /// write paths so that a future redb default change cannot silently
-    /// downgrade durability — `set_durability` is a no-op when already at
-    /// Immediate and `Err`s if we somehow ask for something weaker. The
-    /// `set_durability` Err arm therefore *cannot* fire under redb 4, but
-    /// we log it for defence in depth.
+    /// `WriteTransaction` durability to `Durability::Immediate` (fsync before
+    /// `commit` returns) but will happily accept a downgrade to
+    /// `Durability::None`, so the explicit pin on every Raft-critical write
+    /// path is load-bearing, not decorative: it is what stops a
+    /// throughput-motivated refactor — or a redb default change — from
+    /// silently trading the fsync away. `set_durability` only `Err`s when the
+    /// transaction created or deleted a persistent savepoint, which this
+    /// storage never does, so that arm is unreachable in practice and is
+    /// merely logged.
     ///
     /// # Errors
     /// Returns an error if the write transaction, serialization, insert, or
@@ -294,8 +295,8 @@ impl RedbLogStorage {
     /// silently depends on the redb default. Truncate especially is a Raft
     /// safety operation: a conflicting log suffix must be durably gone before
     /// the leader's replacement entries are accepted, or a crash could
-    /// resurrect them and diverge the log. See `append_entries` for why redb 4
-    /// cannot actually reduce below `Immediate` today (defence in depth).
+    /// resurrect them and diverge the log. See `append_entries` for why the pin
+    /// is load-bearing and why the `Err` arm is unreachable here.
     fn pin_immediate(write_txn: &mut redb::WriteTransaction) {
         if let Err(e) = write_txn.set_durability(redb::Durability::Immediate) {
             tracing::error!(
@@ -1060,5 +1061,580 @@ mod tests {
             storage.load_snapshot_verified().unwrap().unwrap(),
             data.to_vec()
         );
+    }
+
+    // ── Crash recovery ───────────────────────────────────────────────────
+    //
+    // A unit test cannot kill its own process, so "crash" is simulated two
+    // ways, named per test:
+    //
+    // * **Pre-write read snapshot.** redb is MVCC, so a read transaction opened
+    //   before a write sees exactly the committed state a crash at any point
+    //   *inside* that write would leave on disk. This is what pins OUR
+    //   transaction boundaries — that a multi-key write is one transaction and
+    //   not several.
+    // * **Reopen from the same file.** Drop every handle and call
+    //   `RedbLogStorage::new` on the same path, which is the real startup path.
+    //   This covers process death immediately after a commit returned.
+    //
+    // NOT simulated: power loss between redb's fsync and the platter, torn
+    // writes inside redb's own two-slot commit protocol, and filesystem
+    // misbehaviour. Those are redb/OS guarantees, not ours.
+
+    fn blank(index: u64, term: u64) -> LogEntry {
+        LogEntry {
+            index,
+            term,
+            leader_node_id: 1,
+            payload: LogEntryPayload::Blank,
+        }
+    }
+
+    fn snapshot_meta(index: u64, voters: Vec<NodeId>) -> SnapshotMeta {
+        SnapshotMeta {
+            last_applied: LastAppliedState {
+                last_applied_term: Some(3),
+                last_applied_index: Some(index),
+                last_applied_leader_node_id: 1,
+            },
+            membership: LocalStoredMembership {
+                log_id_index: Some(index),
+                log_id_term: Some(3),
+                log_id_leader_node_id: 1,
+                configs: vec![voters.clone()],
+                nodes: voters
+                    .into_iter()
+                    .map(|id| (id, format!("10.0.0.{id}:5433")))
+                    .collect(),
+            },
+        }
+    }
+
+    /// Crash mid-append. `append_entries` must put the whole batch in one
+    /// transaction, so no crash inside it can leave a partial suffix — a
+    /// partially-applied `AppendEntries` batch is a diverged log.
+    ///
+    /// Simulated via a pre-write read snapshot (partial visibility) plus a
+    /// reopen (post-commit durability).
+    #[test]
+    fn crash_mid_append_leaves_no_partial_batch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        storage.append_entries(&[blank(1, 1)]).unwrap();
+
+        let batch: Vec<LogEntry> = (2..=6).map(|i| blank(i, 2)).collect();
+        let pre_append = storage.db.begin_read().unwrap();
+        storage.append_entries(&batch).unwrap();
+
+        {
+            let table = pre_append.open_table(LOGS_TABLE).unwrap();
+            assert!(table.get(1).unwrap().is_some(), "prior entry must survive");
+            for entry in &batch {
+                assert!(
+                    table.get(entry.index).unwrap().is_none(),
+                    "index {} was visible before the batch committed — the batch \
+                     is not a single transaction, so a crash can tear it",
+                    entry.index
+                );
+            }
+        }
+        drop(pre_append);
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        for i in 1..=6 {
+            assert!(
+                reopened.get_entry(i).unwrap().is_some(),
+                "index {i} lost across reopen"
+            );
+        }
+        assert_eq!(reopened.last_entry().unwrap().unwrap().index, 6);
+    }
+
+    /// Crash after entries are staged but before the commit returns. The log
+    /// must be exactly where it was: `last_entry` feeds `get_log_state`, so an
+    /// entry surfacing there without being durable would have this node ack a
+    /// log position it does not hold.
+    ///
+    /// Simulated by staging inserts in a write transaction and dropping it
+    /// without committing — the on-disk state a death inside `append_entries`
+    /// (between the inserts and `commit`) produces — then reopening.
+    #[test]
+    fn crash_before_append_commit_does_not_advance_the_log() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        storage.append_entries(&[blank(1, 1), blank(2, 1)]).unwrap();
+
+        {
+            let write_txn = storage.db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(LOGS_TABLE).unwrap();
+                for i in 3..=5u64 {
+                    let bytes = postcard::to_allocvec(&blank(i, 2)).unwrap();
+                    table.insert(i, bytes.as_slice()).unwrap();
+                }
+            }
+            drop(write_txn);
+        }
+
+        drop(storage);
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        assert_eq!(
+            reopened.last_entry().unwrap().unwrap().index,
+            2,
+            "uncommitted entries must not advance last_entry"
+        );
+        for i in 3..=5 {
+            assert!(reopened.get_entry(i).unwrap().is_none());
+        }
+    }
+
+    /// Crash mid-truncate. A conflicting suffix must be durably gone before the
+    /// leader's replacement entries are accepted; a half-deleted range would
+    /// resurrect rejected entries on restart.
+    ///
+    /// Simulated via a pre-write read snapshot plus a reopen.
+    #[test]
+    fn crash_mid_truncate_is_all_or_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        let entries: Vec<LogEntry> = (1..=8).map(|i| blank(i, 1)).collect();
+        storage.append_entries(&entries).unwrap();
+
+        let pre_truncate = storage.db.begin_read().unwrap();
+        storage.delete_from(4).unwrap();
+        {
+            let table = pre_truncate.open_table(LOGS_TABLE).unwrap();
+            for i in 4..=8u64 {
+                assert!(
+                    table.get(i).unwrap().is_some(),
+                    "index {i} vanished before the truncate committed"
+                );
+            }
+        }
+        drop(pre_truncate);
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        for i in 1..=3 {
+            assert!(reopened.get_entry(i).unwrap().is_some());
+        }
+        for i in 4..=8 {
+            assert!(reopened.get_entry(i).unwrap().is_none());
+        }
+        assert_eq!(reopened.last_entry().unwrap().unwrap().index, 3);
+    }
+
+    /// Crash mid-purge. Deleting the covered prefix and recording the purge
+    /// point are one transaction: a purge point without the deletion would hide
+    /// live entries, and a deletion without the purge point would make
+    /// `get_log_state` under-report `last_purged_log_id` and trigger needless
+    /// full snapshots.
+    ///
+    /// Simulated via a pre-write read snapshot plus a reopen.
+    #[test]
+    fn crash_mid_purge_keeps_deletion_and_purge_point_together() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        let entries: Vec<LogEntry> = (1..=8).map(|i| blank(i, 4)).collect();
+        storage.append_entries(&entries).unwrap();
+
+        let purge = PurgedLogId {
+            term: 4,
+            leader_node_id: 1,
+            index: 5,
+        };
+        let pre_purge = storage.db.begin_read().unwrap();
+        storage.delete_up_to(&purge).unwrap();
+        {
+            let logs = pre_purge.open_table(LOGS_TABLE).unwrap();
+            assert!(logs.get(1).unwrap().is_some());
+            let meta = pre_purge.open_table(META_TABLE).unwrap();
+            assert!(
+                meta.get("last_purged").unwrap().is_none(),
+                "purge point committed separately from the deletion"
+            );
+        }
+        drop(pre_purge);
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        assert_eq!(reopened.load_last_purged().unwrap(), Some(purge));
+        for i in 1..=5 {
+            assert!(reopened.get_entry(i).unwrap().is_none());
+        }
+        assert_eq!(reopened.last_entry().unwrap().unwrap().index, 8);
+    }
+
+    /// Crash mid-snapshot-install. The five keys an install writes across two
+    /// tables — snapshot data, meta, digest, `last_applied`, applied membership
+    /// — must land together. Data without its digest is unverifiable; a stale
+    /// `last_applied` after an install reports an applied position below the
+    /// purge point, and a stale membership is a split-brain enabler.
+    ///
+    /// Simulated via a pre-write read snapshot plus a reopen.
+    #[test]
+    fn crash_mid_snapshot_install_is_all_or_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+
+        let old = snapshot_meta(10, vec![1, 2, 3]);
+        storage.save_installed_snapshot(&old, b"old-state").unwrap();
+
+        let new = snapshot_meta(99, vec![1, 2, 3, 4]);
+        let new_data = b"new-state-with-a-different-length";
+        let pre_install = storage.db.begin_read().unwrap();
+        storage.save_installed_snapshot(&new, new_data).unwrap();
+
+        {
+            let snap = pre_install.open_table(SNAPSHOT_TABLE).unwrap();
+            assert_eq!(
+                snap.get("data").unwrap().unwrap().value(),
+                b"old-state",
+                "snapshot data committed ahead of the rest of the install"
+            );
+            let meta = pre_install.open_table(META_TABLE).unwrap();
+            let applied: LastAppliedState =
+                postcard::from_bytes(meta.get("last_applied").unwrap().unwrap().value()).unwrap();
+            assert_eq!(
+                applied.last_applied_index,
+                Some(10),
+                "last_applied moved ahead of the snapshot payload"
+            );
+        }
+        drop(pre_install);
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        // Digest verifies, so data and digest were committed together.
+        assert_eq!(
+            reopened.load_snapshot_verified().unwrap().unwrap(),
+            new_data.to_vec()
+        );
+        let meta = reopened.load_snapshot_meta().unwrap().unwrap();
+        let applied = reopened.load_last_applied().unwrap();
+        let membership = reopened.load_applied_membership().unwrap().unwrap();
+        assert_eq!(applied.last_applied_index, Some(99));
+        assert_eq!(
+            applied.last_applied_index,
+            meta.last_applied.last_applied_index
+        );
+        assert_eq!(membership.configs, meta.membership.configs);
+        assert!(
+            membership.log_id_index <= applied.last_applied_index,
+            "membership at {:?} is ahead of last_applied {:?}",
+            membership.log_id_index,
+            applied.last_applied_index
+        );
+    }
+
+    /// Failure *between* the two tables a snapshot install writes must roll the
+    /// whole thing back, including the snapshot payload already inserted into
+    /// `raft_snapshot`. Otherwise a restart finds a snapshot whose applied
+    /// position and membership still describe the previous one.
+    ///
+    /// The failure is injected for real (not simulated): `raft_meta` is
+    /// re-created with a mismatched value type, so `open_table(META_TABLE)`
+    /// errors after the payload inserts have already run inside the same
+    /// transaction. This is the one point where an install can fail mid-flight,
+    /// and it is what proves the write is a single transaction rather than one
+    /// per table.
+    #[test]
+    fn snapshot_install_rolls_back_payload_when_the_meta_write_fails() {
+        const WRONG_META: TableDefinition<'_, u64, u64> = TableDefinition::new("raft_meta");
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        storage
+            .save_installed_snapshot(&snapshot_meta(10, vec![1, 2, 3]), b"old-state")
+            .unwrap();
+
+        {
+            let write_txn = storage.db.begin_write().unwrap();
+            assert!(write_txn.delete_table(META_TABLE).unwrap());
+            {
+                let mut wrong = write_txn.open_table(WRONG_META).unwrap();
+                wrong.insert(0u64, 0u64).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let result =
+            storage.save_installed_snapshot(&snapshot_meta(99, vec![1, 2, 3, 4]), b"new-state");
+        assert!(
+            result.is_err(),
+            "the meta write must fail for this injection to mean anything"
+        );
+
+        let read_txn = storage.db.begin_read().unwrap();
+        let snap = read_txn.open_table(SNAPSHOT_TABLE).unwrap();
+        assert_eq!(
+            snap.get("data").unwrap().unwrap().value(),
+            b"old-state",
+            "snapshot payload survived a failed install — data and applied state \
+             are not written in one transaction"
+        );
+        let digest = snap.get("data_sha256").unwrap().unwrap();
+        assert_eq!(
+            digest.value(),
+            Sha256::digest(b"old-state").as_slice(),
+            "payload and digest diverged across a failed install"
+        );
+    }
+
+    /// Crash between persisting `last_applied` and the membership write.
+    /// `save_applied_membership_and_last_applied` writes both in one
+    /// transaction, so recovery can never see membership ahead of
+    /// `last_applied` — the state that would replay the membership entry
+    /// against a state machine already reflecting it.
+    ///
+    /// Simulated via a pre-write read snapshot plus a reopen. Both keys live in
+    /// `raft_meta`, so unlike the snapshot install there is no point at which a
+    /// failure can be injected between them; what is asserted is that nothing
+    /// leaks before the commit and that recovery lands both keys consistently,
+    /// with the deliberately-stale starting `last_applied` making an
+    /// ahead-of-applied membership detectable.
+    #[test]
+    fn crash_between_last_applied_and_membership_is_impossible() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        storage
+            .save_last_applied(&LastAppliedState {
+                last_applied_term: Some(1),
+                last_applied_index: Some(2),
+                last_applied_leader_node_id: 1,
+            })
+            .unwrap();
+
+        let target = snapshot_meta(7, vec![1, 2, 3]);
+        let pre_write = storage.db.begin_read().unwrap();
+        storage
+            .save_applied_membership_and_last_applied(&target.membership, &target.last_applied)
+            .unwrap();
+
+        {
+            let meta = pre_write.open_table(META_TABLE).unwrap();
+            assert!(
+                meta.get("applied_membership").unwrap().is_none(),
+                "membership committed separately from last_applied"
+            );
+            let applied: LastAppliedState =
+                postcard::from_bytes(meta.get("last_applied").unwrap().unwrap().value()).unwrap();
+            assert_eq!(applied.last_applied_index, Some(2));
+        }
+        drop(pre_write);
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        let applied = reopened.load_last_applied().unwrap();
+        let membership = reopened.load_applied_membership().unwrap().unwrap();
+        assert_eq!(applied.last_applied_index, Some(7));
+        assert!(reopened.has_membership().unwrap());
+        assert!(
+            membership.log_id_index <= applied.last_applied_index,
+            "membership at {:?} is ahead of last_applied {:?}",
+            membership.log_id_index,
+            applied.last_applied_index
+        );
+    }
+
+    /// Second line of defence behind the atomic snapshot write: if snapshot
+    /// data and its digest ever disagree — corruption, or a torn payload from a
+    /// failure mode redb does not cover — the loader refuses instead of feeding
+    /// postcard garbage that would decode into a nonsense `ClusterState`.
+    ///
+    /// The disagreement is injected directly (our single-transaction write
+    /// cannot produce it), so this tests the check, not the writer.
+    #[test]
+    fn torn_snapshot_payload_is_refused_on_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        let meta = snapshot_meta(5, vec![1, 2, 3]);
+        storage.save_installed_snapshot(&meta, b"intact").unwrap();
+
+        {
+            let write_txn = storage.db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SNAPSHOT_TABLE).unwrap();
+                table.insert("data", b"tampered".as_slice()).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        let err = reopened
+            .load_snapshot_verified()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("integrity check failed"),
+            "digest mismatch must be refused, got: {err}"
+        );
+    }
+
+    /// Every Raft-critical write path is readable after a close and reopen from
+    /// the same file: the real startup path, exercised once per write method so
+    /// a new path cannot be added without a durability check.
+    #[test]
+    fn every_write_path_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let membership = snapshot_meta(9, vec![1, 2]).membership;
+
+        {
+            let storage = RedbLogStorage::new(&path).unwrap();
+            let entries: Vec<LogEntry> = (1..=10).map(|i| blank(i, 6)).collect();
+            storage.append_entries(&entries).unwrap();
+            storage.delete_from(9).unwrap();
+            storage
+                .delete_up_to(&PurgedLogId {
+                    term: 6,
+                    leader_node_id: 1,
+                    index: 2,
+                })
+                .unwrap();
+            storage
+                .save_vote(&Vote {
+                    term: 7,
+                    voted_for: Some(3),
+                    committed: true,
+                })
+                .unwrap();
+            storage
+                .save_last_applied(&LastAppliedState {
+                    last_applied_term: Some(6),
+                    last_applied_index: Some(8),
+                    last_applied_leader_node_id: 1,
+                })
+                .unwrap();
+            storage
+                .save_applied_membership_and_last_applied(
+                    &membership,
+                    &LastAppliedState {
+                        last_applied_term: Some(6),
+                        last_applied_index: Some(8),
+                        last_applied_leader_node_id: 1,
+                    },
+                )
+                .unwrap();
+            storage
+                .save_snapshot(&snapshot_meta(8, vec![1, 2]), b"payload")
+                .unwrap();
+        }
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        assert_eq!(reopened.last_entry().unwrap().unwrap().index, 8);
+        assert_eq!(reopened.get_entries(1, 11).unwrap().len(), 6);
+        assert_eq!(
+            reopened.load_last_purged().unwrap().map(|p| p.index),
+            Some(2)
+        );
+        let vote = reopened.load_vote().unwrap();
+        assert_eq!(vote.term, 7);
+        assert_eq!(vote.voted_for, Some(3));
+        assert!(vote.committed);
+        assert_eq!(
+            reopened.load_last_applied().unwrap().last_applied_index,
+            Some(8)
+        );
+        assert_eq!(
+            reopened.load_applied_membership().unwrap().unwrap().configs,
+            membership.configs
+        );
+        assert_eq!(
+            reopened.load_snapshot_verified().unwrap().unwrap(),
+            b"payload".to_vec()
+        );
+    }
+
+    /// redb 4 accepts `Durability::None` on a write transaction — it only
+    /// refuses the downgrade when the transaction created or deleted a
+    /// persistent savepoint, which this storage never does. The default is
+    /// `Immediate`, so the explicit pin on every Raft write path is what keeps
+    /// the fsync-before-ack guarantee from being silently traded away.
+    #[test]
+    fn redb_accepts_weaker_durability_so_the_pin_is_load_bearing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+
+        let mut write_txn = storage.db.begin_write().unwrap();
+        assert!(
+            write_txn.set_durability(redb::Durability::None).is_ok(),
+            "redb refuses weaker durability; the explicit pin would be redundant"
+        );
+        assert!(
+            write_txn
+                .set_durability(redb::Durability::Immediate)
+                .is_ok(),
+            "pinning Immediate must always succeed on the Raft write paths"
+        );
+        drop(write_txn);
+    }
+
+    /// openraft 0.9's own storage conformance suite (`openraft::testing::Suite`,
+    /// available unconditionally — no extra feature) run against the production
+    /// openraft glue: `governor::raft::LogStorageAdapter` and
+    /// `StateMachineStore`, both over a real `RedbLogStorage`. It exercises
+    /// append/read/truncate/purge/vote and the snapshot + applied-state
+    /// contracts far more thoroughly than hand-written cases.
+    ///
+    /// The suite drives the same types `Governor::new` builds, through the same
+    /// constructors, so nothing here can drift from production. Coverage gap:
+    /// `install_snapshot` and `build_snapshot` are only ever called
+    /// sequentially by the suite, so the `snapshot_consistency` mutex is taken
+    /// but never contended — the race it exists to prevent is not reached.
+    mod conformance {
+        use super::*;
+        use crate::governor::raft::{LogStorageAdapter, StateMachineStore, TypeConfig};
+        use crate::governor::state_machine::ClusterState;
+        use openraft::testing::{StoreBuilder, Suite};
+        use openraft::{StorageError, StorageIOError};
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        fn build_err<E: std::error::Error + 'static>(e: &E) -> StorageError<NodeId> {
+            StorageIOError::<NodeId>::write(e).into()
+        }
+
+        /// The `TempDir` is the suite's drop guard: it outlives the store and
+        /// removes the `raft.db` when the case ends.
+        struct Builder;
+
+        impl StoreBuilder<TypeConfig, LogStorageAdapter, StateMachineStore, TempDir> for Builder {
+            async fn build(
+                &self,
+            ) -> std::result::Result<
+                (TempDir, LogStorageAdapter, StateMachineStore),
+                StorageError<NodeId>,
+            > {
+                let dir = tempdir().map_err(|e| build_err(&e))?;
+                let storage =
+                    RedbLogStorage::new(dir.path().join("raft.db")).map_err(|e| build_err(&e))?;
+                let state_machine = StateMachineStore::new(
+                    Arc::new(RwLock::new(ClusterState::new())),
+                    storage.clone(),
+                );
+                Ok((dir, LogStorageAdapter::new(storage), state_machine))
+            }
+        }
+
+        /// `Suite::test_all` builds its own tokio runtime per case, so this must
+        /// be a plain `#[test]`, not `#[tokio::test]`.
+        #[test]
+        fn openraft_storage_conformance_suite() {
+            Suite::test_all(Builder).unwrap();
+        }
     }
 }

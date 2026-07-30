@@ -1,0 +1,1 @@
+commitINSERT INTO audit (msg) VALUES ($1); COMMIT;

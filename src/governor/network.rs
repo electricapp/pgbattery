@@ -106,6 +106,38 @@ struct Frame {
     body: BytesMut,
 }
 
+/// Fuzz/test seam over [`take_frame`] and [`append_frame`].
+///
+/// The frame codec only otherwise reachable through a live socket plus an
+/// `openraft` dependency. `Ok(None)` must leave `buf` byte-identical (the
+/// torn-write resume property), and a returned frame must re-encode to exactly
+/// the bytes consumed.
+#[doc(hidden)]
+pub fn decode_rpc_frame_for_fuzz(buf: &mut BytesMut) -> Result<Option<(u8, u64, Vec<u8>)>> {
+    Ok(take_frame(buf, "fuzz")?.map(|f| (f.type_byte, f.corr_id, f.body.to_vec())))
+}
+
+/// Re-encode a frame decoded by [`decode_rpc_frame_for_fuzz`].
+#[doc(hidden)]
+pub fn encode_rpc_frame_for_fuzz(
+    buf: &mut BytesMut,
+    type_byte: u8,
+    corr_id: u64,
+    body: &[u8],
+) -> Result<()> {
+    let total_len = u32::try_from(FRAME_OVERHEAD_AFTER_LEN + body.len())
+        .map_err(|_| Error::Protocol("RPC frame length exceeds u32".to_string()))?;
+    buf.put_u32(total_len);
+    buf.put_u8(type_byte);
+    buf.put_u64(corr_id);
+    buf.put_slice(body);
+    Ok(())
+}
+
+/// Frame-length bounds, exposed for assertions in fuzz targets.
+#[doc(hidden)]
+pub const RPC_FRAME_LEN_BOUNDS: (usize, usize) = (FRAME_OVERHEAD_AFTER_LEN, MAX_RPC_FRAME_LEN);
+
 /// Split one complete frame off the front of `buf`, if present.
 ///
 /// `Ok(None)` means more bytes are needed; the partial frame stays in `buf`

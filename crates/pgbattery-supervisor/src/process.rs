@@ -1352,13 +1352,23 @@ host all all ::/0 {auth_method}
         parsed
     }
 
-    /// Refuse to run `pg_rewind` if the local WAL is more than one block
-    /// ahead of the source. `pg_rewind` aligns local to source by
-    /// discarding any local WAL the source doesn't have — and that
-    /// "extra" WAL is exactly where acknowledged commits live if the
-    /// local node was the previous primary or a sync replica. Beyond
-    /// the one-WAL-block in-flight window, treating this divergence as
-    /// "just catch up" silently throws away client-acked data.
+    /// Refuse to run `pg_rewind` if the local WAL is ahead of the source by
+    /// more than [`PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`] (one 16 MiB WAL
+    /// segment). `pg_rewind` aligns local to source by discarding any local
+    /// WAL the source doesn't have — and that "extra" WAL is exactly where
+    /// acknowledged commits live if the local node was the previous primary
+    /// or a sync replica.
+    ///
+    /// The tolerance is only safe on the assumption that the surplus WAL is
+    /// *unacknowledged*. Under synchronous replication that holds: every
+    /// acked commit is on the sync standby, so WAL only this node has was
+    /// never acked, and discarding up to a segment of it (in-flight
+    /// transaction plus checkpoint/autovacuum/FPI background records on a
+    /// crashed primary) loses nothing a client was promised. During async
+    /// fallback (`synchronous_standby_names` empty) it does NOT hold: up to
+    /// the full threshold of client-acked WAL can be discarded here. That is
+    /// the published async RPO — the `WithinTolerance` warning below exists
+    /// so operators can see each such discard and its size.
     ///
     /// `pre_stop_local_lsn` is the local LSN captured by the caller while
     /// PG was still up (the rewind paths stop PG before this check runs,
@@ -1443,11 +1453,19 @@ host all all ::/0 {auth_method}
         ) {
             RewindDecision::Safe => Ok(()),
             RewindDecision::WithinTolerance { divergence_bytes } => {
-                tracing::debug!(
+                // warn!, not debug!: the discarded surplus is provably unacked
+                // only under sync replication. During async fallback it can
+                // contain client-acked commits (the published async RPO), and
+                // operators need the byte count in the default log level to
+                // audit what a rewind threw away.
+                tracing::warn!(
                     local_lsn,
                     source_lsn,
                     divergence_bytes,
-                    "Local WAL slightly ahead of source within tolerance — proceeding with pg_rewind"
+                    threshold_bytes = PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+                    "Local WAL ahead of rewind source within tolerance — proceeding with pg_rewind; \
+                     the discarded surplus is unacknowledged under sync replication, but during \
+                     async fallback it may include client-acked commits"
                 );
                 Ok(())
             }
@@ -1459,7 +1477,7 @@ host all all ::/0 {auth_method}
                     divergence_bytes,
                     threshold_bytes = PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
                     source = %source_addr,
-                    "Refusing pg_rewind: local WAL is ahead of source by more than one block — rewinding would discard WAL the cluster may still need. Manual intervention required."
+                    "Refusing pg_rewind: local WAL is ahead of source by more than the divergence threshold — rewinding would discard WAL the cluster may still need. Manual intervention required."
                 );
                 Err(Error::RewindDataLossRisk {
                     local_lsn_bytes: local_lsn,
@@ -3827,6 +3845,45 @@ mod tests {
         assert!(matches!(decision, RewindDecision::Refuse { .. }));
     }
 
+    /// Pins the production threshold and the decision boundary AT that
+    /// threshold. The value is load-bearing in both directions: it is the
+    /// auto-rejoin allowance for a crashed primary's unacked surplus under
+    /// sync replication, and simultaneously the worst-case client-acked WAL
+    /// a rewind may discard during async fallback (the published async RPO).
+    /// A change to either the constant or the boundary comparison must be a
+    /// deliberate data-safety decision, not a drive-by.
+    #[test]
+    fn test_rewind_divergence_threshold_value_and_boundary() {
+        assert_eq!(
+            PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+            16 * 1024 * 1024,
+            "threshold is one 16 MiB WAL segment — matches the documented async RPO"
+        );
+        let base: u64 = 100_000_000;
+        // Exactly at the threshold: proceeds (<= comparison).
+        assert_eq!(
+            rewind_divergence_decision(
+                base + PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+                base,
+                PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+            ),
+            RewindDecision::WithinTolerance {
+                divergence_bytes: PG_REWIND_DIVERGENCE_THRESHOLD_BYTES
+            }
+        );
+        // One byte past the threshold: refused.
+        assert_eq!(
+            rewind_divergence_decision(
+                base + PG_REWIND_DIVERGENCE_THRESHOLD_BYTES + 1,
+                base,
+                PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+            ),
+            RewindDecision::Refuse {
+                divergence_bytes: PG_REWIND_DIVERGENCE_THRESHOLD_BYTES + 1
+            }
+        );
+    }
+
     // ── upsert_managed_block ──────────────────────────────────────────────
 
     #[test]
@@ -4159,5 +4216,138 @@ mod tests {
         assert!(parse_role_readonly("true").is_err());
         assert!(parse_role_readonly("t,on").is_err());
         assert!(parse_role_readonly("maybe,on").is_err());
+    }
+
+    /// Property tests over the pure `pg_rewind` data-loss gate.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Increasing severity: `Safe` < `WithinTolerance` < `Refuse`.
+        const fn severity(decision: RewindDecision) -> u8 {
+            match decision {
+                RewindDecision::Safe => 0,
+                RewindDecision::WithinTolerance { .. } => 1,
+                RewindDecision::Refuse { .. } => 2,
+            }
+        }
+
+        proptest! {
+            /// The gate is monotone in divergence magnitude: pushing the local
+            /// WAL further ahead of the source can only ever make the decision
+            /// stricter. Non-monotonicity would mean some larger divergence
+            /// slips through as `Proceed` while a smaller one is refused.
+            #[test]
+            fn prop_rewind_decision_monotone_in_divergence(
+                source in 0u64..u64::MAX / 2,
+                threshold in 0u64..64 * 1024 * 1024,
+                lower_ahead in 0u64..256 * 1024 * 1024,
+                extra_ahead in 0u64..256 * 1024 * 1024,
+            ) {
+                let lower = source.saturating_add(lower_ahead);
+                let higher = lower.saturating_add(extra_ahead);
+                let lower_decision = rewind_divergence_decision(lower, source, threshold);
+                let higher_decision = rewind_divergence_decision(higher, source, threshold);
+                prop_assert!(
+                    severity(lower_decision) <= severity(higher_decision),
+                    "local {lower} gave {lower_decision:?} but local {higher} \
+                     gave the weaker {higher_decision:?}"
+                );
+            }
+
+            /// Exact classification, including the reported byte count that the
+            /// operator-facing error carries.
+            #[test]
+            fn prop_rewind_decision_classification_is_exact(
+                local: u64,
+                source: u64,
+                threshold: u64,
+            ) {
+                let decision = rewind_divergence_decision(local, source, threshold);
+                if local <= source {
+                    prop_assert_eq!(decision, RewindDecision::Safe);
+                } else {
+                    let divergence_bytes = local - source;
+                    let expected = if divergence_bytes <= threshold {
+                        RewindDecision::WithinTolerance { divergence_bytes }
+                    } else {
+                        RewindDecision::Refuse { divergence_bytes }
+                    };
+                    prop_assert_eq!(decision, expected);
+                }
+            }
+
+            /// Documented boundary rule, for every threshold: divergence
+            /// *exactly* at the threshold proceeds (`<=`, so boundary
+            /// conditions cannot deadlock failover), one byte further refuses.
+            #[test]
+            fn prop_rewind_decision_threshold_boundary(
+                source in 0u64..u64::MAX / 4,
+                threshold in 1u64..64 * 1024 * 1024,
+            ) {
+                prop_assert_eq!(
+                    rewind_divergence_decision(source + threshold, source, threshold),
+                    RewindDecision::WithinTolerance { divergence_bytes: threshold }
+                );
+                prop_assert_eq!(
+                    rewind_divergence_decision(source + threshold + 1, source, threshold),
+                    RewindDecision::Refuse { divergence_bytes: threshold + 1 }
+                );
+            }
+
+            /// A local WAL position at or behind the source has nothing for
+            /// `pg_rewind` to discard, so it is unconditionally safe — no
+            /// threshold value may turn it into a refusal.
+            #[test]
+            fn prop_rewind_never_refuses_when_local_not_ahead(
+                local: u64,
+                behind_by: u64,
+                threshold: u64,
+            ) {
+                let source = local.saturating_add(behind_by);
+                prop_assert_eq!(
+                    rewind_divergence_decision(local, source, threshold),
+                    RewindDecision::Safe
+                );
+            }
+
+            /// Fail-closed at the probe. Both LSN probes that feed the gate
+            /// (`capture_lsn_for_rewind_gate`, `get_remote_lsn`) funnel through
+            /// `parse_lsn_local` and hand the gate an `Option<u64>`; a `None`
+            /// becomes `Error::Postgres("failed to probe rewind source: …")`
+            /// before `rewind_divergence_decision` is consulted. So an
+            /// unreadable LSN can only be refused, never silently read as
+            /// position 0 — provided the parser itself never invents a value
+            /// for malformed input.
+            #[test]
+            fn prop_parse_lsn_local_fails_closed_on_malformed(
+                s in r"[0-9a-fA-FxXzZ/ +\-\n]{0,24}",
+            ) {
+                let trimmed = s.trim();
+                if parse_lsn_local(&s).is_some() {
+                    prop_assert!(trimmed.contains('/'), "accepted {s:?} with no field separator");
+                    prop_assert_eq!(
+                        trimmed.matches('/').count(),
+                        1,
+                        "accepted {:?} with multiple field separators",
+                        s
+                    );
+                    prop_assert!(
+                        trimmed
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit() || c == '/' || c == '+'),
+                        "accepted {s:?} containing a non-hex character"
+                    );
+                }
+            }
+
+            /// Round-trips PostgreSQL's `upper/lower` hex LSN encoding for every
+            /// 64-bit position.
+            #[test]
+            fn prop_parse_lsn_local_round_trips(lsn: u64) {
+                let rendered = format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF);
+                prop_assert_eq!(parse_lsn_local(&rendered), Some(lsn));
+            }
+        }
     }
 }

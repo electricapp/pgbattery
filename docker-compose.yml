@@ -14,11 +14,13 @@ services:
     # any chaos sequence that exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
-    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node1.toml:/app/pgbattery.toml:ro
-      - node1_state:/var/lib/postgresql
+      # Volume name is suffixed by PGBATTERY_STATE_SUFFIX (empty by default).
+      # See the `volumes:` block for the persistent vs size-bounded variants.
+      - node1_state${PGBATTERY_STATE_SUFFIX:-}:/var/lib/postgresql
     ports:
       - "5432:5432"   # Client connections
       - "9091:9090"   # Metrics
@@ -45,11 +47,11 @@ services:
     # any chaos sequence that exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
-    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 2 --voter"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 2 --voter"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node2.toml:/app/pgbattery.toml:ro
-      - node2_state:/var/lib/postgresql
+      - node2_state${PGBATTERY_STATE_SUFFIX:-}:/var/lib/postgresql
     ports:
       - "5433:5432"
       - "9092:9090"
@@ -76,11 +78,11 @@ services:
     # any chaos sequence that exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
-    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 3 --voter"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 3 --voter"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node3.toml:/app/pgbattery.toml:ro
-      - node3_state:/var/lib/postgresql
+      - node3_state${PGBATTERY_STATE_SUFFIX:-}:/var/lib/postgresql
     ports:
       - "5434:5432"
       - "9093:9090"
@@ -103,11 +105,11 @@ services:
     build: .
     hostname: witness
     restart: "no"
-    command: ["sh", "-c", "echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 4"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 4"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node4.toml:/app/pgbattery.toml:ro
-      - witness_state:/var/lib/postgresql
+      - witness_state${PGBATTERY_STATE_SUFFIX:-}:/var/lib/postgresql
     ports:
       - "5435:5432"
       - "9095:9090"
@@ -148,8 +150,96 @@ networks:
       config:
         - subnet: 172.28.0.0/16
 
+# Node state (PGDATA + pg_wal + Raft log + backups, all under
+# /var/lib/postgresql) comes in two variants. Each service mounts
+# `node<N>_state${PGBATTERY_STATE_SUFFIX}`, so a single env var picks which one
+# the whole cluster uses:
+#
+#   PGBATTERY_STATE_SUFFIX unset/empty  → node<N>_state          (default)
+#   PGBATTERY_STATE_SUFFIX=_bounded     → node<N>_state_bounded
+#
+# DEFAULT (`node<N>_state`) — ordinary persistent named volumes on the Docker
+# host filesystem. Contents survive `docker compose kill|stop|restart|start`,
+# which every restart-, pg_rewind-, and divergence-oriented case depends on
+# (cluster-restart, restart-permutations, diverged-node-rejoin, wal-hole-resync,
+# restart-budget-sustained-pg-death). Docker's `local` volume driver has no
+# quota, so these are as large as the host filesystem — on a CI runner or dev
+# machine that is hundreds of GB, which is why a blanket `fallocate` fill can
+# never reach ENOSPC here.
+#
+# BOUNDED (`node<N>_state_bounded`) — RAM-backed tmpfs with a hard `size=`, so
+# a fill genuinely exhausts the filesystem PostgreSQL writes WAL to and ENOSPC
+# is reachable. `fault_primitives.disk_full_during_wal` requires this variant
+# and refuses to run against the unbounded default rather than filling a host
+# disk. Two properties to respect before selecting it:
+#
+#   1. NOT restart-persistent. Docker instantiates a tmpfs volume's mount per
+#      container start, so `kill|stop|restart` + `start` comes back with an
+#      EMPTY /var/lib/postgresql. node1 (`run --bootstrap`) would then bootstrap
+#      a brand-new cluster with a fresh Raft log, which silently turns every
+#      durability and split-brain assertion vacuous. Use bounded mode only for
+#      cases that do not restart a node, and never as the default.
+#   2. The fill costs RAM, not disk — exhausting one node's volume pins up to
+#      `size` bytes of tmpfs pages. Fill one node at a time.
+#
+# A tmpfs volume starts empty and root-owned, unlike a fresh named volume, which
+# Docker pre-populates from the image (content, ownership and all). Two things
+# follow, and both are no-ops in default mode:
+#   - `uid=999,gid=999` in the mount options. 999:999 is `postgres` in the
+#     `postgres:18` base image, which is the uid the container runs as; without
+#     it the process cannot write its own state directory.
+#   - each service's command starts with `mkdir -p /var/lib/postgresql/{data,raft}`.
+#     The image creates those directories, but the mount hides them, and
+#     pgbattery expects them to exist ("Failed to read data dir: No such file or
+#     directory" otherwise).
+#
+# Sizing (4 GiB default, measured on a bootstrapped 3-node cluster):
+#   - fresh leader /var/lib/postgresql   88 MiB (65 MiB of it 4x16 MiB WAL segs)
+#   - follower after pg_basebackup       56 MiB
+#   - pg_wal ceiling                     wal_keep_size 1 GiB retention +
+#                                        max_wal_size 1 GiB checkpoint churn
+#   - backups (dump, compressed, retention_count 3)   tens of MiB
+#   - table data written by the suites (tens of thousands of rows, pgbench
+#     scale 1)                           tens of MiB
+# Worst case is therefore ~2.2 GiB; 4 GiB leaves ~1.8 GiB of headroom so no
+# suite runs out spuriously, while still being small enough to fill quickly and
+# to fit alongside the other nodes on a 16 GiB runner. Override per-run with
+# PGBATTERY_BOUNDED_STATE_SIZE (e.g. `2g` to halve the fill cost).
+#
+# PLATFORM: tmpfs volumes are a Linux-kernel feature, so bounded mode works
+# identically on Linux CI runners and on macOS Docker Desktop (the tmpfs lives
+# in the LinuxKit VM, and `size=` counts against the VM's RAM allocation, not
+# the Mac's). No pre-provisioning on the host, unlike a loop-mounted image
+# volume (`type: ext4, device: <file>, o: loop`), which would be bounded AND
+# persistent but needs a formatted image file to already exist on the Docker
+# host — unavailable on Docker Desktop, where the "host" is the VM.
 volumes:
   node1_state:
   node2_state:
   node3_state:
   witness_state:
+
+  node1_state_bounded:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=${PGBATTERY_BOUNDED_STATE_SIZE:-4g},uid=999,gid=999,mode=0755"
+  node2_state_bounded:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=${PGBATTERY_BOUNDED_STATE_SIZE:-4g},uid=999,gid=999,mode=0755"
+  node3_state_bounded:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=${PGBATTERY_BOUNDED_STATE_SIZE:-4g},uid=999,gid=999,mode=0755"
+  witness_state_bounded:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=${PGBATTERY_BOUNDED_STATE_SIZE:-4g},uid=999,gid=999,mode=0755"

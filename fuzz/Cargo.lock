@@ -2913,8 +2913,11 @@ dependencies = [
 name = "pgbattery-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "libfuzzer-sys",
  "pgbattery",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@
 #     "typer>=0.21",
 # ]
 # ///
-"""Lint the CI test harness: validate JSON, Python syntax, SQL file references.
+"""Lint the CI test harness: matrix structure, Python syntax, SQL and contract refs.
 
 Runs fast (~100ms) and catches broken matrix/runner/SQL combinations before
 they hit the heavy integration tests.
@@ -14,7 +14,8 @@ they hit the heavy integration tests.
 Checks:
     1. ``ci_matrix.yaml`` is valid JSON with expected top-level keys.
     2. All Python test scripts (``ci_runner.py``, ``correctness_lite.py``,
-       ``overnight_test.py``) parse without syntax errors.
+       ``overnight_test.py``, and the optional scripts that exist) parse without
+       syntax errors.
     3. Every ``sql`` step in the matrix references a file that exists in
        ``testing/sql/``, and every ``.sql`` file on disk is referenced.
     4. Every step ``type`` used in the matrix is defined in the ``StepType``
@@ -22,6 +23,10 @@ Checks:
     5. Every case ID referenced by a suite exists in the ``cases`` list.
     6. All ``.sql`` files are non-empty valid UTF-8.
     7. No duplicate case IDs in the matrix.
+    8. ``docs/CONTRACTS.md`` still defines parseable contract IDs.
+    9. Every case declares at least one contract ID, and every declared ID is
+       defined in ``docs/CONTRACTS.md`` — the policy that doc states but that
+       nothing enforced while ``contracts`` was an undeclared field.
 
 Exit codes:
     0: All checks passed.
@@ -32,26 +37,36 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 TESTING_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = TESTING_DIR.parent
 SQL_DIR = TESTING_DIR / "sql"
 MATRIX_PATH = TESTING_DIR / "ci_matrix.yaml"
 RUNNER_PATH = TESTING_DIR / "ci_runner.py"
 CORRECTNESS_LITE_PATH = TESTING_DIR / "correctness_lite.py"
 OVERNIGHT_PATH = TESTING_DIR / "overnight_test.py"
 LINEARIZABILITY_PATH = TESTING_DIR / "linearizability_register.py"
+UNIT_TEST_PATH = TESTING_DIR / "test_ci_runner_units.py"
+CONTRACTS_PATH = PROJECT_ROOT / "docs" / "CONTRACTS.md"
 
 # Optional scripts are checked only if they exist (skeletons during build-out).
-_OPTIONAL_SCRIPTS = [LINEARIZABILITY_PATH]
+_OPTIONAL_SCRIPTS = [LINEARIZABILITY_PATH, UNIT_TEST_PATH]
 PYTHON_SCRIPTS = [RUNNER_PATH, CORRECTNESS_LITE_PATH, OVERNIGHT_PATH] + [
     p for p in _OPTIONAL_SCRIPTS if p.exists()
 ]
+
+# Contract IDs are the `### <ID> — <title>` headings in docs/CONTRACTS.md.
+CONTRACT_HEADING_PATTERN = re.compile(r"^###\s+([A-Z]{1,3}[0-9]{1,2})\b", re.MULTILINE)
+# Cases named in a violation message before it switches to a count.
+_MAX_LISTED_CASES = 12
 
 console = Console()
 results: list[tuple[str, bool, str]] = []
@@ -178,6 +193,107 @@ def check_no_duplicate_case_ids() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract-to-test policy
+# ---------------------------------------------------------------------------
+
+
+def extract_contract_ids(markdown: str) -> set[str]:
+    """Collect the contract IDs defined by ``docs/CONTRACTS.md``.
+
+    A contract is defined by an ``### <ID> — <title>`` heading; the
+    contract-to-test index table at the bottom of the doc is derived from those
+    headings and is deliberately not treated as a definition site.
+
+    Args:
+        markdown: Contents of ``docs/CONTRACTS.md``.
+
+    Returns:
+        Set of contract IDs (e.g. ``{"W1", "L2", "R1"}``).
+    """
+    return set(CONTRACT_HEADING_PATTERN.findall(markdown))
+
+
+def _format_case_list(case_ids: list[str]) -> str:
+    """Render a case-ID list, truncating long lists to keep messages readable."""
+    if len(case_ids) <= _MAX_LISTED_CASES:
+        return ", ".join(case_ids)
+    shown = ", ".join(case_ids[:_MAX_LISTED_CASES])
+    return f"{shown}, ... (+{len(case_ids) - _MAX_LISTED_CASES} more)"
+
+
+def collect_contract_violations(cases: list[dict[str, Any]], known_ids: set[str]) -> list[str]:
+    """Check every case against the contract-reference policy.
+
+    Policy (stated by ``docs/CONTRACTS.md``): every CI test case must reference
+    at least one contract ID, and every referenced ID must be a contract the doc
+    actually defines.
+
+    Args:
+        cases: Raw case dicts from the matrix.
+        known_ids: Contract IDs defined in ``docs/CONTRACTS.md``.
+
+    Returns:
+        Actionable violation messages (empty when the policy holds).
+    """
+    missing: list[str] = []
+    malformed: list[str] = []
+    unknown: list[str] = []
+    for case in cases:
+        case_id = str(case.get("id", "<unnamed>"))
+        declared = case.get("contracts")
+        if declared is None or declared == []:
+            missing.append(case_id)
+            continue
+        if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
+            malformed.append(f"{case_id} (contracts={declared!r})")
+            continue
+        unresolved = sorted(set(declared) - known_ids)
+        if unresolved:
+            unknown.append(f"{case_id} -> {unresolved}")
+
+    violations: list[str] = []
+    if missing:
+        violations.append(
+            f"{len(missing)} case(s) declare no contracts. Add "
+            f'"contracts": ["W1", ...] to each case in testing/ci_matrix.yaml '
+            f"(docs/CONTRACTS.md: every CI test case must reference at least one "
+            f"contract ID). Cases: {_format_case_list(missing)}"
+        )
+    if malformed:
+        violations.append(
+            f"{len(malformed)} case(s) have a non-list-of-strings 'contracts' field: "
+            f"{_format_case_list(malformed)}"
+        )
+    if unknown:
+        violations.append(
+            f"{len(unknown)} case(s) reference contract IDs that docs/CONTRACTS.md does not "
+            f"define: {_format_case_list(unknown)}. Defined IDs: {sorted(known_ids)}"
+        )
+    return violations
+
+
+def check_contracts_doc() -> None:
+    """Verify docs/CONTRACTS.md exists and still yields parseable contract IDs."""
+    if not CONTRACTS_PATH.exists():
+        raise AssertionError(f"{CONTRACTS_PATH} not found")
+    ids = extract_contract_ids(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    if not ids:
+        raise AssertionError(
+            f"no '### <ID> — <title>' contract headings found in {CONTRACTS_PATH}; "
+            f"the contract-reference lint cannot run against an empty contract set"
+        )
+
+
+def check_case_contract_refs() -> None:
+    """Enforce the contract-reference policy on every case in the matrix."""
+    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    known_ids = extract_contract_ids(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    violations = collect_contract_violations(data["cases"], known_ids)
+    if violations:
+        raise AssertionError(" | ".join(violations))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -197,6 +313,8 @@ def lint() -> None:
     check("Suite case refs exist", check_suite_case_refs)
     check("SQL files are non-empty UTF-8", check_sql_files_valid)
     check("No duplicate case IDs", check_no_duplicate_case_ids)
+    check("CONTRACTS.md defines contract IDs", check_contracts_doc)
+    check("Cases reference real contract IDs", check_case_contract_refs)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")
