@@ -7,11 +7,17 @@ cannot distinguish `>= N/2` from `> N/2`: at N=3 both give quorum 2. At N=5
 they give 3 and 4, and only one of those survives two failures. That is the
 arithmetic this suite exists to pin down.
 
-Phase 1 is implemented — bootstrap, the two-failure survival case, and the
-three-failure quorum-loss case, with a W1 durability oracle across all of it.
-Later phases (membership chaos, 2-sync/2-async replication, Elle at five nodes)
-are scoped in HARDENING.md and are not here yet; the runner says so and exits
-non-zero rather than reporting a pass it did not earn.
+Phase 1 — bootstrap, surviving two failures, losing quorum at three, and
+recovering with acked writes intact.
+
+Phase 2 — partition shapes a 3-node cluster cannot express: a 3/2 split with
+the leader stranded on the minority side, a leader left with exactly one
+follower (seeing *a* peer is not seeing a quorum), and a three-way split where
+no group reaches 3 and nothing anywhere may write.
+
+Membership chaos, 2-sync/2-async replication, and Elle at five nodes are scoped
+in HARDENING.md and are not here yet; the runner says so rather than implying
+coverage.
 
 Topology lives in `docker-compose.5node.yml`: its own project name, subnet, and
 host ports, so it coexists with the 3-node cluster and neither one's fault
@@ -45,6 +51,20 @@ GATEWAY_PORT: Final[dict[int, int]] = {n: 5441 + n for n in NODES}
 
 BOOTSTRAP_TIMEOUT_S: Final[float] = 180.0
 CONVERGE_TIMEOUT_S: Final[float] = 90.0
+
+REFENCE_CONVERGE_TIMEOUT_S: Final[float] = 240.0
+"""Budget for shapes that strand nodes without quorum.
+
+Fencing escalates to process exit when a node cannot hold its lease, and
+`restart: unless-stopped` then brings the container back — so convergence here
+includes a full pgbattery restart and rejoin on the stranded side, not just an
+election. Measured: the minority containers came back at 13 s and 28 s uptime
+after a partition that had run well under a minute, and the majority's new
+primary was not writable until after that churn settled.
+
+Separate constant rather than raising `CONVERGE_TIMEOUT_S` everywhere: the
+phases that do not strand anyone should stay fast, and a shape that suddenly
+needs this long is worth noticing."""
 
 console = Console()
 app = typer.Typer(add_completion=False, help="5-node topology correctness suite.")
@@ -193,6 +213,38 @@ def voters() -> list[int]:
     return sorted(n for n, role in members().items() if role == "voter")
 
 
+def await_all_healthy(timeout_s: float = REFENCE_CONVERGE_TIMEOUT_S) -> int:
+    """Wait until all five nodes answer *and* are voters, then return the leader.
+
+    `await_leader` is not enough as a precondition for the partition shapes.
+    A node stranded by the previous shape self-fences to process exit and comes
+    back via `restart: unless-stopped`, and while it is restarting the other
+    four can still agree on a leader — so `await_leader` returns happily with a
+    node still down. The next shape then puts that node on the side it is
+    counting, and "3 of 5" is really 2, which cannot elect.
+
+    This is the same mistake as the learner race, in a different costume:
+    asserting on a topology without first establishing it.
+    """
+    deadline = time.time() + timeout_s
+    last = ""
+    while time.time() < deadline:
+        views = leader_views()
+        roles = members()
+        healthy = sorted(views)
+        all_voters = sorted(n for n, r in roles.items() if r == "voter")
+        if len(healthy) == len(NODES) and len(all_voters) == len(NODES):
+            leader = quorum_leader()
+            if leader is not None:
+                return leader
+        last = f"responding={healthy} voters={all_voters}"
+        time.sleep(3)
+    raise SuiteError(
+        f"cluster did not return to all-{len(NODES)}-healthy within {timeout_s:.0f}s ({last}); "
+        "a partition shape run now would be counting a node that is still down"
+    )
+
+
 def writable(node: int) -> bool:
     """Whether `node` accepts a real write. The question W1 and L1 both ask."""
     rc, _ = psql(node, "INSERT INTO five_node_w1(note) VALUES ('probe')")
@@ -307,6 +359,56 @@ def phase_recovers(expected_rows: int) -> None:
     console.print(f"  leader = node{leader}, {out} rows survived (>= {expected_rows} acked)")
 
 
+NODE_IP: Final[dict[int, str]] = {n: f"172.29.0.{10 + n}" for n in NODES}
+
+
+def _iptables(node: int, peer: int, *, insert: bool) -> None:
+    """Add or remove a whole-peer DROP on `node` for traffic from `peer`."""
+    action = "-A" if insert else "-D"
+    tail = "" if insert else " 2>/dev/null; true"
+    rc, _, err = run(
+        f"docker compose exec -T --user root node{node} sh -c "
+        f'"iptables {action} INPUT -s {NODE_IP[peer]} -j DROP{tail}"',
+        timeout=30,
+    )
+    if insert and rc != 0:
+        raise SuiteError(f"could not partition node{node} from node{peer}: {err}")
+
+
+def partition_groups(groups: list[list[int]], *, heal: bool = False) -> None:
+    """Sever every cross-group link, leaving intra-group links up.
+
+    Whole-peer rather than port-granular: these shapes are about who can reach
+    whom at all, so a channel-level cut would leave consensus flowing through
+    the very links the shape is meant to remove.
+
+    Installed on both endpoints of each pair. A one-sided DROP still lets the
+    other direction through, and Raft only needs one direction to keep a
+    follower believing in a leader it cannot answer.
+    """
+    for i, group in enumerate(groups):
+        for other in groups[i + 1 :]:
+            for a in group:
+                for b in other:
+                    _iptables(a, b, insert=not heal)
+                    _iptables(b, a, insert=not heal)
+
+
+def any_writable() -> list[int]:
+    """Which running nodes accept a real write, asked of PostgreSQL directly."""
+    return [n for n in NODES if _running(n) and writable(n)]
+
+
+def await_no_writer(timeout_s: float) -> None:
+    """Wait until no node accepts writes, or fail naming the ones that do."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not any_writable():
+            return
+        time.sleep(3)
+    raise SuiteError(f"nodes {any_writable()} still accept writes without a quorum")
+
+
 def _running(node: int) -> bool:
     rc, out, _ = run(f"docker compose ps -q node{node}", timeout=30)
     if rc != 0 or not out.strip():
@@ -314,6 +416,94 @@ def _running(node: int) -> bool:
     cid = out.strip().split("\n")[-1]
     rc, state, _ = run(f'docker inspect -f "{{{{.State.Status}}}}" {cid}', timeout=30)
     return rc == 0 and state.strip() == "running"
+
+
+def phase_majority_isolation(leader: int) -> None:
+    """Split 3/2 with the leader on the minority side.
+
+    The majority must elect and accept writes; the minority must not, however
+    confident its members are. Asked of PostgreSQL on each side rather than of
+    the control plane, so a node that merely *believes* it leads does not count.
+    """
+    console.print("[bold]Phase 2a[/] 3/2 split, leader on the minority side")
+    minority = [leader, next(n for n in NODES if n != leader)]
+    majority = [n for n in NODES if n not in minority]
+    partition_groups([minority, majority])
+    console.print(f"  minority={minority} majority={majority}")
+    try:
+        deadline = time.time() + REFENCE_CONVERGE_TIMEOUT_S
+        while time.time() < deadline:
+            accepting = [n for n in majority if writable(n)]
+            if len(accepting) == 1:
+                break
+            time.sleep(3)
+        else:
+            raise SuiteError(
+                f"majority {majority} produced no single writer within {CONVERGE_TIMEOUT_S:.0f}s"
+            )
+        stuck = [n for n in minority if writable(n)]
+        if stuck:
+            raise SuiteError(f"minority {stuck} accepted writes — L1 violated")
+        console.print(f"  majority writer = node{accepting[0]}, minority silent")
+    finally:
+        partition_groups([minority, majority], heal=True)
+
+
+def phase_three_way_split() -> None:
+    """No group holds 3 of 5, so nothing anywhere may accept a write."""
+    console.print("[bold]Phase 2b[/] three-way split — nobody may write")
+    groups = [[1, 2], [3, 4], [5]]
+    partition_groups(groups)
+    console.print(f"  groups={groups}, largest={max(len(g) for g in groups)} of {QUORUM} needed")
+    try:
+        await_no_writer(REFENCE_CONVERGE_TIMEOUT_S)
+        console.print("  no node accepts writes")
+    finally:
+        partition_groups(groups, heal=True)
+
+
+def phase_follower_bridge(leader: int) -> None:
+    """The leader keeps exactly one follower and must still step down.
+
+    Seeing *a* follower is not seeing a quorum, and this is the shape where
+    that distinction is easy to get wrong: the leader has a live peer, an open
+    replication stream, and no obvious signal that anything is missing. Only
+    the quorum count says otherwise.
+    """
+    console.print("[bold]Phase 2c[/] leader keeps one follower — must still step down")
+    companion = next(n for n in NODES if n != leader)
+    isolated = [leader, companion]
+    rest = [n for n in NODES if n not in isolated]
+    partition_groups([isolated, rest])
+    console.print(f"  leader node{leader} sees only node{companion}; rest={rest}")
+    try:
+        deadline = time.time() + REFENCE_CONVERGE_TIMEOUT_S
+        while time.time() < deadline:
+            if not writable(leader):
+                break
+            time.sleep(3)
+        else:
+            raise SuiteError(
+                f"node{leader} kept accepting writes while seeing only node{companion} "
+                f"({len(isolated)} of {QUORUM} needed)"
+            )
+        console.print(f"  node{leader} stepped down despite a live follower")
+
+        # Poll rather than sample once: the majority has to elect *and* clear
+        # the promotion hold-down, which is a full lease duration, so a single
+        # check right after the old leader steps down is always too early.
+        accepting: list[int] = []
+        deadline = time.time() + REFENCE_CONVERGE_TIMEOUT_S
+        while time.time() < deadline:
+            accepting = [n for n in rest if writable(n)]
+            if len(accepting) == 1:
+                break
+            time.sleep(3)
+        if len(accepting) != 1:
+            raise SuiteError(f"expected exactly one writer among {rest}, got {accepting}")
+        console.print(f"  majority side elected node{accepting[0]}")
+    finally:
+        partition_groups([isolated, rest], heal=True)
 
 
 @app.command()
@@ -337,6 +527,19 @@ def run_suite() -> None:
 
         phase_recovers(acked)
         results.append(("recovers with acked writes intact", "PASS"))
+
+        # Phase 2 needs a healthy cluster, so it runs after recovery.
+        leader = await_all_healthy()
+        phase_majority_isolation(leader)
+        results.append(("3/2 split: only the majority writes", "PASS"))
+
+        leader = await_all_healthy()
+        phase_follower_bridge(leader)
+        results.append(("leader with one follower steps down", "PASS"))
+
+        await_all_healthy()
+        phase_three_way_split()
+        results.append(("three-way split: nobody writes", "PASS"))
     except SuiteError as exc:
         console.print(f"[red]FAIL[/] {exc}")
         results.append(("suite", f"FAIL: {exc}"))
@@ -345,8 +548,8 @@ def run_suite() -> None:
 
     _report(results)
     console.print(
-        "[yellow]Phases 2-4 (membership chaos, 2-sync/2-async, Elle at five nodes) "
-        "are not implemented.[/] See HARDENING.md."
+        "[yellow]Not implemented: membership chaos, 2-sync/2-async replication, "
+        "Elle at five nodes.[/] See HARDENING.md."
     )
 
 

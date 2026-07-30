@@ -650,13 +650,56 @@ No new infrastructure. Highest confidence per unit of effort.
       `chaos-oracle-cleanup.sql`.
       _Closes_ RW-6, RW-11 reachability · _Blocked by_ H-02 · _Effort_ M
 
-- [ ] **H-06 — Partition shapes beyond node-vs-rest.** Majority-side isolation
-      with the observer on the minority side, three-way splits, and a _follower_
-      as bridge, where the leader must step down even though it still sees one
-      follower.
-      **Done when** each shape has a case asserting the safety outcome, and the
-      5-node asymmetric shape that reaches RW-1 exists.
-      _Closes_ RW-1 · _Blocked by_ H-02, H-04 · _Effort_ M
+- [x] **H-06 — Partition shapes beyond node-vs-rest.** Phase 2 of the 5-node
+      suite, all three shapes green against a live cluster:
+
+      - **3/2 split with the leader stranded on the minority side.** The
+        majority must produce exactly one writer; the minority must produce
+        none, however confident its members are. Asked of PostgreSQL on each
+        side, so a node that merely *believes* it leads does not count.
+      - **Leader keeps exactly one follower.** Seeing *a* peer is not seeing a
+        quorum, and this is where that is easiest to get wrong: the leader has a
+        live peer, an open replication stream, and no obvious signal anything is
+        missing. Only the quorum count says otherwise. Observed stepping down,
+        with the majority side then electing.
+      - **Three-way split** (`[1,2] | [3,4] | [5]`). No group reaches 3, so
+        nothing anywhere may write.
+
+      Partitions are whole-peer and installed on **both** endpoints of every
+      cross-group pair: a one-sided DROP still lets the other direction through,
+      and Raft needs only one direction to keep a follower believing in a leader
+      it cannot answer.
+
+      **Two of my own preconditions had to be enforced rather than assumed**,
+      and the second is the same mistake as H-04's learner race wearing a
+      different costume. A shape that strands nodes makes them self-fence to
+      process exit, and `restart: unless-stopped` brings them back — so
+      convergence includes a restart and rejoin, not just an election
+      (`REFENCE_CONVERGE_TIMEOUT_S`, measured). Worse, `await_leader` returns
+      happily while a stranded node is *still restarting*, because the other
+      four can agree without it. The next shape then counted that node on one
+      side, so "3 of 5" was really 2 and could not elect. `await_all_healthy()`
+      now requires all five responding and all five voters before any shape
+      runs.
+
+      **RW-1 itself is not closed by these.** It is a timing window — the
+      deposed leader's lease anchors at its last quorum ack, which can be later
+      than the winner's local detection of leaderlessness — not a partition
+      shape. Asserting on it needs the window to be observable, which is the
+      `dual_writability_prober` at 50 ms against a 5-node cluster, and the
+      prober is wired to the 3-node ports. Left open and re-pointed at H-44.
+      _Blocked by_ H-02, H-04 · _Effort_ M
+
+- [ ] **H-44 — Point the dual-writability prober at the 5-node cluster.** RW-1
+      is a timing window, not a shape: the deposed leader's lease anchors at its
+      last quorum ack, which can be later than the winner's local detection of
+      leaderlessness, so both can believe they may write for a bounded interval.
+      Observing it needs concurrent real writes at the prober's 50 ms resolution
+      across five internal PostgreSQL ports; today it is wired to the 3-node
+      ports and topology.
+      **Done when** the prober runs against `docker-compose.5node.yml` and a
+      5-node asymmetric partition case asserts at most one acceptance.
+      _Closes_ RW-1 · _Blocked by_ H-04 · _Effort_ M
 
 - [ ] **H-07 — Trigger faults on protocol state, not wall-clock offsets.** Replace
       `sleep 4` with injection keyed off observed state: mid-rewind,
