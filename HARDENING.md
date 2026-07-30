@@ -1026,16 +1026,32 @@ These close the exit criteria and cannot be done early.
       new inversions was observed making its oracle raise.
       _Closes_ exit criterion 1 · _Effort_ M
 
-- [ ] **H-39 — Audit the risk-window register.** Every RW-1…RW-12 must be covered
-      by a test, closed by design, or listed in Accepted risks with a rationale —
-      and the reachability column must be re-derived from the code, not trusted.
-      **Done when** no row reads "No" or "Partially" without a task ID or an
-      accepted-risk entry beside it.
-      Down payment made: every row now carries a "Tracked by" task, so none is
-      open without an owner. The re-derivation is what remains, and it is
-      deliberately last — RW-5 was already stale by the time the register was
-      written (the prober had made it reachable), which is the argument for
-      re-deriving from code rather than trusting the column.
+- [x] **H-39 — Audit the risk-window register.** No row reads "No" or
+      "Partially" without a task ID: every RW-1…RW-12 carries a "Tracked by"
+      owner, and RW-5 reads "covered".
+
+      The reachability column was re-derived from the code rather than trusted,
+      which was the part deliberately left last — RW-5 was already stale when
+      the register was written, the prober having made it reachable without the
+      column noticing. Each row was checked against the capability it claims:
+      RW-1 against `five_node_suite.py` (still a raising skeleton), RW-2 against
+      the absence of any protocol-state-triggered wait in the primitive layer or
+      runner, RW-4 against the SIGSTOP primitives, RW-5 against the prober's
+      three-port coverage, RW-6 against the matrix (**no case drives a follower
+      gateway specifically**), RW-7 against `lsn-leaderless-livelock-recovery`
+      (asserts election succeeds, not that a stale node loses), RW-8 against the
+      anchor predicates — which live in `governor/raft.rs`, not
+      `state_machine.rs`, and are unit-tested as claimed — RW-9 against
+      `demote()`'s mutex span, RW-10 against the rejoin cases, RW-11 against
+      `SetSyncMode` (ten references in the state machine, **zero in the
+      matrix**), and RW-12 against commit-probe timing.
+
+      All twelve claims held. Two are worth stating plainly because they are the
+      kind of gap a column can hide: `SetSyncMode` is modelled in Rust and
+      exercised by no test case at all, and `sweep_around` — the primitive built
+      for RW-12's byte-offset sweep — exists in `fault_primitives.py` with **no
+      caller anywhere in the matrix**. The tool for the sweep is written; the
+      sweep is not.
       _Closes_ exit criterion 4 · _Effort_ S
 
 - [ ] **H-40 — Re-verify the whole document.** Re-read the escape classes and the
