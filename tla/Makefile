@@ -12,11 +12,18 @@
 # The model checker (tla2tools.jar) is PINNED by version + SHA-256, so every run
 # uses an identical, verified binary. CI uses the same target (see
 # ../.github/workflows/tla.yml).
+#
+# Pin a TAGGED release only. tlaplus ships its nightly master builds by
+# replacing the assets on the v1.8.0 pre-release in place, so that tag's jar
+# changes without notice and a hash pinned to it goes stale on the next
+# upstream build — the pin then fails as a mismatch rather than as an
+# out-of-date version, which reads like a supply-chain event. A tagged build
+# records its tag in the jar manifest (`X-Git-Tag`); a nightly leaves it empty.
 
 SHELL := bash
 
-TLA_VERSION    := 1.8.0
-TLA_JAR_SHA256 := 237332bdcc79a35c7d26efa7b82c77c85c2744591c5598673a8a45085ff2a4fb
+TLA_VERSION    := 1.7.4
+TLA_JAR_SHA256 := 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 TLA_JAR_URL    := https://github.com/tlaplus/tlaplus/releases/download/v$(TLA_VERSION)/tla2tools.jar
 
 TOOLS_DIR := .tools
