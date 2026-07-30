@@ -533,7 +533,7 @@ impl App {
             lease_state.clone(),
             shutdown_rx.clone(),
         )?;
-        let mut replication_manager = ReplicationManager::new(
+        let mut replication_manager = ReplicationManager::<Supervisor>::new(
             self.config.node_id,
             postgres_manager.clone(),
             cluster_state.clone(),

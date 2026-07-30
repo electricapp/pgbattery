@@ -18,7 +18,7 @@ use crate::config::{
     REPLICATION_SLOT_ENSURE_INTERVAL_SECS,
 };
 use crate::error::Result;
-use crate::supervisor::{ReplicationStat, ReplicationState, Supervisor, SyncState};
+use crate::supervisor::{ReplicationStat, ReplicationState, SyncState};
 
 /// Replica health status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +73,139 @@ const SLOT_DROP_FAILURE_STUCK_THRESHOLD: u32 = 10;
 /// This implements the "Managed Sync" pattern where we dynamically adjust
 /// `synchronous_standby_names` based on replica health to maintain RPO=0
 /// while maximizing availability.
-pub struct ReplicationManager {
+/// Decide `synchronous_standby_names` and whether that choice is the
+/// degraded async fallback (RPO>0). `has_quorum` is this leader's Raft
+/// quorum status; `in_leader_grace` is true while this node has held
+/// leadership for less than `disconnect_timeout`.
+///
+/// Returning both from one function keeps the GUC decision and the
+/// RPO-degraded signal (gauge + edge logging) in lockstep by
+/// construction.
+fn plan_sync_replication(
+    all_voter_names: &[String],
+    healthy_voter_count: usize,
+    has_quorum: bool,
+    in_leader_grace: bool,
+) -> (String, bool) {
+    // Require enough synchronous acks that the write set (leader + k sync
+    // standbys) intersects every Raft majority, so no elected leader can
+    // lack an acknowledged write. `FIRST 1` is only correct up to 4 voters;
+    // at >=5 it acks a write on leader + 1 standby = 2 of >=5 nodes, and a
+    // failover to the other majority silently loses it. See
+    // `required_sync_standbys`.
+    let required = required_sync_standbys(all_voter_names.len());
+    let sync_list = if required == 0 {
+        String::new()
+    } else {
+        format!("FIRST {required} ({})", all_voter_names.join(", "))
+    };
+
+    if healthy_voter_count == 0 && has_quorum && !in_leader_grace {
+        // Quorum intact but no replica streaming: fall back to async
+        // (empty). A stale list naming disconnected replicas blocks ALL
+        // client writes — including any the operator needs — so with the
+        // cluster otherwise healthy we trade durability (brief RPO>0) for
+        // availability until a replica reconnects. A single-node cluster
+        // (empty voter list) is not degraded — there is no standby whose
+        // ack we are giving up.
+        return (String::new(), !all_voter_names.is_empty());
+    }
+
+    // in_leader_grace: a freshly-promoted leader sees an empty
+    // `pg_stat_replication` because followers are still re-pointing at
+    // it, not because they are dead. It has not observed its replicas
+    // for `disconnect_timeout` yet, so it has no basis to declare them
+    // disconnected — the same hysteresis every tracked replica gets.
+    // Keep the sync list (writes block until a replica connects) rather
+    // than commit an async fallback that would open an
+    // acked-but-unreplicated write window — and loosen every voter's
+    // election LSN gate to the async threshold — on every failover. If
+    // the replicas really are dead, the fallback fires once the grace
+    // window has elapsed.
+    //
+    // healthy_voter_count == 0 && !has_quorum: the lease fences this node
+    // read-only, so there is no client write left to deadlock. Keep the
+    // sync list rather than silently dropping to RPO>0 — fail-stop, not
+    // fail-open. With ≥1 healthy replica, sync replication as normal.
+    (sync_list, false)
+}
+
+/// Whether the tick's `pg_stat_replication` sample shows at least one
+/// expected standby marked `sync`.
+///
+/// Matters for safety visibility (Kukushkin Myth #4): after setting
+/// `synchronous_standby_names`, `PostgreSQL` applies it asynchronously, so
+/// "we set the GUC" does not yet mean "a standby is sync". Evaluated once
+/// per reconcile tick, so verification retries naturally without stalling
+/// the loop during a slow transition.
+fn sync_state_confirmed(repl_stats: &[ReplicationStat], expected_sync_names: &[String]) -> bool {
+    repl_stats
+        .iter()
+        .filter(|s| s.sync_state.is_sync())
+        .any(|s| expected_sync_names.iter().any(|e| e == &s.application_name))
+}
+
+/// Number of synchronous standbys required for RPO=0, given
+/// `other_voter_count` (total voters minus this leader).
+///
+/// Equals `ceil(N/2) - 1` where `N = other_voter_count + 1` — i.e.
+/// `other_voter_count / 2` (integer floor). The leader plus this many
+/// synchronous acks form a write set of size `k + 1 = ceil(N/2)`, which
+/// intersects every Raft majority (`floor(N/2) + 1`) because their sizes
+/// sum to more than `N`. So a committed-and-acked write is held by at least
+/// one member of any quorum that could elect the next leader — no silent
+/// loss on failover.
+///
+/// | N (voters) | other | required |
+/// |-----------:|------:|---------:|
+/// | 1          | 0     | 0 (async, no standby)             |
+/// | 2          | 1     | 0 (async safe: losing a node loses quorum, blocking any lossy failover) |
+/// | 3          | 2     | 1        |
+/// | 4          | 3     | 1        |
+/// | 5          | 4     | 2        |
+/// | 7          | 6     | 3        |
+const fn required_sync_standbys(other_voter_count: usize) -> usize {
+    other_voter_count / 2
+}
+
+fn plan_slot_reconciliation(
+    target_ids: &[NodeId],
+    existing_slots: &HashSet<String>,
+) -> (Vec<NodeId>, Vec<NodeId>) {
+    let desired_slots: HashSet<String> = target_ids
+        .iter()
+        .map(|id| format!("replica_{id}"))
+        .collect();
+
+    let mut create_slots_for = Vec::new();
+    for node_id in target_ids {
+        let slot_name = format!("replica_{node_id}");
+        if !existing_slots.contains(&slot_name) {
+            create_slots_for.push(*node_id);
+        }
+    }
+
+    let mut drop_slots_for = Vec::new();
+    for slot_name in existing_slots {
+        if desired_slots.contains(slot_name) {
+            continue;
+        }
+
+        let Some(id_str) = slot_name.strip_prefix("replica_") else {
+            continue;
+        };
+        let Ok(stale_node_id) = id_str.parse::<NodeId>() else {
+            continue;
+        };
+        drop_slots_for.push(stale_node_id);
+    }
+
+    (create_slots_for, drop_slots_for)
+}
+
+pub struct ReplicationManager<P: crate::governor::pg_control::PgControl> {
     node_id: NodeId,
-    postgres: Arc<tokio::sync::Mutex<Supervisor>>,
+    postgres: Arc<tokio::sync::Mutex<P>>,
     cluster_state: Arc<RwLock<ClusterState>>,
     /// Live truth source for "am I leader" per `docs/STATE_MACHINE.md`.
     /// Reading `cluster_state.leader_id` would consult the Raft-applied
@@ -113,7 +243,7 @@ pub struct ReplicationManager {
     /// not-leader → leader edge, re-derived from `RaftMetrics` each tick.
     /// `None` while not leader. Within `disconnect_timeout` of this instant
     /// the async-fallback decision is suppressed; see
-    /// [`Self::plan_sync_replication`].
+    /// [`plan_sync_replication`].
     leader_since: Option<Instant>,
     /// The clock every timing decision here reads. The async-fallback gate
     /// changes the durability guarantee, so it must expire on the same clock
@@ -121,7 +251,7 @@ pub struct ReplicationManager {
     lease: crate::governor::SharedLeaseState,
 }
 
-impl std::fmt::Debug for ReplicationManager {
+impl<P: crate::governor::pg_control::PgControl> std::fmt::Debug for ReplicationManager<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicationManager")
             .field("node_id", &self.node_id)
@@ -133,11 +263,11 @@ impl std::fmt::Debug for ReplicationManager {
     }
 }
 
-impl ReplicationManager {
+impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
     /// Create a new replication manager.
     pub fn new(
         node_id: NodeId,
-        postgres: Arc<tokio::sync::Mutex<Supervisor>>,
+        postgres: Arc<tokio::sync::Mutex<P>>,
         cluster_state: Arc<RwLock<ClusterState>>,
         raft: Arc<openraft::Raft<TypeConfig>>,
         shutdown_rx: watch::Receiver<bool>,
@@ -242,7 +372,7 @@ impl ReplicationManager {
         let in_leader_grace = self
             .leader_since
             .is_some_and(|since| now.duration_since(since) < self.disconnect_timeout);
-        let (new_sync_names, async_fallback) = Self::plan_sync_replication(
+        let (new_sync_names, async_fallback) = plan_sync_replication(
             &all_voter_names,
             healthy_voter_count,
             has_quorum,
@@ -518,86 +648,6 @@ impl ReplicationManager {
         (all_voter_names, healthy_voter_count)
     }
 
-    /// Number of synchronous standbys required for RPO=0, given
-    /// `other_voter_count` (total voters minus this leader).
-    ///
-    /// Equals `ceil(N/2) - 1` where `N = other_voter_count + 1` — i.e.
-    /// `other_voter_count / 2` (integer floor). The leader plus this many
-    /// synchronous acks form a write set of size `k + 1 = ceil(N/2)`, which
-    /// intersects every Raft majority (`floor(N/2) + 1`) because their sizes
-    /// sum to more than `N`. So a committed-and-acked write is held by at least
-    /// one member of any quorum that could elect the next leader — no silent
-    /// loss on failover.
-    ///
-    /// | N (voters) | other | required |
-    /// |-----------:|------:|---------:|
-    /// | 1          | 0     | 0 (async, no standby)             |
-    /// | 2          | 1     | 0 (async safe: losing a node loses quorum, blocking any lossy failover) |
-    /// | 3          | 2     | 1        |
-    /// | 4          | 3     | 1        |
-    /// | 5          | 4     | 2        |
-    /// | 7          | 6     | 3        |
-    const fn required_sync_standbys(other_voter_count: usize) -> usize {
-        other_voter_count / 2
-    }
-
-    /// Decide `synchronous_standby_names` and whether that choice is the
-    /// degraded async fallback (RPO>0). `has_quorum` is this leader's Raft
-    /// quorum status; `in_leader_grace` is true while this node has held
-    /// leadership for less than `disconnect_timeout`.
-    ///
-    /// Returning both from one function keeps the GUC decision and the
-    /// RPO-degraded signal (gauge + edge logging) in lockstep by
-    /// construction.
-    fn plan_sync_replication(
-        all_voter_names: &[String],
-        healthy_voter_count: usize,
-        has_quorum: bool,
-        in_leader_grace: bool,
-    ) -> (String, bool) {
-        // Require enough synchronous acks that the write set (leader + k sync
-        // standbys) intersects every Raft majority, so no elected leader can
-        // lack an acknowledged write. `FIRST 1` is only correct up to 4 voters;
-        // at >=5 it acks a write on leader + 1 standby = 2 of >=5 nodes, and a
-        // failover to the other majority silently loses it. See
-        // `required_sync_standbys`.
-        let required = Self::required_sync_standbys(all_voter_names.len());
-        let sync_list = if required == 0 {
-            String::new()
-        } else {
-            format!("FIRST {required} ({})", all_voter_names.join(", "))
-        };
-
-        if healthy_voter_count == 0 && has_quorum && !in_leader_grace {
-            // Quorum intact but no replica streaming: fall back to async
-            // (empty). A stale list naming disconnected replicas blocks ALL
-            // client writes — including any the operator needs — so with the
-            // cluster otherwise healthy we trade durability (brief RPO>0) for
-            // availability until a replica reconnects. A single-node cluster
-            // (empty voter list) is not degraded — there is no standby whose
-            // ack we are giving up.
-            return (String::new(), !all_voter_names.is_empty());
-        }
-
-        // in_leader_grace: a freshly-promoted leader sees an empty
-        // `pg_stat_replication` because followers are still re-pointing at
-        // it, not because they are dead. It has not observed its replicas
-        // for `disconnect_timeout` yet, so it has no basis to declare them
-        // disconnected — the same hysteresis every tracked replica gets.
-        // Keep the sync list (writes block until a replica connects) rather
-        // than commit an async fallback that would open an
-        // acked-but-unreplicated write window — and loosen every voter's
-        // election LSN gate to the async threshold — on every failover. If
-        // the replicas really are dead, the fallback fires once the grace
-        // window has elapsed.
-        //
-        // healthy_voter_count == 0 && !has_quorum: the lease fences this node
-        // read-only, so there is no client write left to deadlock. Keep the
-        // sync list rather than silently dropping to RPO>0 — fail-stop, not
-        // fail-open. With ≥1 healthy replica, sync replication as normal.
-        (sync_list, false)
-    }
-
     async fn apply_sync_standby_names(
         &mut self,
         new_sync_names: &str,
@@ -660,7 +710,7 @@ impl ReplicationManager {
         // either way). The gauge lets a stuck transition surface without
         // gating any state change.
         if now_active {
-            let verified = Self::sync_state_confirmed(repl_stats, healthy_replica_names);
+            let verified = sync_state_confirmed(repl_stats, healthy_replica_names);
             if verified {
                 metrics::counter!("pgbattery_sync_state_verifications").increment(1);
             } else {
@@ -720,62 +770,9 @@ impl ReplicationManager {
         // Standard topology requires at least 1 sync standby
         healthy_sync >= 1
     }
-
-    /// Whether the tick's `pg_stat_replication` sample shows at least one
-    /// expected standby marked `sync`.
-    ///
-    /// Matters for safety visibility (Kukushkin Myth #4): after setting
-    /// `synchronous_standby_names`, `PostgreSQL` applies it asynchronously, so
-    /// "we set the GUC" does not yet mean "a standby is sync". Evaluated once
-    /// per reconcile tick, so verification retries naturally without stalling
-    /// the loop during a slow transition.
-    fn sync_state_confirmed(
-        repl_stats: &[ReplicationStat],
-        expected_sync_names: &[String],
-    ) -> bool {
-        repl_stats
-            .iter()
-            .filter(|s| s.sync_state.is_sync())
-            .any(|s| expected_sync_names.iter().any(|e| e == &s.application_name))
-    }
 }
 
-impl ReplicationManager {
-    fn plan_slot_reconciliation(
-        target_ids: &[NodeId],
-        existing_slots: &HashSet<String>,
-    ) -> (Vec<NodeId>, Vec<NodeId>) {
-        let desired_slots: HashSet<String> = target_ids
-            .iter()
-            .map(|id| format!("replica_{id}"))
-            .collect();
-
-        let mut create_slots_for = Vec::new();
-        for node_id in target_ids {
-            let slot_name = format!("replica_{node_id}");
-            if !existing_slots.contains(&slot_name) {
-                create_slots_for.push(*node_id);
-            }
-        }
-
-        let mut drop_slots_for = Vec::new();
-        for slot_name in existing_slots {
-            if desired_slots.contains(slot_name) {
-                continue;
-            }
-
-            let Some(id_str) = slot_name.strip_prefix("replica_") else {
-                continue;
-            };
-            let Ok(stale_node_id) = id_str.parse::<NodeId>() else {
-                continue;
-            };
-            drop_slots_for.push(stale_node_id);
-        }
-
-        (create_slots_for, drop_slots_for)
-    }
-
+impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
     #[allow(
         clippy::too_many_lines,
         reason = "single cohesive slot create/drop reconciliation; splitting obscures the flow"
@@ -817,7 +814,7 @@ impl ReplicationManager {
             };
 
         let (create_slots_for, drop_slots_for) =
-            Self::plan_slot_reconciliation(&target_ids, &existing_slots);
+            plan_slot_reconciliation(&target_ids, &existing_slots);
 
         for node_id in create_slots_for {
             let create_result =
@@ -1091,8 +1088,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let (to_create, to_drop) =
-            ReplicationManager::plan_slot_reconciliation(&target_ids, &existing_slots);
+        let (to_create, to_drop) = plan_slot_reconciliation(&target_ids, &existing_slots);
 
         assert_eq!(to_create, vec![3]);
         assert_eq!(to_drop, vec![5]);
@@ -1150,7 +1146,7 @@ mod tests {
             "pgbattery_node_2".to_string(),
             "pgbattery_node_3".to_string(),
         ];
-        let (plan, fallback) = ReplicationManager::plan_sync_replication(&voters, 1, true, false);
+        let (plan, fallback) = plan_sync_replication(&voters, 1, true, false);
         assert_eq!(plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)");
         assert!(!fallback);
     }
@@ -1158,17 +1154,17 @@ mod tests {
     #[test]
     fn test_required_sync_standbys_intersects_every_majority() {
         // ceil(N/2) - 1, keyed by other-voter count (N-1).
-        assert_eq!(ReplicationManager::required_sync_standbys(0), 0); // N=1
-        assert_eq!(ReplicationManager::required_sync_standbys(1), 0); // N=2
-        assert_eq!(ReplicationManager::required_sync_standbys(2), 1); // N=3
-        assert_eq!(ReplicationManager::required_sync_standbys(3), 1); // N=4
-        assert_eq!(ReplicationManager::required_sync_standbys(4), 2); // N=5
-        assert_eq!(ReplicationManager::required_sync_standbys(5), 2); // N=6
-        assert_eq!(ReplicationManager::required_sync_standbys(6), 3); // N=7
+        assert_eq!(required_sync_standbys(0), 0); // N=1
+        assert_eq!(required_sync_standbys(1), 0); // N=2
+        assert_eq!(required_sync_standbys(2), 1); // N=3
+        assert_eq!(required_sync_standbys(3), 1); // N=4
+        assert_eq!(required_sync_standbys(4), 2); // N=5
+        assert_eq!(required_sync_standbys(5), 2); // N=6
+        assert_eq!(required_sync_standbys(6), 3); // N=7
 
         // Property: leader + k sync acks must intersect every Raft majority.
         for n in 1..=15usize {
-            let k = ReplicationManager::required_sync_standbys(n - 1);
+            let k = required_sync_standbys(n - 1);
             let write_set = k + 1; // leader + k synchronous standbys
             let majority = n / 2 + 1;
             assert!(
@@ -1189,7 +1185,7 @@ mod tests {
             "pgbattery_node_4".to_string(),
             "pgbattery_node_5".to_string(),
         ];
-        let (plan, _fallback) = ReplicationManager::plan_sync_replication(&voters, 4, true, false);
+        let (plan, _fallback) = plan_sync_replication(&voters, 4, true, false);
         assert_eq!(
             plan,
             "FIRST 2 (pgbattery_node_2, pgbattery_node_3, pgbattery_node_4, pgbattery_node_5)"
@@ -1209,8 +1205,7 @@ mod tests {
         ];
 
         // No healthy replica, quorum intact → async fallback (empty).
-        let (with_quorum, fallback) =
-            ReplicationManager::plan_sync_replication(&voters, 0, true, false);
+        let (with_quorum, fallback) = plan_sync_replication(&voters, 0, true, false);
         assert!(
             with_quorum.is_empty(),
             "quorum-intact + no replicas must fall back to async, got {with_quorum:?}"
@@ -1218,8 +1213,7 @@ mod tests {
         assert!(fallback, "the empty list IS the degraded RPO>0 state");
 
         // No healthy replica, quorum LOST → keep the sync list (fail-stop).
-        let (no_quorum, fallback) =
-            ReplicationManager::plan_sync_replication(&voters, 0, false, false);
+        let (no_quorum, fallback) = plan_sync_replication(&voters, 0, false, false);
         assert_eq!(
             no_quorum, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)",
             "quorum-lost must keep sync enabled, not silently drop to RPO>0"
@@ -1240,7 +1234,7 @@ mod tests {
         ];
 
         // In grace: keep the sync list, not degraded.
-        let (plan, fallback) = ReplicationManager::plan_sync_replication(&voters, 0, true, true);
+        let (plan, fallback) = plan_sync_replication(&voters, 0, true, true);
         assert_eq!(
             plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)",
             "grace window must keep sync replication configured"
@@ -1249,12 +1243,12 @@ mod tests {
 
         // Grace elapsed with replicas still absent: the genuine
         // all-replicas-dead case must still fall back to async.
-        let (plan, fallback) = ReplicationManager::plan_sync_replication(&voters, 0, true, false);
+        let (plan, fallback) = plan_sync_replication(&voters, 0, true, false);
         assert!(plan.is_empty());
         assert!(fallback);
 
         // A healthy replica during grace behaves as normal sync.
-        let (plan, fallback) = ReplicationManager::plan_sync_replication(&voters, 1, true, true);
+        let (plan, fallback) = plan_sync_replication(&voters, 1, true, true);
         assert_eq!(plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)");
         assert!(!fallback);
     }
@@ -1264,8 +1258,7 @@ mod tests {
     #[test]
     fn test_single_node_has_empty_sync_list() {
         for in_grace in [false, true] {
-            let (plan, fallback) =
-                ReplicationManager::plan_sync_replication(&[], 0, true, in_grace);
+            let (plan, fallback) = plan_sync_replication(&[], 0, true, in_grace);
             assert!(plan.is_empty());
             assert!(!fallback, "no standby exists whose ack we are giving up");
         }
@@ -1315,7 +1308,7 @@ mod tests {
             /// acked write survive any failover.
             #[test]
             fn prop_write_set_intersects_every_majority(n in 1usize..=1024) {
-                let k = ReplicationManager::required_sync_standbys(n - 1);
+                let k = required_sync_standbys(n - 1);
                 let write_set = k + 1;
                 prop_assert!(
                     write_set + majority(n) > n,
@@ -1329,7 +1322,7 @@ mod tests {
             /// must fail at `k - 1`.
             #[test]
             fn prop_required_sync_standbys_is_minimal(n in 1usize..=1024) {
-                let k = ReplicationManager::required_sync_standbys(n - 1);
+                let k = required_sync_standbys(n - 1);
                 if k > 0 {
                     prop_assert!(
                         k + majority(n) <= n,
@@ -1352,14 +1345,14 @@ mod tests {
                 in_leader_grace: bool,
             ) {
                 let names = voter_names(others);
-                let (plan, degraded) = ReplicationManager::plan_sync_replication(
+                let (plan, degraded) = plan_sync_replication(
                     &names,
                     healthy,
                     has_quorum,
                     in_leader_grace,
                 );
                 let n = others + 1;
-                let required = ReplicationManager::required_sync_standbys(others);
+                let required = required_sync_standbys(others);
 
                 if plan.is_empty() {
                     prop_assert!(
@@ -1394,24 +1387,24 @@ mod tests {
         ];
 
         // A sync-marked expected standby confirms.
-        assert!(ReplicationManager::sync_state_confirmed(
+        assert!(sync_state_confirmed(
             &[stat("pgbattery_node_2", SyncState::Sync)],
             &expected
         ));
 
         // Async-only standbys do not confirm.
-        assert!(!ReplicationManager::sync_state_confirmed(
+        assert!(!sync_state_confirmed(
             &[stat("pgbattery_node_2", SyncState::Async)],
             &expected
         ));
 
         // A sync standby outside the expected list does not confirm.
-        assert!(!ReplicationManager::sync_state_confirmed(
+        assert!(!sync_state_confirmed(
             &[stat("rogue_standby", SyncState::Sync)],
             &expected
         ));
 
         // Empty sample does not confirm.
-        assert!(!ReplicationManager::sync_state_confirmed(&[], &expected));
+        assert!(!sync_state_confirmed(&[], &expected));
     }
 }

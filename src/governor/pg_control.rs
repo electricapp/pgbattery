@@ -26,7 +26,7 @@
 
 use std::net::SocketAddr;
 
-use pgbattery_core::Result;
+use pgbattery_core::{NodeId, Result};
 
 use crate::supervisor::TimelineInfo;
 
@@ -65,6 +65,25 @@ pub trait PgControl: Send + Sync {
     /// "run this SQL" method would let any caller reach past the seam, and the
     /// model would then have to interpret SQL to stay honest.
     fn terminate_client_backends(&self) -> impl Future<Output = Result<String>> + Send;
+
+    /// `pg_stat_replication`, one row per connected standby.
+    ///
+    /// Feeds the healthy-voter count and therefore the async-fallback decision,
+    /// which is what makes the published RPO zero or non-zero.
+    fn get_replication_stats(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::supervisor::ReplicationStat>>> + Send;
+
+    /// Set `synchronous_standby_names` and reload.
+    fn set_sync_standby_names(&self, names: &str) -> impl Future<Output = Result<()>> + Send;
+
+    fn create_replication_slot(&self, node_id: NodeId) -> impl Future<Output = Result<()>> + Send;
+
+    fn drop_replication_slot(&self, node_id: NodeId) -> impl Future<Output = Result<()>> + Send;
+
+    fn list_physical_replication_slots(
+        &self,
+    ) -> impl Future<Output = Result<std::collections::HashSet<String>>> + Send;
 }
 
 impl PgControl for crate::supervisor::Supervisor {
@@ -102,6 +121,26 @@ impl PgControl for crate::supervisor::Supervisor {
              WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();";
         self.execute_sql(TERMINATE_SQL).await
     }
+
+    async fn get_replication_stats(&self) -> Result<Vec<crate::supervisor::ReplicationStat>> {
+        Self::get_replication_stats(self).await
+    }
+
+    async fn set_sync_standby_names(&self, names: &str) -> Result<()> {
+        Self::set_sync_standby_names(self, names).await
+    }
+
+    async fn create_replication_slot(&self, node_id: NodeId) -> Result<()> {
+        Self::create_replication_slot(self, node_id).await
+    }
+
+    async fn drop_replication_slot(&self, node_id: NodeId) -> Result<()> {
+        Self::drop_replication_slot(self, node_id).await
+    }
+
+    async fn list_physical_replication_slots(&self) -> Result<std::collections::HashSet<String>> {
+        Self::list_physical_replication_slots(self).await
+    }
 }
 
 /// A scriptable `PostgreSQL` for tests.
@@ -121,6 +160,10 @@ pub struct ModelPg {
     /// bool per operation: the interesting scenarios fail exactly one step, and
     /// a set of independent bools invites states that cannot occur.
     pub fails: Option<ModelOp>,
+    /// What `pg_stat_replication` reports. The async-fallback gate counts
+    /// healthy standbys from this, so a test scripts RPO scenarios here.
+    pub replication_stats: Vec<crate::supervisor::ReplicationStat>,
+    pub slots: std::collections::HashSet<String>,
     pub calls: std::sync::Mutex<Vec<String>>,
 }
 
@@ -206,5 +249,30 @@ impl PgControl for ModelPg {
     async fn terminate_client_backends(&self) -> Result<String> {
         self.note("terminate_client_backends");
         Ok("0".to_string())
+    }
+
+    async fn get_replication_stats(&self) -> Result<Vec<crate::supervisor::ReplicationStat>> {
+        self.note("get_replication_stats");
+        Ok(self.replication_stats.clone())
+    }
+
+    async fn set_sync_standby_names(&self, names: &str) -> Result<()> {
+        self.note(&format!("set_sync_standby_names({names})"));
+        Ok(())
+    }
+
+    async fn create_replication_slot(&self, node_id: NodeId) -> Result<()> {
+        self.note(&format!("create_replication_slot({node_id})"));
+        Ok(())
+    }
+
+    async fn drop_replication_slot(&self, node_id: NodeId) -> Result<()> {
+        self.note(&format!("drop_replication_slot({node_id})"));
+        Ok(())
+    }
+
+    async fn list_physical_replication_slots(&self) -> Result<std::collections::HashSet<String>> {
+        self.note("list_physical_replication_slots");
+        Ok(self.slots.clone())
     }
 }

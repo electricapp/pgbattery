@@ -939,12 +939,29 @@ the repo.
       reach past the seam and would oblige the model to interpret SQL to stay
       honest.
 
-      **Not converted:** `pg_stat_replication` (`get_replication_stats`). It is
-      consumed by `ReplicationManager`, which holds its own concrete
-      `Arc<Mutex<Supervisor>>`; making it generic propagates a type parameter
-      into `ManagementApiState` and the axum handlers. The async-fallback
-      decision it feeds is worth modelling, so this is a real remainder rather
-      than a decision — tracked as its own follow-up rather than left implied.
+`pg_stat_replication` is covered too, along with
+`set_sync_standby_names` and the three slot operations, so
+`ReplicationManager<P>` is generic and `ModelPg` can script the standby
+rows the async-fallback gate counts. Making it generic turned out to be
+contained — one construction site, not the propagation into
+`ManagementApiState` that first appeared likely.
+
+      Four pure decision functions (`plan_sync_replication`,
+      `sync_state_confirmed`, `required_sync_standbys`,
+      `plan_slot_reconciliation`) moved out of the impl block to module scope
+      while doing it. They take neither `self` nor `P`, so keeping them there
+      forced every caller — including twenty test assertions — to name a
+      concrete `Supervisor` it did not otherwise care about.
+
+      **What is still not model-testable, and why:**
+      `check_and_update_sync_standbys` calls `has_raft_quorum()`, which reads
+      `openraft::RaftMetrics`, and the struct holds a real
+      `Arc<openraft::Raft>` as a field. So no `ReplicationManager` *method* can
+      be driven by a model until there is a Raft seam alongside the PG one —
+      that is H-31's territory, not something the PG seam can reach. The
+      planning helpers those methods delegate to are unit-tested directly, and
+      that is the honest extent of it: the seam is in place and the tick above
+      it is not yet reachable.
       _Blocks_ H-31 · _Effort_ L
 
 - [x] **H-30 — Inject the clock everywhere**, not in the lease alone. Every time
