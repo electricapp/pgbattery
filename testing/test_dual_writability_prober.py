@@ -20,13 +20,17 @@ Run with:
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
+import dual_writability_prober as dwp
 from dual_writability_prober import (
     NodeProbe,
     Outcome,
+    ProberError,
     ProbeRound,
     Verdict,
     analyze,
+    build_transport,
     classify_failure,
     violation_windows,
 )
@@ -558,6 +562,64 @@ class ReportShapeTests(unittest.TestCase):
         self.assertFalse(rnd.is_violation)
         self.assertIsNone(rnd.accepted_overlap_ns)
         self.assertEqual(rnd.answered_count, 1)
+
+
+class TransportSelectionTests(unittest.TestCase):
+    """A silent `docker-exec` fallback reports exactly like a direct probe.
+
+    The two transports classify identically by construction, which is what makes
+    local runs useful — and also what makes a fallback invisible. On Linux CI the
+    bridge is routable, so a fallback there means the routability claim went
+    untested while still reporting PASS.
+    """
+
+    def reachable(self, value: bool) -> None:
+        patcher = mock.patch.object(dwp, "tcp_reachable", lambda ip, port: value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_auto_prefers_direct_when_reachable(self) -> None:
+        self.reachable(True)
+        self.assertEqual(build_transport("auto").name, "direct")
+
+    def test_auto_falls_back_when_unreachable(self) -> None:
+        self.reachable(False)
+        self.assertEqual(build_transport("auto").name, "docker-exec")
+
+    def test_require_direct_rejects_a_fallback(self) -> None:
+        self.reachable(False)
+        with self.assertRaises(ProberError) as ctx:
+            build_transport("auto", require="direct")
+        self.assertIn("docker-exec", str(ctx.exception))
+
+    def test_require_direct_accepts_a_direct_resolution(self) -> None:
+        self.reachable(True)
+        self.assertEqual(build_transport("auto", require="direct").name, "direct")
+
+    def test_explicit_direct_fails_fast_when_unreachable(self) -> None:
+        """Otherwise it fails later as a pile of connection errors, which the
+        indeterminate-rate gate reports as inconclusive rather than as a
+        misconfigured transport."""
+        self.reachable(False)
+        with self.assertRaises(ProberError) as ctx:
+            build_transport("direct")
+        self.assertIn("not reachable", str(ctx.exception))
+
+    def test_require_docker_exec_rejects_direct(self) -> None:
+        self.reachable(True)
+        with self.assertRaises(ProberError):
+            build_transport("auto", require="docker-exec")
+
+    def test_unknown_transport_is_rejected(self) -> None:
+        self.reachable(True)
+        with self.assertRaises(ProberError):
+            build_transport("carrier-pigeon")
+
+    def test_no_requirement_permits_either(self) -> None:
+        for value, expected in ((True, "direct"), (False, "docker-exec")):
+            with self.subTest(reachable=value):
+                self.reachable(value)
+                self.assertEqual(build_transport("auto", require="").name, expected)
 
 
 if __name__ == "__main__":

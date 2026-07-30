@@ -93,6 +93,11 @@ jobs:
       contents: read
     env:
       COMPOSE_PROJECT_NAME: pgbha_seq_${{ github.run_id }}_${{ github.run_attempt }}
+      # Linux runners route the compose bridge, so the prober must probe the
+      # internal ports directly. Without this a docker-exec fallback would
+      # report exactly like a direct probe and the routability claim would go
+      # untested. Deliberately not set locally: Docker Desktop cannot route it.
+      PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -138,6 +143,11 @@ jobs:
       contents: read
     env:
       COMPOSE_PROJECT_NAME: pgbha_${{ matrix.case }}_${{ github.run_id }}_${{ github.run_attempt }}
+      # Linux runners route the compose bridge, so the prober must probe the
+      # internal ports directly. Without this a docker-exec fallback would
+      # report exactly like a direct probe and the routability claim would go
+      # untested. Deliberately not set locally: Docker Desktop cannot route it.
+      PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -174,6 +184,11 @@ jobs:
       contents: read
     env:
       COMPOSE_PROJECT_NAME: pgbha_cppr_${{ github.run_id }}_${{ github.run_attempt }}
+      # Linux runners route the compose bridge, so the prober must probe the
+      # internal ports directly. Without this a docker-exec fallback would
+      # report exactly like a direct probe and the routability claim would go
+      # untested. Deliberately not set locally: Docker Desktop cannot route it.
+      PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -211,6 +226,11 @@ jobs:
       contents: read
     env:
       COMPOSE_PROJECT_NAME: pgbha_assertsanity_${{ github.run_id }}_${{ github.run_attempt }}
+      # Linux runners route the compose bridge, so the prober must probe the
+      # internal ports directly. Without this a docker-exec fallback would
+      # report exactly like a direct probe and the routability claim would go
+      # untested. Deliberately not set locally: Docker Desktop cannot route it.
+      PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -247,6 +267,11 @@ jobs:
       contents: read
     env:
       COMPOSE_PROJECT_NAME: pgbha_cpnightly_${{ github.run_id }}_${{ github.run_attempt }}
+      # Linux runners route the compose bridge, so the prober must probe the
+      # internal ports directly. Without this a docker-exec fallback would
+      # report exactly like a direct probe and the routability claim would go
+      # untested. Deliberately not set locally: Docker Desktop cannot route it.
+      PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

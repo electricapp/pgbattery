@@ -654,12 +654,18 @@ violation, and the first thing a Jepsen analysis would reach for.
       removed.
       _Effort_ M
 
-- [ ] **H-28 — Measure host-to-bridge routability for the prober's `direct`
-      transport.** It is unproven on macOS, where Docker Desktop cannot route the
-      compose subnet, so it auto-falls back to `docker-exec`. The Linux CI path
-      rests on standard bridge behaviour rather than a measurement.
-      **Done when** CI asserts which transport it selected, so a silent
-      fallback cannot masquerade as a direct probe.
+- [x] **H-28 — Measure host-to-bridge routability for the prober's `direct`
+      transport.** Done. `--require-transport` fails the run unless `auto`
+      resolved to the named transport, and all five `ha-ci` jobs set
+      `PGBATTERY_PROBER_REQUIRE_TRANSPORT=direct` via the flag's `envvar`, so no
+      matrix case had to change and local macOS runs still fall back as before.
+
+      The fallback was invisible by construction: both transports classify
+      byte-for-byte identically, which is exactly what makes local runs useful and
+      what made a Linux fallback report as though the bridge had been routed. An
+      explicit `--transport direct` now also fails fast rather than degrading into
+      connection errors that the indeterminate-rate gate reports as inconclusive
+      rather than as a misconfigured transport. Eight tests, both directions.
       _Effort_ S
 
 ### Wave 5 — Deterministic simulation (Tier 4)

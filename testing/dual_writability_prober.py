@@ -233,6 +233,10 @@ CONNECT_BACKOFF_S: Final[float] = 0.5
 dead node's worker from consuming its connect budget every single round, which
 would report that node as `probe_overrun` instead of naming the real failure."""
 
+REQUIRE_TRANSPORT_ENV: Final[str] = "PGBATTERY_PROBER_REQUIRE_TRANSPORT"
+"""Env var backing `--require-transport`, so CI can demand `direct` without every
+matrix case having to pass a flag that would break local macOS runs."""
+
 DEFAULT_MAX_INDETERMINATE_RATE: Final[float] = 0.40
 """Default observability gate. Above 1/3 so that one of three nodes being
 unreachable for an entire run — chaos schedules kill nodes on purpose — is
@@ -1010,21 +1014,51 @@ def build_transport(
     kind: str,
     nodes: Sequence[NodeTarget] = NODES,
     project_root: Path = PROJECT_ROOT,
+    *,
+    require: str = "",
 ) -> Transport:
     """Create the requested transport.
 
     `auto` prefers `direct` and falls back to `docker-exec` when any node's
     internal port is not reachable from the host.
+
+    `require` names the transport the caller insists on, and raises if `auto`
+    resolved to anything else. Without it a fallback is invisible: the probe
+    still runs and still reports, so a `docker-exec` run on a host that was
+    supposed to prove host-to-bridge routability reads exactly like a direct one.
+    An explicit `direct` is checked the same way rather than being allowed to
+    fail later as a pile of connection errors.
     """
     if kind == "direct":
+        _require_direct_reachable(nodes)
         return DirectTransport()
     if kind == "docker-exec":
-        return DockerExecTransport(nodes, project_root)
-    if kind != "auto":
+        transport: Transport = DockerExecTransport(nodes, project_root)
+    elif kind == "auto":
+        if all(tcp_reachable(n.pg_ip, INTERNAL_PG_PORT) for n in nodes):
+            transport = DirectTransport()
+        else:
+            transport = DockerExecTransport(nodes, project_root)
+    else:
         raise ProberError(f"Unknown transport {kind!r}; expected auto|direct|docker-exec")
-    if all(tcp_reachable(n.pg_ip, INTERNAL_PG_PORT) for n in nodes):
-        return DirectTransport()
-    return DockerExecTransport(nodes, project_root)
+    if require and transport.name != require:
+        raise ProberError(
+            f"required transport {require!r} but resolved {transport.name!r}. "
+            f"With --transport {kind}, the internal port was not reachable from "
+            "this host; a silent fallback would report as though it had been."
+        )
+    return transport
+
+
+def _require_direct_reachable(nodes: Sequence[NodeTarget]) -> None:
+    """Fail before probing if any node's internal port is unreachable."""
+    unreachable = [n.pg_ip for n in nodes if not tcp_reachable(n.pg_ip, INTERNAL_PG_PORT)]
+    if unreachable:
+        raise ProberError(
+            f"--transport direct requested but {', '.join(unreachable)}:"
+            f"{INTERNAL_PG_PORT} is not reachable from this host. Docker Desktop "
+            "cannot route the compose subnet; use --transport auto there."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1263,6 +1297,7 @@ class ProberConfig:
     attempt_timeout_s: float | None = None
     """Per-attempt deadline. None derives it from the round period."""
     transport: str = "auto"
+    require_transport: str = ""
     nodes: tuple[NodeTarget, ...] = NODES
     project_root: Path = PROJECT_ROOT
     max_indeterminate_rate: float = DEFAULT_MAX_INDETERMINATE_RATE
@@ -1337,7 +1372,10 @@ class DualWritabilityProber:
                 oracle would silently report rejections everywhere.
         """
         self._transport = build_transport(
-            self.config.transport, self.config.nodes, self.config.project_root
+            self.config.transport,
+            self.config.nodes,
+            self.config.project_root,
+            require=self.config.require_transport,
         )
         self._setup_notes.append(f"transport={self._transport.name}")
         self._create_probe_table()
@@ -1750,6 +1788,14 @@ def run(
         help="auto | direct | docker-exec. auto prefers direct 172.28.0.x:5434 "
         "and falls back to a docker-exec tunnel when the bridge is not routable.",
     ),
+    require_transport: str = typer.Option(
+        "",
+        "--require-transport",
+        envvar=REQUIRE_TRANSPORT_ENV,
+        help="Fail unless the resolved transport is this one. Set it in CI, where "
+        "the bridge is routable, so an unnoticed docker-exec fallback cannot "
+        "report as a direct probe.",
+    ),
     max_indeterminate_rate: float = typer.Option(
         DEFAULT_MAX_INDETERMINATE_RATE,
         "--max-indeterminate-rate",
@@ -1777,6 +1823,7 @@ def run(
         round_period_s=round_ms / 1000.0,
         attempt_timeout_s=(attempt_ms / 1000.0) if attempt_ms > 0 else None,
         transport=transport,
+        require_transport=require_transport,
         max_indeterminate_rate=max_indeterminate_rate,
         min_single_acceptance_rate=min_single_acceptance_rate,
     )
