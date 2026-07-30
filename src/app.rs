@@ -1025,10 +1025,10 @@ impl App {
     /// just-deposed leader can observe `current_leader != self` while the
     /// watch still holds its own address — and demote against itself.
     /// `leader_rx` remains the wakeup signal only.
-    async fn ensure_follows(
+    async fn ensure_follows<P: crate::governor::pg_control::PgControl>(
         node_id: NodeId,
         self_pg_addr: SocketAddr,
-        postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
+        postgres: &Arc<tokio::sync::Mutex<P>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
         lease: &crate::governor::SharedLeaseState,
@@ -1077,8 +1077,8 @@ impl App {
         Self::demote_to_leader(postgres, addr, "follow leader").await;
     }
 
-    async fn promote_local_postgres(
-        postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
+    async fn promote_local_postgres<P: crate::governor::pg_control::PgControl>(
+        postgres: &Arc<tokio::sync::Mutex<P>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         lease: &crate::governor::SharedLeaseState,
     ) {
@@ -1225,8 +1225,8 @@ impl App {
     /// leader. A node already in recovery skips the fence entirely
     /// (`should_fence_before_demote`), so the steady-state reconcile tick on a
     /// healthy follower is probes plus an idempotent no-op demote.
-    async fn demote_to_leader(
-        postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
+    async fn demote_to_leader<P: crate::governor::pg_control::PgControl>(
+        postgres: &Arc<tokio::sync::Mutex<P>>,
         leader_addr: SocketAddr,
         context: &str,
     ) {
@@ -1276,7 +1276,7 @@ impl App {
             // so an in-flight write can't outlive the fence and land in WAL
             // that pg_rewind then destroys — the same escalation the emergency
             // lease fence uses.
-            Self::terminate_client_backends(&pg).await;
+            Self::terminate_client_backends(&*pg).await;
         }
         if let Err(e) = pg.demote(leader_addr).await {
             metrics::counter!("pgbattery_demote_apply_failures").increment(1);
@@ -1601,7 +1601,7 @@ impl App {
                 // role, so a bypasser that survived the fencing tick (e.g. the
                 // termination timed out) is evicted on the next one.
                 *fence_failures = 0;
-                Self::terminate_client_backends(&pg).await;
+                Self::terminate_client_backends(&*pg).await;
                 false
             }
             LeaseAction::RecoverWrites => {
@@ -1767,11 +1767,9 @@ impl App {
     ///
     /// Best-effort: the GUC fence is already in place, and if PG is somehow
     /// still writable the next 100 ms tick re-runs the fence path.
-    async fn terminate_client_backends(pg: &Supervisor) {
-        const TERMINATE_SQL: &str = "SELECT count(pg_terminate_backend(pid)) \
-             FROM pg_stat_activity \
-             WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();";
-        match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.execute_sql(TERMINATE_SQL)).await
+    async fn terminate_client_backends<P: crate::governor::pg_control::PgControl>(pg: &P) {
+        match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.terminate_client_backends())
+            .await
         {
             Ok(Ok(count)) => {
                 tracing::info!(
@@ -2540,6 +2538,87 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const LEASE: Duration = Duration::from_secs(2);
+
+    /// `promote_local_postgres` is the split-brain-prevention core, and until
+    /// the `PgControl` seam existed every path through it needed Docker and a
+    /// live `PostgreSQL`. These drive it against a model in microseconds.
+    mod promotion_gate {
+        use crate::app::App;
+        use crate::governor::SharedLeaseState;
+        use crate::governor::lease::LeaseState;
+        use crate::governor::pg_control::{ModelOp, ModelPg};
+        use crate::governor::state_machine::ClusterState;
+        use std::sync::Arc;
+
+        fn fixtures(
+            model: ModelPg,
+        ) -> (
+            Arc<tokio::sync::Mutex<ModelPg>>,
+            Arc<parking_lot::RwLock<ClusterState>>,
+            SharedLeaseState,
+        ) {
+            (
+                Arc::new(tokio::sync::Mutex::new(model)),
+                Arc::new(parking_lot::RwLock::new(ClusterState::default())),
+                Arc::new(parking_lot::RwLock::new(LeaseState::new())),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_primary_is_left_alone() {
+            // Fast-path idempotency: no failover has happened, so promoting
+            // again would be a pointless pg_controldata shell-out on every tick.
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: false,
+                ..ModelPg::default()
+            });
+            App::promote_local_postgres(&pg, &cluster, &lease).await;
+            let calls = pg.lock().await.calls();
+            assert_eq!(calls, vec!["is_in_recovery"], "did more than probe");
+        }
+
+        #[tokio::test]
+        async fn a_standby_is_promoted_after_its_safety_check() {
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                ..ModelPg::default()
+            });
+            App::promote_local_postgres(&pg, &cluster, &lease).await;
+            let calls = pg.lock().await.calls();
+            assert!(
+                calls.contains(&"verify_promotion_safe".to_string()),
+                "promoted without the safety check: {calls:?}"
+            );
+            assert!(
+                calls.contains(&"promote".to_string()),
+                "never promoted: {calls:?}"
+            );
+            let verify = calls.iter().position(|c| c == "verify_promotion_safe");
+            let promote = calls.iter().position(|c| c == "promote");
+            assert!(
+                verify < promote,
+                "checked safety after promoting: {calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_safety_check_blocks_the_promotion() {
+            // The check exists to stop a node with a diverged timeline becoming
+            // primary. Promoting anyway would be the split-brain this whole
+            // subsystem prevents, and no live-cluster test forces this branch.
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                fails: Some(ModelOp::VerifyPromotionSafe),
+                ..ModelPg::default()
+            });
+            App::promote_local_postgres(&pg, &cluster, &lease).await;
+            let calls = pg.lock().await.calls();
+            assert!(
+                !calls.contains(&"promote".to_string()),
+                "promoted despite a failed safety check: {calls:?}"
+            );
+        }
+    }
 
     /// The debug-event endpoint returned an empty list for the whole life of
     /// the project: five emitters were defined and none was reachable, because

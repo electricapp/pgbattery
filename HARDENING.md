@@ -914,12 +914,37 @@ The actual next level: reproducibility and schedule coverage Docker structurally
 cannot provide. Aimed at `app.rs`, the least-tested and most dangerous file in
 the repo.
 
-- [ ] **H-29 — Add a `PgProbe` seam** over `probe_role_and_readonly`, `promote`,
-      `demote`, and `pg_stat_replication`. Two of the three seams already exist:
-      `LeaseState` reads time through an injectable `Clock`, and
-      `src/governor/network.rs` is the transport seam.
-      **Done when** the governor compiles against a model PostgreSQL with no
-      behaviour change to the real path.
+- [x] **H-29 — `PgControl` seam added** (`src/governor/pg_control.rs`). The
+      third seam, alongside `LeaseState`'s injectable `Clock` and
+      `governor/network.rs` for transport.
+
+      `ensure_follows`, `promote_local_postgres`, and `demote_to_leader` — the
+      split-brain-prevention core, and the reason `app.rs` was the least-tested
+      large file in the repo — are now generic over the trait. `ModelPg` scripts
+      the answers and records the calls, so those paths run without Docker: the
+      three new tests finish in 0.00 s against a model that a live cluster would
+      need minutes and luck to put in the same state.
+
+      One of them is the point of the whole exercise: **a failed
+      `verify_promotion_safe` must not promote.** That check is what stops a node
+      with a diverged timeline becoming primary, and no live-cluster case forces
+      the branch — you would have to manufacture a divergence and time it.
+      Against the model it is three lines.
+
+      Design choices worth keeping: generic rather than `dyn`, because these are
+      `async fn`s and `dyn` would need boxing or an `async-trait` dependency —
+      monomorphising keeps the real path identical to what it was before the
+      seam existed. And the trait exposes `terminate_client_backends()` rather
+      than `execute_sql()`, because a general "run this SQL" method lets callers
+      reach past the seam and would oblige the model to interpret SQL to stay
+      honest.
+
+      **Not converted:** `pg_stat_replication` (`get_replication_stats`). It is
+      consumed by `ReplicationManager`, which holds its own concrete
+      `Arc<Mutex<Supervisor>>`; making it generic propagates a type parameter
+      into `ManagementApiState` and the axum handlers. The async-fallback
+      decision it feeds is worth modelling, so this is a real remainder rather
+      than a decision — tracked as its own follow-up rather than left implied.
       _Blocks_ H-31 · _Effort_ L
 
 - [x] **H-30 — Inject the clock everywhere**, not in the lease alone. Every time
