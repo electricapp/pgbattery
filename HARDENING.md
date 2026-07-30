@@ -114,20 +114,20 @@ Ranked by expected severity. "Reachable" means the current harness can actually
 produce the conditions, not that a test asserts the right thing. "Tracked by"
 names the task that closes the window, so no row is open without an owner.
 
-| #     | Window                                                                                                                                                                                                     | Contract   | Reachable today                                                                              | Tracked by        |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------- | ----------------- |
-| RW-1  | Deposed leader retains a quorum excluding the election winner; the promotion hold-down is vacuous and safety rests on the quorum-loss self-fence plus sync replication refusing acks                       | L1         | No — needs 5-node asymmetric partition shapes                                                | H-06 (needs H-04) |
-| RW-2  | Post-promotion window where `synchronous_standby_names` is cleared before the replication manager reinstates it: commits ack with zero standby acks                                                        | W1, R2     | No — needs injection triggered by protocol state, not a sleep                                | H-07              |
-| RW-3  | Async fallback then `pg_rewind` discarding up to the divergence threshold of genuinely acked WAL. The threshold's justification assumes sync replication is active, which is exactly false during fallback | W1         | Partially — the fallback is reachable, but nothing measures what rewind destroys             | H-14              |
-| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                  | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured         | H-13              |
-| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                          | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution          | covered           |
-| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                        | W1         | Partially — never driven through a _follower_ gateway specifically                           | H-05              |
-| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win      | L3         | No — the existing case asserts election _succeeds_ (liveness), not that a stale node _loses_ | H-11              |
-| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                          | L1         | Partially — pure functions are unit-tested; the live coalescing race is not                  | H-18              |
-| RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                    | L1         | No                                                                                           | H-15              |
-| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash                                                 | R1, V2     | Partially                                                                                    | H-16              |
-| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                     | W1, L3     | No                                                                                           | H-05              |
-| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                             | W1, W2, S1 | Partially — one fixed timing, no sweep                                                       | H-17              |
+| #     | Window                                                                                                                                                                                                     | Contract   | Reachable today                                                                      | Tracked by        |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------ | ----------------- |
+| RW-1  | Deposed leader retains a quorum excluding the election winner; the promotion hold-down is vacuous and safety rests on the quorum-loss self-fence plus sync replication refusing acks                       | L1         | No — needs 5-node asymmetric partition shapes                                        | H-06 (needs H-04) |
+| RW-2  | Post-promotion window where `synchronous_standby_names` is cleared before the replication manager reinstates it: commits ack with zero standby acks                                                        | W1, R2     | No — needs injection triggered by protocol state, not a sleep                        | H-07              |
+| RW-3  | Async fallback then `pg_rewind` discarding up to the divergence threshold of genuinely acked WAL. The threshold's justification assumes sync replication is active, which is exactly false during fallback | W1         | Partially — the fallback is reachable, but nothing measures what rewind destroys     | H-14              |
+| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                  | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured | H-13              |
+| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                          | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution  | covered           |
+| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                        | W1         | Partially — never driven through a _follower_ gateway specifically                   | H-05              |
+| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win      | L3         | Closed — aged-LSN tiebreak; `test_stale_restored_node_loses_a_leaderless_election`   | H-11 (done)       |
+| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                          | L1         | Partially — pure functions are unit-tested; the live coalescing race is not          | H-18              |
+| RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                    | L1         | No                                                                                   | H-15              |
+| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash                                                 | R1, V2     | Partially                                                                            | H-16              |
+| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                     | W1, L3     | No                                                                                   | H-05              |
+| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                             | W1, W2, S1 | Partially — one fixed timing, no sweep                                               | H-17              |
 
 The pattern worth noting: the harness is densest exactly where the design is
 already strongest, and thinnest where the design documents its own residual
@@ -689,7 +689,7 @@ No new infrastructure. Highest confidence per unit of effort.
       reads, and the checker is shown to reject an injected stale read.
       _Closes_ part of Class B · _Effort_ M
 
-- [ ] **H-11 — RW-7 as a safety test.** The existing case asserts election
+- [x] **H-11 — RW-7 as a safety test.** The existing case asserts election
       _succeeds_ (liveness). Restore a node from a stale basebackup, keep its Raft
       directory, start the cluster after the LSN staleness threshold has elapsed,
       and assert the stale node cannot win.
@@ -707,11 +707,27 @@ No new infrastructure. Highest confidence per unit of effort.
       the permissive behaviour, for a good reason — the alternative was election
       livelock after a long leaderless window.
 
-      So this is a real fork, not a test gap: either add a tiebreak that compares
-      even aged LSN reports when nothing fresh exists (safety, at some liveness
-      cost), or move RW-7 to Accepted risks and say plainly that a node restored
-      from an old basebackup with its Raft state intact can win an election. It
-      needs a decision before it needs a test.
+      **Decided: the tiebreak, and the liveness cost it was assumed to carry
+      does not exist.** `evaluate_lsn_acceptable` now compares against the
+      maximum *aged* report when nothing is fresh, and goes permissive only when
+      `node_lsns` is empty — a cluster that has genuinely never reported. Aged
+      is not absent: WAL positions do not go backwards, so a peer that once
+      reported 100 MB has at least that much.
+
+      The reason this looked like a safety-versus-liveness trade, and is not:
+      **the node holding the aged maximum compares against itself, so its gap is
+      zero and it always passes.** Some candidate is therefore always electable
+      no matter how stale the data is, which is exactly the property the blanket
+      permissive rule existed to protect. `test_aged_tiebreak_always_leaves_
+      someone_electable` pins it directly, and
+      `test_lsn_acceptable_leaderless_window_bootstrap_fallback` still passes
+      unchanged — its three nodes share one aged LSN, so their gap is zero too.
+
+      `test_stale_restored_node_loses_a_leaderless_election` is the safety
+      assertion H-11 asked for: a node 50 MB behind, all reports aged, must
+      lose — and its peers at the aged max must still win, so the rejection is
+      not vacuous. Shown red by stubbing the comparison to `false`, at which
+      point the stale node wins and the test reports exactly that.
       _Closes_ RW-7 · _Effort_ M
 
 - [x] **H-12 — Harden `overnight_test.py`.** All three criteria met, and

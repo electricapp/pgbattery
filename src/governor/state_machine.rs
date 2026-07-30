@@ -390,6 +390,7 @@ impl ClusterState {
         let staleness = crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
         let mut fresh_max: u64 = 0;
         let mut any_fresh = false;
+        let mut aged_max: u64 = 0;
         for &(lsn, ts) in self.node_lsns.values() {
             let age = if ts > now { 0 } else { now.saturating_sub(ts) };
             if age < staleness {
@@ -398,13 +399,51 @@ impl ClusterState {
                     fresh_max = lsn;
                 }
             }
+            if lsn > aged_max {
+                aged_max = lsn;
+            }
         }
 
-        // Bootstrap: no fresh data anywhere in the cluster. Either the cluster
-        // is genuinely fresh or it's been leaderless past the staleness
-        // window. Either way, permissive — Raft log-matching protects us.
         if !any_fresh {
-            return (true, "bootstrap: no fresh cluster LSN data");
+            // Genuine bootstrap: nobody has ever reported. Permissive, because
+            // there is nothing to compare against and the cluster has to be
+            // able to elect a first leader.
+            if self.node_lsns.is_empty() {
+                return (true, "bootstrap: no cluster LSN data at all");
+            }
+
+            // Leaderless past the staleness window. Every report is aged, but
+            // aged is not absent: an old report still says this node once held
+            // that LSN, and WAL positions do not go backwards. Comparing
+            // against the aged maximum is what stops a node restored from an
+            // old basebackup — with its Raft directory intact, so log matching
+            // sees a current log and has no view of how old the PostgreSQL
+            // data under it is — from winning an election it would win under a
+            // blanket permissive rule (RW-7).
+            //
+            // This cannot livelock, which is what made the permissive branch
+            // look necessary: the node holding `aged_max` compares against
+            // itself and its gap is zero, so at least one candidate is always
+            // acceptable no matter how stale the data is.
+            let Some(&(candidate_lsn, _)) = self.node_lsns.get(&candidate_id) else {
+                if missing_candidate_ok {
+                    return (true, "leaderless: no aged LSN data for candidate");
+                }
+                return (
+                    false,
+                    "no LSN report for candidate in a leaderless window (fail-closed)",
+                );
+            };
+            if aged_max > candidate_lsn && (aged_max - candidate_lsn) > catchup_threshold_bytes {
+                return (
+                    false,
+                    "candidate LSN too far behind cluster max (aged reports)",
+                );
+            }
+            return (
+                true,
+                "leaderless: candidate within catch-up of aged cluster max",
+            );
         }
 
         // Bootstrap: cluster has fresh data from someone, but the candidate
@@ -644,6 +683,97 @@ mod tests {
         assert!(acceptable_2);
         let (acceptable_3, _) = state.is_lsn_acceptable_for_election(3);
         assert!(acceptable_3);
+    }
+
+    /// RW-7: a node restored from an old basebackup, with its Raft directory
+    /// intact, must not win an election held after the staleness window.
+    ///
+    /// Raft log matching cannot catch this — it sees a current log and has no
+    /// view of how old the `PostgreSQL` data underneath it is. The blanket
+    /// "no fresh data anywhere ⇒ permissive" rule this replaced would have let
+    /// the restored node win and silently discard every write its peers held.
+    ///
+    /// Aged reports are the only evidence available in a leaderless window, and
+    /// they are still evidence: WAL positions do not go backwards, so a peer
+    /// that once reported 100 MB has at least that much.
+    #[test]
+    fn test_stale_restored_node_loses_a_leaderless_election() {
+        let mut state = ClusterState::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for id in 1..=3 {
+            add_test_node(&mut state, id);
+        }
+        let stale_ts =
+            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
+        state.node_lsns.insert(1, (100_000_000, stale_ts));
+        state.node_lsns.insert(2, (100_000_000, stale_ts));
+        // Restored from a basebackup taken ~50 MB of WAL ago.
+        state.node_lsns.insert(3, (50_000_000, stale_ts));
+
+        let (stale_wins, reason) = state.is_lsn_acceptable_for_election(3);
+        assert!(
+            !stale_wins,
+            "a node 50 MB behind won a leaderless election: {reason}"
+        );
+
+        // Not vacuous: the peers at the aged max are still electable, which is
+        // the liveness property the permissive rule existed to protect.
+        for id in [1, 2] {
+            let (acceptable, reason) = state.is_lsn_acceptable_for_election(id);
+            assert!(
+                acceptable,
+                "node{id} at the aged max was rejected: {reason}"
+            );
+        }
+    }
+
+    /// The tiebreak must not be able to reject everyone — that would be the
+    /// election livelock the permissive branch was introduced to avoid.
+    ///
+    /// Whatever the spread of aged reports, the node holding the maximum
+    /// compares against itself with a gap of zero, so it always passes.
+    #[test]
+    fn test_aged_tiebreak_always_leaves_someone_electable() {
+        let mut state = ClusterState::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for id in 1..=3 {
+            add_test_node(&mut state, id);
+        }
+        let stale_ts =
+            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
+        for (id, lsn) in [(1u64, 10_000_000u64), (2, 900_000_000), (3, 1_000)] {
+            state.node_lsns.insert(id, (lsn, stale_ts));
+        }
+        let electable: Vec<u64> = (1..=3)
+            .filter(|&id| state.is_lsn_acceptable_for_election(id).0)
+            .collect();
+        assert!(
+            !electable.is_empty(),
+            "every candidate rejected in a leaderless window — livelock"
+        );
+        assert!(
+            electable.contains(&2),
+            "the node holding the aged maximum must always be electable, got {electable:?}"
+        );
+    }
+
+    /// A cluster that has genuinely never reported stays permissive: there is
+    /// nothing to compare against and a first leader has to be electable.
+    #[test]
+    fn test_true_bootstrap_stays_permissive() {
+        let mut state = ClusterState::new();
+        for id in 1..=3 {
+            add_test_node(&mut state, id);
+        }
+        assert!(state.node_lsns.is_empty());
+        let (acceptable, reason) = state.is_lsn_acceptable_for_election(1);
+        assert!(acceptable, "first boot must be able to elect: {reason}");
     }
 
     /// L3 fail-closed must still fire when SOME peer has fresh data but
