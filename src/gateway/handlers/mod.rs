@@ -1967,6 +1967,7 @@ impl ConnectionHandler {
                 "declare",
                 "do",
                 "load",
+                "call",
             ],
         )
     }
@@ -3068,6 +3069,23 @@ impl ConnectionHandler {
             pg_query::protobuf::node::Node::DoStmt(_) => StatementClass::Modeled(Some(
                 SessionChange::NonMigratable("DO block (opaque body)"),
             )),
+            // `CALL proc()` is opaque for the same reason: the procedure body
+            // lives in the catalog, not in the parse tree, so a procedure that
+            // creates a temp table or takes a session advisory lock is
+            // indistinguishable here from one that leaves nothing behind. A
+            // procedure can also COMMIT mid-body, which `DO` cannot.
+            //
+            // Severing is the documented polarity for anything the analyzer
+            // cannot see into, and unlike `LOAD` it is not free: a
+            // stored-procedure-heavy workload loses its connections on every
+            // failover rather than migrating them. That cost is availability;
+            // migrating would trade it for silent session-state loss. If it
+            // proves too expensive, the narrower fix is to consult
+            // `prokind`/`provolatile` for the target procedure rather than to
+            // widen the fallback.
+            pg_query::protobuf::node::Node::CallStmt(_) => StatementClass::Modeled(Some(
+                SessionChange::NonMigratable("CALL (opaque procedure body)"),
+            )),
             // `LOAD 'lib'` links a shared library into this backend for the rest
             // of the session. A migrated backend has not loaded it, so anything
             // the library provides — functions, hooks, custom GUCs — silently
@@ -3678,6 +3696,7 @@ mod tests {
             "DECLARE c CURSOR WITH HOLD FOR SELECT 1",
             "DO $$ BEGIN PERFORM 1; END $$",
             "LOAD 'auto_explain'",
+            "CALL refresh_totals()",
         ] {
             assert!(
                 ConnectionHandler::might_contain_session_state_command(query),
@@ -3785,6 +3804,28 @@ mod tests {
         assert!(!marks_non_migratable(
             "INSERT INTO audit (action) VALUES ('LOAD')"
         ));
+    }
+
+    /// `CALL` runs a procedure body the analyzer cannot see: it lives in the
+    /// catalog, not the parse tree. Unlike `LOAD`, severing has a real cost for
+    /// stored-procedure-heavy workloads, so the polarity is deliberate.
+    #[test]
+    fn test_analyze_query_flags_call() {
+        assert!(marks_non_migratable("CALL refresh_totals()"));
+        assert!(marks_non_migratable("call refresh_totals(1, 'x')"));
+        // A CALL anywhere in a multi-statement batch ratchets the session.
+        assert!(marks_non_migratable("SELECT 1; CALL refresh_totals()"));
+        // Naming the word must not sever: only a leading CALL is the statement.
+        assert!(!marks_non_migratable(
+            "SELECT payload FROM jobs WHERE kind = 'call'"
+        ));
+        assert!(!marks_non_migratable(
+            "INSERT INTO audit (action) VALUES ('CALL')"
+        ));
+        // A function *call* in a SELECT is not a CALL statement and must stay
+        // on the hot path — this is the shape that would make the arm costly if
+        // it over-matched.
+        assert!(!marks_non_migratable("SELECT refresh_totals()"));
     }
 
     /// The analyzer is a deny-list: a node type it has no arm for is

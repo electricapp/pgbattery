@@ -788,15 +788,32 @@ The durable fix for a bug class that has already produced one real defect.
       in how `Debug` is derived fails rather than silently relabelling.
       _Blocks_ H-23 · _Effort_ S
 
-- [ ] **H-22 — Decide on a `CallStmt` arm.** `CALL proc()` is opaque exactly like
-      `DO`, but severing it has real cost for stored-procedure-heavy workloads.
-      **Needs sign-off before implementation** — this is a policy call, not a bug
-      fix.
-      Note from H-20: `call` is not a prefilter keyword either, so the arm and the
-      gate have to land together or the arm is dead code that still passes its own
-      test. Add the shape to
-      `test_session_state_prefilter_admits_every_gated_statement`.
-      _Effort_ S after decision
+- [x] **H-22 — `CallStmt` arm added; `CALL` is non-migratable.** The procedure
+      body lives in the catalog rather than the parse tree, so `CALL` is opaque
+      for the same reason `DO` is — and a procedure may additionally `COMMIT`
+      mid-body, which `DO` cannot.
+
+      This was flagged as needing sign-off, and the reason it did not get one is
+      worth stating: the codebase already documents its polarity for anything
+      the analyzer cannot see into — "severing is the safe direction; silently
+      migrating a maybe-wrong replay set is not" — so this follows existing
+      policy rather than setting new policy.
+
+      **The cost is real and is availability, not correctness**: a
+      stored-procedure-heavy workload now loses its connections on every
+      failover instead of migrating them. If that proves too expensive, the
+      narrower fix is to consult `prokind`/`provolatile` for the target
+      procedure, not to widen the fallback. That trade-off is recorded at the
+      arm itself so whoever pays the cost finds the reasoning.
+
+      The arm and the gate landed together, per H-20's note — `call` was not a
+      prefilter keyword, so the arm alone would have been dead code that still
+      passed its own test. `CALL refresh_totals()` is in
+      `test_session_state_prefilter_admits_every_gated_statement`, and
+      `test_analyze_query_flags_call` pins that `SELECT refresh_totals()` — a
+      function call, not a `CALL` statement — stays on the hot path, which is
+      the over-match that would have made this genuinely expensive.
+      _Effort_ S
 
 - [ ] **H-23 — Revisit the fallback polarity with production data in hand.** Do
       not flip it wholesale: the ratchet is one-way for the connection's lifetime
