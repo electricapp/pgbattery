@@ -977,12 +977,20 @@ def test_real_matrix_still_parses() -> None:
 # FATAL contracts declare an inversion
 # ---------------------------------------------------------------------------
 
-CONTRACT_INDEX_SAMPLE = """
+SAMPLE_INVERSION_CASE = "assert-sanity-acked"
+"""A real matrix case, because the check now resolves the names it reads.
+
+An invented ID would make the accepting test below fail for the right reason —
+which is the point of the change — so the sample has to point at something that
+exists. `test_the_sample_inversion_case_is_real` fails loudly if it is renamed,
+rather than letting this drift into an unresolvable token nobody notices."""
+
+CONTRACT_INDEX_SAMPLE = f"""
 ## Contract-to-Test Index
 
 | Contract | Severity | Primary Tests | Inversion |
 | -------- | -------- | ------------- | --------- |
-| W1       | FATAL    | `a-case`      | `a-bad`   |
+| W1       | FATAL    | `a-case`      | `{SAMPLE_INVERSION_CASE}` |
 | V1       | SLO      | `b-case`      | —         |
 """
 
@@ -1018,14 +1026,64 @@ def test_inversion_check_accepts_a_complete_table() -> None:
     _check_index(CONTRACT_INDEX_SAMPLE, Path(tempfile.mkdtemp(prefix="contracts-ok-")))
 
 
+def test_the_sample_inversion_case_is_real() -> None:
+    """Keeps the sample honest: if this case is renamed, say so here rather than
+    letting the accepting test start passing on an unresolvable name."""
+    matrix = ci_runner.parse_matrix(MATRIX_PATH)
+    assert any(case.id == SAMPLE_INVERSION_CASE for case in matrix.cases), (
+        f"{SAMPLE_INVERSION_CASE} is gone; point CONTRACT_INDEX_SAMPLE at a case that exists"
+    )
+
+
 def test_inversion_check_rejects_a_fatal_row_without_one() -> None:
     """The check exists to catch exactly this, so it has to be seen catching it."""
-    stripped = CONTRACT_INDEX_SAMPLE.replace("| `a-bad`   |", "| —         |")
+    stripped = CONTRACT_INDEX_SAMPLE.replace(f"`{SAMPLE_INVERSION_CASE}`", "—")
     assert_raises(
         AssertionError,
         lambda: _check_index(stripped, Path(tempfile.mkdtemp(prefix="contracts-bad-"))),
         "W1 is FATAL with no inversion",
     )
+
+
+def test_inversion_check_rejects_a_dangling_reference() -> None:
+    """A non-empty cell was the whole bar until now, so a case that was renamed
+    or deleted left the contract still claiming a working oracle. The claim has
+    to resolve."""
+    renamed = CONTRACT_INDEX_SAMPLE.replace(SAMPLE_INVERSION_CASE, "assert-sanity-deleted")
+    assert_raises(
+        AssertionError,
+        lambda: _check_index(renamed, Path(tempfile.mkdtemp(prefix="contracts-dangling-"))),
+        "assert-sanity-deleted",
+    )
+
+
+def test_inversion_check_rejects_prose_with_nothing_checkable() -> None:
+    """Prose is allowed alongside a name, never instead of one."""
+    vague = CONTRACT_INDEX_SAMPLE.replace(f"`{SAMPLE_INVERSION_CASE}`", "covered somewhere")
+    assert_raises(
+        AssertionError,
+        lambda: _check_index(vague, Path(tempfile.mkdtemp(prefix="contracts-vague-"))),
+        "names nothing checkable",
+    )
+
+
+def test_inversion_refs_resolve_by_case_file_or_function() -> None:
+    """The three shapes the real index uses, and one that resolves as none."""
+    known_cases = {"a-case"}
+    known_fns = {"test_something"}
+    resolve = lint_matrix.unresolved_inversion_refs
+    assert resolve("`a-case`", known_cases, known_fns) == []
+    assert resolve("unit: `test_something`", known_cases, known_fns) == []
+    assert resolve("`docs/CONTRACTS.md` — every case", known_cases, known_fns) == []
+    assert resolve("`no-such-thing`", known_cases, known_fns) == ["no-such-thing"]
+
+
+def test_inversion_refs_expand_brace_groups() -> None:
+    """`assert-sanity-chaos-oracle{,-post,-full}` is three case IDs, and each
+    must resolve; the real index writes them this way."""
+    known = {"c", "c-post"}
+    assert lint_matrix.expand_braces("c{,-post,-full}") == ["c", "c-post", "c-full"]
+    assert lint_matrix.unresolved_inversion_refs("`c{,-post,-full}`", known, set()) == ["c-full"]
 
 
 def test_inversion_check_refuses_to_pass_on_an_unparseable_doc() -> None:

@@ -394,21 +394,91 @@ def parse_contract_index(markdown: str) -> list[list[str]]:
     return rows[1:] if rows else []
 
 
+BACKTICKED: Final[re.Pattern[str]] = re.compile(r"`([^`]+)`")
+"""Identifiers in the index are backticked; surrounding prose is not.
+
+Only backticked tokens are resolved. Prose like "LSN-gate proptest" is a
+pointer for a human and is not claimed to be a name, so demanding it resolve
+would push authors into deleting the context instead of writing it.
+"""
+
+BRACE_GROUP: Final[re.Pattern[str]] = re.compile(r"^(.*)\{([^}]*)\}(.*)$")
+"""`assert-sanity-chaos-oracle{,-post,-full}` names three cases."""
+
+TEST_FN: Final[re.Pattern[str]] = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?(?:fn|def)\s+(\w+)")
+
+
+def expand_braces(token: str) -> list[str]:
+    """Expand one shell-style brace group, if present."""
+    match = BRACE_GROUP.match(token)
+    if match is None:
+        return [token]
+    prefix, alternatives, suffix = match.groups()
+    return [f"{prefix}{alt}{suffix}" for alt in alternatives.split(",")]
+
+
+def _known_test_function_names() -> set[str]:
+    """Every Rust and Python function name in the tree.
+
+    Broader than "test functions" on purpose: an inversion may point at a
+    helper, and the question being asked is only whether the name still exists.
+    """
+    names: set[str] = set()
+    roots = (PROJECT_ROOT / "src", PROJECT_ROOT / "crates", TESTING_DIR)
+    for root in roots:
+        for path in root.rglob("*"):
+            if path.suffix not in {".rs", ".py"} or not path.is_file():
+                continue
+            if "target" in path.parts or "__pycache__" in path.parts:
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                found = TEST_FN.match(line)
+                if found:
+                    names.add(found.group(1))
+    return names
+
+
+def unresolved_inversion_refs(inversion: str, case_ids: set[str], fn_names: set[str]) -> list[str]:
+    """Backticked names in an inversion cell that resolve to nothing.
+
+    A name resolves as a matrix case ID, a path that exists, or a function
+    defined somewhere in the tree. Anything else is a dangling pointer: the
+    case was renamed or deleted and the contract's claim to have a working
+    oracle went stale without anything noticing.
+    """
+    dangling: list[str] = []
+    for quoted in BACKTICKED.findall(inversion):
+        for token in expand_braces(quoted.strip()):
+            name = token.strip()
+            if not name:
+                continue
+            if name in case_ids or name in fn_names or (PROJECT_ROOT / name).exists():
+                continue
+            dangling.append(name)
+    return dangling
+
+
 def check_fatal_contracts_have_inversions() -> None:
-    """Every FATAL contract must name a case proving its oracle can fail.
+    """Every FATAL contract must name a case proving its oracle can fail, and
+    that case must still exist.
 
     A test that has only ever passed cannot be told apart from one that cannot
-    fail, and a suite of those reports PASS on a broken cluster. This is the
-    single check standing between the contract index and that failure mode, so
-    it also verifies the table was found at all rather than passing vacuously
-    on a parse miss.
+    fail, and a suite of those reports PASS on a broken cluster. Checking only
+    that the cell is non-empty made this table a promise nothing kept: a
+    renamed or deleted inversion left the contract still claiming coverage.
+    Every backticked name here is resolved against the matrix, the filesystem,
+    and the function names in the tree.
     """
     rows = parse_contract_index(CONTRACTS_PATH.read_text(encoding="utf-8"))
     if not rows:
         raise AssertionError("Contract-to-Test Index not found or unparseable")
 
+    case_ids = {str(case.get("id", "")) for case in json.loads(MATRIX_PATH.read_text())["cases"]}
+    fn_names = _known_test_function_names()
+
     problems: list[str] = []
     fatal_seen = 0
+    resolved_any = False
     for cells in rows:
         if len(cells) < 4:
             problems.append(f"row has {len(cells)} columns, expected 4: {cells[:1]}")
@@ -419,8 +489,27 @@ def check_fatal_contracts_have_inversions() -> None:
         fatal_seen += 1
         if not inversion or inversion == "—":
             problems.append(f"{contract} is FATAL with no inversion")
+            continue
+        if not BACKTICKED.findall(inversion):
+            problems.append(
+                f"{contract}'s inversion names nothing checkable: {inversion!r}. "
+                f"Backtick the case ID, test function, or file that proves the "
+                f"oracle can fail."
+            )
+            continue
+        dangling = unresolved_inversion_refs(inversion, case_ids, fn_names)
+        if dangling:
+            problems.append(
+                f"{contract}'s inversion points at {dangling}, which no longer exist "
+                f"as matrix cases, files, or functions"
+            )
+        else:
+            resolved_any = True
+
     if fatal_seen == 0:
         raise AssertionError("no FATAL rows parsed; the check would pass vacuously")
+    if not resolved_any and not problems:
+        raise AssertionError("no inversion reference resolved; the resolver is not working")
     if problems:
         raise AssertionError("; ".join(problems))
 

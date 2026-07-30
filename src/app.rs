@@ -2891,9 +2891,6 @@ mod tests {
             let (fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-            for _ in 0..5 {
-                fence_tx.send(FenceState::unfenced()).unwrap();
-            }
             let handle = tokio::spawn(App::run_transition_observer(
                 7,
                 Arc::clone(&events),
@@ -2901,11 +2898,36 @@ mod tests {
                 fence_rx,
                 shutdown_rx,
             ));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            shutdown_tx.send(true).unwrap();
-            drop(tokio::time::timeout(std::time::Duration::from_secs(5), handle).await);
+            tokio::task::yield_now().await;
+            for _ in 0..5 {
+                fence_tx.send(FenceState::unfenced()).unwrap();
+            }
+            // A real transition after the resends. Asserting only "nothing was
+            // recorded" would pass just as well against an observer that never
+            // ran at all — the whole point of the loop above is that the task
+            // saw those sends and declined them, so the run has to leave proof
+            // it was alive.
+            fence_tx
+                .send(FenceState {
+                    fenced: true,
+                    has_quorum: true,
+                })
+                .unwrap();
+            observe_until_event(&events, handle, &shutdown_tx).await;
 
-            assert_eq!(events.get_last(10).len(), 0, "resends were recorded");
+            let recorded = events.get_last(10);
+            assert_eq!(
+                recorded.len(),
+                1,
+                "expected only the real transition, got {recorded:?}"
+            );
+            let only = recorded.first().unwrap();
+            assert_eq!(only.event_type, "fence");
+            assert_eq!(
+                only.data.get("reason"),
+                Some(&serde_json::json!("lease")),
+                "the recorded event is not the transition that followed the resends"
+            );
         }
     }
 

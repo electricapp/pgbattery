@@ -73,19 +73,47 @@ code that depends on it rather than drifting in a registry nobody opens."""
 console = Console()
 
 
+class AmbiguousTestBoundary(Exception):
+    """More than one `#[cfg(test)]` boundary in a guarded module.
+
+    The scan cannot tell which one begins the trailing test module, so it
+    refuses to pick rather than silently skipping the rest of the file.
+    """
+
+    def __init__(self, line_indices: list[int]) -> None:
+        self.lines = [n + 1 for n in line_indices]
+        super().__init__(
+            f"{len(self.lines)} `#[cfg(test)]` boundaries at lines {self.lines}. "
+            "The scan treats everything after the boundary as test code, so a second "
+            "one would silently un-guard the lines between them. Move test-only items "
+            "into the trailing test module, or teach this lint to match modules by brace."
+        )
+
+
 def guarded_violations(source: str) -> list[tuple[int, str]]:
     """Line numbers and text of direct clock reads outside `mod tests`.
 
-    Everything from the first `mod tests` declaration to end of file is treated
-    as test code. Crude, and correct for this repo: tests live in one trailing
-    module per file.
+    Everything from the `#[cfg(test)]` boundary to end of file is treated as
+    test code. That holds only while there is exactly one such boundary per
+    file, which is how this repo is written: one trailing test module.
+
+    Raises rather than guessing when that stops being true. A second
+    `#[cfg(test)]` earlier in the file — a test-only helper, a fixture
+    constructor — would move the cutoff up and silently stop scanning
+    everything after it, and the lint would go on printing PASS over an
+    unguarded module. A check that can quietly stop checking is the failure
+    mode this whole layer exists to prevent, so the ambiguity has to be loud.
     """
     lines = source.splitlines()
-    cutoff = len(lines)
-    for n, line in enumerate(lines):
-        if re.match(r"\s*mod tests\b", line) or line.strip() == "#[cfg(test)]":
-            cutoff = n
-            break
+    # `#[cfg(test)]` is the boundary. `mod tests` is only a fallback for a test
+    # module written without it — counting both would read the ordinary
+    # `#[cfg(test)] #[allow(...)] mod tests {` spelling as two boundaries.
+    boundaries = [n for n, line in enumerate(lines) if line.strip() == "#[cfg(test)]"]
+    if not boundaries:
+        boundaries = [n for n, line in enumerate(lines) if re.match(r"\s*mod tests\b", line)]
+    if len(boundaries) > 1:
+        raise AmbiguousTestBoundary(boundaries)
+    cutoff = boundaries[0] if boundaries else len(lines)
 
     found: list[tuple[int, str]] = []
     for n, line in enumerate(lines[:cutoff], start=1):
@@ -111,11 +139,17 @@ def main() -> int:
             problems.append(f"{rel}: guarded module not found; the scan would pass vacuously")
             continue
         scanned += 1
-        for line_no, text in guarded_violations(path.read_text(encoding="utf-8")):
+        try:
+            violations = guarded_violations(path.read_text(encoding="utf-8"))
+        except AmbiguousTestBoundary as exc:
+            problems.append(f"{rel}: {exc}")
+            continue
+        for line_no, text in violations:
             problems.append(f"{rel}:{line_no}: {text}")
 
     if scanned != len(GUARDED):
         console.print("[red]FAIL[/] guarded module list is stale")
+        return 1
 
     if problems:
         console.print(
