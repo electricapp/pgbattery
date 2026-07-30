@@ -80,7 +80,7 @@ jobs:
           toolchain: nightly
 
       # ~/.cargo/bin is cached alongside the build artifacts so the cargo-fuzz
-      # install below is a no-op on a warm cache. With seven parallel jobs that
+      # install below is skipped on a warm cache. Across the target matrix that
       # is the single largest chunk of avoidable CI time here.
       - name: Cache cargo registry + fuzz target dir
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -95,8 +95,15 @@ jobs:
             fuzz-${{ runner.os }}-${{ matrix.target }}-
             fuzz-${{ runner.os }}-
 
+      # Skipped when the cache already supplied the binary. `cargo install`
+      # cannot be relied on to no-op here: it tracks what it installed in
+      # ~/.cargo/.crates.toml, which is not one of the cached paths, so on a
+      # warm cache it finds a binary it has no record of and refuses with
+      # "binary `cargo-fuzz` already exists in destination" rather than
+      # skipping. Restoring the record instead would not help older cache
+      # entries, which hold the binary alone.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
 
       # libFuzzer writes newly-discovered inputs into the FIRST corpus
       # directory, so the working corpus is listed first and the committed seed
