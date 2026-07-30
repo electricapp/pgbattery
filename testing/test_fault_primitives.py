@@ -1433,10 +1433,12 @@ class NetworkDetachedTests(unittest.TestCase):
 IPTABLES_PORT_DROP = """\
 -P INPUT ACCEPT
 -A INPUT -s 172.28.0.12/32 -p tcp -m tcp --dport 5434 -j DROP
+-A INPUT -s 172.28.0.12/32 -p tcp -m tcp --sport 5434 -j DROP
 --- counters ---
 Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
  pkts bytes target prot opt in out source        destination
    17  1020 DROP   tcp  --  *  *   172.28.0.12   0.0.0.0/0    tcp dpt:5434
+    0     0 DROP   tcp  --  *  *   172.28.0.12   0.0.0.0/0    tcp spt:5434
 """
 
 IPTABLES_PORT_DROP_COLD = IPTABLES_PORT_DROP.replace("   17  1020 DROP", "    0     0 DROP")
@@ -1464,18 +1466,26 @@ class ChannelTests(unittest.TestCase):
 
 class PortDropParsingTests(unittest.TestCase):
     def test_rule_present_is_detected(self) -> None:
-        self.assertTrue(parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.12", 5434))
+        self.assertTrue(
+            parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.12", 5434, from_listener=False)
+        )
 
     def test_rule_for_another_port_does_not_match(self) -> None:
         """The whole point is severing one protocol; matching the wrong port
         would report a replication cut that never happened."""
-        self.assertFalse(parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.12", 5433))
+        self.assertFalse(
+            parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.12", 5433, from_listener=False)
+        )
 
     def test_rule_for_another_peer_does_not_match(self) -> None:
-        self.assertFalse(parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.13", 5434))
+        self.assertFalse(
+            parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.13", 5434, from_listener=False)
+        )
 
     def test_empty_chain_has_no_rule(self) -> None:
-        self.assertFalse(parse_port_drop_rule(IPTABLES_EMPTY_CHAIN, "172.28.0.12", 5434))
+        self.assertFalse(
+            parse_port_drop_rule(IPTABLES_EMPTY_CHAIN, "172.28.0.12", 5434, from_listener=False)
+        )
 
     def test_packet_counter_is_read(self) -> None:
         self.assertEqual(parse_port_drop_packets(IPTABLES_PORT_DROP, "172.28.0.12", 5434), 17)
@@ -1495,29 +1505,31 @@ class PortDropRunner:
     """
 
     def __init__(self, *, packets: int = 17) -> None:
-        self.rules: set[tuple[str, int]] = set()
+        self.rules: set[tuple[str, int, bool]] = set()
         self.packets = packets
         self.calls: list[str] = []
         self.insert_result: CommandResult | None = None
         self.refuse_delete = False
 
     @staticmethod
-    def _parse(cmd: str) -> tuple[str, int]:
-        match = re.search(r"-s (\S+) --dport (\d+)", cmd)
+    def _parse(cmd: str) -> tuple[str, int, bool]:
+        match = re.search(r"-s (\S+) --(s|d)port (\d+)", cmd)
         assert match is not None, cmd
-        return match.group(1), int(match.group(2))
+        return match.group(1), int(match.group(3)), match.group(2) == "s"
 
     def _render(self) -> str:
         lines = ["-P INPUT ACCEPT"]
         lines += [
-            f"-A INPUT -s {ip}/32 -p tcp -m tcp --dport {port} -j DROP"
-            for ip, port in sorted(self.rules)
+            f"-A INPUT -s {ip}/32 -p tcp -m tcp "
+            f"--{'sport' if from_listener else 'dport'} {port} -j DROP"
+            for ip, port, from_listener in sorted(self.rules)
         ]
         lines += ["--- counters ---", "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)"]
         lines += [" pkts bytes target prot opt in out source destination"]
         lines += [
-            f"   {self.packets}  1020 DROP tcp -- * * {ip} 0.0.0.0/0 tcp dpt:{port}"
-            for ip, port in sorted(self.rules)
+            f"   {self.packets}  1020 DROP tcp -- * * {ip} 0.0.0.0/0 tcp "
+            f"{'spt' if from_listener else 'dpt'}:{port}"
+            for ip, port, from_listener in sorted(self.rules)
         ]
         return "\n".join(lines) + "\n"
 
@@ -1552,18 +1564,20 @@ class PartitionChannelTests(unittest.TestCase):
         runner = self.install(PortDropRunner())
         with partition_channel("node1", ["node2"], Channel.REPLICATION, settle_s=0.0) as handle:
             self.assertEqual(handle.port, 5434)
-            self.assertEqual(handle.dropped_packets, 17)
+            # Two rules per peer (dport + sport), so the counter sums both.
+            self.assertEqual(handle.dropped_packets, 34)
         inserts = runner.matching("iptables -I INPUT")
-        self.assertEqual(len(inserts), 1)
-        self.assertIn("--dport 5434", inserts[0])
+        self.assertEqual(len(inserts), 2)
+        self.assertTrue(any("--dport 5434" in c for c in inserts))
+        self.assertTrue(any("--sport 5434" in c for c in inserts))
         # Raft must be left alone, or this is just a full partition.
-        self.assertNotIn("--dport 5433", inserts[0])
+        self.assertFalse(any("5433" in c for c in inserts))
 
     def test_heals_every_rule_it_installed(self) -> None:
         runner = self.install(PortDropRunner())
         with partition_channel("node1", ["node2", "node3"], Channel.RAFT, settle_s=0.0):
-            self.assertEqual(len(runner.rules), 2)
-        self.assertEqual(len(runner.matching("iptables -D INPUT")), 2)
+            self.assertEqual(len(runner.rules), 4)
+        self.assertEqual(len(runner.matching("iptables -D INPUT")), 4)
         self.assertEqual(runner.rules, set())
 
     def test_rule_that_matched_nothing_is_a_failure(self) -> None:

@@ -3190,7 +3190,11 @@ impl ConnectionHandler {
             "Probing new leader for transaction status"
         );
         let status = self.query_txid_status_via_management_api(txid).await?;
-        Ok(self.interpret_probe_status(txid, status.as_deref()))
+        Ok(Self::interpret_probe_status(
+            self.id,
+            txid,
+            status.as_deref(),
+        ))
     }
 
     async fn query_txid_status_via_management_api(&self, txid: i64) -> Result<Option<String>> {
@@ -3256,11 +3260,11 @@ impl ConnectionHandler {
             .ok_or_else(|| Error::Protocol("No leader management address available".to_string()))
     }
 
-    fn interpret_probe_status(&self, txid: i64, status_result: Option<&str>) -> bool {
+    fn interpret_probe_status(conn_id: u64, txid: i64, status_result: Option<&str>) -> bool {
         match status_result {
             Some("committed") => {
                 tracing::info!(
-                    conn_id = self.id,
+                    conn_id = conn_id,
                     txid = txid,
                     "Transaction confirmed COMMITTED on new leader"
                 );
@@ -3269,7 +3273,7 @@ impl ConnectionHandler {
             }
             Some("aborted") => {
                 tracing::info!(
-                    conn_id = self.id,
+                    conn_id = conn_id,
                     txid = txid,
                     "Transaction confirmed ABORTED on new leader"
                 );
@@ -3278,7 +3282,7 @@ impl ConnectionHandler {
             }
             Some("in progress") => {
                 tracing::warn!(
-                    conn_id = self.id,
+                    conn_id = conn_id,
                     txid = txid,
                     "Transaction still in progress on new leader"
                 );
@@ -3287,7 +3291,7 @@ impl ConnectionHandler {
             }
             Some(other) => {
                 tracing::warn!(
-                    conn_id = self.id,
+                    conn_id = conn_id,
                     txid = txid,
                     status = other,
                     "Unknown txid_status result"
@@ -3295,7 +3299,7 @@ impl ConnectionHandler {
                 false
             }
             None => {
-                tracing::warn!(conn_id = self.id, txid = txid, "txid_status returned NULL");
+                tracing::warn!(conn_id = conn_id, txid = txid, "txid_status returned NULL");
                 false
             }
         }
@@ -3689,6 +3693,41 @@ mod tests {
             assert!(
                 !ConnectionHandler::might_contain_session_state_command(query),
                 "prefilter sends {query:?} to the parser"
+            );
+        }
+    }
+
+    /// This decides whether a client is told its transaction committed after the
+    /// primary died mid-`COMMIT`. Only `PostgreSQL`'s literal `"committed"` may
+    /// answer yes: anything else — aborted, still running, an unrecognised
+    /// string, or NULL because the txid aged past `txid_status`'s visibility
+    /// horizon — must answer no, because a wrong yes manufactures a phantom
+    /// commit the client will never retry.
+    #[test]
+    fn interpret_probe_status_only_trusts_committed() {
+        const TXID: i64 = 4242;
+        assert!(ConnectionHandler::interpret_probe_status(
+            1,
+            TXID,
+            Some("committed")
+        ));
+        for status in [
+            Some("aborted"),
+            Some("in progress"),
+            // Case and whitespace variants are not PostgreSQL's spelling; if one
+            // ever shows up it is a bug, and guessing "committed" is the unsafe
+            // guess.
+            Some("COMMITTED"),
+            Some(" committed"),
+            Some("committed "),
+            Some("commited"),
+            Some(""),
+            Some("unknown"),
+            None,
+        ] {
+            assert!(
+                !ConnectionHandler::interpret_probe_status(1, TXID, status),
+                "{status:?} must not be reported as committed"
             );
         }
     }

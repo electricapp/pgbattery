@@ -447,15 +447,30 @@ Nothing else in Wave 1 is safe or cheap until these land.
 
 No new infrastructure. Highest confidence per unit of effort.
 
-- [ ] **H-05 — Port-granular partitions.** Primitive done, cases remain.
-      `partition_channel(container, peers, Channel.RAFT|REPLICATION|GATEWAY|
-  MANAGEMENT)` drops inbound traffic to one protocol port with iptables,
-      leaving the others up. It verifies the rule is present _and_ that packets
-      actually hit it — a rule matching nothing partitions nothing — and fails if
-      a DROP survives the heal. 15 tests, cluster-free.
+- [ ] **H-05 — Port-granular partitions.** Primitive done and live-validated;
+      matrix cases remain. `partition_channel(target, peers, Channel)` severs one
+      protocol port and leaves the others up, verifying the rules are present
+      _and_ that packets hit them, and failing if a DROP survives the heal.
+
+      Live testing corrected the design twice, and neither error was visible to a
+      unit test with a stubbed runner:
+
+      1. Matching `--dport` alone caught nothing. Only one side of a TCP channel
+         listens on the service port; replies reach the initiator with `--sport P`
+         and an ephemeral destination. Both are now installed.
+      2. Which side to install on is per channel, and traffic has to exist. Raft
+         works from either end, since peers exchange RPCs constantly. Replication
+         must go on the **standby** and needs write load in flight: the leader
+         streams, the standby only replies every `wal_receiver_status_interval`,
+         and an idle cluster produces no WAL at all — measured 0 packets idle
+         against 23 under load.
+
+      Both are recorded on `Channel` and in the failure hint, because the tempting
+      "fix" for either is `require_traffic=False`, which restores exactly the
+      vacuous case the check exists to prevent.
+
       **Remaining:** matrix cases that sever replication while Raft stays healthy
-      and assert the leader notices, plus the inverse, and a live run to confirm
-      the counters tick within the settle window on a real cluster.
+      and assert the leader notices, plus the inverse.
       _Closes_ RW-6, RW-11 reachability · _Blocked by_ H-02 · _Effort_ M
 
 - [ ] **H-06 — Partition shapes beyond node-vs-rest.** Majority-side isolation

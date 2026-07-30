@@ -850,9 +850,23 @@ class Channel(StrEnum):
     """
 
     RAFT = "raft"
+    """Either side works: peers exchange RPCs continuously in both directions."""
+
     REPLICATION = "replication"
+    """Install on the **standby**, with write load in flight.
+
+    Measured on a live cluster: the leader streams and the standby only answers
+    every `wal_receiver_status_interval` (10 s by default), so a rule on the
+    leader matches nothing for many seconds. And an idle cluster generates no
+    WAL at all — the same rule on the standby saw 0 packets idle and 23 under
+    load. Both failures look identical to a fault that did not land, which is
+    the point: do not reach for `require_traffic=False` to silence them."""
+
     GATEWAY = "gateway"
+    """Needs client traffic in flight; there is no steady background chatter."""
+
     MANAGEMENT = "management"
+    """Polled by the harness rather than by peers, so also traffic-dependent."""
 
     @property
     def port(self) -> int:
@@ -864,10 +878,29 @@ class Channel(StrEnum):
         }[self]
 
 
-def iptables_port_drop_cmd(peer_ip: str, port: int, *, insert: bool) -> str:
-    """Add or remove an INPUT DROP for `peer_ip` traffic to `port`."""
+_CHANNEL_SIDE_HINT: Final[dict[Channel, str]] = {
+    Channel.REPLICATION: "Install this on the standby, with write load in flight: "
+    "the leader streams (so the standby sees the traffic), and an idle cluster "
+    "generates no WAL to stream at all.",
+    Channel.GATEWAY: "This channel is idle without client traffic; run a workload "
+    "or pass require_traffic=False.",
+    Channel.MANAGEMENT: "This channel is idle unless the harness is polling it; "
+    "pass require_traffic=False.",
+}
+
+
+def iptables_port_drop_cmd(peer_ip: str, port: int, *, insert: bool, from_listener: bool) -> str:
+    """Add or remove an INPUT DROP for `peer_ip` traffic on `port`.
+
+    `from_listener` selects `--sport` instead of `--dport`. Both are needed
+    because only one side of a TCP channel listens on the service port: requests
+    arrive at the listener with `--dport P`, replies arrive at the initiator with
+    `--sport P` and an ephemeral destination. Matching one direction alone
+    silently catches nothing whenever the traffic happens to flow the other way.
+    """
     action = "-I" if insert else "-D"
-    return f"iptables {action} INPUT -p tcp -s {peer_ip} --dport {port} -j DROP"
+    match = f"--sport {port}" if from_listener else f"--dport {port}"
+    return f"iptables {action} INPUT -p tcp -s {peer_ip} {match} -j DROP"
 
 
 def iptables_rules_cmd() -> str:
@@ -875,34 +908,36 @@ def iptables_rules_cmd() -> str:
     return "iptables -S INPUT; echo '--- counters ---'; iptables -L INPUT -n -v"
 
 
-def parse_port_drop_rule(text: str, peer_ip: str, port: int) -> bool:
-    """Whether `iptables -S` output carries a DROP for `peer_ip` to `port`.
+def parse_port_drop_rule(text: str, peer_ip: str, port: int, *, from_listener: bool) -> bool:
+    """Whether `iptables -S` output carries the DROP for `peer_ip` on `port`.
 
     Tolerates the ``/32`` iptables appends when printing rules back, and the
     counter dump appended by `iptables_rules_cmd`.
     """
+    direction = "sport" if from_listener else "dport"
     pattern = re.compile(
         rf"^-A\s+INPUT\s+.*-s\s+{re.escape(peer_ip)}(?:/\d+)?\s+.*"
-        rf"--dport\s+{port}\b.*-j\s+DROP\b"
+        rf"--{direction}\s+{port}\b.*-j\s+DROP\b"
     )
     return any(pattern.match(line.strip()) for line in text.splitlines())
 
 
 def parse_port_drop_packets(text: str, peer_ip: str, port: int) -> int:
-    """Packets matched by the port DROP rule, from ``iptables -L -n -v`` output.
+    """Packets matched by the port DROP rules, from ``iptables -L -n -v`` output.
 
-    Zero means the rule exists but nothing hit it, which is indistinguishable
-    from no partition at all for anything downstream.
+    Sums both directions. Zero means the rules exist but nothing hit them, which
+    is indistinguishable from no partition at all for anything downstream.
     """
+    total = 0
     for line in text.splitlines():
         fields = line.split()
         if len(fields) < 2 or "DROP" not in line or peer_ip not in line:
             continue
-        if f"dpt:{port}" not in line:
+        if f"dpt:{port}" not in line and f"spt:{port}" not in line:
             continue
         with suppress(ValueError):
-            return int(fields[0])
-    return 0
+            total += int(fields[0])
+    return total
 
 
 def faketime_offset_literal(offset_ms: int) -> str:
@@ -1700,22 +1735,27 @@ def partition_channel(
     port = channel.port
     _emit("inject", "partition_channel", container, {"channel": str(channel), "peers": peers})
 
-    installed: list[str] = []
+    installed: list[tuple[str, bool]] = []
     try:
         for ip in peer_ips:
-            result = exec_in(container, iptables_port_drop_cmd(ip, port, insert=True))
-            if not result.ok:
-                raise FaultInjectionError(
-                    f"could not drop {channel} traffic from {ip} at {container}: "
-                    f"{result.output.strip()}"
+            for from_listener in (False, True):
+                result = exec_in(
+                    container,
+                    iptables_port_drop_cmd(ip, port, insert=True, from_listener=from_listener),
                 )
-            installed.append(ip)
+                if not result.ok:
+                    raise FaultInjectionError(
+                        f"could not drop {channel} traffic from {ip} at {container}: "
+                        f"{result.output.strip()}"
+                    )
+                installed.append((ip, from_listener))
 
         rules = exec_in(container, iptables_rules_cmd()).output
-        for ip in peer_ips:
-            if not parse_port_drop_rule(rules, ip, port):
+        for ip, from_listener in installed:
+            if not parse_port_drop_rule(rules, ip, port, from_listener=from_listener):
                 raise FaultEffectNotObserved(
-                    f"{container}: no DROP rule for {ip} port {port} after insert"
+                    f"{container}: no DROP rule for {ip} port {port} "
+                    f"({'sport' if from_listener else 'dport'}) after insert"
                 )
 
         # Raft heartbeats and WAL streaming are continuous, so a live rule starts
@@ -1728,7 +1768,8 @@ def partition_channel(
             if matched == 0:
                 raise FaultEffectNotObserved(
                     f"{container}: {channel} DROP rules matched no packets in "
-                    f"{settle_s}s; nothing was partitioned"
+                    f"{settle_s}s; nothing was partitioned. "
+                    f"{_CHANNEL_SIDE_HINT.get(channel, '')}".strip()
                 )
 
         yield ChannelPartitionHandle(
@@ -1740,13 +1781,16 @@ def partition_channel(
         )
     finally:
         heal_failures: list[str] = []
-        for ip in installed:
-            result = exec_in(container, iptables_port_drop_cmd(ip, port, insert=False))
+        for ip, from_listener in installed:
+            result = exec_in(
+                container,
+                iptables_port_drop_cmd(ip, port, insert=False, from_listener=from_listener),
+            )
             if not result.ok:
                 heal_failures.append(f"{ip}: {result.output.strip()}")
         residue = exec_in(container, iptables_rules_cmd()).output
-        for ip in installed:
-            if parse_port_drop_rule(residue, ip, port):
+        for ip, from_listener in installed:
+            if parse_port_drop_rule(residue, ip, port, from_listener=from_listener):
                 heal_failures.append(f"{ip}: DROP rule survived removal")
         _emit("heal", "partition_channel", container, {"channel": str(channel)})
         if heal_failures:
