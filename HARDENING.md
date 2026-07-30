@@ -725,6 +725,25 @@ nothing detects drift.
       anchor stamp and clear, promote and demote, fence escalation.
       **Done when** the event stream is complete enough to reconstruct a failover
       without reading logs.
+
+      Less work than it looks, and worse than it looks. `DebugEventBuffer`
+      already exists, is served at `/debug/events`, and defines five emitters —
+      `leader_change`, `fence_change`, `membership_change`, `sync_state_change`,
+      `connection_migrated`. **None of them is called from anywhere outside its own
+      module**, so the endpoint has always returned an empty list. An event API
+      that reads as an event API and emits nothing is the same shape as a fault
+      that reads as a fault and injects nothing.
+
+      The reason is structural, not an oversight: the buffer lives inside
+      `Arc<ManagementApiState>`, which `app.rs` constructs and then moves into
+      `start_management_api`, so the transition sites cannot reach it. Two ways
+      out — keep a clone of the `Arc`, or hold the buffer as its own
+      `Arc<DebugEventBuffer>` shared by both. The second is cleaner.
+
+      Prefer observing the existing `watch` channels (`fence_tx`/`fence_rx` and
+      the leader watch) from one task over threading a buffer through the
+      split-brain-prevention core. That gets every transition with no edit to the
+      safety paths at all.
       _Blocks_ H-34 · _Effort_ M
 
 - [ ] **H-34 — Validate real traces against the specs.** This turns "we have
