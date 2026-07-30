@@ -313,19 +313,16 @@ are reads and must stay allowed.
 
 PRIMITIVE_MODULE: Final[str] = "fault_primitives.py"
 
-PENDING_FAULT_MIGRATION: Final[frozenset[str]] = frozenset(
-    {
-        # Addresses containers by literal name, so it inherits the Class A1 bug
-        # the moment it runs under a non-default compose project. Pending H-12.
-        "overnight_test.py",
-    }
-)
+PENDING_FAULT_MIGRATION: Final[frozenset[str]] = frozenset()
 """Modules that still inject faults directly, each tracked by a task.
+
+Now empty: every harness routes through the primitive layer. Anything added
+here is a regression that owes a task, not a standing exemption.
 
 The point of this list is to stop the *spread*. It is not a correctness check:
 matching source text cannot tell a command from a sentence about a command, and
 a verb assembled at runtime is invisible to it. What it does buy is that a new
-module cannot quietly start injecting faults, and that these two cannot be
+module cannot quietly start injecting faults, and that an entry cannot be
 forgotten — a file that becomes clean has to be removed from the list, which is
 the only ratchet worth having here.
 """

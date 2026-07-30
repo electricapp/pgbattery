@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import random
 import subprocess
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +21,8 @@ from pydantic import BaseModel
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+
+import fault_primitives as fp
 
 console = Console()
 
@@ -94,6 +98,8 @@ class ChaosTest:
         # (ghost write). Lets us detect lost-during-chaos writes that the
         # original "did the cluster come back?" check would miss.
         self._next_seq = 0
+        # The load thread and the foreground both allocate seq numbers.
+        self._seq_lock = threading.Lock()
         self.acked_seqs: set[int] = set()
         self.indeterminate_seqs: set[int] = set()
         self.failure_artifacts_dir = (
@@ -115,19 +121,31 @@ class ChaosTest:
         return result.stdout, result.stderr, result.returncode
 
     def get_cluster_status(self) -> tuple[bool, str]:
-        """Check if cluster is healthy."""
-        nodes_arg = ",".join([f"localhost:909{i}" for i in range(1, self.nodes + 1)])
-        stdout, stderr, rc = self.run_command(
-            f"./target/release/pgbattery status --nodes {nodes_arg}"
-        )
+        """Report cluster health by querying state, not by grepping CLI text.
 
-        if rc != 0:
-            return False, f"Command failed: {stderr}"
+        The previous oracle asked whether ``"HEALTHY" in stdout`` — which is
+        also true of ``UNHEALTHY`` — and counted ``"LEADER"`` substrings, which
+        any ``NOT_LEADER`` line inflates. Both errors run in the permissive
+        direction, so a broken cluster read as recovered and every chaos
+        scenario after it was measured against a cluster nobody had checked.
 
-        healthy = "HEALTHY" in stdout
-        leader_count = stdout.count("LEADER")
+        Health here is the single-writer property this system exists to hold:
+        exactly one node reporting a valid lease, with every node answering.
+        `pgbattery_lease_valid` rather than Raft role because an isolated
+        ex-leader keeps its role while its lease expires — the role would count
+        a fenced node as a second leader.
+        """
+        holders: list[int] = []
+        unreachable: list[int] = []
+        for i in range(1, self.nodes + 1):
+            value = fp.read_metric(f"node{i}", "pgbattery_lease_valid")
+            if value is None:
+                unreachable.append(i)
+            elif value >= 0.5:
+                holders.append(i)
 
-        return healthy and leader_count == 1, stdout
+        detail = f"lease holders={holders} unreachable={unreachable} of {self.nodes} nodes"
+        return len(holders) == 1 and not unreachable, detail
 
     def wait_for_healthy(self, timeout: int = 60) -> tuple[bool, str, float]:
         """Poll cluster status until healthy or timeout."""
@@ -142,14 +160,15 @@ class ChaosTest:
         return False, last_status, time.time() - start
 
     def get_leader_node(self) -> int | None:
-        """Find which node is currently the leader."""
-        for i in range(1, self.nodes + 1):
-            stdout, _, rc = self.run_command(
-                f"./target/release/pgbattery status --nodes localhost:909{i}"
-            )
-            if rc == 0 and "LEADER" in stdout:
-                return i
-        return None
+        """The node holding write authority, or None mid-failover.
+
+        The lease gauge, not `"LEADER" in stdout` — that substring also matches
+        a `NOT_LEADER` line, and it would name a fenced ex-leader as a write
+        target. None is a real answer here, not a failure: inside a failover
+        window no node may accept writes.
+        """
+        holder = fp.find_lease_holder(tuple(f"node{i}" for i in range(1, self.nodes + 1)))
+        return int(holder.removeprefix("node")) if holder else None
 
     @staticmethod
     def _extract_iter_number(name: str) -> int:
@@ -167,7 +186,11 @@ class ChaosTest:
         start = time.time()
 
         try:
-            action()
+            # Load runs for the fault itself, then stops before the recovery
+            # wait: the oracle asks whether the cluster converged, and writes
+            # still landing would keep provoking the state it is measuring.
+            with self.load_in_flight():
+                action()
 
             healthy, status, wait_elapsed = self.wait_for_healthy(timeout=60)
             duration = time.time() - start
@@ -220,9 +243,9 @@ class ChaosTest:
         node = random.randint(1, self.nodes)
         if self.verbose:
             console.print(f"  [dim]Killing random node {node}[/]")
-        self.run_command(f"docker kill pgbattery-node{node}-1")
+        fp.kill_container(f"node{node}")
         time.sleep(2)
-        self.run_command(f"docker start pgbattery-node{node}-1")
+        fp.start_container(f"node{node}")
 
     def kill_leader(self) -> None:
         """Kill the current leader node and restart it."""
@@ -230,9 +253,9 @@ class ChaosTest:
         if leader:
             if self.verbose:
                 console.print(f"  [dim]Killing leader (node {leader})[/]")
-            self.run_command(f"docker kill pgbattery-node{leader}-1")
+            fp.kill_container(f"node{leader}")
             time.sleep(3)
-            self.run_command(f"docker start pgbattery-node{leader}-1")
+            fp.start_container(f"node{leader}")
         else:
             console.print("  [yellow]No leader found, skipping[/]")
 
@@ -241,7 +264,7 @@ class ChaosTest:
         if self.verbose:
             console.print(f"  [dim]Restarting all {self.nodes} nodes[/]")
         for i in range(1, self.nodes + 1):
-            self.run_command(f"docker restart pgbattery-node{i}-1")
+            fp.restart_container(f"node{i}")
         time.sleep(5)
 
     def network_partition(self) -> None:
@@ -249,21 +272,63 @@ class ChaosTest:
         node = random.randint(1, self.nodes)
         if self.verbose:
             console.print(f"  [dim]Pausing node {node} for 15 seconds[/]")
-        self.run_command(f"docker pause pgbattery-node{node}-1")
+        fp.pause_container(f"node{node}")
         time.sleep(15)
-        self.run_command(f"docker unpause pgbattery-node{node}-1")
+        fp.unpause_container(f"node{node}")
 
     def _ensure_seq_table(self, leader: int) -> None:
         """Create chaos_seq if absent. Cheap — DDL is idempotent."""
         self.run_command(
-            f"docker exec pgbattery-node{leader}-1 psql -U postgres -c "
+            f"docker compose exec -T node{leader} psql -U postgres -c "
             f'"CREATE TABLE IF NOT EXISTS chaos_seq '
             f'(seq BIGINT PRIMARY KEY, ts TIMESTAMP DEFAULT NOW());"'
         )
 
     def _next_seq_value(self) -> int:
-        self._next_seq += 1
-        return self._next_seq
+        with self._seq_lock:
+            self._next_seq += 1
+            return self._next_seq
+
+    @contextmanager
+    def load_in_flight(self) -> Iterator[None]:
+        """Keep writes going for the whole body.
+
+        Nine of the ten scenarios used to fault an idle cluster, which cannot
+        observe the failures that matter: a lost acked write, a write accepted
+        by a node that had already lost authority, or a gateway severing a
+        connection mid-transaction. None of those exist without a client. The
+        seq bookkeeping (`acked_seqs` / `indeterminate_seqs`) was already here
+        and only one scenario fed it.
+
+        Writes go to whichever node currently answers as leader and are
+        re-resolved every iteration, because the fault under test is frequently
+        "the leader went away". A write that fails is not an error here: it is
+        the datum, classified by `write_next_seq` and reconciled at run end.
+        """
+        stop = threading.Event()
+
+        def loop() -> None:
+            while not stop.is_set():
+                leader = self.get_leader_node()
+                if leader is None:
+                    # Leaderless is expected mid-failover; keep the loop hot so
+                    # the first write after recovery lands close to it.
+                    time.sleep(0.2)
+                    continue
+                # A failed write is the datum, not an error: write_next_seq
+                # classifies it, and the run-end reconciliation is what turns
+                # an indeterminate into a verdict.
+                with suppress(Exception):
+                    self.write_next_seq(leader)
+                time.sleep(0.1)
+
+        worker = threading.Thread(target=loop, daemon=True, name="chaos-load")
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join(timeout=10)
 
     def write_next_seq(self, leader: int) -> tuple[int, str]:
         """Insert the next seq# via the leader. Classifies outcome strictly.
@@ -275,7 +340,7 @@ class ChaosTest:
         """
         seq = self._next_seq_value()
         cmd = (
-            f"docker exec pgbattery-node{leader}-1 psql -U postgres "
+            f"docker compose exec -T node{leader} psql -U postgres "
             f"-v ON_ERROR_STOP=1 "
             f'-c "INSERT INTO chaos_seq(seq) VALUES ({seq});" 2>&1'
         )
@@ -344,7 +409,7 @@ class ChaosTest:
             return  # No acks → nothing to verify here; full check at end-of-run.
         seq_list = ",".join(str(s) for s in acked_in_batch)
         stdout, _, rc = self.run_command(
-            f"docker exec pgbattery-node{read_node}-1 psql -U postgres -t -A -c "
+            f"docker compose exec -T node{read_node} psql -U postgres -t -A -c "
             f'"SELECT seq FROM chaos_seq WHERE seq IN ({seq_list}) ORDER BY seq;"'
         )
         if rc != 0:
@@ -370,7 +435,7 @@ class ChaosTest:
         missing: list[str] = []
         for value in self.written_values:
             stdout, _, rc = self.run_command(
-                f"docker exec pgbattery-node{node}-1 psql -U postgres -t -c "
+                f"docker compose exec -T node{node} psql -U postgres -t -c "
                 f"\"SELECT value FROM chaos_test WHERE value = '{value}';\""
             )
             if rc != 0 or value not in stdout:
@@ -392,7 +457,7 @@ class ChaosTest:
 
         node = self.get_leader_node() or 1
         stdout, _, rc = self.run_command(
-            f"docker exec pgbattery-node{node}-1 psql -U postgres -t -A -c "
+            f"docker compose exec -T node{node} psql -U postgres -t -A -c "
             f'"SELECT seq FROM chaos_seq ORDER BY seq;"'
         )
         if rc != 0:
@@ -429,11 +494,11 @@ class ChaosTest:
             for label, cmd in (
                 (
                     "pg_controldata",
-                    f"docker exec pgbattery-node{i}-1 pg_controldata /var/lib/postgresql/data",
+                    f"docker compose exec -T node{i} pg_controldata /var/lib/postgresql/data",
                 ),
                 (
                     "raft data dir (proxy for redb state)",
-                    f"docker exec pgbattery-node{i}-1 ls -la /var/lib/postgresql/raft",
+                    f"docker compose exec -T node{i} ls -la /var/lib/postgresql/raft",
                 ),
                 (
                     "pgbattery status from node mgmt API",
@@ -441,7 +506,7 @@ class ChaosTest:
                 ),
                 (
                     "last 200 lines of container log",
-                    f"docker logs --tail 200 pgbattery-node{i}-1",
+                    f"docker compose logs --tail 200 node{i}",
                 ),
             ):
                 sections.append(f"\n--- {label} ---")
@@ -463,13 +528,16 @@ class ChaosTest:
 
         killed = random.sample(range(1, self.nodes + 1), nodes_to_kill)
         for node in killed:
-            self.run_command(f"docker kill pgbattery-node{node}-1")
+            fp.kill_container(f"node{node}")
             time.sleep(2)
 
         time.sleep(5)
 
-        for i in range(1, self.nodes + 1):
-            self.run_command(f"docker start pgbattery-node{i}-1")
+        # Only the nodes this step killed. The old code started all of them,
+        # which meant a survivor that had died for an unrelated reason got
+        # quietly revived and the cascade looked cleaner than it was.
+        for node in killed:
+            fp.start_container(f"node{node}")
 
     def fill_disk_and_recover(self) -> None:
         """Fill a node's data disk and ensure it recovers once space is freed."""
@@ -478,11 +546,11 @@ class ChaosTest:
             console.print(f"  [dim]Filling disk on node {node}[/]")
         filler = "/var/lib/postgresql/data/.pgbattery_fill"
         self.run_command(
-            f"docker exec pgbattery-node{node}-1 bash -c "
+            f"docker compose exec -T node{node} bash -c "
             f'"fallocate -l 2G {filler} || fallocate -l 1G {filler}"'
         )
         time.sleep(5)
-        self.run_command(f"docker exec pgbattery-node{node}-1 rm -f {filler}")
+        self.run_command(f"docker compose exec -T node{node} rm -f {filler}")
 
     def raft_dir_readonly(self) -> None:
         """Make raft directory read-only to simulate storage fault."""
@@ -490,11 +558,11 @@ class ChaosTest:
         if self.verbose:
             console.print(f"  [dim]Setting raft dir read-only on node {node}[/]")
         self.run_command(
-            f'docker exec pgbattery-node{node}-1 bash -c "chmod -R 500 /var/lib/postgresql/raft"'
+            f'docker compose exec -T node{node} bash -c "chmod -R 500 /var/lib/postgresql/raft"'
         )
         time.sleep(5)
         self.run_command(
-            f'docker exec pgbattery-node{node}-1 bash -c "chmod -R 700 /var/lib/postgresql/raft"'
+            f'docker compose exec -T node{node} bash -c "chmod -R 700 /var/lib/postgresql/raft"'
         )
 
     def rotate_tls_cert(self) -> None:
@@ -503,13 +571,13 @@ class ChaosTest:
         if self.verbose:
             console.print(f"  [dim]Rotating TLS cert on node {node}[/]")
         self.run_command(
-            f"docker exec pgbattery-node{node}-1 bash -c "
+            f"docker compose exec -T node{node} bash -c "
             '"openssl req -x509 -nodes -newkey rsa:2048 '
             "-keyout /var/lib/postgresql/tls/server.key "
             "-out /var/lib/postgresql/tls/server.crt "
             "-subj '/CN=node' -days 1\""
         )
-        self.run_command(f"docker restart pgbattery-node{node}-1")
+        fp.restart_container(f"node{node}")
         time.sleep(3)
 
     def restore_corrupt_backup(self) -> None:

@@ -654,14 +654,47 @@ No new infrastructure. Highest confidence per unit of effort.
       needs a decision before it needs a test.
       _Closes_ RW-7 · _Effort_ M
 
-- [ ] **H-12 — Harden `overnight_test.py`.** It addresses docker objects literally
-      at about 30 sites, so it inherits the Class A1 bug the moment it runs under
-      a non-default compose project. It is local-only, injects 9 of its 10 faults
-      with no client load in flight, and its health oracle is a substring match on
-      CLI output.
-      **Done when** it routes through the primitive layer, runs load during every
-      fault, and its oracle queries state instead of grepping text.
-      _Blocked by_ H-02 · _Effort_ M
+- [x] **H-12 — Harden `overnight_test.py`.** All three criteria met, and
+      `PENDING_FAULT_MIGRATION` is now empty — every harness routes through the
+      primitive layer.
+
+      **Literal docker names** are gone from all 23 sites. The ten lifecycle
+      faults call new primitives (`kill_container`, `start_container`,
+      `restart_container`, `pause_container`, `unpause_container`) which resolve
+      the container through the compose project and verify their own effect;
+      the thirteen `docker exec pgbattery-node{N}-1` sites became
+      `docker compose exec -T node{N}`. `ContainerRunState` moved into the
+      primitive layer as the canonical copy, with `started_at` the field that
+      separates an observed restart from an assumed one: `docker kill` against
+      an already-dead container exits 0 and changes nothing, and that no-op is
+      now a `FaultEffectNotObserved` rather than a pass.
+
+      **The health oracle was broken in the permissive direction.** It asked
+      `"HEALTHY" in stdout` — which is also true of `UNHEALTHY` — and counted
+      `"LEADER"` substrings, which any `NOT_LEADER` line inflates. A cluster
+      that never recovered read as healthy, and every scenario after it was
+      measured against a cluster nobody had checked. Health is now the
+      single-writer property itself: exactly one node reporting
+      `pgbattery_lease_valid`, with every node answering. `get_leader_node` had
+      the same substring bug and now reads the lease gauge, so it can no longer
+      hand the load generator a fenced ex-leader as a write target.
+
+      **Load now runs during every fault**, not just the one scenario that had
+      it. Nine of ten faults hit an idle cluster, which structurally cannot
+      observe a lost acked write or a write accepted by a node that had already
+      lost authority — none of those exist without a client. The seq
+      bookkeeping was already there and only one scenario fed it. The load
+      thread re-resolves the leader each iteration, because "the leader went
+      away" is usually the fault under test, and stops before the recovery wait
+      so the oracle is not measuring a state it keeps provoking.
+
+      Also fixed while here: the cascade scenario restarted _every_ node rather
+      than the ones it killed, quietly reviving a survivor that had died for an
+      unrelated reason and making the cascade look cleaner than it was.
+
+      **Not yet run against a live cluster** — this is a code and oracle change,
+      gated by unit tests and the lint ratchet.
+      _Closes_ Class A1 for the last harness · _Effort_ M
 
 - [ ] **H-13 — Measure the fencing failure tail.** Wedged postmaster, exhausted
       connection slots, and a backend in uninterruptible I/O surviving

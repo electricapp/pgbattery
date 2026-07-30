@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from unittest import mock
 
+import fault_primitives as fp
 from fault_primitives import (
     DEFAULT_COMPOSE_PROJECT,
     Aim,
@@ -1634,6 +1635,57 @@ class ContainerNetworksCmdTests(unittest.TestCase):
         cmd = container_networks_cmd("abc123")
         self.assertIn(".NetworkSettings.Networks", cmd)
         self.assertIn(".IPAddress", cmd)
+
+
+class ContainerRunStateTests(unittest.TestCase):
+    """`started_at` is what separates an observed restart from an assumed one."""
+
+    RUNNING = "running 2026-07-30T12:00:00.000000000Z 0\n"
+    RESTARTED = "running 2026-07-30T12:05:00.000000000Z 1\n"
+
+    def test_parses_the_three_fields(self) -> None:
+        state = fp.parse_container_runstate(self.RUNNING)
+        assert state is not None
+        self.assertEqual(state.status, "running")
+        self.assertEqual(state.restart_count, 0)
+
+    def test_unreadable_output_is_none_not_a_default(self) -> None:
+        """A docker error must not decode as a stopped container."""
+        for text in ("", "Error: No such object: node1", "running", "a b c"):
+            with self.subTest(text=text):
+                self.assertIsNone(fp.parse_container_runstate(text))
+
+    def test_incarnation_check_rejects_an_unchanged_container(self) -> None:
+        """`docker kill` on an already-dead container exits 0 and changes
+        nothing; that no-op is what this refuses to accept."""
+        before = fp.parse_container_runstate(self.RUNNING)
+        with self.assertRaises(fp.FaultEffectNotObserved):
+            fp.verify_incarnation_changed(
+                before, before, target="node1", action="restart_container"
+            )
+
+    def test_incarnation_check_accepts_a_new_incarnation(self) -> None:
+        before = fp.parse_container_runstate(self.RUNNING)
+        after = fp.parse_container_runstate(self.RESTARTED)
+        fp.verify_incarnation_changed(before, after, target="node1", action="restart_container")
+
+    def test_incarnation_check_rejects_an_unreadable_result(self) -> None:
+        before = fp.parse_container_runstate(self.RUNNING)
+        with self.assertRaises(fp.FaultEffectNotObserved):
+            fp.verify_incarnation_changed(before, None, target="node1", action="kill_container")
+
+    def test_status_check_reports_the_mismatch(self) -> None:
+        state = fp.parse_container_runstate(self.RUNNING)
+        with self.assertRaises(fp.FaultEffectNotObserved) as caught:
+            fp.verify_status(state, target="node1", expected="paused")
+        self.assertIn("paused", str(caught.exception))
+        fp.verify_status(state, target="node1", expected="running")
+
+    def test_runstate_command_asks_for_what_the_dataclass_carries(self) -> None:
+        cmd = fp.container_runstate_cmd("abc123")
+        for field in (".State.Status", ".State.StartedAt", ".RestartCount"):
+            self.assertIn(field, cmd)
+        self.assertTrue(cmd.endswith("abc123"))
 
 
 if __name__ == "__main__":

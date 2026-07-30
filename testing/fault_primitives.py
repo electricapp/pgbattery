@@ -489,6 +489,75 @@ def container_id(service: str) -> str:
     return cid
 
 
+@dataclass(frozen=True)
+class ContainerRunState:
+    """Container liveness identity, enough to prove an incarnation changed.
+
+    `started_at` is what distinguishes a restart from a no-op: a container that
+    was never killed keeps its timestamp, so comparing the triple before and
+    after is the difference between observing a fault and assuming one.
+    """
+
+    status: str
+    started_at: str
+    restart_count: int
+
+
+def container_runstate_cmd(container: str) -> str:
+    """Inspect the fields `ContainerRunState` carries, space-separated."""
+    fmt = "{{.State.Status}} {{.State.StartedAt}} {{.RestartCount}}"
+    return f'docker inspect --format "{fmt}" {container}'
+
+
+def parse_container_runstate(text: str) -> ContainerRunState | None:
+    """Parse `container_runstate_cmd` output; None if nothing usable.
+
+    None covers a missing container, a docker error, and empty output alike:
+    all three mean the state could not be read, which callers must not confuse
+    with a container that is simply stopped.
+    """
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not parts[2].isdigit():
+            continue
+        return ContainerRunState(status=parts[0], started_at=parts[1], restart_count=int(parts[2]))
+    return None
+
+
+def read_container_runstate(service: str) -> ContainerRunState | None:
+    """Current `ContainerRunState` for `service`, or None if unreadable."""
+    return parse_container_runstate(run(container_runstate_cmd(container_id(service))).stdout)
+
+
+def verify_incarnation_changed(
+    before: ContainerRunState | None,
+    after: ContainerRunState | None,
+    *,
+    target: str,
+    action: str,
+) -> None:
+    """Assert `action` actually replaced the container's incarnation.
+
+    A `docker kill` against an already-dead container exits 0 and changes
+    nothing, which is precisely the silent no-op that reads as coverage.
+    """
+    if after is None:
+        raise FaultEffectNotObserved(f"{action}: cannot read {target} state afterwards")
+    if before is not None and before.started_at == after.started_at:
+        raise FaultEffectNotObserved(
+            f"{action}: {target} still on the same incarnation "
+            f"(started_at={after.started_at}); the container was not replaced"
+        )
+
+
+def verify_status(state: ContainerRunState | None, *, target: str, expected: str) -> None:
+    """Assert the container reports `expected` docker status."""
+    if state is None:
+        raise FaultEffectNotObserved(f"cannot read {target} state; expected {expected!r}")
+    if state.status != expected:
+        raise FaultEffectNotObserved(f"{target} is {state.status!r}, expected {expected!r}")
+
+
 def read_container_networks(service: str) -> dict[str, str]:
     """Network name → IP for `service`'s container."""
     result = run(container_networks_cmd(container_id(service)))
@@ -2319,6 +2388,80 @@ def sigstop_checkpointer(container: str, duration_s: float) -> Iterator[StoppedP
         "sigstop_checkpointer",
     ) as handle:
         yield handle
+
+
+def _lifecycle(service: str, verb: str) -> CommandResult:
+    """Run a docker lifecycle verb against `service`'s resolved container."""
+    result = run(f"docker {verb} {container_id(service)}")
+    if not result.ok:
+        raise FaultInjectionError(f"docker {verb} {service} failed: {result.stderr.strip()}")
+    return result
+
+
+def kill_container(service: str) -> None:
+    """SIGKILL `service`, and prove the incarnation was replaced.
+
+    Note this is a *clean* fault: `docker kill` leaves the host page cache
+    intact, so it says nothing about whether fsync was honoured.
+    """
+    before = read_container_runstate(service)
+    _lifecycle(service, "kill")
+    _emit("fault.inject", "kill_container", service, {})
+    after = _wait_for_status(service, "exited")
+    if before is not None and after is not None and before.status != "running":
+        raise FaultPreconditionError(
+            f"kill_container: {service} was {before.status!r}, not running; "
+            "killing an already-dead container is a silent no-op"
+        )
+
+
+def start_container(service: str) -> None:
+    """Start `service` and wait until docker reports it running."""
+    _lifecycle(service, "start")
+    _emit("fault.heal", "start_container", service, {})
+    _wait_for_status(service, "running")
+
+
+def restart_container(service: str) -> None:
+    """Restart `service`, proving it came back as a new incarnation."""
+    before = read_container_runstate(service)
+    _lifecycle(service, "restart")
+    _emit("fault.inject", "restart_container", service, {})
+    after = _wait_for_status(service, "running")
+    verify_incarnation_changed(before, after, target=service, action="restart_container")
+
+
+def pause_container(service: str) -> None:
+    """SIGSTOP every process in `service` via the freezer cgroup."""
+    _lifecycle(service, "pause")
+    _emit("fault.inject", "pause_container", service, {})
+    _wait_for_status(service, "paused")
+
+
+def unpause_container(service: str) -> None:
+    """Thaw a paused `service`."""
+    _lifecycle(service, "unpause")
+    _emit("fault.heal", "unpause_container", service, {})
+    _wait_for_status(service, "running")
+
+
+def _wait_for_status(
+    service: str, expected: str, *, timeout_s: float = 30.0
+) -> ContainerRunState | None:
+    """Poll until `service` reports `expected`, then return that state.
+
+    Docker's lifecycle verbs return before the state settles, so asserting
+    immediately races the daemon and fails on a fault that did land.
+    """
+    deadline = time.monotonic() + timeout_s
+    state = read_container_runstate(service)
+    while time.monotonic() < deadline:
+        if state is not None and state.status == expected:
+            return state
+        time.sleep(0.25)
+        state = read_container_runstate(service)
+    verify_status(state, target=service, expected=expected)
+    return state
 
 
 def find_raft_leader(nodes: Sequence[str] = NODES) -> str | None:
