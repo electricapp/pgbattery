@@ -25,13 +25,15 @@ from collections.abc import Callable
 from inspect import signature
 from typing import Final
 
-from linearizability_register import ATTACK_DISPATCH, SEEDED_ATTACKS
+from linreg.attacks import ATTACK_DISPATCH, SEEDED_ATTACKS
 from linreg.checkers import _is_linearizable, _is_weakly_consistent
 from linreg.cluster import GATEWAY_PORTS
 from linreg.records import History, Op
 from linreg.workload import next_gateway_port
 
-Checker = Callable[[list[Op]], tuple[bool, str]]
+Checker = Callable[[list[Op]], tuple[bool | None, str]]
+"""`None` is the WGL "state budget spent, key unchecked" verdict. These cases
+are all tiny, so None here would mean the budget stopped binding correctly."""
 
 KEY: Final[int] = 0
 """All histories target one register; the checkers are per-key."""
@@ -99,11 +101,13 @@ class CheckerCase(unittest.TestCase):
 
     def assert_flagged(self, checker: Checker, ops: list[Op], label: str) -> None:
         ok, reason = checker(ops)
-        self.assertFalse(ok, f"{label}: checker reported PASS, reason={reason!r}")
+        # `is False`, not falsiness: None means the search gave up, and a
+        # giving-up checker would otherwise satisfy every flagged case here.
+        self.assertIs(ok, False, f"{label}: expected FAIL, got {ok!r}, reason={reason!r}")
 
     def assert_accepted(self, checker: Checker, ops: list[Op], label: str) -> None:
         ok, reason = checker(ops)
-        self.assertTrue(ok, f"{label}: checker reported FAIL, reason={reason!r}")
+        self.assertIs(ok, True, f"{label}: expected PASS, got {ok!r}, reason={reason!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,6 +374,56 @@ class SeededAttackTests(unittest.TestCase):
         for attack, fn in ATTACK_DISPATCH.items():
             if attack not in SEEDED_ATTACKS:
                 signature(fn).bind(2.0)
+
+
+class StateBudgetTests(unittest.TestCase):
+    """WGL is exponential in concurrency, and `WGL_OPS_PER_KEY_CAP` does not
+    bound it -- it caps op count, which is the wrong variable. A 45 s / 6-worker
+    / 8-key kill run put ~1,450 ops on each key, well under the 2,000 cap, and
+    5 of 8 keys were still searching after 30 s. Unbounded, that is a hang; CI
+    kills it and the run reads as an infra flake rather than as an unchecked
+    history.
+    """
+
+    @staticmethod
+    def _wide_concurrent_history(n: int) -> list[Op]:
+        """`n` acked concurrent writes of distinct values, plus one read that
+        returns a value nobody ever wrote.
+
+        Mutually concurrent, so real-time order prunes nothing and every
+        interleaving is reachable. Unsatisfiable, so the search cannot stop
+        early on a lucky branch -- it has to visit the whole memoized state
+        space before it can answer, which is precisely the shape that made the
+        real run hang.
+        """
+        ops: list[Op] = [_write(op_id=i, invoke=0.0, ret=100.0, value=i + 1) for i in range(n)]
+        ops.append(_read(op_id=n, invoke=0.0, ret=100.0, value=n + 1))
+        return ops
+
+    def test_budget_stops_a_search_that_would_not_terminate(self) -> None:
+        ops = self._wide_concurrent_history(10)
+        ok, reason = _is_linearizable(ops, max_states=500)
+        self.assertIsNone(ok, f"expected UNCHECKED, got {ok!r} ({reason})")
+        self.assertIn("UNCHECKED", reason)
+
+    def test_the_same_history_is_decidable_with_a_large_budget(self) -> None:
+        """Without this, the test above would also pass if the checker had
+        simply become unable to decide anything."""
+        ops = self._wide_concurrent_history(10)
+        ok, _ = _is_linearizable(ops, max_states=10_000_000)
+        self.assertIsNotNone(ok, "budget exhaustion is not what made this UNCHECKED")
+
+    def test_small_histories_never_hit_the_default_budget(self) -> None:
+        """The default must not turn the ordinary cases above into UNCHECKED."""
+        ok, reason = _is_linearizable(self._wide_concurrent_history(3))
+        self.assertIsNotNone(ok, f"default budget too small: {reason}")
+
+    def test_verdict_is_a_function_of_the_history_alone(self) -> None:
+        """A wall-clock deadline would make coverage depend on machine load, so
+        the same seed could pass on CI and go unchecked on a laptop."""
+        ops = self._wide_concurrent_history(10)
+        verdicts = {_is_linearizable(ops, max_states=500)[0] for _ in range(3)}
+        self.assertEqual(len(verdicts), 1, f"same history gave different verdicts: {verdicts}")
 
 
 if __name__ == "__main__":

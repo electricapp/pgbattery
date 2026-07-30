@@ -426,14 +426,14 @@ Nothing else in Wave 1 is safe or cheap until these land.
       of which has run against these changes.
       _Closes_ Class A1 structurally · _Blocks_ H-05…H-09, H-12 · _Effort_ M
 
-- [ ] **H-03 — Split `linearizability_register.py`.** Five seams extracted; the
-      attack table remains. `linreg/` now holds `records.py` (`Op`,
-      `JepsenRecord`, `History`), `checkers.py` (WGL and weak, with their op cap),
-      `cluster.py` (shell, leader discovery, topology constants), `config.py`
-      (`WorkloadConfig` and its defaults), and `workload.py` (table setup, op
-      helpers, the three worker loops, and the gateway-rebind helpers the loops
-      call). The entrypoint keeps the CLI and the attacks, down from 1,821 lines
-      to 1,017.
+- [x] **H-03 — Split `linearizability_register.py`.** All six seams extracted.
+      `linreg/` holds `records.py` (`Op`, `JepsenRecord`, `History`),
+      `checkers.py` (WGL and weak), `cluster.py` (shell, leader discovery,
+      topology constants), `config.py` (`WorkloadConfig` and its defaults),
+      `workload.py` (table setup, op helpers, the three worker loops, and the
+      gateway-rebind helpers the loops call), and `attacks.py` (every injector,
+      `ATTACK_DISPATCH`, and the seeded/scaffold sets). The entrypoint keeps the
+      CLI and the verdict, down from 1,821 lines to 485.
 
       Tests import from the package directly rather than through re-exports, so
       the boundaries are real. Two guards were widened to survive the move: the
@@ -442,8 +442,44 @@ Nothing else in Wave 1 is safe or cheap until these land.
       `*/*.py`, because moving an attack into a package would otherwise walk
       straight out of the confinement check.
 
-      **Remaining:** the attack table, then a real Elle run — the failure mode is
-      a silently weakened workload, which unit tests do not see.
+      Live-validated against a 3-node cluster: a default `--attack kill --check
+      wgl` run injects a real leader-kill, the cluster fails over node1 → node2,
+      and all three keys check clean in 11.8 s. The refactor is exercised
+      end-to-end, not just by unit tests.
+
+      The live run also surfaced **H-41**, below.
+      _Closes_ Class A1 structurally · _Effort_ M
+
+- [x] **H-41 — Bound WGL on explored states, and report an unchecked key as
+      unchecked.** Found by H-03's live run, so it sits here rather than at the
+      end of the plan. `WGL_OPS_PER_KEY_CAP = 2000` was documented as the bound on
+      WGL's blowup, but it caps op count, which is not the variable WGL's cost
+      depends on. A 45 s / 6-worker / 8-key kill run put ~1,450 ops on every key
+      — every one under the cap — and 22% of them were pending, from the fault
+      window. Measured per-key: 0.3 s, 20.5 s, 11.8 s, and five keys still
+      searching after 30 s.
+
+      Unbounded, that is a hang. The failure mode is the dangerous one: a lucky
+      seed finishes and prints PASS, an unlucky one is killed by the CI timeout
+      and reads as an infra flake. Neither ever says the key went unchecked.
+
+      `WGL_MAX_EXPLORED_STATES = 250_000` now bounds the search, counted in
+      memoized states rather than wall-clock so a verdict is a function of the
+      history alone — a wall-clock deadline would make coverage depend on
+      machine load, which is how an unchecked key starts reading as a pass.
+      Calibrated from that run: the decidable keys needed 8 k, 71 k, and 127 k
+      states.
+
+      `_is_linearizable` returns `bool | None`, `None` meaning unchecked, and the
+      harness reports it as its own `INCONCLUSIVE` verdict with exit 2 — exit 1
+      stays "we found a violation", exit 2 is "we did not look". Replayed
+      against the history that hung: 210 s total, three keys decided, five
+      reported `UNCHECKED` with the op and pending counts and what to shrink.
+
+      The sanity suite's `assert_flagged` asserted `assertFalse(ok)`, which
+      `None` also satisfies — a checker that gave up would have satisfied every
+      flagged case. Both helpers now assert `is False` / `is True`.
+      _Closes_ Class B (unchecked history reported as a pass) · _Effort_ S
       _Blocked by_ H-01 (done) · _Effort_ M
 
 - [ ] **H-04 — Build the 5-node topology.** `five_node_suite.py` is a skeleton

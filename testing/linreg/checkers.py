@@ -10,7 +10,30 @@ from linreg.records import Op
 
 # Bound on the per-key op count WGL searches; a longer per-key history is
 # reduced to one contiguous window of this size (see `_is_linearizable`).
+#
+# This caps memory and sort cost. It is NOT a bound on runtime: WGL's cost is
+# driven by concurrency, not op count. Measured on a 45 s / 6-worker / 8-key
+# kill run (~1,450 ops per key, 22% of them pending), 5 of 8 keys were still
+# searching after 30 s while another finished in 0.3 s -- all far below this
+# cap. `WGL_MAX_EXPLORED_STATES` is the bound that actually binds.
 WGL_OPS_PER_KEY_CAP: Final[int] = 2000
+
+WGL_MAX_EXPLORED_STATES: Final[int] = 250_000
+"""Search states WGL may explore per key before giving up and saying so.
+
+Counted states rather than wall-clock so a verdict is a function of the
+history alone: the same `--seed` replays to the same answer on a loaded
+laptop and on CI. A wall-clock deadline would make coverage depend on
+machine speed, which is how an unchecked key starts reading as a pass.
+
+Calibrated from the run above: keys that were decidable at all landed at
+8 k, 71 k, and 127 k states, so this leaves roughly 2x headroom over the
+worst decidable key while capping an undecidable one near 40 s.
+"""
+
+
+class _SearchExhausted(Exception):
+    """Raised deep in the WGL recursion once the state budget is spent."""
 
 
 def _apply_op_to_register(op: Op, current: int) -> tuple[bool, int]:
@@ -147,8 +170,16 @@ def _is_weakly_consistent(ops: list[Op]) -> tuple[bool, str]:
     return True, f"weakly-consistent ({len(legit_values)} installable values)"
 
 
-def _is_linearizable(ops: list[Op]) -> tuple[bool, str]:
-    """WGL search over `ops` (single-register history). Returns (ok, reason)."""
+def _is_linearizable(
+    ops: list[Op], *, max_states: int = WGL_MAX_EXPLORED_STATES
+) -> tuple[bool | None, str]:
+    """WGL search over `ops` (single-register history). Returns (ok, reason).
+
+    `ok` is True (linearizable), False (no valid total order exists), or None
+    (the search hit `max_states` and the key is simply unchecked). None is not
+    a pass: callers must surface it, because a history nobody could check looks
+    exactly like a history with nothing wrong in it.
+    """
     # Only consider ops that completed OR have at least an invoke timestamp
     # (pending ops are tried both ways via the loop below).
     if not ops:
@@ -191,16 +222,21 @@ def _is_linearizable(ops: list[Op]) -> tuple[bool, str]:
     remaining_init: frozenset[int] = frozenset(op_by_id)
 
     visited: set[tuple[frozenset[int], int]] = set()
+    explored = 0
 
     sys.setrecursionlimit(10_000)
 
     def search(remaining: frozenset[int], reg_val: int) -> bool:
+        nonlocal explored
         if not remaining:
             return True
         state_key = (remaining, reg_val)
         if state_key in visited:
             return False
         visited.add(state_key)
+        explored += 1
+        if explored > max_states:
+            raise _SearchExhausted
         # Minimum return_ts among remaining — only ops invoked at-or-before
         # this are eligible to be linearized next (others must come strictly
         # after by real-time order).
@@ -214,7 +250,14 @@ def _is_linearizable(ops: list[Op]) -> tuple[bool, str]:
                 return True
         return False
 
-    ok = search(remaining_init, initial_value)
+    try:
+        ok = search(remaining_init, initial_value)
+    except _SearchExhausted:
+        return None, (
+            f"UNCHECKED: search exceeded {max_states:,} states on {len(ops_sorted)} ops "
+            f"({sum(1 for o in ops_sorted if o.return_ts is None)} pending). "
+            "Shorten --duration, lower --workers, or use --check weak."
+        )
     if ok:
         return True, "linearizable"
     return False, "no total order satisfies real-time + sequential register semantics"
