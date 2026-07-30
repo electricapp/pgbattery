@@ -174,18 +174,24 @@ write ACK until the write has been flushed to the standby's WAL.
 
 ## Contract-to-Test Index
 
-| Contract                          | Severity | Primary Tests                                                                                           |
-| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| W1                                | FATAL    | `acked-write-durability`, `failover-commit-boundary`, `correctness-lite-invariants` I1/I2               |
-| W2                                | FATAL    | `concurrent-writes-failover`, `rogue-pg-promote`, `correctness-lite-invariants` I3/B3/B4                |
-| W3                                | FATAL    | `ddl-failover`                                                                                          |
-| L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4, `dual-writability-prober` |
-| L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5                          |
-| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`                                                            |
-| Linearizability (single-register) | FATAL    | `linearizability-register`                                                                              |
-| V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                                      |
-| V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                                     |
-| S1                                | FATAL    | `failover-commit-boundary`, `prepared-transaction-semantics`                                            |
-| S2                                | SLO      | `gateway-connection-survival`, `session-semantics-contract`                                             |
-| R1                                | FATAL    | `replication-slot-no-leak`                                                                              |
-| R2                                | FATAL    | `acked-write-durability` (sync path)                                                                    |
+Every FATAL contract carries an **inversion**: a case or test that feeds the
+oracle data it must reject, proving the oracle can fail. An oracle never
+observed failing is indistinguishable from one that cannot, and a suite full of
+those reports PASS on a broken cluster. `lint_matrix.py` enforces that this
+column is non-empty for every FATAL row.
+
+| Contract                          | Severity | Primary Tests                                                                                           | Inversion (proves the oracle can fail)                                                                    |
+| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| W1                                | FATAL    | `acked-write-durability`, `failover-commit-boundary`, `correctness-lite-invariants` I1/I2               | `assert-sanity-acked`, `assert-sanity-acked-dup`, `assert-sanity-chaos-oracle{,-post,-full}`              |
+| W2                                | FATAL    | `concurrent-writes-failover`, `rogue-pg-promote`, `correctness-lite-invariants` I3/B3/B4                | `assert-sanity-concurrent`, `assert-sanity-cascade-atomicity`, unit: `test_duplicate_ledger_row_flags_b3` |
+| W3                                | FATAL    | `ddl-failover`                                                                                          | `assert-sanity-ddl`                                                                                       |
+| L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4, `dual-writability-prober` | unit: `test_two_confirmed_acceptances_is_a_fatal_violation`, `test_split_brain_signal_flags_l2`           |
+| L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5                          | unit: `test_contained_ack_is_fatal_i5`, `test_fence_failure_signal_flags_l2`                              |
+| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`                                                            | unit: `test_emergency_fence_without_confirmation_flags_l3`, LSN-gate proptest                             |
+| Linearizability (single-register) | FATAL    | `linearizability-register`                                                                              | `testing/test_checker_sanity.py` — every `assert_flagged` case                                            |
+| V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                                      | —                                                                                                         |
+| V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                                     | `assert-sanity-diverged`                                                                                  |
+| S1                                | FATAL    | `failover-commit-boundary`, `prepared-transaction-semantics`                                            | `assert-sanity-commit-boundary`                                                                           |
+| S2                                | SLO      | `gateway-connection-survival`, `session-semantics-contract`                                             | `assert-sanity-gateway-migration`                                                                         |
+| R1                                | FATAL    | `replication-slot-no-leak`                                                                              | `assert-sanity-slot-leak`                                                                                 |
+| R2                                | FATAL    | `acked-write-durability` (sync path)                                                                    | `assert-sanity-acked-dup`                                                                                 |

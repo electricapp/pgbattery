@@ -993,11 +993,37 @@ value without the retrofit.
 
 These close the exit criteria and cannot be done early.
 
-- [ ] **H-38 — Pair every FATAL contract oracle with an inversion test** proving
-      that oracle can fail. Partly done: the `assert-sanity-*-bad.sql` cases and
-      the prober's self-falsification are this pattern already.
-      **Done when** every FATAL contract in `docs/CONTRACTS.md` names both its
-      oracle and its inversion case, enforced by `lint_matrix.py`.
+- [x] **H-38 — Pair every FATAL contract oracle with an inversion test.** The
+      Contract-to-Test Index gained an **Inversion** column, and
+      `lint_matrix.py` now fails if any FATAL row leaves it empty. Four
+      contracts had no inversion at all and now do:
+
+      - **W3** — `assert-sanity-ddl` leaves `ci_ddl_atomic` present but without
+        its `PRIMARY KEY`. W3's assertion accepts both "fully committed" and
+        "fully absent", so it passes on an empty database: a `ddl-failover` run
+        whose DDL never executed was indistinguishable from one that survived.
+      - **S1** — `assert-sanity-commit-boundary` duplicates the autocommit row.
+        That assertion is deliberately loose on the txn side (0 or 1 are both
+        legal after an interrupted commit), so the autocommit count is the only
+        thing pinning it down, and nothing had shown that half could fail.
+      - **R1** — `assert-sanity-slot-leak` creates an inactive physical slot.
+        Every slot on a healthy cluster is active, so the assertion passed
+        trivially. Cleanup drops only the slot the case made, never a managed
+        one.
+      - **R2 / W1** — `assert-sanity-acked-dup` seeds exactly 60 rows of which
+        10 are duplicates. `assert-sanity-acked` seeds 5 and returns on
+        `total_rows <> 60`, so the **duplicate branch had never executed** —
+        the at-most-once half of that assertion, and the half R2's sync path
+        leans on, was unproven. Hitting the count exactly is what forces
+        execution past the first branch.
+
+      The check refuses to pass on a document it could not parse, so a table
+      that moves or gets reformatted fails loudly instead of retiring the whole
+      thing; a unit test asserts the real doc yields at least eight FATAL rows
+      so the parser cannot silently match nothing.
+
+      Live-gated: all 12 `ha-assert-sanity` cases pass, meaning each of the four
+      new inversions was observed making its oracle raise.
       _Closes_ exit criterion 1 · _Effort_ M
 
 - [ ] **H-39 — Audit the risk-window register.** Every RW-1…RW-12 must be covered

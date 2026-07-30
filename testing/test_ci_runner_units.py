@@ -974,6 +974,71 @@ def test_real_matrix_still_parses() -> None:
 
 
 # ---------------------------------------------------------------------------
+# FATAL contracts declare an inversion
+# ---------------------------------------------------------------------------
+
+CONTRACT_INDEX_SAMPLE = """
+## Contract-to-Test Index
+
+| Contract | Severity | Primary Tests | Inversion |
+| -------- | -------- | ------------- | --------- |
+| W1       | FATAL    | `a-case`      | `a-bad`   |
+| V1       | SLO      | `b-case`      | —         |
+"""
+
+
+def test_contract_index_parses_only_the_index_table() -> None:
+    """A prose table elsewhere in the doc must not read as a coverage claim."""
+    noise = "| not | a | coverage | table |\n" + CONTRACT_INDEX_SAMPLE
+    rows = lint_matrix.parse_contract_index(noise)
+    assert [r[0] for r in rows] == ["W1", "V1"]
+
+
+def test_real_contracts_doc_has_fatal_rows() -> None:
+    """Guards the parser against silently matching nothing, which would make
+    the check below pass on any document at all."""
+    rows = lint_matrix.parse_contract_index(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    fatal = [r for r in rows if len(r) > 1 and r[1] == "FATAL"]
+    assert len(fatal) >= 8, f"only {len(fatal)} FATAL rows parsed from the real doc"
+
+
+def _check_index(markdown: str, tmp: Path) -> None:
+    """Run the inversion check against `markdown` instead of the real doc."""
+    doc = tmp / "CONTRACTS.md"
+    doc.write_text(markdown, encoding="utf-8")
+    original = lint_matrix.CONTRACTS_PATH
+    lint_matrix.CONTRACTS_PATH = doc
+    try:
+        lint_matrix.check_fatal_contracts_have_inversions()
+    finally:
+        lint_matrix.CONTRACTS_PATH = original
+
+
+def test_inversion_check_accepts_a_complete_table() -> None:
+    _check_index(CONTRACT_INDEX_SAMPLE, Path(tempfile.mkdtemp(prefix="contracts-ok-")))
+
+
+def test_inversion_check_rejects_a_fatal_row_without_one() -> None:
+    """The check exists to catch exactly this, so it has to be seen catching it."""
+    stripped = CONTRACT_INDEX_SAMPLE.replace("| `a-bad`   |", "| —         |")
+    assert_raises(
+        AssertionError,
+        lambda: _check_index(stripped, Path(tempfile.mkdtemp(prefix="contracts-bad-"))),
+        "W1 is FATAL with no inversion",
+    )
+
+
+def test_inversion_check_refuses_to_pass_on_an_unparseable_doc() -> None:
+    """Silence from the parser must be an error, not a pass: a table that moved
+    or got reformatted would otherwise retire the whole check."""
+    assert_raises(
+        AssertionError,
+        lambda: _check_index("# nothing here\n", Path(tempfile.mkdtemp(prefix="contracts-empty-"))),
+        "not found or unparseable",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Leadership resolution across nodes
 # ---------------------------------------------------------------------------
 

@@ -369,6 +369,62 @@ def count_raw_fault_verbs(source: str) -> list[int]:
     )
 
 
+CONTRACT_INDEX_ROW: Final[re.Pattern[str]] = re.compile(r"^\|(?P<cells>.+)\|\s*$")
+
+
+def parse_contract_index(markdown: str) -> list[list[str]]:
+    """Rows of the Contract-to-Test Index, cells stripped.
+
+    Header and separator rows are dropped, as is anything before the index
+    heading, so prose tables elsewhere in the document cannot be mistaken for
+    coverage declarations.
+    """
+    rows: list[list[str]] = []
+    _, _, tail = markdown.partition("## Contract-to-Test Index")
+    for line in tail.splitlines():
+        match = CONTRACT_INDEX_ROW.match(line.strip())
+        if match is None:
+            if rows:
+                break  # table ended
+            continue
+        cells = [cell.strip() for cell in match.group("cells").split("|")]
+        if all(set(cell) <= {"-", ":"} for cell in cells if cell):
+            continue  # separator
+        rows.append(cells)
+    return rows[1:] if rows else []
+
+
+def check_fatal_contracts_have_inversions() -> None:
+    """Every FATAL contract must name a case proving its oracle can fail.
+
+    A test that has only ever passed cannot be told apart from one that cannot
+    fail, and a suite of those reports PASS on a broken cluster. This is the
+    single check standing between the contract index and that failure mode, so
+    it also verifies the table was found at all rather than passing vacuously
+    on a parse miss.
+    """
+    rows = parse_contract_index(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    if not rows:
+        raise AssertionError("Contract-to-Test Index not found or unparseable")
+
+    problems: list[str] = []
+    fatal_seen = 0
+    for cells in rows:
+        if len(cells) < 4:
+            problems.append(f"row has {len(cells)} columns, expected 4: {cells[:1]}")
+            continue
+        contract, severity, _tests, inversion = cells[0], cells[1], cells[2], cells[3]
+        if severity != "FATAL":
+            continue
+        fatal_seen += 1
+        if not inversion or inversion == "—":
+            problems.append(f"{contract} is FATAL with no inversion")
+    if fatal_seen == 0:
+        raise AssertionError("no FATAL rows parsed; the check would pass vacuously")
+    if problems:
+        raise AssertionError("; ".join(problems))
+
+
 def check_fault_injection_confined() -> None:
     """Keep direct fault injection confined to the modules already tracked for it.
 
@@ -424,6 +480,7 @@ def lint() -> None:
     check("CONTRACTS.md defines contract IDs", check_contracts_doc)
     check("Cases reference real contract IDs", check_case_contract_refs)
     check("Fault injection confined to tracked modules", check_fault_injection_confined)
+    check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")
