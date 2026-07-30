@@ -30,6 +30,7 @@ from unittest import mock
 from fault_primitives import (
     DEFAULT_COMPOSE_PROJECT,
     Aim,
+    Channel,
     CommandResult,
     Direction,
     DiskUsage,
@@ -64,11 +65,14 @@ from fault_primitives import (
     parse_curl_seconds,
     parse_df,
     parse_netem,
+    parse_port_drop_packets,
+    parse_port_drop_rule,
     parse_ps,
     parse_rust_duration_const_ms,
     parse_rust_u64_const,
     parse_size_literal,
     parse_tc_filters,
+    partition_channel,
     partition_lossy,
     ps_cmd,
     read_system_timings,
@@ -1424,6 +1428,186 @@ class NetworkDetachedTests(unittest.TestCase):
         self.addCleanup(set_command_runner, previous)
         with self.assertRaises(FaultPreconditionError):
             container_id("node1")
+
+
+IPTABLES_PORT_DROP = """\
+-P INPUT ACCEPT
+-A INPUT -s 172.28.0.12/32 -p tcp -m tcp --dport 5434 -j DROP
+--- counters ---
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target prot opt in out source        destination
+   17  1020 DROP   tcp  --  *  *   172.28.0.12   0.0.0.0/0    tcp dpt:5434
+"""
+
+IPTABLES_PORT_DROP_COLD = IPTABLES_PORT_DROP.replace("   17  1020 DROP", "    0     0 DROP")
+
+IPTABLES_EMPTY_CHAIN = """\
+-P INPUT ACCEPT
+--- counters ---
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target prot opt in out source destination
+"""
+
+
+class ChannelTests(unittest.TestCase):
+    def test_each_channel_maps_to_its_port(self) -> None:
+        self.assertEqual(Channel.RAFT.port, 5433)
+        self.assertEqual(Channel.REPLICATION.port, 5434)
+        self.assertEqual(Channel.GATEWAY.port, 5432)
+        self.assertEqual(Channel.MANAGEMENT.port, 9091)
+
+    def test_channels_are_distinct_ports(self) -> None:
+        """Two channels sharing a port would make a gray split unexpressible."""
+        ports = [c.port for c in Channel]
+        self.assertEqual(len(ports), len(set(ports)))
+
+
+class PortDropParsingTests(unittest.TestCase):
+    def test_rule_present_is_detected(self) -> None:
+        self.assertTrue(parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.12", 5434))
+
+    def test_rule_for_another_port_does_not_match(self) -> None:
+        """The whole point is severing one protocol; matching the wrong port
+        would report a replication cut that never happened."""
+        self.assertFalse(parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.12", 5433))
+
+    def test_rule_for_another_peer_does_not_match(self) -> None:
+        self.assertFalse(parse_port_drop_rule(IPTABLES_PORT_DROP, "172.28.0.13", 5434))
+
+    def test_empty_chain_has_no_rule(self) -> None:
+        self.assertFalse(parse_port_drop_rule(IPTABLES_EMPTY_CHAIN, "172.28.0.12", 5434))
+
+    def test_packet_counter_is_read(self) -> None:
+        self.assertEqual(parse_port_drop_packets(IPTABLES_PORT_DROP, "172.28.0.12", 5434), 17)
+
+    def test_cold_rule_reports_zero(self) -> None:
+        self.assertEqual(parse_port_drop_packets(IPTABLES_PORT_DROP_COLD, "172.28.0.12", 5434), 0)
+
+    def test_counter_for_another_port_is_zero(self) -> None:
+        self.assertEqual(parse_port_drop_packets(IPTABLES_PORT_DROP, "172.28.0.12", 5433), 0)
+
+
+class PortDropRunner:
+    """Renders iptables output from the rules actually installed via -I / -D.
+
+    A static transcript cannot express "installed, then removed", which is
+    exactly what the heal verification checks.
+    """
+
+    def __init__(self, *, packets: int = 17) -> None:
+        self.rules: set[tuple[str, int]] = set()
+        self.packets = packets
+        self.calls: list[str] = []
+        self.insert_result: CommandResult | None = None
+        self.refuse_delete = False
+
+    @staticmethod
+    def _parse(cmd: str) -> tuple[str, int]:
+        match = re.search(r"-s (\S+) --dport (\d+)", cmd)
+        assert match is not None, cmd
+        return match.group(1), int(match.group(2))
+
+    def _render(self) -> str:
+        lines = ["-P INPUT ACCEPT"]
+        lines += [
+            f"-A INPUT -s {ip}/32 -p tcp -m tcp --dport {port} -j DROP"
+            for ip, port in sorted(self.rules)
+        ]
+        lines += ["--- counters ---", "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)"]
+        lines += [" pkts bytes target prot opt in out source destination"]
+        lines += [
+            f"   {self.packets}  1020 DROP tcp -- * * {ip} 0.0.0.0/0 tcp dpt:{port}"
+            for ip, port in sorted(self.rules)
+        ]
+        return "\n".join(lines) + "\n"
+
+    def __call__(self, cmd: str, timeout_s: float) -> CommandResult:
+        self.calls.append(cmd)
+        if "iptables -I INPUT" in cmd:
+            if self.insert_result is not None:
+                return self.insert_result
+            self.rules.add(self._parse(cmd))
+        elif "iptables -D INPUT" in cmd:
+            if self.refuse_delete:
+                return CommandResult(1, "", "iptables: Bad rule")
+            self.rules.discard(self._parse(cmd))
+        elif "iptables -S" in cmd:
+            return CommandResult(0, self._render(), "")
+        return CommandResult(0, "", "")
+
+    def matching(self, needle: str) -> list[str]:
+        return [c for c in self.calls if needle in c]
+
+
+class PartitionChannelTests(unittest.TestCase):
+    def install(self, runner: PortDropRunner) -> PortDropRunner:
+        previous = set_command_runner(runner)
+        self.addCleanup(set_command_runner, previous)
+        self.events: list[dict[str, object]] = []
+        previous_sink = set_event_sink(self.events.append)
+        self.addCleanup(set_event_sink, previous_sink)
+        return runner
+
+    def test_severs_only_the_named_channel(self) -> None:
+        runner = self.install(PortDropRunner())
+        with partition_channel("node1", ["node2"], Channel.REPLICATION, settle_s=0.0) as handle:
+            self.assertEqual(handle.port, 5434)
+            self.assertEqual(handle.dropped_packets, 17)
+        inserts = runner.matching("iptables -I INPUT")
+        self.assertEqual(len(inserts), 1)
+        self.assertIn("--dport 5434", inserts[0])
+        # Raft must be left alone, or this is just a full partition.
+        self.assertNotIn("--dport 5433", inserts[0])
+
+    def test_heals_every_rule_it_installed(self) -> None:
+        runner = self.install(PortDropRunner())
+        with partition_channel("node1", ["node2", "node3"], Channel.RAFT, settle_s=0.0):
+            self.assertEqual(len(runner.rules), 2)
+        self.assertEqual(len(runner.matching("iptables -D INPUT")), 2)
+        self.assertEqual(runner.rules, set())
+
+    def test_rule_that_matched_nothing_is_a_failure(self) -> None:
+        """The Class A1 shape: the rule is installed, and partitions nothing."""
+        self.install(PortDropRunner(packets=0))
+        with (
+            self.assertRaises(FaultEffectNotObserved),
+            partition_channel("node1", ["node2"], Channel.REPLICATION, settle_s=0.0),
+        ):
+            pass
+
+    def test_failed_insert_raises(self) -> None:
+        runner = self.install(PortDropRunner())
+        runner.insert_result = CommandResult(1, "", "iptables: Permission denied")
+        with (
+            self.assertRaises(FaultInjectionError),
+            partition_channel("node1", ["node2"], Channel.REPLICATION, settle_s=0.0),
+        ):
+            pass
+
+    def test_rule_surviving_the_heal_raises(self) -> None:
+        """A DROP left behind poisons every later case in the run."""
+        runner = self.install(PortDropRunner())
+        with (
+            self.assertRaises(FaultEffectNotObserved),
+            partition_channel("node1", ["node2"], Channel.REPLICATION, settle_s=0.0),
+        ):
+            runner.refuse_delete = True
+
+    def test_require_traffic_can_be_waived(self) -> None:
+        """Only for channels with no steady traffic to wait for."""
+        self.install(PortDropRunner(packets=0))
+        with partition_channel(
+            "node1", ["node2"], Channel.GATEWAY, require_traffic=False, settle_s=0.0
+        ) as handle:
+            self.assertEqual(handle.dropped_packets, 0)
+
+    def test_emits_inject_and_heal_events(self) -> None:
+        self.install(PortDropRunner())
+        with partition_channel("node1", ["node2"], Channel.RAFT, settle_s=0.0):
+            pass
+        kinds = [(e.get("event"), e.get("primitive")) for e in self.events]
+        self.assertIn(("inject", "partition_channel"), kinds)
+        self.assertIn(("heal", "partition_channel"), kinds)
 
 
 class ContainerNetworksCmdTests(unittest.TestCase):

@@ -211,6 +211,12 @@ unreachable). ``pgbattery_has_lease`` is per-node and cannot lie about a node
 other than itself."""
 
 MGMT_INTERNAL_PORT: Final[int] = 9091
+
+RAFT_PORT: Final[int] = 5433
+"""Raft consensus traffic between peers."""
+
+GATEWAY_PORT: Final[int] = 5432
+"""Client-facing gateway port."""
 """In-container management API port — the probe target for reachability."""
 
 LEASE_METRIC: Final[str] = "pgbattery_has_lease"
@@ -831,6 +837,72 @@ def egress_drop_cmds(dst_ip: str, *, dev: str = NET_DEVICE) -> list[str]:
         f"tc filter add dev {dev} protocol ip parent 1: prio 1 "
         f"u32 match ip dst {dst_ip}/32 flowid 1:1",
     ]
+
+
+class Channel(StrEnum):
+    """A destination port class, so a partition can sever one protocol.
+
+    Every existing partition is per-peer-IP, which takes down all five ports at
+    once. The interesting failures are the gray splits: Raft healthy while
+    streaming replication is dead (the leader keeps its lease and its quorum but
+    cannot ship WAL), or the inverse (replication flowing while consensus is
+    blind).
+    """
+
+    RAFT = "raft"
+    REPLICATION = "replication"
+    GATEWAY = "gateway"
+    MANAGEMENT = "management"
+
+    @property
+    def port(self) -> int:
+        return {
+            Channel.RAFT: RAFT_PORT,
+            Channel.REPLICATION: PG_INTERNAL_PORT,
+            Channel.GATEWAY: GATEWAY_PORT,
+            Channel.MANAGEMENT: MGMT_INTERNAL_PORT,
+        }[self]
+
+
+def iptables_port_drop_cmd(peer_ip: str, port: int, *, insert: bool) -> str:
+    """Add or remove an INPUT DROP for `peer_ip` traffic to `port`."""
+    action = "-I" if insert else "-D"
+    return f"iptables {action} INPUT -p tcp -s {peer_ip} --dport {port} -j DROP"
+
+
+def iptables_rules_cmd() -> str:
+    """Dump INPUT rules plus their packet counters in one exec."""
+    return "iptables -S INPUT; echo '--- counters ---'; iptables -L INPUT -n -v"
+
+
+def parse_port_drop_rule(text: str, peer_ip: str, port: int) -> bool:
+    """Whether `iptables -S` output carries a DROP for `peer_ip` to `port`.
+
+    Tolerates the ``/32`` iptables appends when printing rules back, and the
+    counter dump appended by `iptables_rules_cmd`.
+    """
+    pattern = re.compile(
+        rf"^-A\s+INPUT\s+.*-s\s+{re.escape(peer_ip)}(?:/\d+)?\s+.*"
+        rf"--dport\s+{port}\b.*-j\s+DROP\b"
+    )
+    return any(pattern.match(line.strip()) for line in text.splitlines())
+
+
+def parse_port_drop_packets(text: str, peer_ip: str, port: int) -> int:
+    """Packets matched by the port DROP rule, from ``iptables -L -n -v`` output.
+
+    Zero means the rule exists but nothing hit it, which is indistinguishable
+    from no partition at all for anything downstream.
+    """
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or "DROP" not in line or peer_ip not in line:
+            continue
+        if f"dpt:{port}" not in line:
+            continue
+        with suppress(ValueError):
+            return int(fields[0])
+    return 0
 
 
 def faketime_offset_literal(offset_ms: int) -> str:
@@ -1487,6 +1559,17 @@ class Aim(StrEnum):
 
 
 @dataclass(frozen=True)
+class ChannelPartitionHandle:
+    """Live state of a :func:`partition_channel` window."""
+
+    container: str
+    peers: tuple[str, ...]
+    channel: Channel
+    port: int
+    dropped_packets: int
+
+
+@dataclass(frozen=True)
 class NetworkDetachHandle:
     """Live state of a :func:`network_detached` window."""
 
@@ -1593,6 +1676,83 @@ class DiskFullHandle:
 # ─────────────────────────────────────────────────────────────────────────────
 # Primitives
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def partition_channel(
+    container: str,
+    peers: Sequence[str],
+    channel: Channel,
+    *,
+    require_traffic: bool = True,
+    settle_s: float = 2.0,
+) -> Iterator[ChannelPartitionHandle]:
+    """Drop inbound traffic to one protocol port from `peers`, leaving the rest.
+
+    Expresses the gray split that per-peer-IP partitions cannot: kill streaming
+    replication while Raft stays healthy, or the reverse.
+
+    `require_traffic` fails the window if no packet ever hit the rule. A rule
+    that exists but matched nothing partitions nothing, and the case around it
+    would still pass.
+    """
+    peer_ips = [_resolve_ip(p) for p in peers]
+    port = channel.port
+    _emit("inject", "partition_channel", container, {"channel": str(channel), "peers": peers})
+
+    installed: list[str] = []
+    try:
+        for ip in peer_ips:
+            result = exec_in(container, iptables_port_drop_cmd(ip, port, insert=True))
+            if not result.ok:
+                raise FaultInjectionError(
+                    f"could not drop {channel} traffic from {ip} at {container}: "
+                    f"{result.output.strip()}"
+                )
+            installed.append(ip)
+
+        rules = exec_in(container, iptables_rules_cmd()).output
+        for ip in peer_ips:
+            if not parse_port_drop_rule(rules, ip, port):
+                raise FaultEffectNotObserved(
+                    f"{container}: no DROP rule for {ip} port {port} after insert"
+                )
+
+        # Raft heartbeats and WAL streaming are continuous, so a live rule starts
+        # counting within a tick or two; no synthetic traffic needed.
+        matched = 0
+        if require_traffic:
+            time.sleep(settle_s)
+            counters = exec_in(container, iptables_rules_cmd()).output
+            matched = sum(parse_port_drop_packets(counters, ip, port) for ip in peer_ips)
+            if matched == 0:
+                raise FaultEffectNotObserved(
+                    f"{container}: {channel} DROP rules matched no packets in "
+                    f"{settle_s}s; nothing was partitioned"
+                )
+
+        yield ChannelPartitionHandle(
+            container=container,
+            peers=tuple(peers),
+            channel=channel,
+            port=port,
+            dropped_packets=matched,
+        )
+    finally:
+        heal_failures: list[str] = []
+        for ip in installed:
+            result = exec_in(container, iptables_port_drop_cmd(ip, port, insert=False))
+            if not result.ok:
+                heal_failures.append(f"{ip}: {result.output.strip()}")
+        residue = exec_in(container, iptables_rules_cmd()).output
+        for ip in installed:
+            if parse_port_drop_rule(residue, ip, port):
+                heal_failures.append(f"{ip}: DROP rule survived removal")
+        _emit("heal", "partition_channel", container, {"channel": str(channel)})
+        if heal_failures:
+            raise FaultEffectNotObserved(
+                f"{container}: {channel} partition did not heal — " + "; ".join(heal_failures)
+            )
 
 
 @contextmanager

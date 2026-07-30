@@ -447,12 +447,15 @@ Nothing else in Wave 1 is safe or cheap until these land.
 
 No new infrastructure. Highest confidence per unit of effort.
 
-- [ ] **H-05 — Port-granular partitions.** All current rules are per-peer-IP, so
-      the classic gray split — Raft heartbeats healthy while PostgreSQL streaming
-      is dead, or the inverse — cannot be expressed. Partition by destination
-      port: Raft/management vs replication vs gateway.
-      **Done when** a case severs replication while leaving Raft intact and
-      asserts the leader notices, plus the inverse.
+- [ ] **H-05 — Port-granular partitions.** Primitive done, cases remain.
+      `partition_channel(container, peers, Channel.RAFT|REPLICATION|GATEWAY|
+    MANAGEMENT)` drops inbound traffic to one protocol port with iptables,
+      leaving the others up. It verifies the rule is present _and_ that packets
+      actually hit it — a rule matching nothing partitions nothing — and fails if
+      a DROP survives the heal. 15 tests, cluster-free.
+      **Remaining:** matrix cases that sever replication while Raft stays healthy
+      and assert the leader notices, plus the inverse, and a live run to confirm
+      the counters tick within the settle window on a real cluster.
       _Closes_ RW-6, RW-11 reachability · _Blocked by_ H-02 · _Effort_ M
 
 - [ ] **H-06 — Partition shapes beyond node-vs-rest.** Majority-side isolation
