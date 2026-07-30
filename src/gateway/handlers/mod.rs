@@ -3720,7 +3720,7 @@ mod tests {
             Some("COMMITTED"),
             Some(" committed"),
             Some("committed "),
-            Some("commited"),
+            Some("commit"),
             Some(""),
             Some("unknown"),
             None,
