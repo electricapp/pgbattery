@@ -449,7 +449,7 @@ No new infrastructure. Highest confidence per unit of effort.
 
 - [ ] **H-05 — Port-granular partitions.** Primitive done, cases remain.
       `partition_channel(container, peers, Channel.RAFT|REPLICATION|GATEWAY|
-    MANAGEMENT)` drops inbound traffic to one protocol port with iptables,
+  MANAGEMENT)` drops inbound traffic to one protocol port with iptables,
       leaving the others up. It verifies the rule is present _and_ that packets
       actually hit it — a rule matching nothing partitions nothing — and fails if
       a DROP survives the heal. 15 tests, cluster-free.
@@ -503,6 +503,23 @@ No new infrastructure. Highest confidence per unit of effort.
       and assert the stale node cannot win.
       **Done when** the assertion is that a stale node _loses_, and it is shown to
       fail if the staleness gate is disabled.
+
+      Read the code before writing that test: it will not pass, and the reason is
+      a design decision rather than a missing assertion.
+      `evaluate_lsn_acceptable` returns permissive the moment *no* node has a
+      fresh LSN report — "bootstrap: no fresh cluster LSN data" — justified in
+      comment by "Raft log-matching protects us". That justification does not
+      cover RW-7's scenario, which keeps the Raft directory intact: log matching
+      sees a current log and has no view of how old the PostgreSQL data under it
+      is. `test_lsn_acceptable_leaderless_window_bootstrap_fallback` already pins
+      the permissive behaviour, for a good reason — the alternative was election
+      livelock after a long leaderless window.
+
+      So this is a real fork, not a test gap: either add a tiebreak that compares
+      even aged LSN reports when nothing fresh exists (safety, at some liveness
+      cost), or move RW-7 to Accepted risks and say plainly that a node restored
+      from an old basebackup with its Raft state intact can win an election. It
+      needs a decision before it needs a test.
       _Closes_ RW-7 · _Effort_ M
 
 - [ ] **H-12 — Harden `overnight_test.py`.** It addresses docker objects literally
