@@ -3806,6 +3806,36 @@ mod tests {
         ));
     }
 
+    /// H-23 decided not to flip the `_ => Unmodeled` fallback, and the argument
+    /// rests entirely on this: a plain `SELECT` is classified by its own arm, so
+    /// `SELECT my_func()` never reaches the fallback and flipping it could not
+    /// close the function-body hole. If a refactor ever routes `SelectStmt`
+    /// through the fallback, that argument silently stops holding.
+    #[test]
+    fn select_is_classified_by_its_own_arm_not_the_fallback() {
+        for query in [
+            "SELECT my_func()",
+            "SELECT id FROM readings WHERE id = 1",
+            "SELECT 1",
+        ] {
+            let parsed = pg_query::parse(query).unwrap();
+            let protobuf = parsed.protobuf;
+            let node = protobuf
+                .stmts
+                .first()
+                .and_then(|s| s.stmt.as_ref())
+                .and_then(|s| s.node.as_ref())
+                .unwrap();
+            assert!(
+                !matches!(
+                    ConnectionHandler::classify_statement(node),
+                    StatementClass::Unmodeled
+                ),
+                "{query:?} reached the Unmodeled fallback; H-23's reasoning no longer holds"
+            );
+        }
+    }
+
     /// `CALL` runs a procedure body the analyzer cannot see: it lives in the
     /// catalog, not the parse tree. Unlike `LOAD`, severing has a real cost for
     /// stored-procedure-heavy workloads, so the polarity is deliberate.

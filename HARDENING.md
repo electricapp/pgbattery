@@ -342,6 +342,14 @@ changes.
   and can disrupt a healthy leader. `CheckQuorum` is the only guard. The
   flap-partition nemesis exists but is checked for convergence, not for
   disruption cost.
+- **A function body that leaves session state is migrated.** `SELECT my_func()`
+  parses to a `SelectStmt`, which has its own `classify_statement` arm, so a
+  function that creates a temp table or takes a session advisory lock is
+  classified migratable and the gateway will move the connection. Closing this
+  needs catalog introspection of the target function on the hot read path, which
+  is the one place the design deliberately keeps off `libpg_query`. Note this is
+  _not_ reachable by changing the `_ => Unmodeled` fallback polarity: a
+  `SelectStmt` never reaches that arm (see H-23).
 
 ## Exit criteria
 
@@ -815,14 +823,28 @@ The durable fix for a bug class that has already produced one real defect.
       the over-match that would have made this genuinely expensive.
       _Effort_ S
 
-- [ ] **H-23 — Revisit the fallback polarity with production data in hand.** Do
-      not flip it wholesale: the ratchet is one-way for the connection's lifetime
-      and poolers hold connections for hours, so one early `ALTER TABLE` or
-      `VACUUM` would permanently disqualify a pooled session. It also would not
-      close the deepest hole — `SELECT my_func()` is a `SelectStmt` and a function
-      body can create a temp table or take a session lock.
-      **Gated on** H-21 data. Outcome may legitimately be "no change, documented".
-      _Blocked by_ H-21 · _Effort_ M
+- [x] **H-23 — Fallback polarity: no change, and the reason is now verified in
+      code rather than argued.** The outcome this task allowed for.
+
+      The decisive point is structural, not empirical, so it does not wait on
+      production data: `SELECT my_func()` parses to a `SelectStmt`, which has its
+      own `classify_statement` arm and is therefore `Modeled`. It **never reaches
+      `_ => StatementClass::Unmodeled`**. Flipping the fallback to
+      non-migratable would pay the full cost — a one-way ratchet for the
+      connection's lifetime, so one early `ALTER TABLE` or `VACUUM` permanently
+      disqualifies a session a pooler then holds for hours — and would not touch
+      the deepest hole, because the deepest hole is not in that branch.
+
+      The function-body hole is now in Accepted risks with what closing it would
+      actually take: catalog introspection of the target function on the hot read
+      path, which is the one place the design deliberately keeps off
+      `libpg_query`.
+
+      `pgbattery_gateway_unmodeled_statements_total{node_type}` (H-21) remains
+      the right instrument, and its value is unchanged by this: it tells us which
+      node types are actually hit in production, which is how a *specific* arm
+      gets prioritised. That is a better use of the data than a wholesale flip.
+      _Effort_ M
 
 ### Wave 3 — Prove durability (Tier 3)
 
