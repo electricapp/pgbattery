@@ -115,6 +115,10 @@ pub struct ReplicationManager {
     /// the async-fallback decision is suppressed; see
     /// [`Self::plan_sync_replication`].
     leader_since: Option<Instant>,
+    /// The clock every timing decision here reads. The async-fallback gate
+    /// changes the durability guarantee, so it must expire on the same clock
+    /// the lease does rather than on an independent `Instant::now()`.
+    lease: crate::governor::SharedLeaseState,
 }
 
 impl std::fmt::Debug for ReplicationManager {
@@ -138,9 +142,11 @@ impl ReplicationManager {
         raft: Arc<openraft::Raft<TypeConfig>>,
         shutdown_rx: watch::Receiver<bool>,
         disconnect_timeout_ms: u64,
+        lease: crate::governor::SharedLeaseState,
     ) -> Self {
         Self {
             node_id,
+            lease,
             postgres,
             cluster_state,
             raft,
@@ -213,7 +219,7 @@ impl ReplicationManager {
                     // suppresses the async fallback while followers are
                     // still re-pointing at this node.
                     if self.leader_since.is_none() {
-                        self.leader_since = Some(Instant::now());
+                        self.leader_since = Some(self.lease.read().now());
                     }
 
                     if let Err(e) = self.check_and_update_sync_standbys().await {
@@ -232,9 +238,10 @@ impl ReplicationManager {
         let (all_voter_names, healthy_voter_count, repl_stats) =
             self.refresh_replica_health_and_metrics().await?;
         let has_quorum = self.has_raft_quorum();
+        let now = self.lease.read().now();
         let in_leader_grace = self
             .leader_since
-            .is_some_and(|since| since.elapsed() < self.disconnect_timeout);
+            .is_some_and(|since| now.duration_since(since) < self.disconnect_timeout);
         let (new_sync_names, async_fallback) = Self::plan_sync_replication(
             &all_voter_names,
             healthy_voter_count,
@@ -288,7 +295,7 @@ impl ReplicationManager {
     }
 
     async fn ensure_replication_slots_if_due(&mut self) {
-        let now = Instant::now();
+        let now = self.lease.read().now();
         let should_ensure_slots = match self.last_slot_ensure {
             Some(last) => now.duration_since(last) >= self.slot_ensure_interval,
             None => true,
@@ -306,7 +313,7 @@ impl ReplicationManager {
         &self,
     ) -> Result<(Vec<String>, usize, Vec<ReplicationStat>)> {
         let repl_stats = self.postgres.lock().await.get_replication_stats().await?;
-        let now = Instant::now();
+        let now = self.lease.read().now();
         let known_node_ids: HashSet<NodeId> = {
             let cluster = self.cluster_state.read();
             cluster.nodes.keys().copied().collect()

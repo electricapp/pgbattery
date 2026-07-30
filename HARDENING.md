@@ -922,9 +922,37 @@ the repo.
       behaviour change to the real path.
       _Blocks_ H-31 · _Effort_ L
 
-- [ ] **H-30 — Inject the clock everywhere**, not in the lease alone.
-      **Done when** no safety decision reads `Instant::now()` or `SystemTime::now()`
-      directly, enforced by a lint.
+- [x] **H-30 — Inject the clock everywhere**, not in the lease alone. Every time
+      comparison that gates write authority now reads `lease.read().now()`, and
+      `testing/lint_clock_injection.py` fails the build if one stops.
+
+      Four modules are guarded: `lease.rs` (expiry), `raft.rs` (metrics-watchdog
+      fence, leaderless-recovery threshold and cooldown),
+      `replication_manager.rs` (async-fallback grace — the gate that changes the
+      durability guarantee), and `app.rs` (promotion hold-down). The lease was
+      already the one injectable clock and already exposed `now()` for exactly
+      this reason; the work was routing the rest through it, which meant giving
+      the replication manager and the supervisor loop the `SharedLeaseState`
+      they lacked.
+
+      **The lint earned its place immediately.** The first pass converted every
+      `Instant::now()` and looked complete; the lint then found seven surviving
+      reads, five of them `.elapsed()`. That call is implicitly
+      `Instant::now() - self`, so a value *stamped* from a `ManualClock` and then
+      read with `.elapsed()` still consults the real clock — a half-conversion
+      that type-checks, passes tests, and silently defeats the whole exercise.
+      Two of the five were the watchdog-fence gate and the leaderless-recovery
+      threshold.
+
+      `state_machine.rs` is deliberately not guarded: LSN staleness rides in
+      replicated Raft state and snapshots, where a monotonic `Instant` is
+      meaningless across processes. That is the documented wall-clock exception.
+
+      Non-safety reads inside a guarded module (a rate-limiter window, a
+      histogram sample) carry a `// clock-lint: allow — <reason>` marker at the
+      line rather than living in a registry, so the justification is reviewed
+      with the code that depends on it. The lint's own inversions are checked:
+      it flags a gate, respects a marker, and ignores `mod tests`.
       _Blocks_ H-31 · _Effort_ M
 
 - [ ] **H-31 — Run the governor and `app.rs` orchestration under `madsim`** with a

@@ -120,6 +120,20 @@ struct RuntimeChannels {
     fence_rx: watch::Receiver<FenceState>,
 }
 
+/// Everything the supervisor loop needs. A struct rather than eight positional
+/// arguments, matching `DataNodeSpawnInputs`.
+struct SupervisorLoopInputs {
+    leader_rx: watch::Receiver<Option<SocketAddr>>,
+    shutdown_rx: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
+    postgres: Arc<tokio::sync::Mutex<Supervisor>>,
+    raft_client: Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+    cluster_state: Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+    /// The clock every safety decision in this loop reads, so the promotion
+    /// hold-down and the lease expiry cannot disagree.
+    lease: crate::governor::SharedLeaseState,
+}
+
 struct DataNodeSpawnInputs {
     governor: Governor,
     raft: Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
@@ -526,6 +540,7 @@ impl App {
             raft.clone(),
             shutdown_rx.clone(),
             self.config.replica_disconnect_timeout_ms,
+            lease_state.clone(),
         );
         let supervisor_shutdown_rx = shutdown_rx.clone();
         let management_shutdown_rx = shutdown_rx.clone();
@@ -553,14 +568,15 @@ impl App {
         Ok(DataNodeTaskHandles {
             governor: Self::spawn_logging_errors("Governor", async move { governor.run().await }),
             gateway: Self::spawn_logging_errors("Gateway", async move { gateway.run().await }),
-            supervisor: self.spawn_supervisor_loop(
+            supervisor: self.spawn_supervisor_loop(SupervisorLoopInputs {
                 leader_rx,
-                supervisor_shutdown_rx,
+                shutdown_rx: supervisor_shutdown_rx,
                 shutdown_tx,
-                postgres_manager.clone(),
-                raft,
+                postgres: postgres_manager.clone(),
+                raft_client: raft,
                 cluster_state,
-            ),
+                lease: lease_state.clone(),
+            }),
             rpc: Self::spawn_logging_errors(
                 "Raft RPC server",
                 async move { rpc_server.run().await },
@@ -705,6 +721,8 @@ impl App {
             transfer_lock: tokio::sync::Mutex::new(()),
             membership_lock: tokio::sync::Mutex::new(()),
             backup_lock: tokio::sync::Mutex::new(()),
+            // clock-lint: allow — brute-force rate-limit window, decides nothing
+            // about write authority.
             auth_failures: parking_lot::Mutex::new((Instant::now(), 0)),
         })
     }
@@ -788,15 +806,16 @@ impl App {
     }
 
     /// Spawn the supervisor event loop.
-    fn spawn_supervisor_loop(
-        &self,
-        mut leader_rx: watch::Receiver<Option<SocketAddr>>,
-        mut shutdown_rx: watch::Receiver<bool>,
-        shutdown_tx: watch::Sender<bool>,
-        postgres: Arc<tokio::sync::Mutex<Supervisor>>,
-        raft_client: Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
-        cluster_state: Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
-    ) -> JoinHandle<()> {
+    fn spawn_supervisor_loop(&self, input: SupervisorLoopInputs) -> JoinHandle<()> {
+        let SupervisorLoopInputs {
+            mut leader_rx,
+            mut shutdown_rx,
+            shutdown_tx,
+            postgres,
+            raft_client,
+            cluster_state,
+            lease,
+        } = input;
         let node_id = self.config.node_id;
         let self_pg_addr = self.config.get_advertise_pg_addr();
         let mgmt_token = self
@@ -863,10 +882,10 @@ impl App {
                         ).await;
                     }
                     _ = leader_rx.changed() => {
-                        Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client).await;
+                        Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
                     }
                     _ = reconcile_interval.tick() => {
-                        Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client).await;
+                        Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
                     }
                     _ = lsn_interval.tick() => {
                         Self::report_lsn(
@@ -1012,6 +1031,7 @@ impl App {
         postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+        lease: &crate::governor::SharedLeaseState,
     ) {
         let leader_id = {
             let metrics = raft.metrics();
@@ -1025,7 +1045,7 @@ impl App {
             return;
         };
         if leader_id == node_id {
-            Self::promote_local_postgres(postgres, cluster_state).await;
+            Self::promote_local_postgres(postgres, cluster_state, lease).await;
             return;
         }
 
@@ -1060,6 +1080,7 @@ impl App {
     async fn promote_local_postgres(
         postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        lease: &crate::governor::SharedLeaseState,
     ) {
         let mut pg = postgres.lock().await;
         // Fast-path idempotency: if PG is already primary we have nothing to
@@ -1163,12 +1184,15 @@ impl App {
         // — the election timeout is shorter than the lease — so an unguarded
         // promote here makes both primaries writable. No sleep: the reconcile
         // loop re-checks the gate on its 2 s cadence.
-        let lease = crate::governor::DEFAULT_LEASE_DURATION;
-        if let Some(elapsed) = promotion_lease_holddown(failover_started_at, Instant::now(), lease)
-        {
+        let lease_duration = crate::governor::DEFAULT_LEASE_DURATION;
+        // Read the instant into a local first: `lease.read()` in the scrutinee
+        // would hold the lock across the whole `if let` body, and the governor
+        // writes this lock on every metrics tick.
+        let now = lease.read().now();
+        if let Some(elapsed) = promotion_lease_holddown(failover_started_at, now, lease_duration) {
             info!(
                 elapsed_ms = elapsed.as_millis(),
-                lease_ms = lease.as_millis(),
+                lease_ms = lease_duration.as_millis(),
                 "Holding promotion until the deposed leader's lease has expired"
             );
             metrics::counter!("pgbattery_promotion_lease_holddowns").increment(1);
@@ -1178,6 +1202,7 @@ impl App {
         match pg.promote().await {
             Ok(()) => {
                 if let Some(started_at) = failover_started_at {
+                    // clock-lint: allow — histogram sample, not a gate.
                     let total_secs = started_at.elapsed().as_secs_f64();
                     metrics::histogram!("pgbattery_failover_total_seconds").record(total_secs);
                     tracing::info!(total_secs, "Failover total duration recorded");

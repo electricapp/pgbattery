@@ -65,6 +65,13 @@ jobs:
       - name: Lint matrix, SQL, and Python scripts
         run: uv run --python 3.14 --script testing/lint_matrix.py
 
+      # Every time comparison that gates write authority must run on the one
+      # injectable clock, or a ManualClock cannot drive the state machine and
+      # the lease, promotion hold-down, and async-fallback grace can disagree
+      # under test while agreeing in production by accident.
+      - name: Lint clock injection in safety modules
+        run: uv run --python 3.14 --script testing/lint_clock_injection.py
+
       # Offline unit tests for the harness itself: checker sanity (proves the
       # consistency checkers can fail), invariant classification, runner
       # plumbing, fault-primitive parsing. No cluster or Docker required.

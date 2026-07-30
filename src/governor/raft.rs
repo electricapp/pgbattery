@@ -242,7 +242,7 @@ impl Governor {
             prev_leader_id: None,
             prev_is_leader: false,
             prev_should_fence: None,
-            last_metrics_update: Instant::now(),
+            last_metrics_update: self.lease.read().now(),
             leader_lost_at: None,
             leaderless_recovery_last_fired_at: None,
         };
@@ -277,7 +277,7 @@ impl Governor {
                 }
 
                 Ok(()) = metrics_rx.changed() => {
-                    runtime.last_metrics_update = Instant::now();
+                    runtime.last_metrics_update = self.lease.read().now();
                     let metrics = metrics_rx.borrow().clone();
                     self.process_metrics_update(&metrics, &mut runtime);
                 }
@@ -336,7 +336,12 @@ impl Governor {
         } else if leader_id.is_some() && tracking_election {
             // A new leader appeared while we were tracking an election.
             if let Some(lost_at) = runtime.leader_lost_at.take() {
-                let elapsed = lost_at.elapsed().as_secs_f64();
+                let elapsed = self
+                    .lease
+                    .read()
+                    .now()
+                    .duration_since(lost_at)
+                    .as_secs_f64();
                 metrics::histogram!("pgbattery_failover_election_seconds").record(elapsed);
                 tracing::info!(
                     election_secs = elapsed,
@@ -681,7 +686,11 @@ impl Governor {
     ) {
         let timeout =
             std::time::Duration::from_millis(crate::config::constants::METRICS_WATCHDOG_TIMEOUT_MS);
-        let elapsed = runtime.last_metrics_update.elapsed();
+        let elapsed = self
+            .lease
+            .read()
+            .now()
+            .duration_since(runtime.last_metrics_update);
         if elapsed <= timeout {
             return;
         }
@@ -703,7 +712,7 @@ impl Governor {
             v
         };
         if !is_leader {
-            runtime.last_metrics_update = Instant::now();
+            runtime.last_metrics_update = self.lease.read().now();
             return;
         }
 
@@ -716,7 +725,7 @@ impl Governor {
             fenced: true,
             has_quorum: false,
         });
-        runtime.last_metrics_update = Instant::now();
+        runtime.last_metrics_update = self.lease.read().now();
     }
 
     /// Force an election when the cluster has been leaderless for too long.
@@ -785,7 +794,8 @@ impl Governor {
         };
 
         let threshold = Self::leaderless_threshold(rank, self.election_timeout_ms);
-        if leader_lost_at.elapsed() < threshold {
+        let now = self.lease.read().now();
+        if now.duration_since(leader_lost_at) < threshold {
             return;
         }
 
@@ -799,7 +809,7 @@ impl Governor {
                 .saturating_mul(self.election_timeout_ms),
         );
         if let Some(last) = runtime.leaderless_recovery_last_fired_at
-            && last.elapsed() < cooldown
+            && now.duration_since(last) < cooldown
         {
             return;
         }
@@ -807,7 +817,8 @@ impl Governor {
         tracing::warn!(
             node_id = self.node_id,
             rank = rank,
-            stall_ms = u64::try_from(leader_lost_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            stall_ms =
+                u64::try_from(now.duration_since(leader_lost_at).as_millis()).unwrap_or(u64::MAX),
             threshold_ms = u64::try_from(threshold.as_millis()).unwrap_or(u64::MAX),
             "Cluster leaderless past threshold — forcing election to break openraft no-pre-vote deadlock"
         );
@@ -815,7 +826,7 @@ impl Governor {
         if let Err(e) = self.raft.trigger().elect().await {
             tracing::warn!(error = %e, "Forced election trigger failed");
         }
-        runtime.leaderless_recovery_last_fired_at = Some(Instant::now());
+        runtime.leaderless_recovery_last_fired_at = Some(self.lease.read().now());
     }
 
     /// Leaderless duration after which the voter at `rank` (0-based position
