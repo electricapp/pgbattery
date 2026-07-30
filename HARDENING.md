@@ -743,6 +743,27 @@ nothing detects drift.
       log away entirely, so its `ElectionSafety` is the textbook Raft theorem
       rather than a statement about openraft.
       **Done when** the nightly job checks the larger configs within its budget.
+
+      Deferred, but the tractability question is answered — measured locally
+      (M4, `-workers auto`) so nobody has to rediscover it:
+
+      | Spec             | Config                     | Distinct states | Time    |
+      | ---------------- | -------------------------- | --------------- | ------- |
+      | `lease_fencing`  | 5 nodes, MaxTerm 5         | 4.8M            | 13 s    |
+      | `lease_fencing`  | 5 nodes, MaxTerm 4         | 1.1M            | 3 s     |
+      | `raft_lsn`       | 3 nodes, MaxTerm 5         | 283 k           | 1 s     |
+      | `raft_lsn`       | 4 nodes, MaxTerm 3         | 1.6M            | 6 s     |
+      | `raft_lsn`       | 4 nodes, MaxTerm 3, LSN 3  | 7.0M            | 28 s    |
+      | `raft_lsn`       | 5 nodes, MaxTerm 3         | intractable     | >180 s  |
+      | `raft_lsn`       | 5 nodes, MaxTerm 4         | intractable     | >10 min |
+
+      `lease_fencing` scales to 5 nodes cheaply, which is the config that matters
+      for RW-1. `raft_lsn` does not: it carries a per-node LSN and term, so the
+      state space multiplies on several dimensions at once and the queue grows
+      faster than TLC drains it — at 5 nodes it was still 66M states from done
+      after ten minutes. Its realistic ceiling is 4 nodes, and raising `MaxLSN`
+      buys more than raising the node count. Any future attempt should move one
+      axis at a time and run under a hard timeout.
       _Effort_ M
 
 ### Wave 7 — Real Jepsen (Tier 6)
