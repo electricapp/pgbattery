@@ -646,13 +646,24 @@ violation, and the first thing a Jepsen analysis would reach for.
 
 ### Wave 4 — Concurrency gaps (Tier 3.5)
 
-- [ ] **H-27 — Test the `snapshot_consistency` race.** The conformance suite drives
-      `build_snapshot` and `install_snapshot` sequentially, so the mutex is taken
-      and never contended. The interleaving it exists to prevent — a builder
-      observing the installer's redb write before its state swap, emitting a
-      snapshot whose meta is ahead of its data — is uncovered.
-      **Done when** a concurrency test contends the mutex and fails with the lock
-      removed.
+- [x] **H-27 — Test the `snapshot_consistency` race.** Done, but not the way this
+      task assumed, and the reason is worth keeping.
+
+      Racing a builder against an installer does not work. The window between the
+      installer's redb write and its state swap is a few instructions with no
+      await point, so the interleaving essentially never occurs: a 60-round racing
+      test passed just as happily with the lock removed. Instrumenting it showed
+      why — every build landed either wholly before the redb write or wholly after
+      the state swap, never between.
+
+      The lock discipline is asserted directly instead. The test holds
+      `snapshot_consistency` and requires the installer to make no observable
+      change: neither redb's `last_applied` nor the in-memory state may move while
+      the critical section is occupied, which is exactly the claim that both
+      writes are inside it. A second test requires `build_snapshot` to block on
+      the same lock. Deterministic, no timing dependence, and no test seam in the
+      production path — the additions are entirely inside `mod tests`. Verified by
+      removing each lock in turn; each mutation fails its own test.
       _Effort_ M
 
 - [x] **H-28 — Measure host-to-bridge routability for the prober's `direct`

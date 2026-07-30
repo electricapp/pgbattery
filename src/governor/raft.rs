@@ -2608,6 +2608,133 @@ mod tests {
         assert_eq!(restored.nodes.len(), 3);
     }
 
+    /// Fixture for the two `snapshot_consistency` tests: redb at `last_applied`
+    /// 7 with a 3-node state, plus the meta and bytes of a 5-node snapshot
+    /// claiming index 99. Node count alone distinguishes before from after.
+    fn snapshot_lock_fixture() -> (
+        tempfile::TempDir,
+        StateMachineStore,
+        OpenRaftSnapshotMeta<NodeId, BasicNode>,
+        Vec<u8>,
+    ) {
+        use std::sync::atomic::AtomicU64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = RedbLogStorage::new(dir.path().join("raft.db")).unwrap();
+        storage
+            .save_last_applied(&LastAppliedState {
+                last_applied_term: Some(1),
+                last_applied_index: Some(7),
+                last_applied_leader_node_id: 1,
+            })
+            .unwrap();
+
+        let mut before = ClusterState::new();
+        for id in 1..=3 {
+            before.apply(ClusterCommand::AddNode(test_node_info(id)));
+        }
+        let mut after = ClusterState::new();
+        for id in 1..=5 {
+            after.apply(ClusterCommand::AddNode(test_node_info(id)));
+        }
+        let incoming = postcard::to_allocvec(&after).unwrap();
+
+        let sm = StateMachineStore {
+            state: Arc::new(RwLock::new(before)),
+            storage,
+            applied_end: Arc::new(AtomicU64::new(8)),
+            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let meta = OpenRaftSnapshotMeta::<NodeId, BasicNode> {
+            last_log_id: Some(LogId::new(CommittedLeaderId::new(1, 1), 99)),
+            last_membership: StoredMembership::new(
+                None,
+                openraft::Membership::new(vec![(1..=5).collect()], None),
+            ),
+            snapshot_id: "lock-discipline".to_owned(),
+        };
+        (dir, sm, meta, incoming)
+    }
+
+    /// How long a blocked task is given to prove it is actually blocked.
+    ///
+    /// Proving a negative needs a bound, and this is a test, not a state gate:
+    /// the assertion is "made no progress", which has no edge to wait on.
+    const LOCK_BLOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// `install_snapshot` must hold `snapshot_consistency` across BOTH the redb
+    /// write and the in-memory state swap.
+    ///
+    /// If it held the lock across only one, a builder could read the new redb
+    /// position while cloning the pre-install state and emit a snapshot whose
+    /// meta is ahead of its data — a node installing that silently drops every
+    /// entry in between.
+    ///
+    /// Asserted by holding the lock from the test and requiring the installer to
+    /// make *no observable change*: neither redb nor the in-memory state may move
+    /// while the critical section is occupied. Racing two tasks and hoping to
+    /// catch the interleaving does not work here — the window between the two
+    /// writes is a few instructions with no await point, so the race never fires
+    /// and the test passes just as happily with the lock removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn install_snapshot_holds_the_lock_across_redb_write_and_state_swap() {
+        let (_dir, mut sm, meta, incoming) = snapshot_lock_fixture();
+        let state = sm.state.clone();
+        let storage = sm.storage.clone();
+
+        let held = sm.snapshot_consistency.clone().lock_owned().await;
+        let handle = tokio::spawn(async move {
+            sm.install_snapshot(&meta, Box::new(Cursor::new(incoming)))
+                .await
+        });
+
+        tokio::time::sleep(LOCK_BLOCK_GRACE).await;
+        assert!(
+            !handle.is_finished(),
+            "install_snapshot completed while the consistency lock was held"
+        );
+        assert_eq!(
+            storage.load_last_applied().unwrap().last_applied_index,
+            Some(7),
+            "the redb write escaped the critical section"
+        );
+        assert_eq!(
+            state.read().nodes.len(),
+            3,
+            "the state swap escaped the critical section"
+        );
+
+        drop(held);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            storage.load_last_applied().unwrap().last_applied_index,
+            Some(99)
+        );
+        assert_eq!(state.read().nodes.len(), 5);
+    }
+
+    /// `build_snapshot` must take the same lock before reading the redb meta and
+    /// cloning the state, or the installer's two writes are not atomic to it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_snapshot_waits_for_the_consistency_lock() {
+        let (_dir, mut sm, _meta, _incoming) = snapshot_lock_fixture();
+        let held = sm.snapshot_consistency.clone().lock_owned().await;
+        let mut builder = sm.get_snapshot_builder().await;
+        let handle = tokio::spawn(async move { builder.build_snapshot().await });
+
+        tokio::time::sleep(LOCK_BLOCK_GRACE).await;
+        assert!(
+            !handle.is_finished(),
+            "build_snapshot read the meta and state without taking the lock"
+        );
+
+        drop(held);
+        let snap = handle.await.unwrap().unwrap();
+        assert_eq!(snap.meta.last_log_id.map(|l| l.index), Some(7));
+        let restored: ClusterState = postcard::from_bytes(snap.snapshot.get_ref()).unwrap();
+        assert_eq!(restored.nodes.len(), 3);
+    }
+
     /// With no snapshot, the rebuild replays the whole applied log prefix.
     #[test]
     fn restore_without_snapshot_replays_from_log_start() {
