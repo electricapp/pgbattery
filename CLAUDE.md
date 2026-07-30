@@ -121,6 +121,8 @@ Every fault currently injected is a _clean_ fault (SIGKILL, container stop, netw
 
 A fault that silently fails to inject is worse than no test, because it reads as coverage. This has bitten five times: `iptables` missing from the image; every fault `exec` running as unprivileged `postgres` (the image ends `USER postgres`, so `NET_ADMIN` on the container does not reach the process — privileged operations need `--user root`); and three cases addressing docker objects by literal name while CI sets a per-run `COMPOSE_PROJECT_NAME`. Derive container and network names from the active compose project, never hardcode them, and assert the fault landed. `HARDENING.md` has the full list.
 
+Service names, static addresses and published ports come from `testing/topology.py`, which reads the compose file named by `COMPOSE_FILE`. Do not restate them in a harness: an unreachable node is recorded `indeterminate`, which the L1 verdict treats as "no acceptance observed", so a harness addressing ports that moved passes while blind. `topology.py` raises rather than returning an empty node list — a list nothing iterates makes every loop over it a silent no-op. `lint_matrix.py` reconciles `ci_matrix.yaml`'s own cluster block against it, and pins the log strings `correctness_lite.py` greps for against the Rust sources that emit them.
+
 ## Testing Philosophy
 
 - Verify correctness, not just "it didn't crash"

@@ -1347,3 +1347,88 @@ These close the exit criteria and cannot be done early.
       **Done when** the prose describes the system as it then is, with no gap left
       unclaimed.
       _Effort_ S
+
+## Review pass — one fact, one place
+
+An adversarial read of the whole hardening series, looking for two things: a
+check that matches text where it could consult the thing itself, and a fact
+written down more than once. Both fail the same way — quietly, in the direction
+that reports coverage.
+
+Nine findings, all closed. Grouped by what was actually wrong:
+
+**A fabricated observation.** `do_cas` decided whether a compare-and-swap
+committed by asking whether `1` appeared anywhere in the psql transcript. The
+command merges stderr into stdout to classify rejects, so any diagnostic
+carrying a `1` promoted a witness mismatch to a committed CAS — an invented
+`:ok` in the history the linearizability checker then reports a FATAL violation
+against. `_parse_first_int` had the same shape. Both now read the result set.
+
+**A property checked against a copy of itself.** `encode_rpc_frame_for_fuzz`
+reimplemented the wire format instead of calling the encoder the transport
+uses, so the fuzzer's round-trip property would have kept passing after the
+real encoder changed. One `append_frame_bytes` now.
+
+**A format instead of a type.** The replication slot name was a format string
+in seven places across three crates, and ownership was decided by
+`starts_with("replica_")`. `ReplicationSlot` carries the node id and renders
+the name; `Display` and `FromStr` are the only crossings of the string
+boundary, so they are inverse by construction. A reconciler that fails to
+recognise a slot it created drops and recreates it every tick, discarding the
+WAL reservation the standby needs.
+
+**A topology written down six times.** Service names, static addresses and
+published ports were declared independently in five Python modules and
+`ci_matrix.yaml` — two of them computed arithmetically and agreeing with
+compose by coincidence. This is the failure this document opens with, one level
+up: a harness addressing a docker object that is not there injects nothing and
+reads as coverage, and the prober records an unreachable node as
+`indeterminate`, which the L1 verdict treats as "no acceptance observed".
+`testing/topology.py` derives all of it from the compose file, taking node
+identity from the config each service mounts and voter membership from its
+start command. Nothing falls back to a default: an unreadable compose file
+raises rather than yielding an empty node list that turns every loop into a
+no-op. `ci_matrix.yaml` still declares its own cluster, and a lint reconciles
+it.
+
+**Log strings shared with nothing.** `correctness_lite.py` reads L2 and L3 out
+of container logs by matching strings that live in Rust `tracing` calls.
+Rewording `"potential split-brain"` in `src/` would not have failed anything —
+the grep would simply stop matching, and a run with the real signal in its logs
+would report PASS. All ten markers are now pinned by lint.
+
+**A lint that could stop scanning.** `lint_clock_injection.py` cut its scan at
+the first `#[cfg(test)]`; a test-only helper above the trailing module would
+have moved that cutoff up and silently un-guarded everything after it. A second
+boundary is now a loud failure — and hardening it immediately showed the
+assumption was already wrong, since `#[cfg(test)]` and `mod tests` sit four
+lines of `#[allow(...)]` apart here. That lint also had no inversion of its
+own, the one layer in the tree without a proof it can fail.
+
+**An inversion column nothing resolved.** `check_fatal_contracts_have_inversions`
+asked only whether the cell was non-empty, so a renamed or deleted case left
+the contract still claiming a working oracle. Every backticked name now resolves
+against the matrix, the filesystem, or the function names in the tree.
+
+**A model that ignored its commands.** `ModelPg` recorded `set_readonly` and the
+slot operations but never applied them, while the probes answered from the
+untouched fields — so the convergence the seam was added to test could not be
+expressed. Every command now changes the state its probe reports. The seam also
+stopped short of the lease enforcement loop, leaving the most safety-critical
+path needing Docker; it now covers `lease_enforcement_tick` end to end, and the
+RW-4 escalation has a test, which `fencing_tail.py` cannot reach from outside
+because it has no way to make `ALTER SYSTEM` fail on demand.
+
+**A settle sleep pretending to be a wait.** `fencing_tail.py` slept 20 s between
+modes and proceeded whether or not the cluster had taken the lease back, so the
+second mode could measure the churn. It now waits for write authority and fails
+loudly if it never returns.
+
+Two things were considered and left alone, with reasons: `parse_netem` parses
+`tc` output with regexes rather than `tc -json`, but it fails closed — an
+unrecognised format yields zeros and the verifier rejects — and switching
+depends on the image's iproute2 version, which cannot be checked without a
+cluster. `PgControl::terminate_client_backends` returns the raw psql string
+rather than a count; the caller only logs it, and parsing a persistent psql
+session's multi-line output into a `u64` would turn a formatting quirk into a
+counted fence failure.

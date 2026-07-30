@@ -1078,6 +1078,24 @@ def test_inversion_refs_resolve_by_case_file_or_function() -> None:
     assert resolve("`no-such-thing`", known_cases, known_fns) == ["no-such-thing"]
 
 
+def test_log_marker_check_catches_a_reworded_line() -> None:
+    """The harness reads L2 and L3 out of container logs by matching strings
+    that live in Rust `tracing` calls. Rewording one there would not fail
+    anything — the grep would just stop matching, and a run with a real
+    split-brain signal in its logs would report PASS."""
+    markers = {"LOG_SPLIT_BRAIN_SIGNALS": ("potential split-brain", "gone from the source")}
+    found = lint_matrix.missing_log_markers(markers, 'tracing::error!("potential split-brain")')
+    assert found == ["LOG_SPLIT_BRAIN_SIGNALS: 'gone from the source'"], found
+
+
+def test_log_marker_check_reads_the_real_sources() -> None:
+    """Without this the case above would pass against an empty corpus, which is
+    also how the check itself would stop working."""
+    corpus = lint_matrix._rust_corpus()
+    assert len(corpus) > 100_000, "the Rust corpus is implausibly small"
+    assert lint_matrix.missing_log_markers(lint_matrix._harness_log_markers(), corpus) == []
+
+
 def test_inversion_refs_expand_brace_groups() -> None:
     """`assert-sanity-chaos-oracle{,-post,-full}` is three case IDs, and each
     must resolve; the real index writes them this way."""

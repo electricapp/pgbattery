@@ -573,6 +573,68 @@ def check_matrix_cluster_matches_compose() -> None:
         raise AssertionError("; ".join(problems))
 
 
+RUST_SOURCE_ROOTS: Final[tuple[str, ...]] = ("src", "crates")
+
+
+def _rust_corpus() -> str:
+    """Every Rust source in the workspace, concatenated."""
+    chunks: list[str] = []
+    for root in RUST_SOURCE_ROOTS:
+        for path in (PROJECT_ROOT / root).rglob("*.rs"):
+            if "target" in path.parts:
+                continue
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    if not chunks:
+        raise AssertionError(
+            f"no Rust sources under {RUST_SOURCE_ROOTS}; every marker would read as missing"
+        )
+    return "\n".join(chunks)
+
+
+def missing_log_markers(markers: dict[str, tuple[str, ...]], corpus: str) -> list[str]:
+    """Markers the harness greps for that no longer appear in the Rust sources."""
+    return [
+        f"{group}: {marker!r}"
+        for group, group_markers in markers.items()
+        for marker in group_markers
+        if marker not in corpus
+    ]
+
+
+def _harness_log_markers() -> dict[str, tuple[str, ...]]:
+    import correctness_lite
+
+    return {
+        "LOG_LIVENESS_MARKERS": correctness_lite.LOG_LIVENESS_MARKERS,
+        "LOG_SPLIT_BRAIN_SIGNALS": correctness_lite.LOG_SPLIT_BRAIN_SIGNALS,
+        "LOG_FENCE_MARKERS": correctness_lite.LOG_FENCE_MARKERS,
+        "LOG_FENCE_CONFIRMED": (correctness_lite.LOG_FENCE_CONFIRMED,),
+    }
+
+
+def check_log_markers_still_exist() -> None:
+    """Every log line the harness greps for must still be emitted somewhere.
+
+    `correctness_lite.py` reads L2 and L3 out of the container logs by matching
+    strings that live in Rust `tracing` calls, and nothing connects the two
+    copies. Rewording `"potential split-brain"` in `src/` would not fail
+    anything — the grep would simply stop matching, and a run with a real
+    split-brain signal in its logs would report PASS. That is the silent
+    direction, so the strings are pinned here.
+
+    Matching is exact and substring-based, the same way the harness matches, so
+    this asserts precisely what the harness relies on.
+    """
+    missing = missing_log_markers(_harness_log_markers(), _rust_corpus())
+    if missing:
+        raise AssertionError(
+            "log markers the harness greps for are no longer emitted: "
+            + "; ".join(missing)
+            + ". The grep would silently stop matching, and correctness_lite would "
+            "report PASS on a log containing the real signal."
+        )
+
+
 def check_fault_injection_confined() -> None:
     """Keep direct fault injection confined to the modules already tracked for it.
 
@@ -630,6 +692,7 @@ def lint() -> None:
     check("Fault injection confined to tracked modules", check_fault_injection_confined)
     check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
     check("Matrix cluster matches docker-compose", check_matrix_cluster_matches_compose)
+    check("Log markers the harness greps for exist", check_log_markers_still_exist)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")
