@@ -836,12 +836,39 @@ No new infrastructure. Highest confidence per unit of effort.
       gated by unit tests and the lint ratchet.
       _Closes_ Class A1 for the last harness · _Effort_ M
 
-- [ ] **H-13 — Measure the fencing failure tail.** Wedged postmaster, exhausted
-      connection slots, and a backend in uninterruptible I/O surviving
-      `pg_terminate_backend`. SIGSTOP of the postmaster exists; the write path
-      during it is unmeasured.
-      **Done when** the prober runs concurrently with each fencing-failure mode
-      and the escalation to process exit and container restart is observed.
+- [x] **H-13 — Measure the fencing failure tail.** `testing/fencing_tail.py`
+      drives the leader into a state where fencing may not be able to complete,
+      with the dual-writability prober racing real writes at all three internal
+      PostgreSQL ports for the whole window. Both modes pass: L1 held, and the
+      node stopped being a write authority.
+
+      **Breaking PostgreSQL is not enough, and finding that out was the first
+      real result.** SIGSTOPping every postgres process leaves pgbattery running
+      with its Raft leadership and a valid lease — and a node that still *holds*
+      write authority has nothing to fence, so no escalation is expected. The
+      first run sat wedged for 210 s with no restart, which is correct behaviour
+      for that state rather than the failure tail. Each mode now also isolates
+      the node from its peers, costing it quorum, so the lease expires and the
+      enforcement loop must act through a PostgreSQL that may not answer.
+
+      **Connection exhaustion does not reach the tail either, and that is worth
+      knowing.** `superuser_reserved_connections` is 3 and pgbattery connects as
+      a superuser, so PostgreSQL keeps slots available for exactly this kind of
+      administrative work: the fence still completes. The mode is kept because
+      "connection exhaustion cannot starve the fence" is a property worth
+      holding, not because it breaks anything.
+
+      So the assertion is the safety property rather than one mechanism: the
+      node must stop accepting writes, whether by fencing itself read-only or by
+      escalating to process exit and container restart. Which one fired is
+      reported. Demanding a restart specifically failed a node that had fenced
+      cleanly — the assertion was wrong, not the system.
+
+      Ordering is enforced rather than assumed: the prober's startup DDL needs a
+      writable node, and these modes leave none, so the script waits for a row in
+      the probe table — proof a round landed — before applying the mode. A
+      backend in uninterruptible I/O is still not covered; it needs a blocking
+      device, which is H-25's dm-flakey work.
       _Closes_ RW-4 · _Effort_ M
 
 - [ ] **H-14 — Measure what `pg_rewind` discards.** Async fallback then rewind can
