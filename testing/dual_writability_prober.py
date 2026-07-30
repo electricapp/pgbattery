@@ -178,6 +178,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+import topology
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Topology
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,15 +202,27 @@ class NodeTarget:
     """Internal bridge address, for the `direct` transport."""
 
 
-NODES: Final[tuple[NodeTarget, ...]] = (
-    NodeTarget(node_id=1, service="node1", pg_ip="172.28.0.11"),
-    NodeTarget(node_id=2, service="node2", pg_ip="172.28.0.12"),
-    NodeTarget(node_id=3, service="node3", pg_ip="172.28.0.13"),
-)
+def _targets(compose_file: str) -> tuple[NodeTarget, ...]:
+    """Every voter in a compose file, as probe targets.
 
-FIVE_NODES: Final[tuple[NodeTarget, ...]] = tuple(
-    NodeTarget(node_id=n, service=f"node{n}", pg_ip=f"172.29.0.{10 + n}") for n in range(1, 6)
-)
+    Read from compose rather than restated. These addresses used to be written
+    out here as well as in `fault_primitives.py` and derived arithmetically for
+    the 5-node case (`172.29.0.{10 + n}`), so a subnet change would have left
+    the prober connecting to nothing — and a prober that cannot reach a node
+    reports `indeterminate` for it, which the L1 verdict treats as "no
+    acceptance observed". Silently probing fewer nodes than exist is exactly
+    how this check would pass while blind.
+    """
+    loaded = topology.load(topology.REPO_ROOT / compose_file)
+    return tuple(
+        NodeTarget(node_id=node.node_id, service=node.service, pg_ip=node.ip)
+        for node in loaded.voters
+    )
+
+
+NODES: Final[tuple[NodeTarget, ...]] = _targets("docker-compose.yml")
+
+FIVE_NODES: Final[tuple[NodeTarget, ...]] = _targets("docker-compose.5node.yml")
 """`docker-compose.5node.yml`, which uses its own subnet so both clusters can
 exist at once.
 

@@ -4,6 +4,9 @@
 # dependencies = [
 #     "rich>=14.0",
 #     "typer>=0.21",
+#     # topology.py reads docker-compose.yml, which is the truth source for the
+#     # cluster the matrix claims to describe.
+#     "pyyaml>=6.0",
 # ]
 # ///
 """Lint the CI test harness: matrix structure, Python syntax, SQL and contract refs.
@@ -45,6 +48,8 @@ from typing import Any, Final
 import typer
 from rich.console import Console
 from rich.table import Table
+
+import topology
 
 TESTING_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTING_DIR.parent
@@ -514,6 +519,60 @@ def check_fatal_contracts_have_inversions() -> None:
         raise AssertionError("; ".join(problems))
 
 
+def cluster_topology_mismatches(cluster: dict[str, Any], derived: topology.Topology) -> list[str]:
+    """Where the matrix's `cluster` block disagrees with the compose file.
+
+    The runner builds its node map from the matrix, so this is the one place
+    the topology is still written down twice. Reconciling it here is cheaper
+    than threading the derivation through the runner, and it turns a silent
+    divergence — a runner polling a management port nothing is listening on,
+    reading no metrics, and concluding the node is down — into a lint failure.
+    """
+    problems: list[str] = []
+    voters = {node.node_id: node for node in derived.voters}
+
+    expected = cluster.get("expected_nodes")
+    if expected != len(voters):
+        problems.append(
+            f"expected_nodes is {expected} but {derived.compose_file.name} declares "
+            f"{len(voters)} voters"
+        )
+
+    declared = cluster.get("nodes") or []
+    if {int(node["id"]) for node in declared} != set(voters):
+        problems.append(
+            f"matrix node ids {sorted(int(n['id']) for n in declared)} != "
+            f"compose voter ids {sorted(voters)}"
+        )
+        return problems
+
+    for node in declared:
+        node_id = int(node["id"])
+        real = voters[node_id]
+        if node.get("name") != real.service:
+            problems.append(f"node {node_id}: matrix name {node.get('name')!r} != {real.service!r}")
+        if node.get("mgmt_url") != f"http://localhost:{real.mgmt_port}":
+            problems.append(
+                f"node {node_id}: mgmt_url {node.get('mgmt_url')!r} does not address the "
+                f"published management port {real.mgmt_port}"
+            )
+        if node.get("metrics_url") != f"http://localhost:{real.metrics_port}/metrics":
+            problems.append(
+                f"node {node_id}: metrics_url {node.get('metrics_url')!r} does not address the "
+                f"published metrics port {real.metrics_port}"
+            )
+    return problems
+
+
+def check_matrix_cluster_matches_compose() -> None:
+    """The matrix's cluster block must describe the cluster compose creates."""
+    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    compose_file = PROJECT_ROOT / data["compose_file"]
+    problems = cluster_topology_mismatches(data["cluster"], topology.load(compose_file))
+    if problems:
+        raise AssertionError("; ".join(problems))
+
+
 def check_fault_injection_confined() -> None:
     """Keep direct fault injection confined to the modules already tracked for it.
 
@@ -570,6 +629,7 @@ def lint() -> None:
     check("Cases reference real contract IDs", check_case_contract_refs)
     check("Fault injection confined to tracked modules", check_fault_injection_confined)
     check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
+    check("Matrix cluster matches docker-compose", check_matrix_cluster_matches_compose)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

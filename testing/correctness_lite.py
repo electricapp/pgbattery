@@ -191,11 +191,13 @@ BANK_INITIAL_BALANCE: Final[int] = 1000
 BANK_TOTAL: Final[int] = BANK_ACCOUNTS * BANK_INITIAL_BALANCE
 """Invariant total that must be conserved across all transfers."""
 
-MGMT_PORTS: Final[list[int]] = [9081, 9082, 9083]
-"""Management API ports for node1/node2/node3."""
+NODES: Final[list[str]] = list(fp.NODES)
+"""Compose service names of the voters, derived from the compose file rather
+than restated. Never container names: those carry the project prefix, which CI
+overrides per run."""
 
-NODES: Final[list[str]] = ["node1", "node2", "node3"]
-"""Docker Compose service names."""
+MGMT_PORTS: Final[list[int]] = [fp.MGMT_PORTS[node] for node in NODES]
+"""Host-published management API ports, in the same order as `NODES`."""
 
 PSQL_TIMEOUT: Final[int] = 5
 """Seconds before a psql write attempt is classified as indeterminate."""

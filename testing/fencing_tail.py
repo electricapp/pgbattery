@@ -77,6 +77,13 @@ Long enough to cover the lease expiry plus the supervisor's consecutive-failure
 budget before it signals shutdown, which is what the escalation assertion is
 waiting for."""
 
+RECOVERY_TIMEOUT_S: Final[float] = 180.0
+"""How long the cluster gets to take the lease back between modes.
+
+Generous, because the previous mode may have restarted a node that then has to
+rejoin and catch up. Exceeding it is a real failure — the cluster did not
+recover — and reported as one rather than absorbed by the next mode."""
+
 console = Console()
 app = typer.Typer(add_completion=False, help="RW-4: fencing-failure tail.")
 
@@ -101,6 +108,29 @@ def leader_service() -> str:
     if holder is None:
         raise TailError("no node holds a valid lease; cluster is mid-failover or down")
     return holder
+
+
+def await_lease_holder(timeout_s: float) -> str:
+    """Block until some node holds a valid lease, or say why it never did.
+
+    A settling sleep is not a wait. The previous mode isolated a node and may
+    have restarted it, and running the next mode against a cluster with no
+    write authority measures the churn rather than the fence — or fails inside
+    the next mode for a reason that has nothing to do with what it tests. This
+    observes the condition, and if it never arrives the run says so instead of
+    proceeding on a hope.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        holder = fp.find_lease_holder()
+        if holder is not None:
+            return holder
+        time.sleep(2)
+    raise TailError(
+        f"no node took the lease within {timeout_s:.0f}s of the previous mode. "
+        "The cluster did not recover, so the next mode would run against no "
+        "write authority and its verdict would be meaningless."
+    )
 
 
 def wedge_postmaster(service: str) -> list[int]:
@@ -322,7 +352,21 @@ def run(
 
     results: list[tuple[str, str]] = []
     failed = False
-    for m in selected:
+    for index, m in enumerate(selected):
+        # Wait for write authority before each mode rather than sleeping after
+        # the previous one. The mode isolates a node and may restart it, so the
+        # cluster is mid-recovery when it returns; a fixed sleep proceeds
+        # whether or not that recovery finished, and the next mode then
+        # measures the churn.
+        if index > 0:
+            try:
+                holder = await_lease_holder(RECOVERY_TIMEOUT_S)
+                console.print(f"[dim]cluster recovered: {holder} holds the lease[/]")
+            except TailError as exc:
+                console.print(f"[red]FAIL[/] {m}: {exc}")
+                results.append((m, f"FAIL: {exc}"))
+                failed = True
+                continue
         try:
             run_mode(m)
             results.append((m, "PASS"))
@@ -330,11 +374,6 @@ def run(
             console.print(f"[red]FAIL[/] {m}: {exc}")
             results.append((m, f"FAIL: {exc}"))
             failed = True
-        # Let the cluster settle before the next mode: the previous one just
-        # restarted a node, and driving the next against a half-rejoined
-        # cluster measures the churn rather than the fence.
-        if not fp.find_lease_holder():
-            time.sleep(20)
 
     table = Table(title="Fencing-failure tail (RW-4)")
     table.add_column("Mode", style="bold")

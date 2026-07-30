@@ -8,9 +8,15 @@ import subprocess
 import time
 from typing import Final
 
-GATEWAY_PORTS: Final[list[int]] = [5432, 5433, 5434]
-MGMT_PORTS: Final[list[int]] = [9081, 9082, 9083]
-NODES: Final[list[str]] = ["node1", "node2", "node3"]
+import topology
+
+# Derived from the compose file, not restated here: the ports and service names
+# used to be declared independently in this module, `fault_primitives.py`,
+# `correctness_lite.py`, and `dual_writability_prober.py`, so a port change in
+# compose left four harnesses quietly talking to nothing.
+NODES: Final[list[str]] = list(topology.NODES)
+GATEWAY_PORTS: Final[list[int]] = list(topology.GATEWAY_PORTS)
+MGMT_PORTS: Final[list[int]] = [topology.MGMT_PORTS[node] for node in NODES]
 
 
 def run_cmd(cmd: str, timeout: int = 30) -> tuple[int, str, str]:

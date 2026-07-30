@@ -174,35 +174,28 @@ from typing import Final
 import typer
 from rich.console import Console
 
+import topology
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Topology & substrate constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-NODES: Final[tuple[str, ...]] = ("node1", "node2", "node3")
-"""Default cluster membership, in Raft node-id order."""
+# Derived from the compose file that creates the containers, never declared
+# here. Four modules used to carry their own copy of this, and a harness that
+# addresses a docker object which is not there injects nothing while reading as
+# coverage — the failure mode this repo has been bitten by repeatedly. See
+# `topology.py`.
+NODES: Final[tuple[str, ...]] = topology.NODES
+"""Voter services, in Raft node-id order. Learners (the witness) are excluded:
+counting one as a voter makes every quorum assertion vacuous."""
 
-NODE_IPS: Final[dict[str, str]] = {
-    "node1": "172.28.0.11",
-    "node2": "172.28.0.12",
-    "node3": "172.28.0.13",
-    "witness": "172.28.0.14",
-}
-"""Static addresses on ``raft_net``. Mirrors ``docker-compose.yml``."""
+NODE_IPS: Final[dict[str, str]] = topology.NODE_IPS
+"""Static addresses on the cluster network, for peer-level faults."""
 
-MGMT_PORTS: Final[dict[str, int]] = {
-    "node1": 9081,
-    "node2": 9082,
-    "node3": 9083,
-    "witness": 9085,
-}
+MGMT_PORTS: Final[dict[str, int]] = topology.MGMT_PORTS
 """Host-published management API ports."""
 
-METRICS_PORTS: Final[dict[str, int]] = {
-    "node1": 9091,
-    "node2": 9092,
-    "node3": 9093,
-    "witness": 9095,
-}
+METRICS_PORTS: Final[dict[str, int]] = topology.METRICS_PORTS
 """Host-published Prometheus ports. These, not the management API, are the truth
 source for lease state: ``GET /api/v1/cluster/leader`` serves the last leader it
 knows about, so after a leader dies its peers keep naming it for the whole

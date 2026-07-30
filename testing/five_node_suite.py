@@ -39,15 +39,25 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+import topology
+
 COMPOSE_FILE: Final[str] = "docker-compose.5node.yml"
 PROJECT: Final[str] = "pgbattery5"
-NODES: Final[tuple[int, ...]] = (1, 2, 3, 4, 5)
+
+_FIVE: Final[topology.Topology] = topology.load(topology.REPO_ROOT / COMPOSE_FILE)
+"""Read from the compose file this suite starts, so the ports and addresses
+cannot drift from it. The arithmetic that used to stand in for them
+(`9180 + n`, `172.29.0.{10 + n}`) agreed with compose only by coincidence, and
+a renumbered subnet would have left every peer-level fault addressing an
+unused address — landing nowhere while the run reported coverage."""
+
+NODES: Final[tuple[int, ...]] = tuple(n.node_id for n in _FIVE.voters)
 QUORUM: Final[int] = 3
 """`floor(5/2) + 1`. Stated rather than computed so a wrong constant is a
 visible edit rather than a silently-agreeing derivation."""
 
-MGMT_PORT: Final[dict[int, int]] = {n: 9180 + n for n in NODES}
-GATEWAY_PORT: Final[dict[int, int]] = {n: 5441 + n for n in NODES}
+MGMT_PORT: Final[dict[int, int]] = {n.node_id: n.mgmt_port for n in _FIVE.voters}
+GATEWAY_PORT: Final[dict[int, int]] = {n.node_id: n.gateway_port for n in _FIVE.voters}
 
 BOOTSTRAP_TIMEOUT_S: Final[float] = 180.0
 CONVERGE_TIMEOUT_S: Final[float] = 90.0
@@ -370,7 +380,7 @@ def phase_recovers(expected_rows: int) -> None:
     console.print(f"  leader = node{leader}, {out} rows survived (>= {expected_rows} acked)")
 
 
-NODE_IP: Final[dict[int, str]] = {n: f"172.29.0.{10 + n}" for n in NODES}
+NODE_IP: Final[dict[int, str]] = {n.node_id: n.ip for n in _FIVE.nodes}
 
 
 def _iptables(node: int, peer: int, *, insert: bool) -> None:
