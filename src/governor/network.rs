@@ -88,12 +88,23 @@ fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
 /// Append one framed message to `buf`: length prefix, type byte,
 /// correlation ID, body.
 fn append_frame(buf: &mut BytesMut, rpc_type: RpcType, corr_id: u64, body: &[u8]) -> Result<()> {
+    append_frame_bytes(buf, rpc_type as u8, corr_id, body)
+}
+
+/// The wire format itself, written once.
+///
+/// `append_frame` takes a typed [`RpcType`]; the fuzz seam takes whatever type
+/// byte the fuzzer produced, including values no variant maps to. Both go
+/// through here so the round-trip property the fuzzer checks is a property of
+/// the *shipping* encoder — a second copy of these four writes would keep
+/// agreeing with the decoder after the real one had changed.
+fn append_frame_bytes(buf: &mut BytesMut, type_byte: u8, corr_id: u64, body: &[u8]) -> Result<()> {
     let total_len = FRAME_OVERHEAD_AFTER_LEN + body.len();
     let total_len_u32 = u32::try_from(total_len)
         .map_err(|_| Error::Protocol("RPC frame length exceeds u32".to_string()))?;
     buf.reserve(4 + total_len);
     buf.put_u32(total_len_u32);
-    buf.put_u8(rpc_type as u8);
+    buf.put_u8(type_byte);
     buf.put_u64(corr_id);
     buf.put_slice(body);
     Ok(())
@@ -118,6 +129,11 @@ pub fn decode_rpc_frame_for_fuzz(buf: &mut BytesMut) -> Result<Option<(u8, u64, 
 }
 
 /// Re-encode a frame decoded by [`decode_rpc_frame_for_fuzz`].
+///
+/// Delegates to the same [`append_frame_bytes`] the transport writes through.
+/// A separate copy of the four writes would make the fuzzer's round-trip
+/// property self-referential: it would keep passing against a stale encoder
+/// while the shipping one drifted.
 #[doc(hidden)]
 pub fn encode_rpc_frame_for_fuzz(
     buf: &mut BytesMut,
@@ -125,13 +141,7 @@ pub fn encode_rpc_frame_for_fuzz(
     corr_id: u64,
     body: &[u8],
 ) -> Result<()> {
-    let total_len = u32::try_from(FRAME_OVERHEAD_AFTER_LEN + body.len())
-        .map_err(|_| Error::Protocol("RPC frame length exceeds u32".to_string()))?;
-    buf.put_u32(total_len);
-    buf.put_u8(type_byte);
-    buf.put_u64(corr_id);
-    buf.put_slice(body);
-    Ok(())
+    append_frame_bytes(buf, type_byte, corr_id, body)
 }
 
 /// Frame-length bounds, exposed for assertions in fuzz targets.

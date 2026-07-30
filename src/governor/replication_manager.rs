@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
+use pgbattery_core::ReplicationSlot;
 use tokio::sync::watch;
 use tokio::time::interval;
 
@@ -172,33 +173,26 @@ fn plan_slot_reconciliation(
     target_ids: &[NodeId],
     existing_slots: &HashSet<String>,
 ) -> (Vec<NodeId>, Vec<NodeId>) {
-    let desired_slots: HashSet<String> = target_ids
+    // `existing_slots` is what `pg_replication_slots` said, so it is text and
+    // may name slots this cluster does not own. Parse once, here: everything
+    // below reasons about node ids, and a name that is not ours simply has no
+    // `ReplicationSlot` and so cannot be dropped by accident.
+    let existing: HashSet<NodeId> = existing_slots
         .iter()
-        .map(|id| format!("replica_{id}"))
+        .filter_map(|name| name.parse::<ReplicationSlot>().ok())
+        .map(ReplicationSlot::node_id)
         .collect();
+    let desired: HashSet<NodeId> = target_ids.iter().copied().collect();
 
-    let mut create_slots_for = Vec::new();
-    for node_id in target_ids {
-        let slot_name = format!("replica_{node_id}");
-        if !existing_slots.contains(&slot_name) {
-            create_slots_for.push(*node_id);
-        }
-    }
+    // Sorted, so a reconcile tick issues the same operations in the same order
+    // every time. The drop list previously came out of `HashSet` iteration,
+    // which made a multi-slot tick's log — and any test over it — depend on
+    // hash order.
+    let mut create_slots_for: Vec<NodeId> = desired.difference(&existing).copied().collect();
+    create_slots_for.sort_unstable();
 
-    let mut drop_slots_for = Vec::new();
-    for slot_name in existing_slots {
-        if desired_slots.contains(slot_name) {
-            continue;
-        }
-
-        let Some(id_str) = slot_name.strip_prefix("replica_") else {
-            continue;
-        };
-        let Ok(stale_node_id) = id_str.parse::<NodeId>() else {
-            continue;
-        };
-        drop_slots_for.push(stale_node_id);
-    }
+    let mut drop_slots_for: Vec<NodeId> = existing.difference(&desired).copied().collect();
+    drop_slots_for.sort_unstable();
 
     (create_slots_for, drop_slots_for)
 }
@@ -837,7 +831,7 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         // refuses to drop for long enough to matter (pinned WAL, disk risk).
         let drop_attempted = !drop_slots_for.is_empty();
         for stale_node_id in drop_slots_for {
-            let slot_name = format!("replica_{stale_node_id}");
+            let slot_name = ReplicationSlot::for_node(stale_node_id);
             let drop_result =
                 tokio::time::timeout(SLOT_SQL_BUDGET, pg.drop_replication_slot(stale_node_id))
                     .await

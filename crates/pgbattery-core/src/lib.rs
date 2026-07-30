@@ -15,4 +15,7 @@ pub mod types;
 
 pub use clock::{Clock, SystemClock};
 pub use error::{Error, Result};
-pub use types::{BackupConfig, BackupType, NodeId, PgAuthMode, RedactedSecret, WalLevel};
+pub use types::{
+    BackupConfig, BackupType, ForeignSlot, NodeId, PgAuthMode, RedactedSecret, ReplicationSlot,
+    WalLevel,
+};

@@ -15,7 +15,7 @@ use pgbattery_core::constants::{
     PG_CTL_STOP_TIMEOUT_MS, PG_REWIND_DIVERGENCE_THRESHOLD_BYTES, PG_REWIND_MAX_RETRIES,
     PG_REWIND_RETRY_DELAY_MS,
 };
-use pgbattery_core::{Error, NodeId, PgAuthMode, Result, WalLevel};
+use pgbattery_core::{Error, NodeId, PgAuthMode, ReplicationSlot, Result, WalLevel};
 
 /// Prefix of the per-query end marker echoed back by the persistent psql
 /// session. The full marker is `__PGBATTERY_SQL_END_<seq>__`.
@@ -281,12 +281,16 @@ fn validate_pg_identifier(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether `slot_name` is a `replica_{id}` physical slot this node minted as a
-/// leader and may safely drop when orphaned. Guards the demote-time sweep so it
-/// only ever touches slots pgbattery owns (never an operator-created or
-/// otherwise-named slot) and never a name that fails identifier validation.
+/// Whether `slot_name` is a physical slot this node minted as a leader and may
+/// safely drop when orphaned. Guards the demote-time sweep so it only ever
+/// touches slots pgbattery owns (never an operator-created or otherwise-named
+/// slot) and never a name that fails identifier validation.
+///
+/// Ownership is decided by parsing into [`ReplicationSlot`] — the same type
+/// that renders the names — so the sweep cannot start disagreeing with the
+/// minting about which slots are ours.
 fn is_sweepable_replica_slot(slot_name: &str) -> bool {
-    slot_name.starts_with("replica_") && validate_pg_identifier(slot_name).is_ok()
+    slot_name.parse::<ReplicationSlot>().is_ok() && validate_pg_identifier(slot_name).is_ok()
 }
 
 /// Supervisor configuration.
@@ -1562,10 +1566,10 @@ host all all ::/0 {auth_method}
             .collect();
 
         format!(
-            "{}\nprimary_conninfo = '{}'\nprimary_slot_name = 'replica_{}'\n",
+            "{}\nprimary_conninfo = '{}'\nprimary_slot_name = '{}'\n",
             preserved_lines.join("\n"),
             Self::primary_conninfo_for(leader_addr, cfg),
-            cfg.node_id
+            ReplicationSlot::for_node(cfg.node_id)
         )
     }
 
@@ -2969,7 +2973,7 @@ host all all ::/0 {auth_method}
     /// Returns an error if the slot name is invalid or the `CREATE` query
     /// fails for a reason other than the slot already existing.
     pub async fn create_replication_slot(&self, node_id: NodeId) -> Result<()> {
-        let slot_name = format!("replica_{node_id}");
+        let slot_name = ReplicationSlot::for_node(node_id).to_string();
 
         // Defense-in-depth: validate identifier even though node_id is a u64
         validate_pg_identifier(&slot_name)?;
@@ -3045,7 +3049,7 @@ host all all ::/0 {auth_method}
     /// Returns an error if the slot name is invalid or the existence check or
     /// `pg_drop_replication_slot` query fails.
     pub async fn drop_replication_slot(&self, node_id: NodeId) -> Result<()> {
-        let slot_name = format!("replica_{node_id}");
+        let slot_name = ReplicationSlot::for_node(node_id).to_string();
 
         // Defense-in-depth: validate identifier
         validate_pg_identifier(&slot_name)?;
@@ -3718,6 +3722,29 @@ mod tests {
         // A name that would fail identifier validation is never dropped
         // (defense-in-depth against a crafted pg_replication_slots row).
         assert!(!is_sweepable_replica_slot("replica_1; DROP TABLE x"));
+        // The prefix alone is not ownership. Only names this cluster could
+        // have minted — the prefix plus a node id — are ours, so an operator
+        // slot that merely starts the same way survives the sweep.
+        assert!(!is_sweepable_replica_slot("replica_archive"));
+        assert!(!is_sweepable_replica_slot("replica_1_old"));
+    }
+
+    /// Every slot this node can mint must survive its own identifier
+    /// validation and be recognised by the sweep as ours.
+    ///
+    /// `ReplicationSlot` makes rendering and recognition inverse by
+    /// construction; what this adds is that the *sweep's* extra condition —
+    /// `validate_pg_identifier` — never rejects a name we ourselves produce,
+    /// which would strand a slot nothing is able to clean up.
+    #[test]
+    fn test_every_minted_slot_is_sweepable() {
+        for node_id in [0u64, 1, 42, u64::MAX] {
+            let name = ReplicationSlot::for_node(node_id).to_string();
+            assert!(
+                is_sweepable_replica_slot(&name),
+                "a slot we mint must be one we recognise as ours: {name}"
+            );
+        }
     }
 
     #[test]

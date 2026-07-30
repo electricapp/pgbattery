@@ -354,16 +354,27 @@ impl ClusterState {
     /// the staleness window. The stored `self.max_cluster_lsn` is only
     /// refreshed by Raft applies, so during a leaderless window past the
     /// staleness threshold it remains frozen at the pre-outage value while
-    /// every individual timestamp has aged out. Re-deriving here means a
-    /// prolonged leaderless cluster falls back to bootstrap-permissive
-    /// (no fresh peers anywhere) rather than wedging itself with stale
-    /// rejections.
+    /// every individual timestamp has aged out. Re-deriving here keeps the
+    /// comparison honest about which reports are current.
+    ///
+    /// **When every report has aged out** the gate does not go permissive. It
+    /// compares against the maximum of the *aged* reports instead: WAL
+    /// positions do not go backwards, so a peer that once reported a position
+    /// still holds at least that much, and a node restored from an old
+    /// basebackup would otherwise win the election Raft log-matching cannot
+    /// see is unsafe (RW-7). Only a cluster where nobody has *ever* reported
+    /// is permissive. See `evaluate_lsn_acceptable` for why that branch
+    /// cannot livelock and why it uses the loose threshold.
     ///
     /// **Threshold selection** uses `self.sync_replication_active`:
     /// - sync active: one WAL block. Under sync replication the leader's
     ///   last-acked LSN equals at least one follower's LSN, so any
     ///   candidate many KB behind cannot hold the acked WAL.
     /// - sync inactive: 16 MB, matching the published async RPO.
+    ///
+    /// The aged-report branch overrides that selection and always uses the
+    /// loose threshold, because a sync-mode flag as stale as the LSNs is not
+    /// evidence that a standby currently holds acked WAL.
     #[must_use]
     pub fn is_lsn_acceptable_for_election(&self, candidate_id: NodeId) -> (bool, &'static str) {
         // Election gate: permissive when the candidate has no LSN report yet
@@ -390,7 +401,10 @@ impl ClusterState {
         let staleness = crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
         let mut fresh_max: u64 = 0;
         let mut any_fresh = false;
-        let mut aged_max: u64 = 0;
+        // Maximum over *every* report regardless of age. Read only from the
+        // `!any_fresh` branch below, where no report is fresh and it is
+        // therefore the aged maximum; computed here to keep the scan single-pass.
+        let mut reported_max: u64 = 0;
         for &(lsn, ts) in self.node_lsns.values() {
             let age = if ts > now { 0 } else { now.saturating_sub(ts) };
             if age < staleness {
@@ -399,8 +413,8 @@ impl ClusterState {
                     fresh_max = lsn;
                 }
             }
-            if lsn > aged_max {
-                aged_max = lsn;
+            if lsn > reported_max {
+                reported_max = lsn;
             }
         }
 
@@ -422,7 +436,7 @@ impl ClusterState {
             // blanket permissive rule (RW-7).
             //
             // This cannot livelock, which is what made the permissive branch
-            // look necessary: the node holding `aged_max` compares against
+            // look necessary: the node holding `reported_max` compares against
             // itself and its gap is zero, so at least one candidate is always
             // acceptable no matter how stale the data is.
             let Some(&(candidate_lsn, _)) = self.node_lsns.get(&candidate_id) else {
@@ -444,7 +458,7 @@ impl ClusterState {
             // invalidates the assumption about sync state along with them.
             //
             // It also has to be loose to stay live. "Somebody always qualifies"
-            // holds cluster-wide — the node at `aged_max` compares against
+            // holds cluster-wide — the node at `reported_max` compares against
             // itself — but not inside a partition, where that node may be on
             // the other side. With a single-block tolerance every reachable
             // follower is then rejected and the majority cannot elect at all.
@@ -455,7 +469,8 @@ impl ClusterState {
             // restored from an old basebackup is a whole backup behind, not
             // 16 MB.
             let leaderless_threshold = crate::config::constants::lsn_catchup_threshold_for(false);
-            if aged_max > candidate_lsn && (aged_max - candidate_lsn) > leaderless_threshold {
+            if reported_max > candidate_lsn && (reported_max - candidate_lsn) > leaderless_threshold
+            {
                 return (
                     false,
                     "candidate LSN too far behind cluster max (aged reports)",

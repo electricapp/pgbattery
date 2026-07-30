@@ -29,7 +29,7 @@ from linreg.attacks import ATTACK_DISPATCH, SEEDED_ATTACKS
 from linreg.checkers import _is_linearizable, _is_weakly_consistent
 from linreg.cluster import GATEWAY_PORTS
 from linreg.records import History, Op
-from linreg.workload import next_gateway_port
+from linreg.workload import _parse_first_int, cas_committed, next_gateway_port
 
 Checker = Callable[[list[Op]], tuple[bool | None, str]]
 """`None` is the WGL "state budget spent, key unchecked" verdict. These cases
@@ -424,6 +424,68 @@ class StateBudgetTests(unittest.TestCase):
         ops = self._wide_concurrent_history(10)
         verdicts = {_is_linearizable(ops, max_states=500)[0] for _ in range(3)}
         self.assertEqual(len(verdicts), 1, f"same history gave different verdicts: {verdicts}")
+
+
+class CasOutcomeTests(unittest.TestCase):
+    """The CAS outcome classifier is the first oracle in the chain.
+
+    Everything above checks whether a history is linearizable. This checks
+    whether the history is *true*: `do_cas` turns one psql transcript into
+    `:ok` / `:fail` / `:info`, and a wrong answer here hands the checkers a
+    history the cluster never produced. A fabricated `:ok` is the dangerous
+    direction — it invents a compare-and-swap that succeeded, and the checker
+    then reports a FATAL violation against a correct cluster.
+    """
+
+    def test_a_returned_row_is_a_commit(self) -> None:
+        self.assertTrue(cas_committed("1\n"))
+        self.assertTrue(cas_committed("1"))
+
+    def test_no_returned_row_is_a_witness_mismatch(self) -> None:
+        self.assertFalse(cas_committed(""))
+        self.assertFalse(cas_committed("\n"))
+
+    def test_a_diagnostic_mentioning_one_is_not_a_commit(self) -> None:
+        """The command merges stderr into stdout to classify rejects, so
+        anything `PostgreSQL` prints on a successful run shares the buffer with
+        the result set. Substring-matching that buffer for `1` promoted every
+        such line to a committed CAS."""
+        for noise in (
+            "psql:1: WARNING:  there is no transaction in progress",
+            "NOTICE:  identifier will be truncated to 1 character",
+            "UPDATE 1",
+        ):
+            with self.subTest(noise=noise):
+                self.assertFalse(
+                    cas_committed(noise),
+                    f"a diagnostic was read as a committed CAS: {noise!r}",
+                )
+
+    def test_a_row_alongside_a_diagnostic_is_still_a_commit(self) -> None:
+        """The fix must not go the other way and drop real commits."""
+        self.assertTrue(cas_committed("WARNING:  something\n1\n"))
+
+
+class ReadParseTests(unittest.TestCase):
+    """`-t -A` renders an integer column as nothing but its digits, so a line
+    carrying anything else is a diagnostic sharing the buffer, not a value.
+    Reading one as the register's value puts a state in the history that the
+    register never held."""
+
+    def test_a_bare_integer_is_the_value(self) -> None:
+        self.assertEqual(_parse_first_int("42\n"), 42)
+        self.assertEqual(_parse_first_int("-7"), -7)
+
+    def test_no_row_is_nil(self) -> None:
+        self.assertIsNone(_parse_first_int(""))
+
+    def test_a_line_with_trailing_text_is_not_a_value(self) -> None:
+        for noise in ("1 row", "0 rows returned", "42 is the answer"):
+            with self.subTest(noise=noise):
+                self.assertIsNone(
+                    _parse_first_int(noise),
+                    f"a diagnostic was read as the register's value: {noise!r}",
+                )
 
 
 if __name__ == "__main__":

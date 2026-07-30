@@ -150,12 +150,22 @@ impl PgControl for crate::supervisor::Supervisor {
 /// by luck: a promotion that fails its safety check, a node reporting itself
 /// primary while we believe it a standby, a demote that errors.
 ///
-/// Not `#[cfg(test)]`: integration tests and future simulation harnesses live
-/// outside the unit-test cfg and need it too.
+/// **Self-consistent by construction.** Every command that changes `PostgreSQL`
+/// state changes this model's state, and every probe answers from it. A model
+/// that recorded `set_readonly(true)` but kept reporting itself writable would
+/// make a convergence test — the fencing loop re-running until the node stops
+/// accepting writes — either impossible to write or passing for the wrong
+/// reason. That is the failure mode this whole seam exists to remove, so the
+/// model must not reintroduce it. The commands that mutate take `&self`, like
+/// their real counterparts, so the mutable fields sit behind a `Mutex`.
+///
+/// Compiled only for tests. It was briefly unconditional on the grounds that
+/// "future simulation harnesses" would need it, but a test double in the
+/// shipping binary earns its place when something ships it, not before.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct ModelPg {
     pub in_recovery: bool,
-    pub readonly: bool,
     /// Which operation, if any, this model refuses. One field rather than a
     /// bool per operation: the interesting scenarios fail exactly one step, and
     /// a set of independent bools invites states that cannot occur.
@@ -163,18 +173,25 @@ pub struct ModelPg {
     /// What `pg_stat_replication` reports. The async-fallback gate counts
     /// healthy standbys from this, so a test scripts RPO scenarios here.
     pub replication_stats: Vec<crate::supervisor::ReplicationStat>,
-    pub slots: std::collections::HashSet<String>,
-    pub calls: std::sync::Mutex<Vec<String>>,
+    // Behind a `Mutex` because the commands that change them take `&self`,
+    // like their real counterparts. `pub(crate)` only so `..Default::default()`
+    // works at the call sites; construct them through the builders below.
+    pub(crate) readonly: std::sync::Mutex<bool>,
+    pub(crate) slots: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub(crate) calls: std::sync::Mutex<Vec<String>>,
 }
 
 /// The operation a `ModelPg` can be told to fail.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelOp {
     Promote,
     VerifyPromotionSafe,
     Demote,
+    SetReadonly,
 }
 
+#[cfg(test)]
 impl ModelPg {
     fn note(&self, what: &str) {
         if let Ok(mut calls) = self.calls.lock() {
@@ -187,8 +204,36 @@ impl ModelPg {
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().map(|c| c.clone()).unwrap_or_default()
     }
+
+    /// Start read-only, as a node that has already been fenced.
+    #[must_use]
+    pub fn starting_readonly(mut self) -> Self {
+        self.readonly = std::sync::Mutex::new(true);
+        self
+    }
+
+    /// Start with these replication slots already present.
+    #[must_use]
+    pub fn with_slots<I: IntoIterator<Item = String>>(mut self, slots: I) -> Self {
+        self.slots = std::sync::Mutex::new(slots.into_iter().collect());
+        self
+    }
+
+    /// Whether this node currently refuses writes — the property the fencing
+    /// loop exists to establish.
+    #[must_use]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.lock().is_ok_and(|r| *r)
+    }
+
+    /// Slots as the model currently holds them, after every create and drop.
+    #[must_use]
+    pub fn current_slots(&self) -> std::collections::HashSet<String> {
+        self.slots.lock().map(|s| s.clone()).unwrap_or_default()
+    }
 }
 
+#[cfg(test)]
 impl PgControl for ModelPg {
     async fn is_in_recovery(&self) -> Result<bool> {
         self.note("is_in_recovery");
@@ -233,6 +278,14 @@ impl PgControl for ModelPg {
 
     async fn set_readonly(&self, readonly: bool) -> Result<()> {
         self.note(&format!("set_readonly({readonly})"));
+        if self.fails == Some(ModelOp::SetReadonly) {
+            return Err(pgbattery_core::Error::Postgres(
+                "model: ALTER SYSTEM failed".to_string(),
+            ));
+        }
+        if let Ok(mut current) = self.readonly.lock() {
+            *current = readonly;
+        }
         Ok(())
     }
 
@@ -243,7 +296,7 @@ impl PgControl for ModelPg {
 
     async fn probe_role_and_readonly(&self) -> Result<(bool, bool)> {
         self.note("probe_role_and_readonly");
-        Ok((self.in_recovery, self.readonly))
+        Ok((self.in_recovery, self.is_readonly()))
     }
 
     async fn terminate_client_backends(&self) -> Result<String> {
@@ -263,16 +316,22 @@ impl PgControl for ModelPg {
 
     async fn create_replication_slot(&self, node_id: NodeId) -> Result<()> {
         self.note(&format!("create_replication_slot({node_id})"));
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.insert(pgbattery_core::ReplicationSlot::for_node(node_id).to_string());
+        }
         Ok(())
     }
 
     async fn drop_replication_slot(&self, node_id: NodeId) -> Result<()> {
         self.note(&format!("drop_replication_slot({node_id})"));
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.remove(&pgbattery_core::ReplicationSlot::for_node(node_id).to_string());
+        }
         Ok(())
     }
 
     async fn list_physical_replication_slots(&self) -> Result<std::collections::HashSet<String>> {
         self.note("list_physical_replication_slots");
-        Ok(self.slots.clone())
+        Ok(self.current_slots())
     }
 }

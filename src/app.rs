@@ -1565,14 +1565,14 @@ impl App {
         clippy::significant_drop_tightening,
         reason = "the supervisor guard is intentionally held across the tick's await points"
     )]
-    async fn lease_enforcement_tick(
-        postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
+    async fn lease_enforcement_tick<P: crate::governor::pg_control::PgControl>(
+        postgres: &Arc<tokio::sync::Mutex<P>>,
         lease: &crate::governor::SharedLeaseState,
         fence_failures: &mut u32,
         shutdown_tx: &watch::Sender<bool>,
     ) -> bool {
         let pg = postgres.lock().await;
-        let (in_recovery, pg_writable) = Self::probe_pg_state(&pg).await;
+        let (in_recovery, pg_writable) = Self::probe_pg_state(&*pg).await;
 
         // Read the lease AFTER the lock wait and the probes, immediately
         // before choosing a path. Acquiring the supervisor lock can block
@@ -1590,7 +1590,7 @@ impl App {
                 // GUC not yet read-only (or the probe failed → fail-closed): set
                 // it and evict client backends. `handle_emergency_fence`
                 // manages `fence_failures` and terminates on success.
-                Self::handle_emergency_fence(&pg, fence_failures, shutdown_tx).await
+                Self::handle_emergency_fence(&*pg, fence_failures, shutdown_tx).await
             }
             LeaseAction::TerminateBypassers => {
                 // Invalid lease, GUC already read-only, PG still a confirmed
@@ -1607,7 +1607,7 @@ impl App {
             LeaseAction::RecoverWrites => {
                 // Lease valid + PG read-only on a confirmed primary → recover.
                 *fence_failures = 0;
-                Self::try_recover_writes(&pg).await;
+                Self::try_recover_writes(&*pg).await;
                 false
             }
             LeaseAction::None => {
@@ -1675,7 +1675,9 @@ impl App {
     /// the `(in_recovery, readonly)` pair — this runs every 100 ms under the
     /// supervisor lock, and the pair must come from one consistent snapshot.
     /// Budgeted: a hung postmaster must not pin the lock past one tick.
-    async fn probe_pg_state(pg: &Supervisor) -> (Option<bool>, bool) {
+    async fn probe_pg_state<P: crate::governor::pg_control::PgControl>(
+        pg: &P,
+    ) -> (Option<bool>, bool) {
         match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.probe_role_and_readonly()).await
         {
             Ok(Ok((in_recovery, is_readonly))) => {
@@ -1708,8 +1710,8 @@ impl App {
     /// CRITICAL PATH: lease expired but PG is writable. Issue ALTER SYSTEM,
     /// budgeted. Returns `true` if the caller should break the loop (fence
     /// failures exceeded threshold).
-    async fn handle_emergency_fence(
-        pg: &Supervisor,
+    async fn handle_emergency_fence<P: crate::governor::pg_control::PgControl>(
+        pg: &P,
         fence_failures: &mut u32,
         shutdown_tx: &watch::Sender<bool>,
     ) -> bool {
@@ -1791,7 +1793,7 @@ impl App {
         }
     }
 
-    async fn try_recover_writes(pg: &Supervisor) {
+    async fn try_recover_writes<P: crate::governor::pg_control::PgControl>(pg: &P) {
         match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.set_readonly(false)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!(error = %e, "Failed to enable writes"),
@@ -2115,7 +2117,7 @@ impl App {
 
         info!(leader_pg = %leader.pg_addr, "Running pg_basebackup from leader");
         let pg_basebackup = self.config.pg_bin_dir.join("pg_basebackup");
-        let slot_name = format!("replica_{}", self.config.node_id);
+        let slot_name = pgbattery_core::ReplicationSlot::for_node(self.config.node_id).to_string();
         let status = Command::new(&pg_basebackup)
             .arg("-w")
             .arg("-h")
@@ -2616,6 +2618,163 @@ mod tests {
             assert!(
                 !calls.contains(&"promote".to_string()),
                 "promoted despite a failed safety check: {calls:?}"
+            );
+        }
+    }
+
+    /// The lease enforcement loop, driven end to end against a model.
+    ///
+    /// This is contract L1 — at most one write authority — expressed as the
+    /// only thing this node controls: an expired lease must leave local
+    /// `PostgreSQL` unable to accept writes, by fencing it or, failing that,
+    /// by taking the process down. `testing/fencing_tail.py` observes the same
+    /// property on a live cluster, but only from the outside; it cannot make
+    /// `ALTER SYSTEM` fail on demand, so the escalation branch has never run
+    /// there. A model can hold the failure for exactly as long as it takes.
+    mod lease_enforcement {
+        use crate::app::App;
+        use crate::governor::lease::LeaseState;
+        use crate::governor::pg_control::{ModelOp, ModelPg};
+        use std::sync::Arc;
+        use tokio::sync::watch;
+
+        /// A leader whose lease has expired, holding a writable primary.
+        fn expired_lease_over_a_writable_primary(
+            model: ModelPg,
+        ) -> (
+            Arc<tokio::sync::Mutex<ModelPg>>,
+            crate::governor::SharedLeaseState,
+        ) {
+            let lease = LeaseState::new();
+            // Never renewed, so it has already expired: `is_valid()` requires
+            // leadership *and* an unexpired deadline.
+            assert!(
+                !lease.is_valid(),
+                "fixture must start with an invalid lease"
+            );
+            (
+                Arc::new(tokio::sync::Mutex::new(model)),
+                Arc::new(parking_lot::RwLock::new(lease)),
+            )
+        }
+
+        #[tokio::test]
+        async fn an_expired_lease_fences_a_writable_primary() {
+            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            let should_stop =
+                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+
+            assert!(!should_stop, "one fence attempt must not stop the loop");
+            let (readonly, calls) = {
+                let guard = pg.lock().await;
+                (guard.is_readonly(), guard.calls())
+            };
+            assert!(
+                readonly,
+                "an expired lease left PostgreSQL writable: {calls:?}"
+            );
+            assert!(
+                calls.contains(&"terminate_client_backends".to_string()),
+                "fenced but left existing sessions writing: {calls:?}"
+            );
+            assert_eq!(fence_failures, 0, "a successful fence must reset the count");
+        }
+
+        #[tokio::test]
+        async fn a_fence_that_cannot_land_escalates_to_shutdown() {
+            // The RW-4 tail. `set_readonly` failing every tick is a node that
+            // has lost write authority and cannot give it up, so the only
+            // remaining way to stop it accepting writes is to stop being a
+            // process. Nothing else in the suite reaches this branch.
+            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg {
+                fails: Some(ModelOp::SetReadonly),
+                ..ModelPg::default()
+            });
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            let mut ticks = 0;
+            let mut stopped = false;
+            while ticks < App::FENCE_FAILURE_SHUTDOWN_THRESHOLD * 2 {
+                ticks += 1;
+                if App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+
+            assert!(
+                stopped,
+                "a fence that never lands must eventually stop the loop"
+            );
+            assert_eq!(
+                ticks,
+                App::FENCE_FAILURE_SHUTDOWN_THRESHOLD,
+                "escalated after {ticks} failures, not the declared threshold"
+            );
+            assert!(
+                *shutdown_rx.borrow(),
+                "the loop stopped without signalling shutdown — the node would keep \
+                 running with a writable primary and no lease"
+            );
+            assert!(
+                !pg.lock().await.is_readonly(),
+                "the model was supposed to refuse the fence"
+            );
+        }
+
+        #[tokio::test]
+        async fn one_recovered_fence_clears_the_escalation_count() {
+            // Otherwise transient ALTER SYSTEM failures accumulate across
+            // unrelated outages and take the node down on the fifth over its
+            // whole lifetime rather than the fifth in a row.
+            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg {
+                fails: Some(ModelOp::SetReadonly),
+                ..ModelPg::default()
+            });
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+            for _ in 0..App::FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1 {
+                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+            }
+            assert_eq!(fence_failures, App::FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1);
+
+            pg.lock().await.fails = None;
+            let should_stop =
+                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+
+            assert!(!should_stop);
+            assert_eq!(fence_failures, 0, "consecutive-failure count did not reset");
+            assert!(pg.lock().await.is_readonly());
+        }
+
+        #[tokio::test]
+        async fn an_expired_lease_leaves_a_standby_alone() {
+            // A standby cannot accept writes whatever the GUC says, so there is
+            // nothing to fence and no escalation is owed. This is the
+            // distinction the live run got wrong first time: it expected a
+            // restart from a node that had nothing to give up.
+            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg {
+                in_recovery: true,
+                ..ModelPg::default()
+            });
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            let should_stop =
+                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+
+            assert!(!should_stop);
+            assert!(!*shutdown_rx.borrow(), "fenced a standby into shutdown");
+            let calls = pg.lock().await.calls();
+            assert_eq!(
+                calls,
+                vec!["probe_role_and_readonly"],
+                "did more than probe"
             );
         }
     }

@@ -97,9 +97,16 @@ _VAL_RE = re.compile(r"-?\d+")
 
 
 def _parse_first_int(s: str) -> int | None:
-    """Pull the first integer out of psql's -t -A output."""
+    """Pull the value out of psql's `-t -A` output.
+
+    A row must be the *whole* line. `-t -A` renders an integer column as
+    nothing but its digits, so a line with anything else on it is a diagnostic
+    sharing the buffer (these commands merge stderr into stdout), not a value —
+    and reading `1 row affected` as the integer 1 would put a value in the
+    history that the register never held.
+    """
     for line in s.strip().splitlines():
-        match = _VAL_RE.match(line.strip())
+        match = _VAL_RE.fullmatch(line.strip())
         if match:
             with contextlib.suppress(ValueError):
                 return int(match.group())
@@ -140,6 +147,24 @@ def do_write(port: int, key: int, val: int) -> bool | None:
     return None  # pending
 
 
+def cas_committed(out: str) -> bool:
+    """Whether `out` is the result set of a CAS that updated its row.
+
+    `-t -A` renders `RETURNING 1` as a lone `1` line when the witness matched
+    and nothing at all when it did not, so the answer is "a row came back",
+    not "the transcript mentions a 1". These commands merge stderr into stdout
+    (`2>&1`) to classify rejects, so any diagnostic `PostgreSQL` prints on an
+    otherwise successful run shares the buffer with the result set — and a
+    substring test turns one containing a `1` into a CAS that committed.
+
+    That direction is the dangerous one. A witness mismatch is a *definite*
+    outcome the history records as `:fail`; promoting it to `:ok` invents a
+    successful compare-and-swap the database never performed, and the checker
+    then reports a linearizability violation against a correct cluster.
+    """
+    return any(line.strip() == "1" for line in out.splitlines())
+
+
 def do_cas(port: int, key: int, old: int, new: int) -> bool | None:
     """Execute a CAS; True on commit, False on witness-mismatch / reject, None pending."""
     cmd = (
@@ -149,7 +174,7 @@ def do_cas(port: int, key: int, old: int, new: int) -> bool | None:
     )
     rc, out, _ = run_cmd(cmd, timeout=PSQL_TIMEOUT_SECONDS)
     if rc == 0:
-        return "1" in out  # one matching row updated → True
+        return cas_committed(out)
     lower = out.lower()
     if "read-only" in lower or "cannot execute" in lower:
         return False
