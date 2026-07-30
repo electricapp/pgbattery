@@ -560,13 +560,39 @@ Nothing else in Wave 1 is safe or cheap until these land.
       _Closes_ Class B (unchecked history reported as a pass) · _Effort_ S
       _Blocked by_ H-01 (done) · _Effort_ M
 
-- [ ] **H-04 — Build the 5-node topology.** `five_node_suite.py` is a skeleton
-      that raises; no 5-node topology is tested anywhere, so quorum arithmetic
-      beyond three nodes and dual-fault tolerance are entirely unexercised.
-      **Done when** a 5-node cluster runs the existing L1 and W1 oracles, and one
-      case survives two simultaneous node failures while another confirms three
-      failures correctly loses quorum.
-      _Closes_ BI1 · _Blocks_ H-06 (5-node shapes), H-11, H-29 · _Effort_ L
+- [x] **H-04 — 5-node topology built, Phase 1 green against a live cluster.**
+      `docker-compose.5node.yml` plus `config/five/node{1..5}.toml`: its own
+      compose project, subnet (172.29/16), and host ports, so it coexists with
+      the 3-node cluster and neither one's fault injection can reach the other.
+
+      All four Phase 1 cases pass: bootstrap to a single leader agreed by a
+      majority, **survives two simultaneous voter failures** (the case a 3-node
+      cluster cannot express — there, two failures *is* quorum loss),
+      **correctly loses quorum at three**, and recovers with every acked write
+      intact. L1 is checked by asking each survivor's PostgreSQL to accept a
+      real write, not by reading the control plane.
+
+      The old skeleton did not raise — it printed a TODO banner and
+      `raise typer.Exit(code=0)`, so anything invoking it got a pass.
+
+      **The first run reported a bogus L1 violation, and why is the durable
+      part.** Compose starts all five joins at once; openraft 0.9 will not run
+      multi-step joint consensus in parallel, so the losers of that race stayed
+      *learners*. The voter set was `{1,4,5}`, not `{1..5}`. Killing "two of
+      five" killed two learners — which costs no quorum at all — and the third
+      kill left 2 of 3 voters, a legitimate majority. The suite would have
+      passed its two-failure case for the wrong reason forever.
+
+      `ensure_all_voters()` now promotes learners one at a time and refuses to
+      proceed until all five are voters, and both kill phases select from
+      `voters()` rather than from all nodes. The skeleton's own implementation
+      notes had warned about the parallel-join race; the fix is that the suite
+      now *enforces* the precondition instead of assuming it.
+
+      Phases 2-4 (membership chaos, 2-sync/2-async replication, Elle at five
+      nodes) are not implemented; the runner says so rather than implying
+      coverage.
+      _Closes_ BI1 · _Blocks_ H-06 (5-node shapes), H-11 · _Effort_ L
 
 ### Wave 1 — Close the oracles (Tier 1)
 

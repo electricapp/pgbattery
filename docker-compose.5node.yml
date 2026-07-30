@@ -1,0 +1,139 @@
+# 5-node topology, parallel to the 3-node `docker-compose.yml`.
+#
+# Separate project name, subnet, and host ports so both clusters can exist at
+# once and neither's fault injection can reach the other. Quorum here is 3, so
+# this is the only place the repo exercises surviving two simultaneous failures
+# — and losing quorum at three, which a 3-node cluster reaches at two.
+#
+# Requires PGBATTERY_MANAGEMENT_API_TOKEN, like the 3-node file.
+name: pgbattery5
+
+services:
+  node1:
+    build: .
+    hostname: node1
+    restart: unless-stopped
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/five/node1.toml:/app/pgbattery.toml:ro
+      - node1_state:/var/lib/postgresql
+    ports:
+      - "5442:5432"
+      - "9191:9090"
+      - "9181:9091"
+    environment:
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.29.0.11
+
+  node2:
+    build: .
+    hostname: node2
+    restart: unless-stopped
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 2 --voter"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/five/node2.toml:/app/pgbattery.toml:ro
+      - node2_state:/var/lib/postgresql
+    ports:
+      - "5443:5432"
+      - "9192:9090"
+      - "9182:9091"
+    environment:
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.29.0.12
+
+  node3:
+    build: .
+    hostname: node3
+    restart: unless-stopped
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 3 --voter"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/five/node3.toml:/app/pgbattery.toml:ro
+      - node3_state:/var/lib/postgresql
+    ports:
+      - "5444:5432"
+      - "9193:9090"
+      - "9183:9091"
+    environment:
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.29.0.13
+
+  node4:
+    build: .
+    hostname: node4
+    restart: unless-stopped
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 4 --voter"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/five/node4.toml:/app/pgbattery.toml:ro
+      - node4_state:/var/lib/postgresql
+    ports:
+      - "5445:5432"
+      - "9194:9090"
+      - "9184:9091"
+    environment:
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.29.0.14
+
+  node5:
+    build: .
+    hostname: node5
+    restart: unless-stopped
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 5 --voter"]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/five/node5.toml:/app/pgbattery.toml:ro
+      - node5_state:/var/lib/postgresql
+    ports:
+      - "5446:5432"
+      - "9195:9090"
+      - "9185:9091"
+    environment:
+      - RUST_LOG=info
+      - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+      - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
+      - FAKETIME_NO_CACHE=1
+      - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+    networks:
+      raft_net:
+        ipv4_address: 172.29.0.15
+
+networks:
+  raft_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+volumes:
+  node1_state:
+  node2_state:
+  node3_state:
+  node4_state:
+  node5_state:
