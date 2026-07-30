@@ -572,9 +572,22 @@ The durable fix for a bug class that has already produced one real defect.
       the fix is reverted.
       _Effort_ L
 
-- [ ] **H-20 — Add a `LoadStmt` arm.** `LOAD 'lib'` is session-local by
-      construction and carries near-zero traffic cost.
-      **Done when** the arm exists with a test, and H-19 agrees.
+- [x] **H-20 — Add a `LoadStmt` arm.** Done. `LOAD 'lib'` links a shared library
+      into one backend, so a migrated session silently stops resolving whatever it
+      provided.
+
+      The arm alone was not enough, and the reason generalises: the analyzer only
+      runs when a prefilter recognises the statement, and `load` was not in that
+      keyword list. The arm was therefore unreachable in production while its own
+      test passed, because `marks_non_migratable` calls `analyze_query` directly
+      and cannot see a missing gate keyword. `load` is now gated, and
+      `test_session_state_prefilter_admits_every_gated_statement` checks the gate
+      layer for all nine keyword shapes — verified to fail when `load` is removed
+      from the list.
+
+      Extracting `leaves_no_session_state` also gave the state-free arms a name;
+      they were previously indistinguishable in shape from the `Unmodeled`
+      fallback, though they mean the opposite.
       _Effort_ S
 
 - [ ] **H-21 — Emit a metric labelled by statement node type whenever the
@@ -589,6 +602,10 @@ The durable fix for a bug class that has already produced one real defect.
       `DO`, but severing it has real cost for stored-procedure-heavy workloads.
       **Needs sign-off before implementation** — this is a policy call, not a bug
       fix.
+      Note from H-20: `call` is not a prefilter keyword either, so the arm and the
+      gate have to land together or the arm is dead code that still passes its own
+      test. Add the shape to
+      `test_session_state_prefilter_admits_every_gated_statement`.
       _Effort_ S after decision
 
 - [ ] **H-23 — Revisit the fallback polarity with production data in hand.** Do

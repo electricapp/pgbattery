@@ -1940,10 +1940,15 @@ impl ConnectionHandler {
     /// Prefilter for statements that mutate tracked session state: session
     /// GUCs (`SET`/`RESET`), the prepared-statement replay set
     /// (`DEALLOCATE`/`DISCARD`/`PREPARE`), backend-local temp objects
-    /// (`CREATE TEMP`), `WITH HOLD` cursors (`DECLARE`), and anonymous blocks
-    /// whose body the analyzer cannot see (`DO`). All are statement-leading
-    /// keywords, so the leading-keyword scan keeps `UPDATE t SET …` /
-    /// `SELECT …` — the hot shapes — away from the C parser.
+    /// (`CREATE TEMP`), `WITH HOLD` cursors (`DECLARE`), anonymous blocks whose
+    /// body the analyzer cannot see (`DO`), and session-local library loads
+    /// (`LOAD`). All are statement-leading keywords, so the leading-keyword scan
+    /// keeps `UPDATE t SET …` / `SELECT …` — the hot shapes — away from the C
+    /// parser.
+    ///
+    /// This list gates whether the analyzer runs at all, so a `classify_statement`
+    /// arm for a statement absent here is unreachable in production: the two must
+    /// be changed together.
     ///
     /// Not exhaustive on its own: `select`-leading statements can still leave
     /// session state (`SELECT … INTO TEMP`), so the callers OR this with the
@@ -1961,6 +1966,7 @@ impl ConnectionHandler {
                 "prepare",
                 "declare",
                 "do",
+                "load",
             ],
         )
     }
@@ -3019,6 +3025,14 @@ impl ConnectionHandler {
             pg_query::protobuf::node::Node::DoStmt(_) => StatementClass::Modeled(Some(
                 SessionChange::NonMigratable("DO block (opaque body)"),
             )),
+            // `LOAD 'lib'` links a shared library into this backend for the rest
+            // of the session. A migrated backend has not loaded it, so anything
+            // the library provides — functions, hooks, custom GUCs — silently
+            // stops resolving. Session-local by construction, and rare enough
+            // that severing costs effectively nothing.
+            pg_query::protobuf::node::Node::LoadStmt(_) => StatementClass::Modeled(Some(
+                SessionChange::NonMigratable("LOAD (session-local library)"),
+            )),
             // DECLARE ... CURSOR WITH HOLD persists past its transaction; a
             // migrated backend would not have it. Non-HOLD cursors die at
             // transaction end and can never reach an Idle migration point.
@@ -3030,25 +3044,35 @@ impl ConnectionHandler {
                         .then_some(SessionChange::NonMigratable("WITH HOLD cursor")),
                 )
             }
-            // Nothing here survives to an Idle migration point. Plain DML
-            // leaves no session state at all (a `set_config` or advisory-lock
-            // call inside one is caught by the token prefilter, which needs no
-            // parse); transaction control, cursor stepping and table locks are
-            // transaction-scoped; SHOW is read-only; and the SQL `PREPARE` an
-            // EXECUTE names already ratcheted the session when it was issued.
-            pg_query::protobuf::node::Node::InsertStmt(_)
-            | pg_query::protobuf::node::Node::UpdateStmt(_)
-            | pg_query::protobuf::node::Node::DeleteStmt(_)
-            | pg_query::protobuf::node::Node::MergeStmt(_)
-            | pg_query::protobuf::node::Node::CopyStmt(_)
-            | pg_query::protobuf::node::Node::TransactionStmt(_)
-            | pg_query::protobuf::node::Node::FetchStmt(_)
-            | pg_query::protobuf::node::Node::ClosePortalStmt(_)
-            | pg_query::protobuf::node::Node::LockStmt(_)
-            | pg_query::protobuf::node::Node::ExecuteStmt(_)
-            | pg_query::protobuf::node::Node::VariableShowStmt(_) => StatementClass::Modeled(None),
+            node if Self::leaves_no_session_state(node) => StatementClass::Modeled(None),
             _ => StatementClass::Unmodeled,
         }
+    }
+
+    /// Node types examined and found to leave nothing that survives to an Idle
+    /// migration point.
+    ///
+    /// Distinct from `Unmodeled`, which means *unexamined*: these are a positive
+    /// claim. Plain DML leaves no session state at all (a `set_config` or
+    /// advisory-lock call inside one is caught by the token prefilter, which
+    /// needs no parse); transaction control, cursor stepping and table locks are
+    /// transaction-scoped; `SHOW` is read-only; and the SQL `PREPARE` an
+    /// `EXECUTE` names already ratcheted the session when it was issued.
+    const fn leaves_no_session_state(stmt: &pg_query::protobuf::node::Node) -> bool {
+        matches!(
+            stmt,
+            pg_query::protobuf::node::Node::InsertStmt(_)
+                | pg_query::protobuf::node::Node::UpdateStmt(_)
+                | pg_query::protobuf::node::Node::DeleteStmt(_)
+                | pg_query::protobuf::node::Node::MergeStmt(_)
+                | pg_query::protobuf::node::Node::CopyStmt(_)
+                | pg_query::protobuf::node::Node::TransactionStmt(_)
+                | pg_query::protobuf::node::Node::FetchStmt(_)
+                | pg_query::protobuf::node::Node::ClosePortalStmt(_)
+                | pg_query::protobuf::node::Node::LockStmt(_)
+                | pg_query::protobuf::node::Node::ExecuteStmt(_)
+                | pg_query::protobuf::node::Node::VariableShowStmt(_)
+        )
     }
 
     fn normalize_condition_name(name: &str) -> Option<String> {
@@ -3588,6 +3612,60 @@ mod tests {
         assert!(marks_non_migratable("DO $$ BEGIN PERFORM 1; END $$"));
         assert!(marks_non_migratable(
             "DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$"
+        ));
+    }
+
+    /// A `classify_statement` arm is only reachable if the prefilter routes the
+    /// statement to the analyzer at all. `marks_non_migratable` calls
+    /// `analyze_query` directly, so it cannot see a missing gate keyword — an arm
+    /// added without one is dead code that still passes its own test.
+    #[test]
+    fn test_session_state_prefilter_admits_every_gated_statement() {
+        for query in [
+            "SET work_mem = '4MB'",
+            "RESET ALL",
+            "DEALLOCATE ALL",
+            "DISCARD ALL",
+            "CREATE TEMP TABLE t (id int)",
+            "PREPARE p AS SELECT 1",
+            "DECLARE c CURSOR WITH HOLD FOR SELECT 1",
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "LOAD 'auto_explain'",
+        ] {
+            assert!(
+                ConnectionHandler::might_contain_session_state_command(query),
+                "prefilter drops {query:?}, so its analyzer arm never runs"
+            );
+        }
+        // The hot shapes must stay off the C parser.
+        for query in [
+            "SELECT id FROM readings WHERE id = 1",
+            "UPDATE readings SET temp = 21.5 WHERE id = 1",
+            "INSERT INTO readings (temp) VALUES (1)",
+        ] {
+            assert!(
+                !ConnectionHandler::might_contain_session_state_command(query),
+                "prefilter sends {query:?} to the parser"
+            );
+        }
+    }
+
+    /// `LOAD` links a shared library into this backend only. A migrated backend
+    /// has not loaded it, so the functions and hooks it provides stop resolving
+    /// with nothing in the parse tree to hint why.
+    #[test]
+    fn test_analyze_query_flags_load() {
+        assert!(marks_non_migratable("LOAD 'auto_explain'"));
+        assert!(marks_non_migratable("load 'pg_stat_statements'"));
+        // A LOAD anywhere in a multi-statement batch ratchets the session.
+        assert!(marks_non_migratable("SELECT 1; LOAD 'auto_explain'"));
+        // The token prefilter must not be what catches it: no bare mention of
+        // the word in ordinary SQL may sever a session.
+        assert!(!marks_non_migratable(
+            "SELECT payload FROM jobs WHERE kind = 'load'"
+        ));
+        assert!(!marks_non_migratable(
+            "INSERT INTO audit (action) VALUES ('LOAD')"
         ));
     }
 
