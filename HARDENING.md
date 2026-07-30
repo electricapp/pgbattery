@@ -426,24 +426,24 @@ Nothing else in Wave 1 is safe or cheap until these land.
       of which has run against these changes.
       _Closes_ Class A1 structurally · _Blocks_ H-05…H-09, H-12 · _Effort_ M
 
-- [ ] **H-03 — Split `linearizability_register.py`.** Three seams extracted, two
-      to go. `linreg/records.py` holds `Op`, `JepsenRecord`, and `History`;
-      `linreg/checkers.py` the WGL and weak checkers with their op cap;
-      `linreg/cluster.py` the shell and leader-discovery helpers plus the topology
-      constants, which had briefly been defined in both files — one source of
-      truth, so they cannot drift. The entrypoint keeps the CLI and is down from
-      1,821 to 1,440 lines.
+- [ ] **H-03 — Split `linearizability_register.py`.** Five seams extracted; the
+      attack table remains. `linreg/` now holds `records.py` (`Op`,
+      `JepsenRecord`, `History`), `checkers.py` (WGL and weak, with their op cap),
+      `cluster.py` (shell, leader discovery, topology constants), `config.py`
+      (`WorkloadConfig` and its defaults), and `workload.py` (table setup, op
+      helpers, the three worker loops, and the gateway-rebind helpers the loops
+      call). The entrypoint keeps the CLI and the attacks, down from 1,821 lines
+      to 1,017.
 
       Tests import from the package directly rather than through re-exports, so
-      the module boundary is real. The `global` guard now scans `linreg/*.py` as
-      well and fails if the package is missing, so it cannot pass vacuously; the
-      `lint_matrix` fault-verb scan gained `*/*.py` for the same reason —
-      otherwise moving an attack into the package would walk straight out of the
-      confinement check. Verified by planting a fault verb in `records.py`.
+      the boundaries are real. Two guards were widened to survive the move: the
+      `global` scan now covers `linreg/*.py` and fails if the package is missing,
+      so it cannot pass vacuously; and `lint_matrix`'s fault-verb scan gained
+      `*/*.py`, because moving an attack into a package would otherwise walk
+      straight out of the confinement check.
 
-      **Remaining:** the workload loops and the attack table, then a real Elle run
-      — the failure mode is a silently weakened workload, which unit tests do not
-      see.
+      **Remaining:** the attack table, then a real Elle run — the failure mode is
+      a silently weakened workload, which unit tests do not see.
       _Blocked by_ H-01 (done) · _Effort_ M
 
 - [ ] **H-04 — Build the 5-node topology.** `five_node_suite.py` is a skeleton

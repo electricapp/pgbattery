@@ -37,6 +37,8 @@ from typing import Final
 from unittest import mock
 
 import linearizability_register as lr
+from linreg import workload
+from linreg.config import WorkloadConfig
 from linreg.records import History
 
 RETIRED_GLOBALS: Final[tuple[str, ...]] = (
@@ -74,7 +76,7 @@ class _StubClient:
         self.port = port
 
 
-def drive_register_worker(cfg: lr.WorkloadConfig, iterations: int, seed: int = 1) -> list[int]:
+def drive_register_worker(cfg: WorkloadConfig, iterations: int, seed: int = 1) -> list[int]:
     """Run `worker_loop` with the op helpers stubbed; return the keys it touched.
 
     Stops the loop from inside the stub once `iterations` ops have been issued,
@@ -100,8 +102,8 @@ def drive_register_worker(cfg: lr.WorkloadConfig, iterations: int, seed: int = 1
         record(key)
         return True
 
-    with mock.patch.multiple(lr, do_read=stub_read, do_write=stub_write, do_cas=stub_cas):
-        lr.worker_loop(0, History(), stop, random.Random(seed), cfg)
+    with mock.patch.multiple(workload, do_read=stub_read, do_write=stub_write, do_cas=stub_cas):
+        workload.worker_loop(0, History(), stop, random.Random(seed), cfg)
     return keys_seen
 
 
@@ -113,8 +115,8 @@ def captured_setup_sql(fn_name: str, num_keys: int) -> str:
         seen.append(cmd)
         return 0, "", ""
 
-    with mock.patch.object(lr, "run_cmd", stub_run_cmd):
-        getattr(lr, fn_name)(num_keys)
+    with mock.patch.object(workload, "run_cmd", stub_run_cmd):
+        getattr(workload, fn_name)(num_keys)
     if not seen:
         raise AssertionError(f"{fn_name} issued no command")
     return seen[0]
@@ -153,18 +155,18 @@ class TestNoConfigGlobalsRemain(unittest.TestCase):
 
 class TestConfigObject(unittest.TestCase):
     def test_config_is_frozen(self) -> None:
-        cfg = lr.WorkloadConfig()
+        cfg = WorkloadConfig()
         with self.assertRaises(FrozenInstanceError):
             cfg.keys = 99  # type: ignore[misc]
 
     def test_config_carries_non_defaults(self) -> None:
-        cfg = lr.WorkloadConfig(workers=9, keys=11, duration_s=13.5, fault_at=0.25)
+        cfg = WorkloadConfig(workers=9, keys=11, duration_s=13.5, fault_at=0.25)
         self.assertEqual((cfg.workers, cfg.keys), (9, 11))
         self.assertEqual((cfg.duration_s, cfg.fault_at), (13.5, 0.25))
 
     def test_every_cli_flag_has_a_config_field(self) -> None:
         """A flag with nowhere to land would be silently discarded."""
-        field_names = {f.name for f in fields(lr.WorkloadConfig)}
+        field_names = {f.name for f in fields(WorkloadConfig)}
         self.assertEqual(field_names, {"workers", "keys", "duration_s", "fault_at"})
 
     def test_cli_defaults_are_the_module_constants(self) -> None:
@@ -185,27 +187,29 @@ class TestWorkerLoopsTakeConfig(unittest.TestCase):
     reports PASS on an empty history."""
 
     def test_thread_arg_tuple_binds_to_every_loop(self) -> None:
-        args = (0, History(), threading.Event(), random.Random(0), lr.WorkloadConfig())
+        args = (0, History(), threading.Event(), random.Random(0), WorkloadConfig())
         for name in WORKER_LOOPS:
             with self.subTest(loop=name):
-                signature(getattr(lr, name)).bind(*args)
+                signature(getattr(workload, name)).bind(*args)
 
     def test_all_loops_share_one_parameter_list(self) -> None:
         """The workload dispatch picks a loop by name, so they must be
         interchangeable."""
-        shapes = {name: list(signature(getattr(lr, name)).parameters) for name in WORKER_LOOPS}
+        shapes = {
+            name: list(signature(getattr(workload, name)).parameters) for name in WORKER_LOOPS
+        }
         distinct = {tuple(v) for v in shapes.values()}
         self.assertEqual(len(distinct), 1, f"worker loops disagree on parameters: {shapes}")
 
 
 class TestKeysGovernsBehaviour(unittest.TestCase):
     def test_single_key_confines_the_register_worker(self) -> None:
-        keys_seen = drive_register_worker(lr.WorkloadConfig(keys=1), iterations=40)
+        keys_seen = drive_register_worker(WorkloadConfig(keys=1), iterations=40)
         self.assertEqual(set(keys_seen), {0}, "keys=1 must confine the worker to key 0")
 
     def test_wider_keyspace_is_actually_used(self) -> None:
         """Confinement alone would also pass if the key were hardcoded to 0."""
-        keys_seen = drive_register_worker(lr.WorkloadConfig(keys=7), iterations=200)
+        keys_seen = drive_register_worker(WorkloadConfig(keys=7), iterations=200)
         self.assertTrue(all(0 <= k < 7 for k in keys_seen), f"key outside [0,7): {keys_seen}")
         self.assertGreater(
             len(set(keys_seen)), 1, "keys=7 produced a single key; cfg.keys is being ignored"
@@ -227,10 +231,8 @@ class TestKeysGovernsBehaviour(unittest.TestCase):
         for name in ("txn_worker_loop", "list_append_worker_loop"):
             with self.subTest(loop=name):
                 stop = threading.Event()
-                with mock.patch.object(lr, "PsycopgWorkerClient", _StubClient):
-                    getattr(lr, name)(
-                        0, History(), stop, random.Random(0), lr.WorkloadConfig(keys=1)
-                    )
+                with mock.patch.object(workload, "PsycopgWorkerClient", _StubClient):
+                    getattr(lr, name)(0, History(), stop, random.Random(0), WorkloadConfig(keys=1))
 
 
 class TestPerKeyTakesCountExplicitly(unittest.TestCase):
