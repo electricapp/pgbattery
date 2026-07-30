@@ -591,12 +591,16 @@ The durable fix for a bug class that has already produced one real defect.
       fallback, though they mean the opposite.
       _Effort_ S
 
-- [ ] **H-21 — Emit a metric labelled by statement node type whenever the
-      unmodeled arm is reached**, so the production tail is measured before any
-      policy change. The classifier is a deny-list covering roughly two dozen of
-      PostgreSQL's ~200 node types and the fallback is _migratable_ — the unsafe
-      direction.
-      **Done when** the metric is exported and documented as the input to H-23.
+- [x] **H-21 — Emit a metric labelled by statement node type whenever the
+      unmodeled arm is reached.** Done.
+      `pgbattery_gateway_unmodeled_statements_total{node_type}`, documented in
+      `docs/DEPLOYMENT.md` as the input to H-23.
+
+      The label is the parse-node variant name, so cardinality is bounded by the
+      enum (~200) and nothing derived from client text reaches a metric. It is
+      read off the derived `Debug` by a sink that stops at the first `(`, which
+      avoids formatting the parse tree; two tests pin that assumption so a change
+      in how `Debug` is derived fails rather than silently relabelling.
       _Blocks_ H-23 · _Effort_ S
 
 - [ ] **H-22 — Decide on a `CallStmt` arm.** `CALL proc()` is opaque exactly like

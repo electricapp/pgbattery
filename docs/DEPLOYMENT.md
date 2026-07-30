@@ -84,14 +84,15 @@ them and build alerts around the handful of signals that actually matter.
 
 ## Core Metrics
 
-| Metric                                           | Meaning                                       | Action                                                                                     |
-| ------------------------------------------------ | --------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `pgbattery_raft_is_leader`                       | 1 if this node is leader                      | Sum across cluster; if nobody reports 1, the cluster is leaderless.                        |
-| `pgbattery_raft_has_quorum`                      | 1 when the leader has quorum                  | Alert if the leader has quorum=0 for >30s.                                                 |
-| `pgbattery_lease_valid`                          | 1 when writes are allowed                     | If the leader’s lease expires, clients are already fenced. Investigate network partitions. |
-| `pgbattery_replica_lag_bytes{node}`              | Lag per replica                               | Alert when lag exceeds your RPO threshold (e.g., 16MB).                                    |
-| `pgbattery_connections_active`                   | Active client connections                     | Track trends; sudden drops often coincide with failovers.                                  |
-| `pgbattery_connections_migrated` / `..._severed` | Counters for migration vs. forced disconnects | Spikes of “severed” connections indicate transactions were cut mid-flight.                 |
+| Metric                                                    | Meaning                                          | Action                                                                                                                       |
+| --------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `pgbattery_raft_is_leader`                                | 1 if this node is leader                         | Sum across cluster; if nobody reports 1, the cluster is leaderless.                                                          |
+| `pgbattery_raft_has_quorum`                               | 1 when the leader has quorum                     | Alert if the leader has quorum=0 for >30s.                                                                                   |
+| `pgbattery_lease_valid`                                   | 1 when writes are allowed                        | If the leader’s lease expires, clients are already fenced. Investigate network partitions.                                   |
+| `pgbattery_replica_lag_bytes{node}`                       | Lag per replica                                  | Alert when lag exceeds your RPO threshold (e.g., 16MB).                                                                      |
+| `pgbattery_connections_active`                            | Active client connections                        | Track trends; sudden drops often coincide with failovers.                                                                    |
+| `pgbattery_connections_migrated` / `..._severed`          | Counters for migration vs. forced disconnects    | Spikes of “severed” connections indicate transactions were cut mid-flight.                                                   |
+| `pgbattery_gateway_unmodeled_statements_total{node_type}` | Statements the session classifier has no arm for | These are treated as migratable without being examined. A node type appearing here in volume is a candidate for its own arm. |
 
 ## Minimal Prometheus Scrape
 

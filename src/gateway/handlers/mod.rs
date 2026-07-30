@@ -2882,13 +2882,56 @@ impl ConnectionHandler {
                 // so one temp-naming statement arms the fallback for its
                 // siblings in the same batch.
                 StatementClass::Unmodeled if names_temp_object => {
+                    Self::record_unmodeled_statement(stmt_node);
                     analysis.session_changes.push(SessionChange::NonMigratable(
                         "unmodeled statement naming a temp-scoped object",
                     ));
                 }
-                StatementClass::Modeled(None) | StatementClass::Unmodeled => {}
+                StatementClass::Unmodeled => Self::record_unmodeled_statement(stmt_node),
+                StatementClass::Modeled(None) => {}
             }
         }
+    }
+
+    /// Count a statement the classifier has no arm for. The fallback for these
+    /// is *migratable* — the unsafe direction — so the tail has to be measured
+    /// before that polarity can be revisited.
+    fn record_unmodeled_statement(stmt: &pg_query::protobuf::node::Node) {
+        metrics::counter!(
+            "pgbattery_gateway_unmodeled_statements_total",
+            "node_type" => Self::node_type_name(stmt),
+        )
+        .increment(1);
+    }
+
+    /// Variant name of a parse node, for use as a metric label.
+    ///
+    /// Derived `Debug` writes the name then `(`, so erroring at the first `(`
+    /// stops before the payload is formatted. Pinned by `node_type_name_*`.
+    fn node_type_name(stmt: &pg_query::protobuf::node::Node) -> String {
+        use std::fmt::Write as _;
+
+        struct UpToOpenParen(String);
+        impl std::fmt::Write for UpToOpenParen {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                if let Some(end) = s.find('(') {
+                    self.0.push_str(&s[..end]);
+                    return Err(std::fmt::Error);
+                }
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+
+        let mut sink = UpToOpenParen(String::new());
+        let _ = write!(sink, "{stmt:?}");
+        let name = sink.0.trim();
+        // Nothing here comes from client text, so cardinality is bounded by the
+        // enum; reject anything unexpected rather than emit it as a label.
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return "unknown".to_owned();
+        }
+        name.to_owned()
     }
 
     fn is_commit_statement(stmt: &pg_query::protobuf::node::Node) -> bool {
@@ -3648,6 +3691,42 @@ mod tests {
                 "prefilter sends {query:?} to the parser"
             );
         }
+    }
+
+    /// The metric label depends on how `Debug` is derived for the node enum. If
+    /// that changes, these fail rather than the label silently becoming junk.
+    #[test]
+    fn node_type_name_is_the_variant_name() {
+        for (sql, expected) in [
+            ("EXPLAIN ANALYZE SELECT 1", "ExplainStmt"),
+            ("VACUUM readings", "VacuumStmt"),
+            ("ALTER TABLE readings ADD COLUMN c int", "AlterTableStmt"),
+            ("GRANT SELECT ON readings TO alice", "GrantStmt"),
+            ("LOAD 'auto_explain'", "LoadStmt"),
+        ] {
+            let parsed = pg_query::parse(sql).unwrap();
+            let node = parsed.protobuf.stmts[0]
+                .stmt
+                .as_ref()
+                .and_then(|s| s.node.as_ref())
+                .unwrap();
+            assert_eq!(ConnectionHandler::node_type_name(node), expected);
+        }
+    }
+
+    /// A label must never carry parse-tree payload: unbounded cardinality, and
+    /// it would put client text into a metric.
+    #[test]
+    fn node_type_name_excludes_the_payload() {
+        let parsed = pg_query::parse("VACUUM some_table_named_here").unwrap();
+        let node = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+            .unwrap();
+        let name = ConnectionHandler::node_type_name(node);
+        assert!(!name.contains("some_table_named_here"), "{name}");
+        assert!(name.chars().all(|c| c.is_ascii_alphanumeric()), "{name}");
     }
 
     /// `LOAD` links a shared library into this backend only. A migrated backend
