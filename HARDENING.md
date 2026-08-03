@@ -1100,15 +1100,53 @@ violation, and the first thing a Jepsen analysis would reach for.
       Raft, because a cluster would put a failover, a `pg_rewind` and a possible
       re-basebackup between the tear and the assertion.
 
+      The Raft store now has its own LazyFS instance, so redb is reachable.
+      `mount_lazyfs` in the entrypoint runs twice — PGDATA at 0700, the Raft
+      store at 0750 — each with its own control FIFO, log and backing root, and
+      `fault_primitives.LazyfsMount` keeps those four paths together so a
+      harness cannot arm a fault on one instance and look for its effect on the
+      other. Two instances rather than one over their common parent: a single
+      one would mean a fault aimed at redb crashes the filesystem holding
+      PostgreSQL, and no suite could then say which store the damage was aimed
+      at.
+
+      That also strengthened the dirty-crash suite, which previously could say
+      nothing at all about Raft durability — `docker kill` could not discard a
+      single un-fsynced redb write while the store sat on an ordinary
+      filesystem, and openraft's storage conformance suite carried those pins
+      alone. Both caches are now discarded before the SIGKILL, and cluster-crash
+      stays green at 300/300 with its inversion red.
+
+      Adding the mount also exposed a false oracle in `leader-crash`, which is
+      worth recording as its own lesson. `--prove-oracle` there weakened
+      `synchronous_commit` and expected acked writes to be lost — but only the
+      leader's WAL flushers are frozen, because only the leader is killed, so
+      the standbys flush the streamed WAL normally and a promoted standby still
+      holds every acked write. The inversion could only go red by killing the
+      leader before replication had made the data durable anywhere. It did go
+      red for months, which was worse than failing outright: it read as the
+      fault being proven when what had been proven was that the writer outran
+      the WAL sender on that run. Slowing the write path with a second LazyFS
+      mount was enough to flip it. `leader-crash` now refuses `--prove-oracle`
+      and says why; the primitive's evidence comes from `cluster-crash`, which
+      shares it and has no survivor to flush anything.
+
+      **An inversion that can be won by racing is not an inversion.** It is a
+      seventh instance of the Class A1 pattern above, in a new shape: not a
+      fault that failed to inject, but a proof that passed for the wrong
+      reason.
+
       **Still open, and the reason this stays unchecked:**
 
-      - redb is untouched, which is the substantive gap. The Raft store lives
-        at `/var/lib/postgresql/raft`, outside the LazyFS mount and therefore
-        outside any tear that can be injected. Covering it needs a second
-        LazyFS mount for the raft directory; the compose and entrypoint changes
-        are the bulk of the remaining work.
-      - Only heap pages. A torn WAL record should be caught by the record CRC
-        and a torn `pg_control` by its own; neither is exercised.
+      - No suite tears redb. The substrate is in place and
+        `arm_torn_write(..., mount=LAZYFS_RAFT)` reaches `raft.db`, but nothing
+        drives it or asserts what a torn Raft record must do. The property is
+        sharper than PostgreSQL's: a torn write that silently corrupted the
+        persisted vote or log would be an election-safety violation, not just
+        lost data.
+      - Only heap pages on the PostgreSQL side. A torn WAL record should be
+        caught by the record CRC and a torn `pg_control` by its own; neither is
+        exercised.
 
       **Done when** a torn write is injected and detected rather than silently
       accepted, in CI, for both PostgreSQL pages and the Raft store. The first

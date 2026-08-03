@@ -235,22 +235,62 @@ PG_INTERNAL_PORT: Final[int] = 5434
 FAKETIME_FILE: Final[str] = "/tmp/faketime"
 """Read on every clock call because the image sets ``FAKETIME_NO_CACHE=1``."""
 
-LAZYFS_FIFO: Final[str] = "/tmp/lazyfs.fifo"
-"""LazyFS control channel. Matches ``[faults].fifo_path`` in
-``testing/lazyfs/lazyfs.toml``, which the ``runtime-lazyfs`` image stage bakes
-in at ``/etc/lazyfs.toml``. Outside PGDATA on purpose: a control channel inside
-the filesystem being crashed vanishes exactly when it is needed."""
 
-LAZYFS_LOG: Final[str] = "/tmp/lazyfs.log"
-"""Where LazyFS mirrors its log, per ``[filesystem].logfile`` in
-``testing/lazyfs/lazyfs.toml``. The fault worker echoes every command it
-consumes, so this file is the only place that distinguishes "the command was
-written to the FIFO" from "LazyFS acted on it"."""
+@dataclass(frozen=True)
+class LazyfsMount:
+    """One LazyFS instance: where it mounts, what backs it, how it is driven.
 
-LAZYFS_ROOT_DIR: Final[str] = f"{PG_STATE_DIR}/pgdata-root"
-"""Backing store behind the LazyFS mount, on the persistent named volume. What
-survives in here after a crash *is* the evidence: it holds exactly the writes
-that were fsynced."""
+    These four paths are a set, not four independent settings. A harness that
+    took the FIFO of one instance and the backing root of another would arm a
+    fault on one filesystem and then look for its effect on the other, and
+    find nothing -- which reads as a fault that did not fire. Keeping them in
+    one object means a caller names an instance rather than assembling one.
+    """
+
+    name: str
+    mount_dir: str
+    root_dir: str
+    fifo: str
+    log: str
+
+    def holds(self, path: str) -> bool:
+        """Whether `path` is a backing-store path belonging to this instance."""
+        return path.startswith(f"{self.root_dir}/")
+
+
+LAZYFS_DATA: Final[LazyfsMount] = LazyfsMount(
+    name="pgdata",
+    mount_dir=PG_DATA_DIR,
+    root_dir=f"{PG_STATE_DIR}/pgdata-root",
+    fifo="/tmp/lazyfs.fifo",
+    log="/tmp/lazyfs.log",
+)
+"""PGDATA. Matches ``testing/lazyfs/lazyfs.toml``, baked in at
+``/etc/lazyfs.toml`` by the ``runtime-lazyfs`` image stage. The FIFO and log
+sit outside the mount on purpose: a control channel inside the filesystem being
+crashed vanishes exactly when it is needed."""
+
+LAZYFS_RAFT: Final[LazyfsMount] = LazyfsMount(
+    name="raft",
+    mount_dir=f"{PG_STATE_DIR}/raft",
+    root_dir=f"{PG_STATE_DIR}/raft-root",
+    fifo="/tmp/lazyfs-raft.fifo",
+    log="/tmp/lazyfs-raft.log",
+)
+"""The Raft store, holding redb's ``raft.db``. A separate instance from
+PGDATA's so a fault aimed at one cannot crash the filesystem holding the other,
+which is what makes it possible to say which store the damage was aimed at.
+pgbattery derives this directory as a sibling of ``pg_data_dir``."""
+
+LAZYFS_FIFO: Final[str] = LAZYFS_DATA.fifo
+LAZYFS_LOG: Final[str] = LAZYFS_DATA.log
+LAZYFS_ROOT_DIR: Final[str] = LAZYFS_DATA.root_dir
+"""PGDATA's paths, named directly for the callers that only ever mean PGDATA.
+The durability suite is the whole of that set: it crashes the node, so which
+instance it addresses is not a choice it makes."""
+
+RAFT_DB_FILE: Final[str] = "raft.db"
+"""redb's database, in ``LAZYFS_RAFT``. Named in ``src/app.rs``."""
 
 FILLER_PATH: Final[str] = f"{PG_STATE_DIR}/_fault_fill.bin"
 """Disk-fill target. Deliberately beside PGDATA rather than inside it: same
@@ -1124,7 +1164,9 @@ def lazyfs_probe_command(nonce: str) -> str:
     return f"lazyfs::pgbattery-probe-{nonce}"
 
 
-def lazyfs_torn_op_cmd(path: str, *, parts: int, persist: Sequence[int]) -> str:
+def lazyfs_torn_op_cmd(
+    path: str, *, parts: int, persist: Sequence[int], mount: LazyfsMount = LAZYFS_DATA
+) -> str:
     """Arm a torn write: split the next write to `path` into `parts` equal
     pieces and persist only those in `persist`.
 
@@ -1157,10 +1199,10 @@ def lazyfs_torn_op_cmd(path: str, *, parts: int, persist: Sequence[int]) -> str:
             f"persisting all {parts} parts is a whole write, not a torn one; "
             f"the fault would report success and change nothing"
         )
-    if not path.startswith(LAZYFS_ROOT_DIR):
+    if not mount.holds(path):
         raise ValueError(
-            f"torn-op needs the LazyFS root path, not the mount path: {path!r} "
-            f"does not start with {LAZYFS_ROOT_DIR}"
+            f"torn-op needs a path in the {mount.name} LazyFS root, not the mount "
+            f"path: {path!r} does not start with {mount.root_dir}/"
         )
     kept = ",".join(str(p) for p in persist)
     return f"lazyfs::torn-op::file={path}::persist={kept}::parts={parts}"
@@ -2575,7 +2617,9 @@ def verify_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> None:
         )
 
 
-def verify_lazyfs_fault_channel(container: str, *, timeout_s: float = 10.0) -> None:
+def verify_lazyfs_fault_channel(
+    container: str, *, mount: LazyfsMount = LAZYFS_DATA, timeout_s: float = 10.0
+) -> None:
     """Assert LazyFS is *consuming* the fault FIFO, not merely accepting writes.
 
     Writing to the FIFO succeeds whenever LazyFS holds it open, which it does
@@ -2593,30 +2637,35 @@ def verify_lazyfs_fault_channel(container: str, *, timeout_s: float = 10.0) -> N
     So: send a command LazyFS cannot recognise and wait for it to say so.
     """
     nonce = uuid.uuid4().hex
-    probe = exec_in(container, lazyfs_control_cmd(lazyfs_probe_command(nonce)))
+    probe = exec_in(container, lazyfs_control_cmd(lazyfs_probe_command(nonce), fifo=mount.fifo))
     if not probe.ok:
         raise FaultPreconditionError(
-            f"{container}: could not write to {LAZYFS_FIFO}: {probe.output}"
+            f"{container}: could not write to {mount.fifo}: {probe.output}"
         )
 
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        log = exec_in(container, lazyfs_log_cmd())
+        log = exec_in(container, lazyfs_log_cmd(log=mount.log))
         if log.ok and parse_lazyfs_consumed(log.stdout, nonce):
             return
         time.sleep(0.2)
 
     raise FaultPreconditionError(
-        f"{container}: LazyFS accepted a write to {LAZYFS_FIFO} but never echoed it "
-        f"within {timeout_s:g}s, so its fault worker is not reading the FIFO. Every "
-        f"fault command would report success and inject nothing.\n"
-        f"  Check {LAZYFS_LOG} in the container for how far startup got, and check "
-        f"that `fifo_path_completed` is unset in testing/lazyfs/lazyfs.toml."
+        f"{container}: the {mount.name} LazyFS accepted a write to {mount.fifo} but "
+        f"never echoed it within {timeout_s:g}s, so its fault worker is not reading "
+        f"the FIFO. Every fault command would report success and inject nothing.\n"
+        f"  Check {mount.log} in the container for how far startup got, and check "
+        f"that `fifo_path_completed` is unset in its config."
     )
 
 
 def arm_torn_write(
-    container: str, path: str, *, parts: int = 2, persist: Sequence[int] = (1,)
+    container: str,
+    path: str,
+    *,
+    parts: int = 2,
+    persist: Sequence[int] = (1,),
+    mount: LazyfsMount = LAZYFS_DATA,
 ) -> None:
     """Arm a torn write on `path` and confirm LazyFS accepted the fault.
 
@@ -2624,20 +2673,29 @@ def arm_torn_write(
     `path`, which has not happened yet. Use :func:`verify_torn_write_injected`
     after driving that write.
     """
-    verify_lazyfs_fault_channel(container)
-    command = lazyfs_torn_op_cmd(path, parts=parts, persist=persist)
+    verify_lazyfs_fault_channel(container, mount=mount)
+    command = lazyfs_torn_op_cmd(path, parts=parts, persist=persist, mount=mount)
 
-    before = _lazyfs_received_count(container, command)
-    armed = exec_in(container, lazyfs_control_cmd(command))
+    before = _lazyfs_received_count(container, command, mount=mount)
+    armed = exec_in(container, lazyfs_control_cmd(command, fifo=mount.fifo))
     if not armed.ok:
         raise FaultInjectionError(f"{container}: could not arm torn-op: {armed.output}")
-    _await_lazyfs_received(container, command, before)
+    _await_lazyfs_received(container, command, before, mount=mount)
 
-    _emit("fault.armed", "torn_write", container, {"path": path, "parts": parts})
+    _emit(
+        "fault.armed",
+        "torn_write",
+        container,
+        {"path": path, "parts": parts, "mount": mount.name},
+    )
 
 
 def verify_torn_write_injected(
-    container: str, path: str, *, expected_bytes: int | None = None
+    container: str,
+    path: str,
+    *,
+    expected_bytes: int | None = None,
+    mount: LazyfsMount = LAZYFS_DATA,
 ) -> int:
     """Assert LazyFS actually tore a write to `path`, and say how much survived.
 
@@ -2646,7 +2704,7 @@ def verify_torn_write_injected(
     logs each surviving piece, so the log is the truth source; the file's size
     is not, because a torn write does not change it.
     """
-    log = exec_in(container, lazyfs_log_cmd())
+    log = exec_in(container, lazyfs_log_cmd(log=mount.log))
     persisted = parse_lazyfs_torn_bytes(log.stdout, path) if log.ok else None
     if persisted is None:
         raise FaultEffectNotObserved(
@@ -2662,19 +2720,26 @@ def verify_torn_write_injected(
     return persisted
 
 
-def _lazyfs_received_count(container: str, command: str) -> int:
+def _lazyfs_received_count(
+    container: str, command: str, *, mount: LazyfsMount = LAZYFS_DATA
+) -> int:
     """How many times `container`'s LazyFS has logged receiving `command`."""
-    log = exec_in(container, lazyfs_log_cmd())
+    log = exec_in(container, lazyfs_log_cmd(log=mount.log))
     return count_lazyfs_received(log.stdout, command) if log.ok else 0
 
 
 def _await_lazyfs_received(
-    container: str, command: str, before: int, *, timeout_s: float = 10.0
+    container: str,
+    command: str,
+    before: int,
+    *,
+    mount: LazyfsMount = LAZYFS_DATA,
+    timeout_s: float = 10.0,
 ) -> None:
     """Block until LazyFS logs receiving `command` more often than `before`."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if _lazyfs_received_count(container, command) > before:
+        if _lazyfs_received_count(container, command, mount=mount) > before:
             return
         time.sleep(0.2)
     raise FaultEffectNotObserved(
@@ -2711,12 +2776,15 @@ def crash_losing_unsynced_writes(
     and therefore the only one that can turn W1 and R2 from asserted into
     demonstrated.
 
-    DOES NOT PROVE: anything about the Raft store, which lives outside the
-    mount at ``/var/lib/postgresql/raft`` on the ordinary filesystem and so
-    keeps its un-fsynced writes across this fault. openraft's storage
-    conformance suite carries the durability pins for that. Nor does it prove
-    torn-write handling: pages here are lost whole, never half-written. That
-    is :func:`arm_torn_write`'s job, and H-25's.
+    The Raft store is included. It has its own LazyFS instance, and both
+    caches are discarded before anything is killed, so redb's un-fsynced writes
+    die here exactly as PostgreSQL's do. That was not true while the Raft store
+    sat on an ordinary filesystem: it kept its un-fsynced writes across this
+    fault, and openraft's storage conformance suite carried the durability
+    pins alone.
+
+    DOES NOT PROVE: torn-write handling. Pages here are lost whole, never
+    half-written. That is :func:`arm_torn_write`'s job, and H-25's.
 
     Every named container is discarded before any is killed. Killing them one
     at a time would let the survivors keep accepting writes and re-replicating
@@ -2726,6 +2794,17 @@ def crash_losing_unsynced_writes(
 
     The containers are left dead. The caller restarts them, because what a
     restart recovers is the measurement.
+
+    Everything between the caller's last write and the SIGKILL is inside the
+    window the fault is trying to measure, so this does the least it can. In
+    particular it does not run the nonce round-trip of
+    :func:`verify_lazyfs_fault_channel`: waiting for LazyFS to log receiving
+    the `clear-cache` proves the same thing more directly, by confirming the
+    command that matters rather than a proxy for it. The round-trips that
+    check bought several seconds of `docker exec` latency, and with
+    `synchronous_commit=off` a few seconds is long enough for a backend to
+    flush WAL under buffer pressure and make writes durable that the inversion
+    needs to lose.
     """
     targets = list(containers)
     if not targets:
@@ -2757,18 +2836,20 @@ def crash_losing_unsynced_writes(
 
     try:
         for target in targets:
-            # A write to the FIFO succeeding says nothing about the command
-            # being executed, so establish that the worker is reading before
-            # sending it anything that matters.
-            verify_lazyfs_fault_channel(target)
-
-            before = _lazyfs_received_count(target, "lazyfs::clear-cache")
-            discard = exec_in(target, lazyfs_control_cmd("lazyfs::clear-cache"))
-            if not discard.ok:
-                raise FaultInjectionError(
-                    f"{target}: could not write clear-cache to {LAZYFS_FIFO}: {discard.output}"
+            # Both instances. A power loss does not discard PGDATA's un-fsynced
+            # writes and spare the Raft store's, and clearing only one would
+            # leave redb's cache to be destroyed by the SIGKILL alone -- true
+            # here, but true by accident rather than by the fault.
+            for mount in (LAZYFS_DATA, LAZYFS_RAFT):
+                before = _lazyfs_received_count(target, "lazyfs::clear-cache", mount=mount)
+                discard = exec_in(
+                    target, lazyfs_control_cmd("lazyfs::clear-cache", fifo=mount.fifo)
                 )
-            _await_lazyfs_received(target, "lazyfs::clear-cache", before)
+                if not discard.ok:
+                    raise FaultInjectionError(
+                        f"{target}: could not write clear-cache to {mount.fifo}: {discard.output}"
+                    )
+                _await_lazyfs_received(target, "lazyfs::clear-cache", before, mount=mount)
 
         # SIGKILL, never `docker stop`. A graceful stop gives LazyFS a chance
         # to unmount, and unmounting flushes — which would quietly write out

@@ -82,12 +82,25 @@ jobs:
       - name: Start the cluster
         run: docker compose -f docker-compose.lazyfs.yml up -d
 
+      # cluster-crash proves the fault first and then asserts. leader-crash
+      # cannot: weakening synchronous_commit does not lose an acked write while
+      # a standby survives to flush the streamed WAL, so its inversion would
+      # only go red by outrunning replication. It shares the primitive with
+      # cluster-crash, which is where that primitive is proven.
       - name: Prove the oracle can fail, then assert durability
+        if: matrix.mode == 'cluster-crash'
         run: |
           uv run --project testing python testing/durability_crash.py \
-            --mode "${{ matrix.mode }}" \
+            --mode cluster-crash \
             --writes 500 \
             --prove-oracle
+
+      - name: Assert durability with a survivor
+        if: matrix.mode == 'leader-crash'
+        run: |
+          uv run --project testing python testing/durability_crash.py \
+            --mode leader-crash \
+            --writes 500
 
       - name: Collect diagnostics
         if: failure()

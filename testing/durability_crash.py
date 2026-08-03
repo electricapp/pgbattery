@@ -311,6 +311,32 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.prove_oracle and args.mode == "leader-crash":
+        # `synchronous_commit=off` is not an inversion for this mode. Only the
+        # leader's WAL flushers are frozen, because only the leader is killed,
+        # so the standbys flush the streamed WAL normally and a promoted
+        # standby still has every acked write. The inversion can therefore only
+        # go red by killing the leader before replication has made the data
+        # durable anywhere -- a race, not a property.
+        #
+        # It did go red for a while, which was worse than failing: it read as
+        # the fault being proven when what had been proven was that the writer
+        # outran the WAL sender that run. Slowing the write path with a second
+        # LazyFS mount was enough to flip it.
+        #
+        # The primitive's evidence comes from cluster-crash, which shares it
+        # and whose inversion is sound: with every node dead there is no
+        # survivor to have flushed anything.
+        raise OracleNotProven(
+            "--prove-oracle is not meaningful for leader-crash. Weakening "
+            "synchronous_commit cannot lose an acked write while a standby "
+            "survives and flushes the streamed WAL, so the inversion would only "
+            "go red by winning a race against replication.\n"
+            "  Prove the fault with cluster-crash, which shares the same "
+            "primitive and has no survivor:\n"
+            "    testing/durability_crash.py --mode cluster-crash --prove-oracle"
+        )
+
     if args.prove_oracle:
         red = run_case(mode=args.mode, writes=args.writes, weaken=True)
         print(json.dumps(verdict(red, mode=args.mode, weaken=True), indent=2))

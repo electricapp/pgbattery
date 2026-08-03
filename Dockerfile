@@ -131,7 +131,11 @@ RUN ldconfig
 RUN echo "user_allow_other" >> /etc/fuse.conf
 
 COPY testing/lazyfs/entrypoint.sh /usr/local/bin/pgbattery-lazyfs
+# Two configs for two LazyFS instances: PGDATA and the Raft store. They must
+# differ in fifo_path and logfile, or the second instance would create a FIFO
+# over the first's and faults would reach whichever won the race.
 COPY testing/lazyfs/lazyfs.toml /etc/lazyfs.toml
+COPY testing/lazyfs/lazyfs-raft.toml /etc/lazyfs-raft.toml
 
 RUN chmod 0755 /usr/local/bin/pgbattery-lazyfs
 
@@ -141,7 +145,14 @@ RUN chmod 0755 /usr/local/bin/pgbattery-lazyfs
 # and executable and failing only at run time, inside a container whose logs
 # nobody reads until the suite has already reported green.
 RUN ldd /usr/local/bin/lazyfs && ! ldd /usr/local/bin/lazyfs | grep -q "not found"
-RUN test -x /usr/local/bin/pgbattery-lazyfs && test -s /etc/lazyfs.toml
+RUN test -x /usr/local/bin/pgbattery-lazyfs && test -s /etc/lazyfs.toml && test -s /etc/lazyfs-raft.toml
+# The two instances must not share a control FIFO or a log. If they did, one
+# would clobber the other's and faults aimed at PGDATA would land on the Raft
+# store or vanish, which no assertion downstream could distinguish from a
+# fault that simply did nothing.
+RUN test "$(grep -c '/tmp/lazyfs-raft' /etc/lazyfs-raft.toml)" -ge 2 \
+    && ! grep -qE 'fifo_path *= *"/tmp/lazyfs\.fifo"' /etc/lazyfs-raft.toml \
+    && ! grep -qE 'logfile *= *"/tmp/lazyfs\.log"' /etc/lazyfs-raft.toml
 RUN command -v setpriv && command -v fusermount3
 
 # Stays root: the entrypoint mounts FUSE and then drops to postgres itself.

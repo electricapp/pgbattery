@@ -1,0 +1,48 @@
+# LazyFS configuration for the Raft store, baked in at /etc/lazyfs-raft.toml.
+# A second instance beside the PGDATA one so a fault aimed at redb cannot take
+# down the filesystem holding PostgreSQL, and vice versa: each has its own
+# control FIFO and its own log, and the harness addresses them separately.
+#
+# Sizing differs from PGDATA deliberately. The Raft store is small -- log
+# entries, vote, membership -- so the cache only has to outlast the un-fsynced
+# window, not a database.
+
+[faults]
+fifo_path = "/tmp/lazyfs-raft.fifo"
+# `fifo_path_completed` is deliberately unset. LazyFS opens that second FIFO
+# `O_WRONLY` while starting its fault worker, and opening a FIFO for writing
+# blocks until some process opens the read end. Nothing here ever does, so
+# setting it parks the worker before it reaches its read loop: the control
+# FIFO still accepts writes, because the worker already holds it open
+# `O_RDWR`, and every command sits unread in the pipe buffer. Faults report
+# success and inject nothing.
+#
+# The completion channel only matters for waiting on an async clear-cache
+# without sleeping. No suite needs it: the fault channel is confirmed with a
+# round-trip probe, and the evidence comes from the backing store after the
+# crash rather than from a completion message.
+
+[cache]
+# Real eviction under memory pressure. With eviction off, LazyFS holds every
+# un-fsynced page until the cache fills and then behaves in a way no disk does.
+apply_eviction = false
+
+[cache.simple]
+# Must exceed the un-fsynced Raft working set between the drop window opening
+# and the crash, or LazyFS evicts (writes through) early and the writes the
+# test intends to lose are already durable. Raft entries here are votes,
+# membership changes and small commands rather than data pages, so this is far
+# smaller than the PGDATA instance and still orders of magnitude above what a
+# run generates.
+custom_size = "256mb"
+blocks_per_page = 1
+
+[filesystem]
+# Per-operation logging stays off: it would log every write redb issues.
+log_all_operations = false
+# With a logfile set, LazyFS installs a console sink *and* a file sink, so the
+# container log keeps everything and the harness gets a file it can grep. That
+# file is how a fault command is confirmed to have been consumed, rather than
+# merely written to a pipe. Under /tmp with the FIFO, not under the mount, for
+# the same reason: it has to outlive the filesystem it describes.
+logfile = "/tmp/lazyfs-raft.log"

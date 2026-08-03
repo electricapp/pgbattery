@@ -1809,7 +1809,36 @@ class TornWriteTests(RunnerFixture):
         path matches nothing and the fault never fires."""
         with self.assertRaises(ValueError) as caught:
             fp.lazyfs_torn_op_cmd(f"{fp.PG_DATA_DIR}/base/5/16384", parts=2, persist=(1,))
-        self.assertIn("root path", str(caught.exception))
+        self.assertIn("LazyFS root", str(caught.exception))
+
+    def test_a_path_in_the_other_instance_is_refused(self) -> None:
+        """The two instances have separate fault tables. Arming a path from one
+        against the other's FIFO configures a fault that can never match, and
+        LazyFS reports that as success."""
+        raft_page = f"{fp.LAZYFS_RAFT.root_dir}/{fp.RAFT_DB_FILE}"
+        with self.assertRaises(ValueError) as caught:
+            fp.lazyfs_torn_op_cmd(raft_page, parts=2, persist=(1,), mount=fp.LAZYFS_DATA)
+        self.assertIn("pgdata", str(caught.exception))
+        # ...and the same path against its own instance is fine.
+        fp.lazyfs_torn_op_cmd(raft_page, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT)
+
+    def test_the_two_instances_share_nothing(self) -> None:
+        """A shared FIFO or log would send faults to whichever instance won the
+        race, and no assertion downstream could tell that from a fault that did
+        nothing."""
+        data, raft = fp.LAZYFS_DATA, fp.LAZYFS_RAFT
+        self.assertNotEqual(data.fifo, raft.fifo)
+        self.assertNotEqual(data.log, raft.log)
+        self.assertNotEqual(data.root_dir, raft.root_dir)
+        self.assertNotEqual(data.mount_dir, raft.mount_dir)
+
+    def test_holds_requires_a_path_below_the_root(self) -> None:
+        """A prefix match on the bare root would accept a sibling directory
+        whose name merely starts the same way."""
+        raft = fp.LAZYFS_RAFT
+        self.assertTrue(raft.holds(f"{raft.root_dir}/{fp.RAFT_DB_FILE}"))
+        self.assertFalse(raft.holds(raft.root_dir))
+        self.assertFalse(raft.holds(f"{raft.root_dir}-backup/raft.db"))
 
     def test_persisting_every_part_is_refused(self) -> None:
         """Not a torn write at all: LazyFS would write the whole thing and log
