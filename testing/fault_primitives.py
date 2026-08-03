@@ -2609,7 +2609,9 @@ def read_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> bool:
     return parse_lazyfs_mounted(result.stdout, mount_dir)
 
 
-def verify_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> None:
+def verify_lazyfs_mounted(
+    container: str, mount_dir: str = PG_DATA_DIR, *, timeout_s: float = 0.0
+) -> None:
     """Assert `container` runs PGDATA on LazyFS, with the remediation attached.
 
     Called before every durability fault. Without LazyFS the crash below is an
@@ -2617,16 +2619,34 @@ def verify_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> None:
     the *host* page cache, which killing a container does not discard — so the
     assertion "every acked write survived" would hold no matter what
     PostgreSQL's durability settings were, and would read as evidence.
+
+    `timeout_s` waits for the mount to appear rather than demanding it already
+    has. The entrypoint makes these mounts during startup, so a suite that
+    checks the instant the container reports "Started" reads a container that
+    is merely early as one that is misconfigured. Waiting weakens nothing: a
+    mount that never appears still fails, with the same message.
+
+    The wait belongs here rather than in `docker compose up --wait`. That gate
+    depends on compose's health aggregation, which was observed calling a node
+    still in `health: starting` unhealthy and aborting the run five seconds in.
+    This waits on the fact the fault actually needs.
     """
-    if not read_lazyfs_mounted(container, mount_dir):
-        raise FaultPreconditionError(
-            f"{container}: {mount_dir} is not a LazyFS mount, so un-fsynced writes "
-            f"cannot be lost and no durability claim can be tested here.\n"
-            f"  Run this suite against docker-compose.lazyfs.yml:\n"
-            f"    COMPOSE_FILE=docker-compose.lazyfs.yml docker compose up -d\n"
-            f"  That file targets the `runtime-lazyfs` image stage and starts each "
-            f"node through the entrypoint that mounts LazyFS at {mount_dir}."
-        )
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if read_lazyfs_mounted(container, mount_dir):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1.0)
+    raise FaultPreconditionError(
+        f"{container}: {mount_dir} is not a LazyFS mount"
+        f"{f' after {timeout_s:g}s' if timeout_s else ''}, so un-fsynced writes "
+        f"cannot be lost and no durability claim can be tested here.\n"
+        f"  Run this suite against docker-compose.lazyfs.yml:\n"
+        f"    COMPOSE_FILE=docker-compose.lazyfs.yml docker compose up -d\n"
+        f"  That file targets the `runtime-lazyfs` image stage and starts each "
+        f"node through the entrypoint that mounts LazyFS at {mount_dir}."
+    )
 
 
 def verify_lazyfs_fault_channel(

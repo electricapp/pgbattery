@@ -2518,7 +2518,10 @@ mod tests {
             panic!("a panicking storage op must not report success")
         };
         let msg = err.to_string();
-        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(
+            msg.contains("corrupted"),
+            "expected corruption error: {msg}"
+        );
         assert!(msg.contains("re-join"), "error must be actionable: {msg}");
         assert!(
             msg.contains(&path.display().to_string()),

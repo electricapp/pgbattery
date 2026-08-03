@@ -56,6 +56,10 @@ TABLE: Final[str] = "torn_raft_probe"
 
 CONVERGE_TIMEOUT_S: Final[float] = 180.0
 REFUSAL_TIMEOUT_S: Final[float] = 90.0
+# How long the LazyFS mounts may take to appear after the containers start.
+# The entrypoint gives itself 30s per mount and there are two, so this covers
+# a slow runner without ever masking a mount that is genuinely absent.
+MOUNT_TIMEOUT_S: Final[float] = 90.0
 CORRUPT_MARKER: Final[str] = "Raft DB corrupted"
 """Emitted by `src/governor/storage.rs` when redb returns an error opening the
 store. Matched rather than a redb string so a change in redb's wording surfaces
@@ -436,8 +440,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # The entrypoint makes these mounts during startup, so this is the suite's
+    # own readiness gate: it waits for the fact it needs rather than trusting
+    # the container to have finished by the time compose says "Started".
     for node in topology.NODES:
-        fp.verify_lazyfs_mounted(node, fp.LAZYFS_RAFT.mount_dir)
+        fp.verify_lazyfs_mounted(node, fp.LAZYFS_RAFT.mount_dir, timeout_s=MOUNT_TIMEOUT_S)
         fp.verify_lazyfs_fault_channel(node, mount=fp.LAZYFS_RAFT)
 
     if args.prove_oracle:

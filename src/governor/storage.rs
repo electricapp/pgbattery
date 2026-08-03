@@ -140,7 +140,9 @@ fn is_corruption(e: &DatabaseError) -> bool {
         // is the first thing on disk, produces exactly this. redb's other
         // `InvalidData` is for opening an empty file without permission to
         // initialize it, which `create` always grants, so it cannot be this.
-        DatabaseError::Storage(StorageError::Io(io)) => io.kind() == std::io::ErrorKind::InvalidData,
+        DatabaseError::Storage(StorageError::Io(io)) => {
+            io.kind() == std::io::ErrorKind::InvalidData
+        }
         _ => false,
     }
 }
@@ -1068,7 +1070,10 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
 
-        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(
+            msg.contains("corrupted"),
+            "expected corruption error: {msg}"
+        );
         assert!(msg.contains("re-join"), "error must be actionable: {msg}");
         assert!(path.exists(), "corrupt file must be preserved in place");
     }
@@ -1092,7 +1097,10 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
 
-        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(
+            msg.contains("corrupted"),
+            "expected corruption error: {msg}"
+        );
         assert!(
             !msg.contains("Any { .. }"),
             "panic detail must be extracted, not printed as an opaque Any: {msg}"
