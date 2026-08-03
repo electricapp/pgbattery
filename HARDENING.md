@@ -1010,11 +1010,38 @@ The durable fix for a bug class that has already produced one real defect.
 Touches the container image. The single most likely place to find a genuine RPO
 violation, and the first thing a Jepsen analysis would reach for.
 
-- [ ] **H-24 — Lost-unfsynced-writes on crash.** LazyFS or libeatmydata. Open the
-      fsync-drop window, collect acked writes, SIGKILL the container, restart,
-      assert every acked write is present.
-      **Done when** W1 and R2 are demonstrated rather than asserted, and the
-      harness is shown to detect a deliberately weakened durability setting.
+- [x] **H-24 — Lost-unfsynced-writes on crash.** Done, and not with the tool this
+      task originally named. **libeatmydata cannot do this job.** Making `fsync()`
+      a no-op still leaves the write in the _host_ page cache, and SIGKILLing a
+      container does not discard host page cache, so the data is all still there
+      on restart. A durability suite built on it passes unconditionally. LazyFS
+      holds un-fsynced writes in its own userspace cache, which dies with the
+      process, so the loss is real.
+
+      `testing/durability_crash.py` against `docker-compose.lazyfs.yml`, where
+      PGDATA is a LazyFS mount. Red-green on a live 3-node cluster:
+
+      | Run   | Configuration                                      | Acked writes lost |
+      | ----- | -------------------------------------------------- | ----------------- |
+      | RED   | `synchronous_commit=off`, WAL flushers frozen      | 300 of 300        |
+      | GREEN | default durability                                 | 0 of 300          |
+
+      `cluster-crash` kills all three nodes at once, which is the only
+      configuration in the repo where a *standby* that acknowledges a flush it
+      never performed becomes observable — so it is the R2 test, not merely a
+      harsher W1 one. `leader-crash` covers W1 with a survivor.
+
+      **Three false greens surfaced building it**, each of which would have
+      reported durability while proving nothing. A settle pause between the last
+      ack and the crash defeated the inversion outright: `synchronous_commit=off`
+      is still fsynced by the walwriter every `wal_writer_delay`, so a 1 s gap
+      made all 300 writes durable and the oracle reported it could not detect
+      weakened durability. `pkill -f` SIGSTOPped its own caller, because the
+      pattern naming those processes appears on the command line of the shell
+      running pkill. And `restart: unless-stopped` raced the kill — Docker
+      restarted the first victim while the last was still being killed, so a
+      whole-cluster crash quietly degraded into a rolling restart.
+
       _Closes_ Class A2 for fsync · _Effort_ L
 
 - [ ] **H-25 — Torn writes via dm-flakey**, which also exercises PostgreSQL page

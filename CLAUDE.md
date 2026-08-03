@@ -115,7 +115,7 @@ Deliberate skeletons that raise rather than silently pass. Do not treat their ab
 - `testing/five_node_suite.py` — Phase 1 is implemented and green (bootstrap, survives 2 voter failures, loses quorum at 3, recovers with acked writes intact) against `docker-compose.5node.yml`. Phases 2-4 — membership chaos, 2-sync/2-async replication, Elle at five nodes — are not, and the runner says so. Note the suite promotes learners to voters before asserting anything: compose starts all five joins at once and openraft 0.9 leaves the losers of that race as learners, which would make every quorum assertion vacuous.
 - `fsync_drop` / `bit_flip` attacks in `linearizability_register.py` — need image changes (LazyFS or libeatmydata; dm-flakey); excluded from `ALL_ATTACKS` and `chaos_storm`.
 
-Every fault currently injected is a _clean_ fault (SIGKILL, container stop, network disconnect, SIGSTOP). `docker kill` leaves the host page cache intact, so **nothing yet proves fsync is honored** or that torn writes are detected — W1 and R2 rest on construction, not evidence. See `HARDENING.md`.
+Faults in the default matrix are all _clean_ (SIGKILL, container stop, network disconnect, SIGSTOP): `docker kill` leaves the host page cache intact, so none of them can discard an un-fsynced write. The dirty-crash path is separate — `testing/durability_crash.py` against `docker-compose.lazyfs.yml`, where PGDATA is a LazyFS mount and un-fsynced writes die with the process. That suite demonstrates W1 and R2 rather than asserting them, and refuses to report a green result until its inversion has gone red. Torn writes are still unproven (H-25). See `HARDENING.md`.
 
 ### Faults must verify their own effect
 

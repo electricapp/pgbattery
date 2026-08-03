@@ -1,0 +1,113 @@
+name: Durability
+
+# The dirty-crash suite (H-24, contracts W1 and R2). Runs against
+# docker-compose.lazyfs.yml, where PGDATA is a LazyFS mount and an un-fsynced
+# write can actually be lost.
+#
+# Its own workflow rather than a ci_matrix case: `compose_file` lives in the
+# matrix-wide cluster block, so a case cannot select a different cluster, and
+# lint_matrix.py reconciles that block against topology.py. Elle and
+# correctness-lite are separated for the same reason.
+#
+# `--prove-oracle` is what makes a green result mean anything. It runs the
+# inversion first — synchronous_commit=off with the WAL flushers frozen, which
+# must lose acked writes — and refuses to report on the real assertion unless
+# that went red. A suite whose fault has silently stopped injecting reports
+# perfect durability, so the inversion is the gate, not an extra.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "docker-compose.lazyfs.yml"
+      - "config/lazyfs/**"
+      - "testing/lazyfs/**"
+      - "testing/durability_crash.py"
+      - "testing/fault_primitives.py"
+      - "crates/pgbattery-supervisor/**"
+      - "src/governor/**"
+      - ".github/workflows/durability.yml"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+  schedule:
+    # 05:00 UTC, after fuzz (04:00) and the control-plane nightly (04:15), so
+    # three container-heavy suites do not contend for the same runner.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: durability-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+jobs:
+  dirty-crash:
+    name: Dirty crash (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # cluster-crash is the R2 test: with every node dead at once, a standby
+        # that acked a flush it never performed becomes observable. leader-crash
+        # is W1 with a survivor, which is the failover path clients actually see.
+        mode: [cluster-crash, leader-crash]
+    env:
+      COMPOSE_FILE: docker-compose.lazyfs.yml
+      COMPOSE_PROJECT_NAME: durability-${{ github.run_id }}-${{ matrix.mode }}
+      PGBATTERY_MANAGEMENT_API_TOKEN: ci-durability-token
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+
+      # The FUSE mount needs /dev/fuse present on the runner. ubuntu-latest
+      # ships it, but asserting beats discovering at container start that the
+      # entrypoint fell back to an ordinary filesystem.
+      - name: Verify FUSE is available on the runner
+        run: test -c /dev/fuse
+
+      - name: Build the LazyFS cluster
+        run: docker compose -f docker-compose.lazyfs.yml build
+
+      - name: Start the cluster
+        run: docker compose -f docker-compose.lazyfs.yml up -d
+
+      - name: Prove the oracle can fail, then assert durability
+        run: |
+          uv run --project testing python testing/durability_crash.py \
+            --mode "${{ matrix.mode }}" \
+            --writes 500 \
+            --prove-oracle
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          mkdir -p artifacts
+          docker compose -f docker-compose.lazyfs.yml logs --no-color > artifacts/compose.log 2>&1 || true
+          docker compose -f docker-compose.lazyfs.yml ps -a > artifacts/ps.txt 2>&1 || true
+          for n in node1 node2 node3; do
+            docker compose -f docker-compose.lazyfs.yml exec -T --user root "$n" \
+              sh -c 'grep postgresql/data /proc/mounts' > "artifacts/$n.mounts.txt" 2>&1 || true
+          done
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: durability-${{ matrix.mode }}-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.lazyfs.yml down -v || true

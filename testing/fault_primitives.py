@@ -57,9 +57,9 @@ WHAT EACH PRIMITIVE PROVES
     running (stopping backends would hang the client, not the durability path).
     No kernel or disk-controller path is exercised, fsync error (EIO) handling
     is untested, and this cannot produce the "fsync returned success without
-    flushing" durability violation — that needs libeatmydata preloaded into
-    postgres, which is an image change. See the ``fsync_drop`` scaffold in
-    ``linearizability_register.py`` for the precondition list.
+    flushing" durability violation. :func:`crash_losing_unsynced_writes` can,
+    and does — run it from ``durability_crash.py`` against
+    ``docker-compose.lazyfs.yml``.
 
 ``clock_skew_at_lease_boundary(container, skew_ms, window_ms)``
     PROVES: whether any decision that a lease guards is actually taken on the
@@ -2405,9 +2405,8 @@ def fsync_stall(container: str, duration_s: float) -> Iterator[StoppedProcessHan
     stopping backends would hang the client rather than the durability path.
     Nothing here touches the kernel or disk-controller path, fsync error (EIO)
     handling is untested, and this cannot produce the "fsync returned success
-    without flushing" violation. That requires libeatmydata preloaded into
-    postgres, i.e. a Dockerfile change; ``linearizability_register.py``'s
-    ``fsync_drop`` scaffold carries the precondition list.
+    without flushing" violation — :func:`crash_losing_unsynced_writes` is the
+    primitive that can.
 
     Distinct from :func:`sigstop_checkpointer`, which stops the checkpointer
     alone and leaves the WAL write path intact.

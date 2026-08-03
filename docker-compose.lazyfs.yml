@@ -41,8 +41,7 @@ services:
   node1:
     <<: *lazyfs-node
     hostname: node1
-    command:
-      ["pgbattery-lazyfs", "pgbattery", "run", "--bootstrap"]
+    command: ["pgbattery-lazyfs", "pgbattery", "run", "--bootstrap"]
     volumes:
       - ./config/lazyfs/node1.toml:/app/pgbattery.toml:ro
       - node1_state:/var/lib/postgresql
