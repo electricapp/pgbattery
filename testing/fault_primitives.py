@@ -2627,9 +2627,9 @@ def verify_lazyfs_mounted(
     mount that never appears still fails, with the same message.
 
     The wait belongs here rather than in `docker compose up --wait`. That gate
-    depends on compose's health aggregation, which was observed calling a node
-    still in `health: starting` unhealthy and aborting the run five seconds in.
-    This waits on the fact the fault actually needs.
+    depends on compose's health aggregation across services, which reports a
+    node still in `health: starting` as unhealthy once a sibling has gone
+    healthy, and aborts. This waits on the fact the fault actually needs.
     """
     deadline = time.monotonic() + timeout_s
     while True:

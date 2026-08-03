@@ -360,6 +360,20 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     return outcome
 
 
+def await_fault_readiness() -> None:
+    """Wait until every node can actually receive a fault.
+
+    Two facts, neither implying the other: the Raft store must be on LazyFS,
+    and LazyFS's fault worker must be consuming its control FIFO. The mount
+    check carries the timeout because it is the one that has to outlast a
+    container still starting; by the time it passes, the container is running
+    and the FIFO probe can reach it.
+    """
+    for node in topology.NODES:
+        fp.verify_lazyfs_mounted(node, fp.LAZYFS_RAFT.mount_dir, timeout_s=MOUNT_TIMEOUT_S)
+        fp.verify_lazyfs_fault_channel(node, mount=fp.LAZYFS_RAFT)
+
+
 def reset_cluster() -> None:
     """Rebuild the cluster from nothing and wait for a leader.
 
@@ -375,6 +389,10 @@ def reset_cluster() -> None:
     if not started.ok:
         raise fp.FaultPreconditionError(f"could not restart the cluster: {started.output}")
     await_leader(CONVERGE_TIMEOUT_S)
+    # A leader says nothing about whether the other nodes can receive a fault
+    # yet. Without this the real run reached a node still restarting its
+    # LazyFS and failed writing to a control FIFO that did not exist.
+    await_fault_readiness()
 
 
 def prove_oracle() -> None:
@@ -440,12 +458,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # The entrypoint makes these mounts during startup, so this is the suite's
-    # own readiness gate: it waits for the fact it needs rather than trusting
-    # the container to have finished by the time compose says "Started".
-    for node in topology.NODES:
-        fp.verify_lazyfs_mounted(node, fp.LAZYFS_RAFT.mount_dir, timeout_s=MOUNT_TIMEOUT_S)
-        fp.verify_lazyfs_fault_channel(node, mount=fp.LAZYFS_RAFT)
+    # The suite's own readiness gate: it waits for the facts it needs rather
+    # than trusting the container to have finished by the time compose says
+    # "Started".
+    await_fault_readiness()
 
     if args.prove_oracle:
         prove_oracle()

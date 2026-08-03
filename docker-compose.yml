@@ -5,11 +5,11 @@ name: pgbattery
 
 # Every service names its build `target` explicitly. A bare `build: .` builds
 # whichever stage is last in the Dockerfile, so appending a stage silently
-# repoints every service in this file at it — which is exactly what happened
-# when `runtime-lazyfs` was added: it runs as root by design, so `initdb`
-# refused and all three nodes restart-looped with no management API. Nothing
-# in the build failed, so the only symptom was a cluster that never converged.
-# `lint_matrix.py` now refuses a service that leaves the target implicit.
+# repoints every service in this file at it. `runtime-lazyfs` is the live
+# hazard: it stays root so its entrypoint can mount FUSE, and `initdb` refuses
+# to run as root, so every node restart-loops with no management API. The build
+# still succeeds and the image is valid, which leaves a cluster that never
+# converges as the only symptom. `lint_matrix.py` refuses an implicit target.
 
 services:
   node1:

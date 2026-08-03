@@ -1274,13 +1274,50 @@ violation, and the first thing a Jepsen analysis would reach for.
       Every one carries an inversion that must go red first.
       _Closes_ Class A2 for torn writes
 
-- [ ] **H-26 — ENOSPC at the next WAL segment**, as distinct from a blanket volume
-      fill. The data volumes are tmpfs-bounded now, so a fill can genuinely
-      exhaust them; targeting exhaustion at WAL-segment allocation is what
-      remains.
-      **Done when** the failure lands at segment allocation specifically and the
-      node fences rather than corrupting.
-      _Effort_ M
+- [x] **H-26 — ENOSPC at the next WAL segment**, as distinct from a blanket volume
+      fill. `testing/wal_enospc.py`, gated by the `wal-enospc` job in
+      `durability.yml`.
+
+      **pgbattery fences by dying.** With free space driven to half a WAL
+      segment on the leader, 122 of 150 writes are refused, PostgreSQL fails,
+      pgbattery exits, and leadership moves. Every acknowledged write survives —
+      178 acked, 178 surviving, none lost — and the cluster takes writes again
+      once space is freed, with nothing restarted deliberately.
+
+      Two things had to be true before that number meant anything, and both
+      were false on the first attempt:
+
+      - **The workload has to force a segment roll.** With bare integer keys,
+        all 200 writes were acknowledged while the disk was proven unable to
+        allocate a 16 MiB segment — a hundred tiny inserts fit inside the
+        *current* segment, so PostgreSQL never asks for the next one. The fault
+        was aimed correctly and nothing pulled the trigger. Rows now carry a
+        256 KiB `STORAGE EXTERNAL` payload, so the roll happens inside the
+        window and the same writes that force it are the ones W1 is asserted
+        over. The suite fails loudly on a run with no observable effect rather
+        than reporting the green.
+      - **The victim must not be the bootstrap node.** Bounded volumes are
+        tmpfs, so a node that restarts comes back with an empty
+        `/var/lib/postgresql`, and `node1` would bootstrap a fresh cluster with
+        a fresh Raft log rather than rejoin — every assertion passing against a
+        database that had discarded the evidence, presented as data loss caused
+        by disk exhaustion. Leadership is moved off `node1` first, so the
+        victim comes back as a follower and re-clones.
+
+      The inversion is a no-fill run required to show **no** effect. That is
+      what makes the signal attributable: writes failing and leadership moving
+      in a cluster nobody touched would mean the same observation under a full
+      disk proves nothing about ENOSPC.
+
+      **L1 is not claimed here.** Leader observations are reported, never
+      asserted on: two distinct leader names across the window are a leadership
+      transition, not two leaders at once, and Raft does not promise every node
+      learns of a new leader at the same instant. L1 is about two nodes being
+      simultaneously *writable*, which only concurrent real writes answer.
+      Running `dual_writability_prober.py` inside the full-disk window is the
+      work that would let this suite claim it, and is worth doing — disk
+      exhaustion is a plausible way to stall a leader past its lease.
+      _Closes_ the ENOSPC class at segment allocation
 
 ### Wave 4 — Concurrency gaps (Tier 3.5)
 
