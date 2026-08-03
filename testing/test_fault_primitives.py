@@ -1791,6 +1791,75 @@ class LazyfsFaultChannelTests(RunnerFixture):
             fp.verify_lazyfs_fault_channel("node1", timeout_s=0.5)
 
 
+class TornWriteTests(RunnerFixture):
+    """Torn-write injection (H-25). Every guard here encodes something read out
+    of the LazyFS source, because each one fails silently rather than loudly:
+    a torn-op that does not match reports "configured successfully" and tears
+    nothing."""
+
+    PAGE = f"{fp.LAZYFS_ROOT_DIR}/base/5/16384"
+
+    def test_command_uses_the_root_path(self) -> None:
+        cmd = fp.lazyfs_torn_op_cmd(self.PAGE, parts=2, persist=(1,))
+        self.assertEqual(cmd, f"lazyfs::torn-op::file={self.PAGE}::persist=1::parts=2")
+
+    def test_mount_path_is_refused(self) -> None:
+        """LazyFS keys its fault table by the path its callbacks receive, which
+        the subdir module has already rewritten to the backing root. A mount
+        path matches nothing and the fault never fires."""
+        with self.assertRaises(ValueError) as caught:
+            fp.lazyfs_torn_op_cmd(f"{fp.PG_DATA_DIR}/base/5/16384", parts=2, persist=(1,))
+        self.assertIn("root path", str(caught.exception))
+
+    def test_persisting_every_part_is_refused(self) -> None:
+        """Not a torn write at all: LazyFS would write the whole thing and log
+        success, which is the shape of a fault that cannot fail."""
+        with self.assertRaises(ValueError):
+            fp.lazyfs_torn_op_cmd(self.PAGE, parts=2, persist=(1, 2))
+
+    def test_degenerate_parameters_are_refused(self) -> None:
+        for parts, persist in ((1, (1,)), (2, ()), (2, (0,)), (2, (3,)), (3, (1, 1))):
+            with self.subTest(parts=parts, persist=persist), self.assertRaises(ValueError):
+                fp.lazyfs_torn_op_cmd(self.PAGE, parts=parts, persist=persist)
+
+    def test_torn_bytes_sums_the_surviving_pieces(self) -> None:
+        log = f"[lazyfs.faults]: Write to path {self.PAGE}: will persist 4096 bytes from offset 0\n"
+        self.assertEqual(fp.parse_lazyfs_torn_bytes(log, self.PAGE), 4096)
+        self.assertEqual(fp.parse_lazyfs_torn_bytes(log * 2, self.PAGE), 8192)
+
+    def test_torn_bytes_is_none_when_the_fault_never_fired(self) -> None:
+        """Configured-but-never-fired is the dangerous state: the file is whole
+        and every downstream assertion passes vacuously."""
+        armed = "[lazyfs.faults.worker]: configured successfully 'lazyfs::torn-op::...'\n"
+        self.assertIsNone(fp.parse_lazyfs_torn_bytes(armed, self.PAGE))
+        self.assertIsNone(fp.parse_lazyfs_torn_bytes("", self.PAGE))
+
+    def test_torn_bytes_does_not_match_another_file(self) -> None:
+        other = f"{fp.LAZYFS_ROOT_DIR}/base/5/99999"
+        log = f"[lazyfs.faults]: Write to path {other}: will persist 4096 bytes from offset 0\n"
+        self.assertIsNone(fp.parse_lazyfs_torn_bytes(log, self.PAGE))
+
+    def test_injection_check_fails_when_nothing_was_torn(self) -> None:
+        """The red half."""
+        self.install(ScriptedRunner([("lazyfs.log", ok("nothing happened here\n"))]))
+        with self.assertRaises(fp.FaultEffectNotObserved) as caught:
+            fp.verify_torn_write_injected("node1", self.PAGE)
+        self.assertIn("vacuous", str(caught.exception))
+
+    def test_injection_check_reports_the_surviving_bytes(self) -> None:
+        log = f"[lazyfs.faults]: Write to path {self.PAGE}: will persist 4096 bytes from offset 0\n"
+        self.install(ScriptedRunner([("lazyfs.log", ok(log))]))
+        self.assertEqual(fp.verify_torn_write_injected("node1", self.PAGE), 4096)
+
+    def test_injection_check_rejects_a_different_split(self) -> None:
+        """A tear of the wrong size means the write that landed was not the
+        write the test meant to tear."""
+        log = f"[lazyfs.faults]: Write to path {self.PAGE}: will persist 512 bytes from offset 0\n"
+        self.install(ScriptedRunner([("lazyfs.log", ok(log))]))
+        with self.assertRaises(fp.FaultEffectNotObserved):
+            fp.verify_torn_write_injected("node1", self.PAGE, expected_bytes=4096)
+
+
 class LazyfsConfigTests(unittest.TestCase):
     """The shipped LazyFS config, checked against what the harness assumes.
 

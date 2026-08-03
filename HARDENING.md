@@ -249,8 +249,8 @@ reach for.
   libeatmydata. The test that matters: open the fsync-drop window, collect acked
   writes, SIGKILL the container, restart, assert every acked write is present.
   That converts W1 and R2 from asserted to demonstrated.
-- **Torn writes** via dm-flakey, which also exercises PostgreSQL page checksums
-  and redb crash recovery.
+- **Torn writes** via `lazyfs::torn-op`, which also exercises PostgreSQL page
+  checksums and redb crash recovery.
 - **ENOSPC at the next WAL segment**, as distinct from a blanket volume fill.
   The data volumes are now tmpfs-bounded so a fill can genuinely exhaust them,
   which is the precondition; targeting the exhaustion at WAL-segment allocation
@@ -883,7 +883,8 @@ No new infrastructure. Highest confidence per unit of effort.
       writable node, and these modes leave none, so the script waits for a row in
       the probe table — proof a round landed — before applying the mode. A
       backend in uninterruptible I/O is still not covered; it needs a blocking
-      device, which is H-25's dm-flakey work.
+      device, which neither `lazyfs::torn-op` nor anything else in H-25
+      provides.
       _Closes_ RW-4 · _Effort_ M
 
 - [ ] **H-14 — Measure what `pg_rewind` discards.** Async fallback then rewind can
@@ -1059,11 +1060,53 @@ violation, and the first thing a Jepsen analysis would reach for.
 
       _Closes_ Class A2 for fsync · _Effort_ L
 
-- [ ] **H-25 — Torn writes via dm-flakey**, which also exercises PostgreSQL page
-      checksums and redb crash recovery.
+- [ ] **H-25 — Torn writes.** The mechanism is proven and the primitives are in
+      `fault_primitives.py` (`lazyfs_torn_op_cmd`, `arm_torn_write`,
+      `verify_torn_write_injected`); the suite that drives them is not written.
+
+      dm-flakey turned out to be unnecessary. LazyFS injects torn writes
+      natively — `lazyfs::torn-op` splits a write into N pieces, persists a
+      chosen subset directly to the backing store, and then crashes itself so
+      the rest die in its userspace cache. This matters beyond convenience:
+      dm-flakey needs device-mapper on the host, which is unreachable on Docker
+      Desktop, where the host is a LinuxKit VM.
+
+      Demonstrated against a standalone PostgreSQL 18 on LazyFS. A one-row table
+      keeps both tuple versions in the second half of its page while the header
+      and line pointers sit in the first, so `persist=1::parts=2` leaves a new
+      header over a stale tuple area — a genuinely torn page, not a truncated
+      one. The file size is unchanged, which is why the size cannot be the
+      oracle:
+
+      | `full_page_writes` | Tear lands | Outcome                                                                                     |
+      | ------------------ | ---------- | ------------------------------------------------------------------------------------------- |
+      | `on` (default)     | yes        | **repaired** — the FPI overwrites the page during redo, the row reads its new value          |
+      | `off` (inversion)  | yes        | **detected** — `page verification failed, calculated checksum 18391 but expected 32765`, FATAL |
+
+      Neither is silent acceptance, so the contract holds either way. The
+      inversion is what makes that meaningful: it proves the tear reaches
+      PostgreSQL's data path rather than being a byte-level curiosity, and it
+      isolates `full_page_writes` as the thing doing the repair. `initdb` in the
+      `postgres:18` image gives `Data page checksum version: 1` with the exact
+      flags `init_db` passes, so the detection half is not a lucky default.
+
+      **Still open, and the reason this stays unchecked:**
+
+      - No harness. The above was a probe, so nothing runs in CI. It needs the
+        `durability_crash.py` treatment: a mode flag, `--prove-oracle` running
+        the `full_page_writes=off` inversion first and refusing to report unless
+        it went red, and a workflow.
+      - redb is untouched. The Raft store lives at
+        `/var/lib/postgresql/raft`, outside the LazyFS mount and therefore
+        outside any tear this can inject. Covering it needs a second LazyFS
+        mount for the raft directory — the compose and entrypoint changes are
+        the bulk of the remaining work.
+      - Only heap pages. A torn WAL record should be caught by the record CRC
+        and a torn `pg_control` by its own CRC; neither is exercised.
+
       **Done when** a torn write is injected and detected rather than silently
-      accepted.
-      _Effort_ L
+      accepted, in CI, for both PostgreSQL pages and the Raft store.
+      _Effort_ M for the PostgreSQL half, L with redb
 
 - [ ] **H-26 — ENOSPC at the next WAL segment**, as distinct from a blanket volume
       fill. The data volumes are tmpfs-bounded now, so a fill can genuinely

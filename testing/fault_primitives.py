@@ -1124,6 +1124,61 @@ def lazyfs_probe_command(nonce: str) -> str:
     return f"lazyfs::pgbattery-probe-{nonce}"
 
 
+def lazyfs_torn_op_cmd(path: str, *, parts: int, persist: Sequence[int]) -> str:
+    """Arm a torn write: split the next write to `path` into `parts` equal
+    pieces and persist only those in `persist`.
+
+    `path` must be the path in the LazyFS **root** directory, not the mount.
+    LazyFS keys its fault table by the path its FUSE callbacks receive, and the
+    subdir module has already rewritten those to the backing root by then; it
+    then `open()`s that path directly to write the surviving pieces. A mount
+    path silently matches nothing.
+
+    The FIFO form cannot select a later write. LazyFS hardcodes the occurrence
+    to 1 when a torn-op arrives over the FIFO -- an `occurrence=` attribute is
+    accepted by the parser and then ignored -- so the fault fires on the very
+    next write to `path` and the caller must arm it immediately before the
+    write it means to tear.
+
+    LazyFS crashes itself once the surviving pieces are down, which is the
+    point: the pieces it did not write are still only in its userspace cache,
+    and they die with it.
+    """
+    if parts < 2:
+        raise ValueError(f"a torn write needs at least 2 parts, got {parts}")
+    if not persist:
+        raise ValueError("persist must name at least one part to keep")
+    if any(p < 1 or p > parts for p in persist):
+        raise ValueError(f"persist parts must be within 1..{parts}: {list(persist)}")
+    if len(set(persist)) != len(persist):
+        raise ValueError(f"persist must not repeat a part: {list(persist)}")
+    if len(persist) == parts:
+        raise ValueError(
+            f"persisting all {parts} parts is a whole write, not a torn one; "
+            f"the fault would report success and change nothing"
+        )
+    if not path.startswith(LAZYFS_ROOT_DIR):
+        raise ValueError(
+            f"torn-op needs the LazyFS root path, not the mount path: {path!r} "
+            f"does not start with {LAZYFS_ROOT_DIR}"
+        )
+    kept = ",".join(str(p) for p in persist)
+    return f"lazyfs::torn-op::file={path}::persist={kept}::parts={parts}"
+
+
+def parse_lazyfs_torn_bytes(log_text: str, path: str) -> int | None:
+    """Bytes LazyFS reports persisting for a torn write to `path`, else None.
+
+    LazyFS logs one line per surviving piece. Their sum is how much of the
+    write reached the backing store, and a `None` return means the fault was
+    configured and never fired -- the case that would otherwise read as a
+    clean run.
+    """
+    pattern = rf"Write to path {re.escape(path)}: will persist (\d+) bytes"
+    sizes = [int(m) for m in re.findall(pattern, log_text)]
+    return sum(sizes) if sizes else None
+
+
 def lazyfs_log_cmd(*, log: str = LAZYFS_LOG) -> str:
     """Read the LazyFS log, tolerating its absence.
 
@@ -2560,6 +2615,53 @@ def verify_lazyfs_fault_channel(container: str, *, timeout_s: float = 10.0) -> N
     )
 
 
+def arm_torn_write(
+    container: str, path: str, *, parts: int = 2, persist: Sequence[int] = (1,)
+) -> None:
+    """Arm a torn write on `path` and confirm LazyFS accepted the fault.
+
+    Confirms configuration, not injection: the tear fires on the next write to
+    `path`, which has not happened yet. Use :func:`verify_torn_write_injected`
+    after driving that write.
+    """
+    verify_lazyfs_fault_channel(container)
+    command = lazyfs_torn_op_cmd(path, parts=parts, persist=persist)
+
+    before = _lazyfs_received_count(container, command)
+    armed = exec_in(container, lazyfs_control_cmd(command))
+    if not armed.ok:
+        raise FaultInjectionError(f"{container}: could not arm torn-op: {armed.output}")
+    _await_lazyfs_received(container, command, before)
+
+    _emit("fault.armed", "torn_write", container, {"path": path, "parts": parts})
+
+
+def verify_torn_write_injected(
+    container: str, path: str, *, expected_bytes: int | None = None
+) -> int:
+    """Assert LazyFS actually tore a write to `path`, and say how much survived.
+
+    A torn-op that was configured but never fired leaves the file whole, which
+    is indistinguishable from a passing test unless this is checked. LazyFS
+    logs each surviving piece, so the log is the truth source; the file's size
+    is not, because a torn write does not change it.
+    """
+    log = exec_in(container, lazyfs_log_cmd())
+    persisted = parse_lazyfs_torn_bytes(log.stdout, path) if log.ok else None
+    if persisted is None:
+        raise FaultEffectNotObserved(
+            f"{container}: LazyFS never tore a write to {path}. The fault was armed "
+            f"and no write to that path followed, so nothing was torn and any "
+            f"assertion about torn-write handling below is vacuous."
+        )
+    if expected_bytes is not None and persisted != expected_bytes:
+        raise FaultEffectNotObserved(
+            f"{container}: torn write to {path} persisted {persisted} bytes, "
+            f"expected {expected_bytes}"
+        )
+    return persisted
+
+
 def _lazyfs_received_count(container: str, command: str) -> int:
     """How many times `container`'s LazyFS has logged receiving `command`."""
     log = exec_in(container, lazyfs_log_cmd())
@@ -2613,8 +2715,8 @@ def crash_losing_unsynced_writes(
     mount at ``/var/lib/postgresql/raft`` on the ordinary filesystem and so
     keeps its un-fsynced writes across this fault. openraft's storage
     conformance suite carries the durability pins for that. Nor does it prove
-    torn-write handling: pages here are lost whole, never half-written, which
-    is H-25's dm-flakey job.
+    torn-write handling: pages here are lost whole, never half-written. That
+    is :func:`arm_torn_write`'s job, and H-25's.
 
     Every named container is discarded before any is killed. Killing them one
     at a time would let the survivors keep accepting writes and re-replicating
