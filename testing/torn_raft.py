@@ -103,6 +103,11 @@ class Outcome:
     victim_refused: bool = False
     leaders_after: list[str] = field(default_factory=list)
     refusal: str = ""
+    torn_offsets: list[int] = field(default_factory=list)
+    observed: list[dict[str, int]] = field(default_factory=list)
+    attempts: int = 0
+    victim: str = ""
+    target: str = ""
 
     @property
     def lost(self) -> list[int]:
@@ -120,8 +125,13 @@ class Outcome:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "target": self.target,
+            "victim": self.victim,
+            "attempts": self.attempts,
             "tears": self.tears,
             "torn_bytes": self.torn_bytes,
+            "torn_offsets": self.torn_offsets,
+            "observed_writes": self.observed,
             "acked": len(self.acked),
             "surviving": len(self.surviving),
             "lost_acked": len(self.lost),
@@ -258,38 +268,64 @@ def await_victim_settled(service: str, timeout_s: float) -> tuple[bool, bool]:
     return container_healthy(service), refused_to_start(service)
 
 
-def tear_once(victim: str, index: int) -> int | None:
-    """Arm one torn write on `victim`'s raft.db and report bytes persisted.
+def tear_once(victim: str, index: int, outcome: Outcome) -> tuple[int, int] | None:
+    """Arm one torn write on `victim`'s raft.db, drive traffic, report the tear.
 
-    Returns None when the tear did not fire, which is a real possibility: the
-    fault is armed for the *next* write to that path, and a follower that has
-    caught up may not write again promptly.
+    Returns ``(bytes, offset)``, or None when the tear did not fire -- a real
+    possibility, because the fault is armed for the *next* write to that path
+    and a node that has caught up may not write again promptly.
+
+    The writes driven here go into `outcome.acked`. They are issued while a
+    tear is armed on a live member of the cluster, which makes them the writes
+    most exposed to it; counting only the ones from before the first tear would
+    have measured the safest keys in the run.
     """
     fp.arm_torn_write(victim, RAFT_DB, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT)
     lead = await_leader(CONVERGE_TIMEOUT_S)
-    write_batch(lead, range(1000 * (index + 1), 1000 * (index + 1) + 50))
+    base = 1000 * (index + 1)
+    outcome.acked.extend(write_batch(lead, range(base, base + 50)))
     time.sleep(3)
-    try:
-        return fp.verify_torn_write_injected(victim, RAFT_DB, mount=fp.LAZYFS_RAFT)
-    except fp.FaultEffectNotObserved:
-        return None
+
+    log = fp.exec_in(victim, fp.lazyfs_log_cmd(log=fp.LAZYFS_RAFT.log))
+    records = fp.parse_lazyfs_torn_records(log.stdout, RAFT_DB) if log.ok else []
+    return records[-1] if records else None
 
 
-def run_tears(*, tears: int) -> Outcome:
+def run_tears(*, tears: int, target: str, min_torn_bytes: int) -> Outcome:
+    """Tear `target`'s Raft store `tears` times, retrying for a big enough tear.
+
+    `min_torn_bytes` exists because redb's next write after arming is usually a
+    short record. A 160-byte tear of a 320-byte append says little about how
+    the store handles damage to a page it has committed, so an attempt that
+    lands under the threshold is retried rather than counted. What each attempt
+    actually tore is recorded either way, because "redb never writes anything
+    larger in this workload" would itself be the answer.
+    """
     outcome = Outcome()
     lead = await_leader(CONVERGE_TIMEOUT_S)
     ensure_table(lead)
     outcome.acked = write_batch(lead, range(200))
 
-    # A follower, so redb's behaviour is not entangled with a promotion
-    # happening at the same moment.
-    victim = next(n for n in topology.NODES if n != lead)
+    # A follower keeps redb's behaviour separate from a promotion happening at
+    # the same moment. The leader is the harder case: it is the node whose vote
+    # and log the cluster is currently relying on.
+    victim = lead if target == "leader" else next(n for n in topology.NODES if n != lead)
+    outcome.victim = victim
+    outcome.target = target
 
-    for index in range(tears):
-        persisted = tear_once(victim, index)
-        if persisted is not None:
-            outcome.tears += 1
-            outcome.torn_bytes.append(persisted)
+    attempts = 0
+    max_attempts = tears * 4
+    while outcome.tears < tears and attempts < max_attempts:
+        attempts += 1
+        record = tear_once(victim, attempts, outcome)
+        if record is not None:
+            persisted, offset = record
+            outcome.observed.append({"bytes": persisted, "offset": offset})
+            if persisted >= min_torn_bytes:
+                outcome.tears += 1
+                outcome.torn_bytes.append(persisted)
+                outcome.torn_offsets.append(offset)
+
         # The tear crashes the Raft store's LazyFS, leaving the mount stale.
         # Recreate rather than restart so the entrypoint remounts both
         # instances through its own tested path.
@@ -305,6 +341,15 @@ def run_tears(*, tears: int) -> Outcome:
             # next tear against a node that cannot be reached: the exec would
             # fail and report as a fault that did not fire.
             break
+        if target == "leader":
+            # Killing the leader's Raft store moves leadership. Re-resolve, or
+            # every later tear would be aimed at a node that is now a follower
+            # while the report still claimed the leader was targeted.
+            lead = await_leader(CONVERGE_TIMEOUT_S)
+            victim = lead
+            outcome.victim = victim
+
+    outcome.attempts = attempts
 
     outcome.leaders_after = leaders()
     survivor = await_leader(CONVERGE_TIMEOUT_S)
@@ -364,7 +409,20 @@ def prove_oracle() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tears", type=int, default=3, help="torn writes to attempt in sequence")
+    parser.add_argument("--tears", type=int, default=3, help="torn writes to land in sequence")
+    parser.add_argument(
+        "--target",
+        choices=("follower", "leader"),
+        default="follower",
+        help="whose Raft store to tear; leader is the harder case",
+    )
+    parser.add_argument(
+        "--min-torn-bytes",
+        type=int,
+        default=0,
+        help="retry an attempt whose tear was smaller than this, so the run can "
+        "aim past redb's short appends at a page it has committed",
+    )
     parser.add_argument(
         "--prove-oracle",
         action="store_true",
@@ -379,14 +437,19 @@ def main() -> int:
     if args.prove_oracle:
         prove_oracle()
 
-    outcome = run_tears(tears=args.tears)
+    outcome = run_tears(tears=args.tears, target=args.target, min_torn_bytes=args.min_torn_bytes)
     print(json.dumps(outcome.as_dict(), indent=2))
 
     if outcome.tears == 0:
+        largest = max((w["bytes"] for w in outcome.observed), default=0)
         raise fp.FaultEffectNotObserved(
-            "no torn write fired in any attempt, so this run asserts nothing about "
-            "torn-write handling. The fault arms for the next write to raft.db; a "
-            "follower that is fully caught up may not write again promptly."
+            f"no torn write met the bar in {outcome.attempts} attempts, so this run "
+            f"asserts nothing about torn-write handling. Largest tear seen was "
+            f"{largest} bytes against a --min-torn-bytes of {args.min_torn_bytes}. "
+            f"Either the fault never fired -- it arms for the *next* write to "
+            f"raft.db, and a caught-up node may not write again promptly -- or redb "
+            f"writes nothing that large in this workload, which is worth recording "
+            f"rather than working around."
         )
     if outcome.lost:
         raise RaftDurabilityViolation(

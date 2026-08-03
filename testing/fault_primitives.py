@@ -1208,6 +1208,18 @@ def lazyfs_torn_op_cmd(
     return f"lazyfs::torn-op::file={path}::persist={kept}::parts={parts}"
 
 
+def parse_lazyfs_torn_records(log_text: str, path: str) -> list[tuple[int, int]]:
+    """Every ``(bytes, offset)`` LazyFS reports persisting for a tear on `path`.
+
+    The offset is what says *which* structure was torn. A store's header or
+    root lives at a low, fixed offset and a data page does not, so a suite that
+    only counts bytes cannot tell a tear that exercised checksum validation
+    from one that clipped an append nobody had committed to yet.
+    """
+    pattern = rf"Write to path {re.escape(path)}: will persist (\d+) bytes from offset (\d+)"
+    return [(int(size), int(offset)) for size, offset in re.findall(pattern, log_text)]
+
+
 def parse_lazyfs_torn_bytes(log_text: str, path: str) -> int | None:
     """Bytes LazyFS reports persisting for a torn write to `path`, else None.
 

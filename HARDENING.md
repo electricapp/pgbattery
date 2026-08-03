@@ -1187,18 +1187,32 @@ violation, and the first thing a Jepsen analysis would reach for.
       harness.** A single torn write produced the third shape, so torn writes to
       redb are not reliably benign either.
 
+      **The tears land on the committed root, which corrects an earlier note
+      here.** Recording the offset rather than only the byte count showed every
+      tear at offset 0 — 160 bytes persisted of a 320-byte write. Offset 0 is
+      redb's database header, the structure its commit protocol rewrites to
+      publish new transaction roots, so this is the case that exercises
+      checksum validation rather than an uncommitted append. The write is small
+      because the header is small, not because the root was being missed. redb
+      survives it by double-buffering that header and falling back to the last
+      copy that verifies, which is now demonstrated rather than assumed.
+
+      Both `--target follower` and `--target leader` are green, the latter
+      re-resolving leadership between tears because tearing the leader's store
+      moves it. Writes driven during the tearing phase count toward the loss
+      assertion — 350 acked, 350 surviving — rather than only the batch written
+      before the first tear, which were the safest keys in the run.
+
       **Still open:**
 
-      - The tears are small. redb's next write after arming is typically a
-        short record — the suite measured 160 bytes persisted of a 320-byte
-        write — so nothing yet lands on a committed root, which is the case
-        that would exercise redb's page checksums. Aiming at one needs the
-        fault armed against a specific offset rather than the next write.
-      - Only a follower, and only PGDATA-side heap pages for PostgreSQL. The
-        leader, torn WAL records, and a torn `pg_control` are unexercised.
-      - Writes issued during the tearing phase are driven but not tracked as
-        acked, so the loss assertion covers the 200 written before the first
-        tear rather than those most at risk.
+      - Only the header is ever torn. Every write to `raft.db` observed in this
+        workload was 320 bytes at offset 0, so redb's btree pages are never the
+        thing that gets split. A workload with a Raft log large enough to force
+        page writes would reach them; this one does not, and `observed_writes`
+        in the report is what would show that changing.
+      - PostgreSQL side: heap pages only. A torn WAL record should be caught by
+        the record CRC and a torn `pg_control` by its own; neither is
+        exercised.
       - Only heap pages on the PostgreSQL side. A torn WAL record should be
         caught by the record CRC and a torn `pg_control` by its own; neither is
         exercised.

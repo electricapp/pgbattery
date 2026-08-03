@@ -184,14 +184,20 @@ jobs:
         run: docker compose --profile tornwrite down -v || true
 
   torn-raft:
-    name: Torn write (Raft store)
+    name: Torn write (Raft store, ${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The leader is the harder case: its vote and log are what the cluster
+        # is relying on at the moment the store is torn.
+        target: [follower, leader]
     env:
       COMPOSE_FILE: docker-compose.lazyfs.yml
-      COMPOSE_PROJECT_NAME: tornraft-${{ github.run_id }}
+      COMPOSE_PROJECT_NAME: tornraft-${{ github.run_id }}-${{ matrix.target }}
       PGBATTERY_MANAGEMENT_API_TOKEN: ci-tornraft-token
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -212,7 +218,9 @@ jobs:
       # in uncommitted pages and are correctly a non-event, so without that a
       # green run could not be told apart from a fault that injected nothing.
       - name: Prove the oracle can fail, then tear the Raft store
-        run: uv run --project testing python testing/torn_raft.py --prove-oracle --tears 3
+        run: |
+          uv run --project testing python testing/torn_raft.py \
+            --prove-oracle --target ${{ matrix.target }} --tears 3
 
       - name: Collect diagnostics
         if: failure()
@@ -228,7 +236,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tornraft-${{ github.run_id }}
+          name: tornraft-${{ matrix.target }}-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: ignore
           retention-days: 14
