@@ -130,11 +130,28 @@ services:
     # supervisor restart things underneath it.
     command: ["pgbattery-lazyfs", "sleep", "infinity"]
     # The runtime stage health-checks pgbattery's management API. Nothing
-    # serves it here, so the inherited check could only ever fail. The
-    # entrypoint already refuses to start unless the mount and the LazyFS
-    # fault worker are both up, which is the readiness that matters.
+    # serves it here, so the inherited check could only ever fail — but
+    # disabling it outright is not the answer either: `docker compose up
+    # --wait` fails on a service with no healthcheck, so the suite would have
+    # no readiness signal at all and would start tearing at whatever state the
+    # container happened to be in.
+    #
+    # This probes the readiness that actually matters here, and it is the same
+    # pair of facts the entrypoint refuses to start without: both stores on
+    # LazyFS, and both fault workers consuming their control FIFO. A mount
+    # without a reader accepts every fault command and executes none.
     healthcheck:
-      disable: true
+      test:
+        - CMD-SHELL
+        - >-
+          grep -qE " /var/lib/postgresql/data fuse" /proc/mounts
+          && grep -qE " /var/lib/postgresql/raft fuse" /proc/mounts
+          && grep -q "waiting for fault commands" /tmp/lazyfs.log
+          && grep -q "waiting for fault commands" /tmp/lazyfs-raft.log
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
     # No restart policy: the tear kills LazyFS, and a restart would race the
     # suite's inspection of the backing store, which is the only place the
     # torn page is visible.

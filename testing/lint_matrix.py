@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -573,6 +574,44 @@ def check_matrix_cluster_matches_compose() -> None:
         raise AssertionError("; ".join(problems))
 
 
+def implicit_build_targets(compose: dict[str, Any], filename: str) -> list[str]:
+    """Services that build from the Dockerfile without naming a stage."""
+    problems: list[str] = []
+    for name, service in (compose.get("services") or {}).items():
+        build = service.get("build")
+        if build is None:
+            continue
+        target = build.get("target") if isinstance(build, dict) else None
+        if not target:
+            problems.append(
+                f"{filename}: service {name!r} builds without an explicit `target`, so it "
+                f"gets whichever stage is last in the Dockerfile"
+            )
+    return problems
+
+
+def check_build_targets_are_explicit() -> None:
+    """Every building service must name the Dockerfile stage it wants.
+
+    A bare ``build: .`` resolves to the last stage in the Dockerfile, so
+    appending a stage silently repoints every such service at it. That is not
+    hypothetical: adding ``runtime-lazyfs`` — which stays root so its entrypoint
+    can mount FUSE — repointed the whole 3-node cluster at it, ``initdb``
+    refused to run as root, and every node restart-looped. The build succeeded
+    and the image was valid, so the only symptom was a cluster that never
+    converged, thirteen minutes into every HA case.
+
+    A stage name in the compose file is the ratchet: it cannot be invalidated
+    by editing the Dockerfile somewhere else.
+    """
+    problems: list[str] = []
+    for path in sorted(PROJECT_ROOT.glob("docker-compose*.yml")):
+        compose = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        problems.extend(implicit_build_targets(compose, path.name))
+    if problems:
+        raise AssertionError("; ".join(problems))
+
+
 RUST_SOURCE_ROOTS: Final[tuple[str, ...]] = ("src", "crates")
 
 
@@ -692,6 +731,7 @@ def lint() -> None:
     check("Fault injection confined to tracked modules", check_fault_injection_confined)
     check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
     check("Matrix cluster matches docker-compose", check_matrix_cluster_matches_compose)
+    check("Compose services pin a build target", check_build_targets_are_explicit)
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
 
     table = Table(title="Test Harness Lint", show_lines=False)

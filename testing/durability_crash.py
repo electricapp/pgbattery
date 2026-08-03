@@ -202,16 +202,8 @@ def await_writable_leader(timeout_s: float) -> str:
 
 
 def restart(ids: dict[str, str]) -> None:
-    """Start each crashed container by id.
-
-    By id, not by compose service: `docker compose ps -q` does not report a
-    container that is not running, which is exactly the state every one of
-    these is in when this is called.
-    """
-    for node, cid in ids.items():
-        started = fp.run(f"docker start {cid}")
-        if not started.ok:
-            raise fp.FaultInjectionError(f"{node}: restart failed: {started.output}")
+    """Start each crashed container by id, and wait for each to be running."""
+    fp.start_containers_by_id(ids)
 
 
 def freeze_wal_flush(nodes: list[str]) -> None:
@@ -247,11 +239,46 @@ def freeze_wal_flush(nodes: list[str]) -> None:
             )
 
 
+def await_postgres_running(nodes: list[str], timeout_s: float) -> None:
+    """Wait until every named node is running a PostgreSQL of its own.
+
+    A writable leader is not evidence that the followers have one. A follower's
+    postmaster only starts once its basebackup finishes, which lags the leader
+    becoming writable by however long the clone takes — so a run that begins the
+    moment a leader answers can reach a follower that has no postmaster at all.
+
+    For the inversion that surfaced as a precondition failure; for the real run
+    it would have been worse, because crashing a node whose PostgreSQL never
+    started measures nothing and still reports a green.
+
+    `checkpointer` and `background writer` run in recovery, so this holds on a
+    standby; `walwriter` does not, which is why any one of them suffices.
+    """
+    deadline = time.monotonic() + timeout_s
+    pending = list(nodes)
+    while pending and time.monotonic() < deadline:
+        still: list[str] = []
+        for node in pending:
+            running = fp.read_processes(node)
+            if not any(name in p.args for p in running for name in WAL_FLUSH_PROCESSES):
+                still.append(node)
+        pending = still
+        if pending:
+            time.sleep(1.0)
+    if pending:
+        raise fp.FaultPreconditionError(
+            f"{', '.join(pending)}: no PostgreSQL running within {timeout_s:g}s "
+            f"(looked for {WAL_FLUSH_PROCESSES}); the run would crash a node that "
+            f"never started and report the result as durability"
+        )
+
+
 def run_case(*, mode: str, writes: int, weaken: bool) -> WriteLog:
     leader = await_writable_leader(CONVERGE_TIMEOUT_S)
     ensure_table(leader)
 
     victims = [leader] if mode == "leader-crash" else list(topology.NODES)
+    await_postgres_running(victims, CONVERGE_TIMEOUT_S)
 
     if weaken:
         freeze_wal_flush(victims)

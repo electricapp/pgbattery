@@ -165,7 +165,7 @@ import threading
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -2902,6 +2902,33 @@ def _await_container_id_status(
     raise FaultEffectNotObserved(
         f"{service} ({container}) reported {status!r}, expected {expected!r} within {timeout_s:g}s"
     )
+
+
+def start_containers_by_id(ids: Mapping[str, str], *, timeout_s: float = 60.0) -> None:
+    """Start each stopped container by id, and prove each one came back.
+
+    By id, not by compose service: `docker compose ps -q` reports nothing for a
+    container that is not running, which is exactly the state every container
+    handed to this is in. The ids must therefore have been resolved before the
+    fault, which is what :func:`crash_losing_unsynced_writes` returns them for.
+
+    The wait is the point. `docker start` returns as soon as the daemon has
+    accepted the request, so a caller that treats exit 0 as "the node is back"
+    goes on to measure recovery against a container that has not started —
+    reading a timeout as lost data rather than as a harness that did not wait.
+    """
+    if not ids:
+        raise FaultPreconditionError("start_containers_by_id needs at least one container")
+
+    joined = ",".join(ids)
+    _emit("fault.begin", "start_containers_by_id", joined, {})
+    for service, container in ids.items():
+        started = run(f"docker start {container}")
+        if not started.ok:
+            raise FaultInjectionError(f"{service}: restart failed: {started.output}")
+    for service, container in ids.items():
+        _await_container_id_status(service, container, "running", timeout_s=timeout_s)
+    _emit("fault.injected", "start_containers_by_id", joined, {})
 
 
 def _lifecycle(service: str, verb: str) -> CommandResult:

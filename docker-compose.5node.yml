@@ -10,7 +10,9 @@ name: pgbattery5
 
 services:
   node1:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node1
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
@@ -33,7 +35,9 @@ services:
         ipv4_address: 172.29.0.11
 
   node2:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node2
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 2 --voter"]
@@ -56,7 +60,9 @@ services:
         ipv4_address: 172.29.0.12
 
   node3:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node3
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 3 --voter"]
@@ -79,7 +85,9 @@ services:
         ipv4_address: 172.29.0.13
 
   node4:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node4
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 4 --voter"]
@@ -102,7 +110,9 @@ services:
         ipv4_address: 172.29.0.14
 
   node5:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node5
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.29.0.11:9091 --node-id 5 --voter"]

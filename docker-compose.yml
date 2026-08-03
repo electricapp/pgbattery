@@ -3,9 +3,19 @@
 # `COMPOSE_PROJECT_NAME` for per-run isolation.
 name: pgbattery
 
+# Every service names its build `target` explicitly. A bare `build: .` builds
+# whichever stage is last in the Dockerfile, so appending a stage silently
+# repoints every service in this file at it — which is exactly what happened
+# when `runtime-lazyfs` was added: it runs as root by design, so `initdb`
+# refused and all three nodes restart-looped with no management API. Nothing
+# in the build failed, so the only symptom was a cluster that never converged.
+# `lint_matrix.py` now refuses a service that leaves the target implicit.
+
 services:
   node1:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node1
     # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
     # — rapid failover triggering pg_rewind loops that each exit non-zero —
@@ -38,7 +48,9 @@ services:
         ipv4_address: 172.28.0.11
 
   node2:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node2
     # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
     # — rapid failover triggering pg_rewind loops that each exit non-zero —
@@ -69,7 +81,9 @@ services:
         ipv4_address: 172.28.0.12
 
   node3:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: node3
     # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
     # — rapid failover triggering pg_rewind loops that each exit non-zero —
@@ -102,7 +116,9 @@ services:
   # Witness node — learner that joins the cluster for 2+1 topology tests.
   # Only started when the "witness" profile is active (not part of default cluster).
   witness:
-    build: .
+    build:
+      context: .
+      target: runtime
     hostname: witness
     restart: "no"
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 4"]

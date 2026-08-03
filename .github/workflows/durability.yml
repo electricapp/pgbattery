@@ -80,8 +80,13 @@ jobs:
       - name: Build the LazyFS cluster
         run: docker compose -f docker-compose.lazyfs.yml build
 
+      # `--wait` gates on each node's healthcheck, which is pgbattery serving
+      # its management API. The entrypoint dies unless both LazyFS mounts are
+      # up first, so a healthy node is also a node whose stores can lose an
+      # un-fsynced write. Without it the suite starts probing seconds after
+      # "Started", before anything is mounted.
       - name: Start the cluster
-        run: docker compose -f docker-compose.lazyfs.yml up -d
+        run: docker compose -f docker-compose.lazyfs.yml up -d --wait
 
       # cluster-crash proves the fault first and then asserts. leader-crash
       # cannot: weakening synchronous_commit does not lose an acked write while
@@ -219,8 +224,12 @@ jobs:
       - name: Verify FUSE is available on the runner
         run: test -c /dev/fuse
 
+      # `--wait`: the first thing this suite does is assert the Raft store is
+      # on LazyFS, and that mount does not exist until the entrypoint has made
+      # it. Without the gate the assertion ran about three seconds after the
+      # container started and correctly reported no mount.
       - name: Start the cluster
-        run: docker compose up -d --build node1 node2 node3
+        run: docker compose up -d --build --wait node1 node2 node3
 
       # The inversion mangles one node's raft.db past repair and requires it to
       # stop rather than run on it, then rebuilds the cluster. Most tears land

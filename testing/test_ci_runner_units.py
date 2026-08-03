@@ -912,6 +912,51 @@ def test_extract_contract_ids_from_the_real_doc() -> None:
     assert {"W1", "W2", "W3", "L1", "L2", "L3", "V1", "V2", "S1", "S2", "R1", "R2"} <= ids
 
 
+def test_implicit_build_target_is_flagged() -> None:
+    """The shape that broke the cluster: `build: .` with no stage named.
+
+    Docker builds the last stage in the Dockerfile, so appending `runtime-lazyfs`
+    (which stays root to mount FUSE) repointed every node at it and `initdb`
+    refused to run as root.
+    """
+    problems = lint_matrix.implicit_build_targets(
+        {"services": {"node1": {"build": "."}}}, "docker-compose.yml"
+    )
+    assert len(problems) == 1
+    assert "node1" in problems[0]
+    assert "explicit `target`" in problems[0]
+
+
+def test_build_target_dict_without_target_is_flagged() -> None:
+    """A long-form build is no safer if it omits the stage."""
+    problems = lint_matrix.implicit_build_targets(
+        {"services": {"node1": {"build": {"context": "."}}}}, "docker-compose.yml"
+    )
+    assert len(problems) == 1
+    assert "node1" in problems[0]
+
+
+def test_pinned_build_target_and_non_building_services_pass() -> None:
+    """A named stage is fine, and a service with no `build` has nothing to pin."""
+    assert (
+        lint_matrix.implicit_build_targets(
+            {
+                "services": {
+                    "node1": {"build": {"context": ".", "target": "runtime"}},
+                    "sidecar": {"image": "postgres:18"},
+                }
+            },
+            "docker-compose.yml",
+        )
+        == []
+    )
+
+
+def test_every_real_compose_file_pins_its_build_target() -> None:
+    """The check against the files actually in the repo, not a fixture."""
+    lint_matrix.check_build_targets_are_explicit()
+
+
 def test_contract_violations_flag_missing_declarations() -> None:
     violations = lint_matrix.collect_contract_violations(
         [{"id": "a", "contracts": ["W1"]}, {"id": "b"}, {"id": "c", "contracts": []}],
