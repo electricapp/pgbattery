@@ -1060,9 +1060,10 @@ violation, and the first thing a Jepsen analysis would reach for.
 
       _Closes_ Class A2 for fsync · _Effort_ L
 
-- [ ] **H-25 — Torn writes.** The mechanism is proven and the primitives are in
-      `fault_primitives.py` (`lazyfs_torn_op_cmd`, `arm_torn_write`,
-      `verify_torn_write_injected`); the suite that drives them is not written.
+- [x] **H-25 — Torn writes.** Injected by `arm_torn_write` in
+      `fault_primitives.py`, driven by `testing/torn_write.py` (PostgreSQL) and
+      `testing/torn_raft.py` (redb), gated by the `torn-write` and `torn-raft`
+      jobs in `durability.yml`.
 
       dm-flakey turned out to be unnecessary. LazyFS injects torn writes
       natively — `lazyfs::torn-op` splits a write into N pieces, persists a
@@ -1232,24 +1233,30 @@ violation, and the first thing a Jepsen analysis would reach for.
       unattributable refusal is a violation, because it is indistinguishable
       from unrelated breakage.
 
-      **Still open:**
+      redb's btree pages are torn too. The FIFO form of `torn-op` fires on the
+      *next* write and hardcodes occurrence to 1, and in a quiet cluster that
+      next write is nearly always the 320-byte header redb rewrites to publish
+      a commit — four attempts running in one measured hunt. `--min-torn-bytes`
+      skips those and retries, and the fifth attempt caught a 4096-byte write
+      at offset 8192 torn at 2048: a page, not the header. redb tolerated it,
+      450 acked and 450 surviving, one leader throughout.
 
-      - Only redb's header is ever torn. Every write to `raft.db` observed in
-        this workload was 320 bytes at offset 0, so its btree pages are never
-        the thing that gets split. The FIFO form of `torn-op` fires on the
-        *next* write and hardcodes occurrence to 1, and in a quiet cluster that
-        next write is almost always the header redb rewrites to publish a
-        commit. Reaching a page write needs either enough Raft churn that page
-        writes become common, or the config-file form of `torn-op`, which
-        honours `occurrence=N` where the FIFO form ignores it.
-      - Only heap pages on the PostgreSQL side. A torn WAL record should be
-        caught by the record CRC and a torn `pg_control` by its own; neither is
-        exercised.
+      CI hunts rather than takes the next write, so a run that finds nothing
+      larger in twelve attempts fails and says so. That would mean redb's write
+      pattern had changed, not that the fault stopped working — the distinction
+      `observed_writes` exists to make.
 
-      **Done when** a torn write is injected and detected rather than silently
-      accepted, in CI, for both PostgreSQL pages and the Raft store. The first
-      half is done.
-      _Effort_ L remaining, all of it redb
+      **What this does not cover:** every result above is a tear at a write
+      boundary LazyFS can see. Sub-sector tearing, where a single 512-byte
+      sector is itself half-written, is a different fault that needs hardware
+      or device-mapper support; `pg_control` is the structure where it would
+      matter, since its payload fits in one sector by design.
+
+      **Done.** Torn writes are injected and either repaired or detected, in
+      CI, across PostgreSQL heap pages, WAL records and `pg_control`, and
+      across redb's header and btree pages on both a follower and the leader.
+      Every one carries an inversion that must go red first.
+      _Closes_ Class A2 for torn writes
 
 - [ ] **H-26 — ENOSPC at the next WAL segment**, as distinct from a blanket volume
       fill. The data volumes are tmpfs-bounded now, so a fill can genuinely

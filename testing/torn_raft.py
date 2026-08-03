@@ -291,7 +291,7 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> tuple[int, int] | No
     return records[-1] if records else None
 
 
-def run_tears(*, tears: int, target: str, min_torn_bytes: int) -> Outcome:
+def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int) -> Outcome:
     """Tear `target`'s Raft store `tears` times, retrying for a big enough tear.
 
     `min_torn_bytes` exists because redb's next write after arming is usually a
@@ -314,7 +314,6 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int) -> Outcome:
     outcome.target = target
 
     attempts = 0
-    max_attempts = tears * 4
     while outcome.tears < tears and attempts < max_attempts:
         attempts += 1
         record = tear_once(victim, attempts, outcome)
@@ -417,6 +416,13 @@ def main() -> int:
         help="whose Raft store to tear; leader is the harder case",
     )
     parser.add_argument(
+        "--attempts",
+        type=int,
+        default=0,
+        help="cap on arming attempts; defaults to four times --tears. Raise it "
+        "when hunting for a write shape that is rare.",
+    )
+    parser.add_argument(
         "--min-torn-bytes",
         type=int,
         default=0,
@@ -437,7 +443,12 @@ def main() -> int:
     if args.prove_oracle:
         prove_oracle()
 
-    outcome = run_tears(tears=args.tears, target=args.target, min_torn_bytes=args.min_torn_bytes)
+    outcome = run_tears(
+        tears=args.tears,
+        target=args.target,
+        min_torn_bytes=args.min_torn_bytes,
+        max_attempts=args.attempts or args.tears * 4,
+    )
     print(json.dumps(outcome.as_dict(), indent=2))
 
     if outcome.tears == 0:
