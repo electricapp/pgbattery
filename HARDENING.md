@@ -1136,14 +1136,36 @@ violation, and the first thing a Jepsen analysis would reach for.
       fault that failed to inject, but a proof that passed for the wrong
       reason.
 
+      redb has been torn, by probe rather than by suite. Arming
+      `arm_torn_write(..., mount=LAZYFS_RAFT)` on a follower's `raft.db` fires
+      on the next append — 2048 bytes of a 4096-byte write persisted — and the
+      node came back healthy in under a minute with every acked write readable
+      and no corruption reported. redb tolerated it, which is the expected
+      shape: its commit protocol rolls back to the last committed state, so a
+      tear in an uncommitted page is a non-event.
+
+      A tolerated fault proves nothing on its own, so the observable was
+      checked for reachability. With `raft.db` mangled past repair, redb
+      reports `All roots are corrupted` and pgbattery refuses to start rather
+      than recreating it, saying why: a recreated store would rejoin the node
+      as a voter without its persisted vote and log, which can double-vote in a
+      term or lose committed entries. So the red is reachable through the same
+      observable the green is measured on:
+
+      | Damage to `raft.db`         | Outcome                                                                     |
+      | --------------------------- | ----------------------------------------------------------------------------- |
+      | one torn write, 2048 / 4096 | tolerated — node recovers, all acked writes readable, nothing logged           |
+      | mangled beyond repair       | detected — `All roots are corrupted`, the node refuses to start and says why |
+
       **Still open, and the reason this stays unchecked:**
 
-      - No suite tears redb. The substrate is in place and
-        `arm_torn_write(..., mount=LAZYFS_RAFT)` reaches `raft.db`, but nothing
-        drives it or asserts what a torn Raft record must do. The property is
-        sharper than PostgreSQL's: a torn write that silently corrupted the
-        persisted vote or log would be an election-safety violation, not just
-        lost data.
+      - No suite. The above was a probe, so nothing runs in CI, and one tear at
+        one arbitrary offset is not coverage. A suite wants the tear repeated
+        across offsets and across the leader as well as a follower, with the
+        mangle case as its inversion.
+      - The tolerated case is only established for a tear that lands in an
+        uncommitted page. A tear landing on a committed root is the case that
+        would actually exercise redb's checksums, and nothing yet aims at one.
       - Only heap pages on the PostgreSQL side. A torn WAL record should be
         caught by the record CRC and a torn `pg_control` by its own; neither is
         exercised.
