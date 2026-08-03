@@ -128,14 +128,21 @@ jobs:
         run: docker compose -f docker-compose.lazyfs.yml down -v || true
 
   torn-write:
-    name: Torn write
+    name: Torn write (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # heap exercises the full-page image; wal the record CRC; control the
+        # control-file CRC. Different structures with different defences, so a
+        # green on one says nothing about the others.
+        target: [heap, wal, control]
     env:
       COMPOSE_FILE: docker-compose.lazyfs.yml
-      COMPOSE_PROJECT_NAME: tornwrite-${{ github.run_id }}
+      COMPOSE_PROJECT_NAME: tornwrite-${{ github.run_id }}-${{ matrix.target }}
       # Required to interpolate the file, which the node services reference
       # even when only `pg` is started. Nothing here serves the API.
       PGBATTERY_MANAGEMENT_API_TOKEN: ci-tornwrite-token
@@ -158,7 +165,9 @@ jobs:
         run: docker compose --profile tornwrite up -d --build --wait pg
 
       - name: Prove the oracle can fail, then assert torn-write handling
-        run: uv run --project testing python testing/torn_write.py --prove-oracle
+        run: |
+          uv run --project testing python testing/torn_write.py \
+            --target ${{ matrix.target }} --prove-oracle
 
       - name: Collect diagnostics
         if: failure()
@@ -174,7 +183,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tornwrite-${{ github.run_id }}
+          name: tornwrite-${{ matrix.target }}-${{ github.run_id }}
           path: artifacts/
           if-no-files-found: ignore
           retention-days: 14

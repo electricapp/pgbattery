@@ -58,6 +58,8 @@ NEW_MARKER: Final[str] = "MARKERBETA"
 prefixes would not survive a grep of the raw page. Both are 10-11 characters of
 uppercase ASCII, which cannot occur by accident in a page header."""
 
+WAL_TABLE: Final[str] = "torn_meta_probe"
+
 PAGE_BYTES: Final[int] = 8192
 HALF_PAGE_BYTES: Final[int] = PAGE_BYTES // 2
 
@@ -316,6 +318,129 @@ def assert_not_silently_accepted(outcome: Outcome) -> None:
     )
 
 
+def backing_path(relative: str) -> str:
+    """A PGDATA-relative path as the backing store has it."""
+    return f"{ROOT}/{relative}"
+
+
+def current_wal_segment() -> str:
+    """PGDATA-relative path of the WAL segment being written right now."""
+    name = psql("SELECT pg_walfile_name(pg_current_wal_lsn())")
+    if not name:
+        raise fp.FaultPreconditionError("could not resolve the current WAL segment")
+    return f"pg_wal/{name}"
+
+
+def durable_rows() -> set[int]:
+    """Rows PostgreSQL acknowledged with synchronous_commit on.
+
+    Read back after recovery. A commit acked under `synchronous_commit=on` has
+    had its WAL flushed, so it must survive; a torn WAL record can only ever
+    cost a commit that was never acknowledged.
+    """
+    out = psql(f"SELECT k FROM {WAL_TABLE} ORDER BY k", expect_ok=False)
+    return {int(line) for line in out.splitlines() if line.strip().isdigit()}
+
+
+def run_metadata_cycle(*, target: str, mangle: bool) -> dict[str, object]:
+    """Tear (or mangle) the WAL or the control file, then recover.
+
+    Neither structure has PostgreSQL's full-page-image safety net, and neither
+    can be repaired from elsewhere in the cluster, so the contract is narrower
+    than for a heap page: every commit that was *acknowledged* must still be
+    there, and anything PostgreSQL cannot vouch for it must refuse rather than
+    serve. A commit that was never acked may legitimately vanish -- that is
+    what an un-flushed WAL record means.
+
+    `mangle` is the inversion. Overwriting the file with random bytes is past
+    what a tear does and must be noticed; if it is not, then the observable a
+    green run is measured on is one that damage never reaches.
+    """
+    reset_cluster()
+    pg_ctl("-w start")
+    psql(f"CREATE TABLE {WAL_TABLE} (k int PRIMARY KEY)")
+    psql("SET synchronous_commit = on")
+    for key in range(50):
+        psql(f"INSERT INTO {WAL_TABLE} VALUES ({key})")
+    psql("CHECKPOINT")
+    acked = durable_rows()
+
+    relative = current_wal_segment() if target == "wal" else "global/pg_control"
+    path = backing_path(relative)
+
+    if mangle:
+        damaged = fp.exec_in(
+            SERVICE, f"dd if=/dev/urandom of={path} bs=4096 count=4 conv=notrunc 2>/dev/null"
+        )
+        if not damaged.ok:
+            raise fp.FaultPreconditionError(f"could not mangle {relative}: {damaged.output}")
+        torn = None
+    else:
+        # pg_control needs a finer split than a WAL segment. Its CRC covers
+        # only the first few hundred bytes, so a tear at the halfway mark
+        # leaves that whole region either wholly stale or wholly fresh --
+        # payload and CRC together -- and the file stays internally consistent,
+        # merely older. That is by design: the payload fits in one sector,
+        # which is why PostgreSQL treats control-file writes as atomic.
+        #
+        # Splitting 8192 into 32 parts puts the boundary at 256 bytes, inside
+        # the CRC-covered region, so the surviving head and the stale bytes
+        # after it disagree and the checksum has something to catch.
+        parts, keep = (32, (1,)) if target == "control" else (2, (1,))
+        fp.arm_torn_write(SERVICE, path, parts=parts, persist=keep)
+        # Drive writes into the armed file. A commit writes WAL; a checkpoint
+        # rewrites pg_control.
+        for key in range(50, 120):
+            psql(f"INSERT INTO {WAL_TABLE} VALUES ({key})", expect_ok=False)
+        psql("CHECKPOINT", expect_ok=False)
+        time.sleep(2)
+        try:
+            torn = fp.verify_torn_write_injected(SERVICE, path)
+        except fp.FaultEffectNotObserved:
+            torn = None
+
+    remount_lazyfs()
+    started = pg_ctl("-w start", expect_ok=False)
+
+    survived: set[int] = set()
+    complaint = ""
+    if started.ok:
+        survived = durable_rows()
+    else:
+        # pg_ctl reports the refusal on its own stderr as well as in the log,
+        # and which one carries the detail varies by failure. Read both, or an
+        # attributable refusal looks unattributable.
+        logs = fp.exec_in(SERVICE, "cat /tmp/pg.log 2>/dev/null || true")
+        lowered = (logs.output + started.output).lower()
+        for marker in (
+            "checksum",
+            "invalid",
+            "corrupt",
+            "could not",
+            "incorrect",
+            "control file",
+            "database system was not",
+            "fatal",
+        ):
+            if marker in lowered:
+                complaint = marker
+                break
+
+    return {
+        "target": target,
+        "mangled": mangle,
+        "file": relative,
+        "torn_bytes": torn,
+        "acked_before": len(acked),
+        "surviving": len(survived),
+        "lost_acked": sorted(acked - survived)[:20],
+        "postgres_started": started.ok,
+        "complaint": complaint,
+        "detected": bool(complaint),
+        "contracts": ["W1", "R2"],
+    }
+
+
 app = typer.Typer(add_completion=False)
 
 
@@ -324,12 +449,70 @@ def main(
     prove_oracle: bool = typer.Option(
         False,
         "--prove-oracle",
-        help="Run the full_page_writes=off inversion first and require it to go red.",
+        help="Run the inversion first and require it to go red.",
+    ),
+    target: str = typer.Option(
+        "heap",
+        "--target",
+        help="heap page, WAL segment, or the control file",
     ),
 ) -> None:
-    """Tear a heap page and assert PostgreSQL never serves it silently."""
+    """Tear a PostgreSQL structure and assert it is never served silently."""
     fp.verify_lazyfs_mounted(SERVICE, MOUNT)
     fp.verify_lazyfs_fault_channel(SERVICE)
+
+    if target not in ("heap", "wal", "control"):
+        raise typer.BadParameter(f"unknown target {target!r}")
+
+    if target in ("wal", "control"):
+        if prove_oracle:
+            red = run_metadata_cycle(target=target, mangle=True)
+            print(json.dumps(red, indent=2))
+            if not red["detected"]:
+                raise OracleNotProven(
+                    f"a {target} file overwritten with random bytes produced no "
+                    f"attributable complaint (started={red['postgres_started']}). "
+                    f"Refusing to start without naming the damage is not proof the "
+                    f"damage was noticed -- it is indistinguishable from the harness "
+                    f"having broken something unrelated, which is exactly the false "
+                    f"green a green run below would then inherit."
+                )
+            print(f"oracle proven: a mangled {target} file is not silently accepted\n")
+
+        meta = run_metadata_cycle(target=target, mangle=False)
+        print(json.dumps(meta, indent=2))
+        if meta["torn_bytes"] is None:
+            raise fp.FaultEffectNotObserved(
+                f"no torn write landed on the {target} file, so this run asserts "
+                f"nothing. The fault arms for the next write to that path."
+            )
+        # Order matters. A refusal makes every row unreadable, so checking for
+        # missing commits first would report a correct detection as data loss.
+        # The contract is repaired-or-detected: if PostgreSQL serves the
+        # database at all, every acked commit must be in it; if it refuses, it
+        # must say what it found.
+        if meta["postgres_started"]:
+            if meta["lost_acked"]:
+                raise TornWriteViolation(
+                    f"PostgreSQL started after a torn {target} write and is missing "
+                    f"acked commits: {meta['lost_acked']}. A commit acknowledged under "
+                    f"synchronous_commit=on did not survive, and nothing refused to "
+                    f"serve the database."
+                )
+        elif not meta["detected"]:
+            raise TornWriteViolation(
+                f"PostgreSQL will not start after a torn {target} write and gave no "
+                f"reason that names the damage; the failure is unattributable and "
+                f"could as easily be unrelated breakage as a caught tear."
+            )
+        if meta["postgres_started"]:
+            print(f"torn {target} write: PostgreSQL recovered; no acked commit lost")
+        else:
+            print(
+                f"torn {target} write: PostgreSQL refused to serve it, "
+                f"reporting {meta['complaint']!r}; never silently accepted"
+            )
+        return
 
     if prove_oracle:
         weakened = run_cycle(weakened=True)

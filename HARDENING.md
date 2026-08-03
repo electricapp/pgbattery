@@ -1203,16 +1203,45 @@ violation, and the first thing a Jepsen analysis would reach for.
       assertion — 350 acked, 350 surviving — rather than only the batch written
       before the first tear, which were the safest keys in the run.
 
+      On the PostgreSQL side all three structures are now torn, matrixed in
+      CI, each with its own inversion:
+
+      | Torn         | Defence          | Result                                                  |
+      | ------------ | ---------------- | --------------------------------------------------------- |
+      | heap page    | full-page image  | repaired during redo, row reads its new value             |
+      | WAL record   | record CRC       | recovered, every acked commit present                     |
+      | `pg_control` | control-file CRC | refused to start, reporting `checksum` — never served     |
+
+      `pg_control` took three attempts to aim, and the two failures are the
+      point. Persisting the first half kept every meaningful field, so the file
+      was undamaged. Persisting the second half left a stale head under a fresh
+      tail — but the payload *and* its CRC both live in that head, so the file
+      stayed internally consistent and merely older. That is by design: the
+      payload occupies one sector, which is exactly why PostgreSQL treats
+      control-file writes as atomic. Only splitting 8192 into 32 parts puts the
+      boundary at 256 bytes, inside the CRC-covered region, where head and tail
+      can disagree. **A tear that a structure is built to survive is not
+      evidence that the structure detects tearing.**
+
+      That run also exposed an ordering bug in the suite's own assertions: it
+      checked for missing acked commits before checking whether PostgreSQL had
+      refused, so a correct detection — which makes every row unreadable —
+      scored as data loss. The contract is repaired-or-detected, so the checks
+      now follow it: if PostgreSQL serves the database at all, every acked
+      commit must be in it; if it refuses, it must name what it found. An
+      unattributable refusal is a violation, because it is indistinguishable
+      from unrelated breakage.
+
       **Still open:**
 
-      - Only the header is ever torn. Every write to `raft.db` observed in this
-        workload was 320 bytes at offset 0, so redb's btree pages are never the
-        thing that gets split. A workload with a Raft log large enough to force
-        page writes would reach them; this one does not, and `observed_writes`
-        in the report is what would show that changing.
-      - PostgreSQL side: heap pages only. A torn WAL record should be caught by
-        the record CRC and a torn `pg_control` by its own; neither is
-        exercised.
+      - Only redb's header is ever torn. Every write to `raft.db` observed in
+        this workload was 320 bytes at offset 0, so its btree pages are never
+        the thing that gets split. The FIFO form of `torn-op` fires on the
+        *next* write and hardcodes occurrence to 1, and in a quiet cluster that
+        next write is almost always the header redb rewrites to publish a
+        commit. Reaching a page write needs either enough Raft churn that page
+        writes become common, or the config-file form of `torn-op`, which
+        honours `occurrence=N` where the FIFO form ignores it.
       - Only heap pages on the PostgreSQL side. A torn WAL record should be
         caught by the record CRC and a torn `pg_control` by its own; neither is
         exercised.
