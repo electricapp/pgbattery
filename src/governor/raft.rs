@@ -29,7 +29,7 @@ use super::network::RaftRpcClient;
 use super::state_machine::{ClusterCommand, ClusterState, NodeId, NodeInfo, NodeRole};
 use super::storage::{
     LastAppliedState, LocalStoredMembership, LogEntry, LogEntryPayload, PurgedLogId,
-    RedbLogStorage, SnapshotMeta, Vote,
+    RedbLogStorage, SnapshotMeta, Vote, panic_payload_text,
 };
 use crate::config::PeerConfig;
 use crate::error::{Error, Result};
@@ -1912,15 +1912,30 @@ fn make_log_id(term: u64, node_id: NodeId, index: u64) -> LogId<NodeId> {
 /// callbacks is preserved by awaiting this before signalling completion.
 /// (`spawn_blocking`, not `block_in_place`: the latter panics on
 /// current-thread runtimes.)
+///
+/// A panic inside `op` is translated rather than reported as a failed task.
+/// redb panics instead of returning an error when it walks a damaged
+/// structure, and every runtime read and write reaches redb through here, so
+/// this is where a corrupt store shows up once the node is past startup. The
+/// closures passed in are thin wrappers over storage methods, so a panic
+/// raised inside one is redb's.
 async fn storage_io<T, F>(storage: &RedbLogStorage, op: F) -> Result<T>
 where
     F: FnOnce(&RedbLogStorage) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    let path = storage.path().to_path_buf();
     let storage = storage.clone();
-    tokio::task::spawn_blocking(move || op(&storage))
-        .await
-        .map_err(|e| Error::Storage(format!("storage task failed to complete: {e}")))?
+    match tokio::task::spawn_blocking(move || op(&storage)).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => Err(RedbLogStorage::panic_corruption_error(
+            &path,
+            &panic_payload_text(e.into_panic().as_ref()),
+        )),
+        Err(e) => Err(Error::Storage(format!(
+            "storage task failed to complete: {e}"
+        ))),
+    }
 }
 
 /// `LogId` recorded by a `LastAppliedState`, when anything has been applied.
@@ -2477,6 +2492,42 @@ mod tests {
                 timestamp: 0,
             }),
         }
+    }
+
+    /// redb panics rather than returning an error when it walks a damaged
+    /// structure, and every runtime read and write goes through `storage_io`
+    /// on the blocking pool. A panic there arrives as a `JoinError`, whose
+    /// own message says only that a task panicked — so without translation
+    /// the operator learns nothing about the store, which is the shape a
+    /// damaged `raft.db` was observed to take in practice.
+    #[tokio::test]
+    async fn a_panicking_storage_task_reports_the_store_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = storage_io(&storage, |_| -> Result<()> {
+            unreachable!("internal error: entered unreachable code")
+        })
+        .await;
+        std::panic::set_hook(previous);
+
+        let Err(err) = result else {
+            panic!("a panicking storage op must not report success")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(msg.contains("re-join"), "error must be actionable: {msg}");
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the store: {msg}"
+        );
+        assert!(
+            msg.contains("entered unreachable code"),
+            "error must carry what redb found: {msg}"
+        );
     }
 
     /// After restart the state machine must be rebuilt from the snapshot plus

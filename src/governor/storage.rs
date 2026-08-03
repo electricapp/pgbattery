@@ -123,10 +123,49 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T>
     })
 }
 
+/// Whether a redb open failure means the bytes on disk are damaged, as opposed
+/// to the environment being wrong.
+///
+/// The distinction decides which error an operator gets, and the corruption
+/// error tells them to move `raft.db` aside and re-join the node as a fresh
+/// learner. Saying that about a permissions problem or a full disk would
+/// destroy a healthy store, so anything not positively identifiable as damage
+/// stays a plain storage error.
+fn is_corruption(e: &DatabaseError) -> bool {
+    match e {
+        DatabaseError::RepairAborted | DatabaseError::Storage(StorageError::Corrupted(_)) => true,
+        // redb rejects a file whose magic number does not match with a bare
+        // `InvalidData` carrying no message. A full-length file that is not a
+        // redb file is a damaged store: a torn write to redb's header, which
+        // is the first thing on disk, produces exactly this. redb's other
+        // `InvalidData` is for opening an empty file without permission to
+        // initialize it, which `create` always grants, so it cannot be this.
+        DatabaseError::Storage(StorageError::Io(io)) => io.kind() == std::io::ErrorKind::InvalidData,
+        _ => false,
+    }
+}
+
+/// Extract a panic's message.
+///
+/// The payload is a `Box<dyn Any>`, whose `Debug` renders as `Any { .. }`, so
+/// formatting it directly discards the only detail the panic carried. The two
+/// concrete types below are what `panic!` produces. The panic *location* is not
+/// in the payload — the default hook has already written it, with a backtrace,
+/// to stderr by the time this runs.
+pub(crate) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic carried no message".to_owned())
+}
+
 /// Redb-based Raft log storage.
 #[derive(Debug)]
 pub struct RedbLogStorage {
     db: Arc<Database>,
+    /// Backing file, kept so failures far from `new` can still name it.
+    path: Arc<Path>,
 }
 
 impl RedbLogStorage {
@@ -157,36 +196,51 @@ impl RedbLogStorage {
             ));
         }
 
-        // Durability configured for Raft safety (fsync on commit)
-        // Wrap in panic catch because Redb may panic on corrupted files
-        let db_result = std::panic::catch_unwind(|| {
-            redb::Builder::new()
-                .set_cache_size(1024 * 1024 * 128)
-                .create(&path_buf)
-        });
-
-        let db = match db_result {
+        // The unwind guard spans the whole open — creating the database *and*
+        // initializing the tables. redb reaches its own consistency assertions
+        // at whichever point it first walks a damaged structure, and table
+        // initialization walks trees `create` never touches, so guarding only
+        // `create` leaves a path where a damaged store kills the process with
+        // a bare backtrace instead of the recovery steps below.
+        let db = match std::panic::catch_unwind(|| Self::open_and_init(&path_buf)) {
             Ok(Ok(db)) => db,
-            Ok(Err(e)) => {
-                let corrupted = matches!(
-                    e,
-                    DatabaseError::RepairAborted
-                        | DatabaseError::Storage(StorageError::Corrupted(_))
-                );
-                if corrupted {
-                    return Err(Self::corruption_error(&path_buf, &e.to_string()));
-                }
-                return Err(Error::Storage(format!("Failed to create database: {e}")));
-            }
-            Err(panic_info) => {
+            Ok(Err(e)) => return Err(e),
+            Err(payload) => {
                 return Err(Self::corruption_error(
                     &path_buf,
-                    &format!("redb panicked while opening: {panic_info:?}"),
+                    &format!(
+                        "redb panicked while opening: {}",
+                        panic_payload_text(payload.as_ref())
+                    ),
                 ));
             }
         };
 
-        // Initialize tables
+        tracing::debug!(path = %path_buf.display(), "Opened Raft storage");
+
+        Ok(Self {
+            db: Arc::new(db),
+            path: Arc::from(path_buf),
+        })
+    }
+
+    /// Open the database and ensure every table exists.
+    ///
+    /// Split out so a single `catch_unwind` covers both halves; it must not be
+    /// called outside that guard.
+    fn open_and_init(path: &Path) -> Result<Database> {
+        // Durability configured for Raft safety (fsync on commit).
+        let db = redb::Builder::new()
+            .set_cache_size(1024 * 1024 * 128)
+            .create(path)
+            .map_err(|e| {
+                if is_corruption(&e) {
+                    Self::corruption_error(path, &e.to_string())
+                } else {
+                    Error::Storage(format!("Failed to create database: {e}"))
+                }
+            })?;
+
         let write_txn = db
             .begin_write()
             .map_err(|e| Error::Storage(format!("Failed to begin write: {e}")))?;
@@ -207,13 +261,16 @@ impl RedbLogStorage {
             .commit()
             .map_err(|e| Error::Storage(format!("Failed to commit: {e}")))?;
 
-        tracing::debug!(path = %path_buf.display(), "Opened Raft storage");
+        Ok(db)
+    }
 
-        Ok(Self { db: Arc::new(db) })
+    /// Path of the backing `raft.db`, for error messages that must name it.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Build the fatal, operator-actionable error for a corrupted Raft DB.
-    fn corruption_error(path: &Path, detail: &str) -> Error {
+    pub(crate) fn corruption_error(path: &Path, detail: &str) -> Error {
         metrics::counter!("pgbattery_raft_db_corruption_fatal").increment(1);
         tracing::error!(path = %path.display(), detail, "Raft DB corrupted — refusing to start");
         Error::Storage(format!(
@@ -222,6 +279,26 @@ impl RedbLogStorage {
              double-vote in a term or lose committed entries. To recover, move the file aside \
              (e.g. mv to {}.corrupted), remove this node from the cluster membership, and \
              re-join it as a fresh learner.",
+            path.display(),
+            path.display(),
+        ))
+    }
+
+    /// Build the fatal error for a redb panic raised after startup.
+    ///
+    /// Worded separately from [`Self::corruption_error`] because the node is
+    /// already running: there is nothing to refuse to start, and the damage is
+    /// inferred from redb's behaviour rather than read off a rejected file.
+    pub(crate) fn panic_corruption_error(path: &Path, detail: &str) -> Error {
+        metrics::counter!("pgbattery_raft_db_corruption_fatal").increment(1);
+        tracing::error!(path = %path.display(), detail, "Raft DB storage operation panicked — treating the store as corrupted");
+        Error::Storage(format!(
+            "Raft DB at {} panicked during a storage operation ({detail}). Treating the store \
+             as corrupted: redb panics rather than returning an error when it walks a damaged \
+             structure. This node must not continue, because it would vote on a store nothing \
+             vouched for. To recover, stop this node, move the file aside (e.g. mv to \
+             {}.corrupted), remove it from the cluster membership, and re-join it as a fresh \
+             learner.",
             path.display(),
             path.display(),
         ))
@@ -884,6 +961,7 @@ impl Clone for RedbLogStorage {
     fn clone(&self) -> Self {
         Self {
             db: self.db.clone(),
+            path: self.path.clone(),
         }
     }
 }
@@ -947,6 +1025,79 @@ mod tests {
         storage.delete_from(2).unwrap();
         assert!(storage.get_entry(2).unwrap().is_none());
         assert!(storage.get_entry(1).unwrap().is_some());
+    }
+
+    /// Build a real `raft.db` with `entries` log records and return its bytes.
+    fn populated_db_bytes(dir: &Path, entries: u64) -> Vec<u8> {
+        let path = dir.join("good.db");
+        {
+            let storage = RedbLogStorage::new(&path).unwrap();
+            let entries: Vec<LogEntry> = (1..=entries)
+                .map(|i| LogEntry {
+                    index: i,
+                    term: 1,
+                    leader_node_id: 1,
+                    payload: LogEntryPayload::Blank,
+                })
+                .collect();
+            storage.append_entries(&entries).unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        bytes
+    }
+
+    /// A `raft.db` whose magic number no longer matches is corrupt, and must
+    /// be reported with the recovery steps rather than as a generic storage
+    /// failure.
+    ///
+    /// This is the shape a torn write to redb's header produces: the file is
+    /// full-length and looks openable, but its first bytes are not redb's.
+    /// redb reports it as `Io(InvalidData)`, which carries no hint that the
+    /// data on disk is the problem.
+    #[test]
+    fn test_bad_magic_number_is_reported_as_corruption() {
+        let dir = tempdir().unwrap();
+        let mut bytes = populated_db_bytes(dir.path(), 500);
+        bytes[..64].fill(0);
+        let path = dir.path().join("bad-magic.db");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let msg = RedbLogStorage::new(&path)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+
+        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(msg.contains("re-join"), "error must be actionable: {msg}");
+        assert!(path.exists(), "corrupt file must be preserved in place");
+    }
+
+    /// When redb panics on a damaged store, the operator must be told what
+    /// redb actually found. The panic payload is a `Box<dyn Any>`, whose
+    /// `Debug` renders as `Any { .. }` — formatting it directly discards the
+    /// only detail the panic carried.
+    #[test]
+    fn test_redb_panic_detail_reaches_the_operator() {
+        let dir = tempdir().unwrap();
+        let mut bytes = populated_db_bytes(dir.path(), 500);
+        // Damage a btree page rather than the header, so redb gets far enough
+        // in to walk the tree and hit one of its own consistency assertions.
+        bytes[8192] = 0x07;
+        let path = dir.path().join("panicking.db");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let msg = RedbLogStorage::new(&path)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+
+        assert!(msg.contains("corrupted"), "expected corruption error: {msg}");
+        assert!(
+            !msg.contains("Any { .. }"),
+            "panic detail must be extracted, not printed as an opaque Any: {msg}"
+        );
+        assert!(msg.contains("re-join"), "error must be actionable: {msg}");
     }
 
     /// A corrupted/truncated raft.db must be a fatal error, not a silent

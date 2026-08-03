@@ -1169,24 +1169,40 @@ violation, and the first thing a Jepsen analysis would reach for.
 
       **Refusal is detected behaviourally, from the container restart-looping,
       not from a log string.** That was learned the hard way across two failed
-      runs. A damaged Raft store reaches an operator in at least three shapes,
-      and matching on text meant every shape not yet seen read as "running
-      fine":
+      runs. A damaged Raft store reached an operator in three shapes, and
+      matching on text meant every shape not yet seen read as "running fine":
 
-      | Shape                                     | What the operator gets       |
-      | ----------------------------------------- | ---------------------------- |
+      | Shape                                    | What the operator got         |
+      | ---------------------------------------- | ----------------------------- |
       | `Raft DB corrupted — refusing to start`  | the reason and recovery steps |
-      | redb `unreachable!()` panic in the btree   | a backtrace                  |
-      | `Failed to create database: I/O error`     | a generic storage error      |
+      | redb `unreachable!()` panic in the btree  | a backtrace                  |
+      | `Failed to create database: I/O error`    | a generic storage error      |
 
-      All three are safe: the process dies rather than voting on a store nobody
-      vouched for. Only the first is actionable. `storage.rs` writes a genuinely
-      good refusal — it declines to recreate the store and explains that doing
-      so rejoins the node as a voter without its persisted vote and log, risking
-      a double-vote in a term or lost committed entries — and two of the three
-      paths never reach it. **That is a real gap in pgbattery, not in the
-      harness.** A single torn write produced the third shape, so torn writes to
-      redb are not reliably benign either.
+      All three were safe — the process dies rather than voting on a store
+      nobody vouched for — but only the first was actionable, and that was a
+      gap in pgbattery rather than in the harness. It is now closed; the three
+      defects behind it are worth recording because each was invisible from the
+      outside:
+
+      - `Io(InvalidData)` was not classified as corruption. It is what redb
+        returns when the magic number does not match, which is precisely what a
+        torn write to redb's header produces — the damage this suite injects.
+      - The unwind guard covered `create` but not table initialization, so a
+        panic while walking a damaged tree escaped as a bare backtrace.
+      - Every caught panic rendered as `Any { .. }`. The payload is a
+        `Box<dyn Any>`, whose `Debug` discards the message, so even the path
+        that did report corruption said nothing about what redb found.
+
+      A fourth was reachable only at runtime: redb panics rather than returning
+      an error, every runtime read and write goes through `storage_io` on the
+      blocking pool, and a panic there arrived as tokio's "task panicked". That
+      is the shape seen in practice, and startup-only handling could never have
+      caught it. The classifier stays deliberately narrow — permission denied
+      and a full disk are not corruption, and the recovery it prescribes
+      destroys a store.
+
+      A single torn write produced the third shape, so torn writes to redb are
+      not reliably benign either.
 
       **The tears land on the committed root, which corrects an earlier note
       here.** Recording the offset rather than only the byte count showed every
