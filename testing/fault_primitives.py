@@ -234,6 +234,23 @@ PG_INTERNAL_PORT: Final[int] = 5434
 FAKETIME_FILE: Final[str] = "/tmp/faketime"
 """Read on every clock call because the image sets ``FAKETIME_NO_CACHE=1``."""
 
+LAZYFS_FIFO: Final[str] = "/tmp/lazyfs.fifo"
+"""LazyFS control channel. Matches ``[faults].fifo_path`` in
+``testing/lazyfs/lazyfs.toml``, which the ``runtime-lazyfs`` image stage bakes
+in at ``/etc/lazyfs.toml``. Outside PGDATA on purpose: a control channel inside
+the filesystem being crashed vanishes exactly when it is needed."""
+
+LAZYFS_FIFO_COMPLETED: Final[str] = "/tmp/lazyfs.completed.fifo"
+"""LazyFS writes here when an async ``clear-cache`` has finished. Reading it is
+how the crash primitive knows the discard completed, instead of sleeping and
+hoping — the discard must be over before the SIGKILL or the test measures a
+race rather than a durability property."""
+
+LAZYFS_ROOT_DIR: Final[str] = f"{PG_STATE_DIR}/pgdata-root"
+"""Backing store behind the LazyFS mount, on the persistent named volume. What
+survives in here after a crash *is* the evidence: it holds exactly the writes
+that were fsynced."""
+
 FILLER_PATH: Final[str] = f"{PG_STATE_DIR}/_fault_fill.bin"
 """Disk-fill target. Deliberately beside PGDATA rather than inside it: same
 filesystem, so ENOSPC is identical, without leaving an unexpected file in the
@@ -1082,6 +1099,27 @@ def curl_probe_cmd(ip: str, *, port: int = MGMT_INTERNAL_PORT, timeout_s: float 
     )
 
 
+def lazyfs_control_cmd(command: str, *, fifo: str = LAZYFS_FIFO) -> str:
+    """Write one ``lazyfs::`` control word to the LazyFS fault FIFO.
+
+    The write must be newline-terminated or LazyFS never sees a complete
+    command, and a command it never sees is a fault that never injects.
+    """
+    if not command.startswith("lazyfs::"):
+        raise ValueError(f"not a lazyfs control command: {command!r}")
+    return f"printf '{command}\\n' > {fifo}"
+
+
+def lazyfs_mounts_cmd() -> str:
+    """Read the container's mount table.
+
+    ``/proc/mounts`` rather than ``mount(8)``: the latter is not installed in
+    the postgres image, and a missing binary would make the mount check exit
+    127, which reads as "not mounted" and would disable the suite silently.
+    """
+    return "cat /proc/mounts"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure output parsing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1238,6 +1276,22 @@ class DiskUsage:
     @property
     def avail_bytes(self) -> int:
         return self.avail_kb * 1024
+
+
+def parse_lazyfs_mounted(proc_mounts: str, mount_dir: str) -> bool:
+    """Whether `mount_dir` appears in ``/proc/mounts`` as a FUSE filesystem.
+
+    The filesystem type is checked, not just the path. A container whose
+    entrypoint failed to mount still has the directory — it is PGDATA on the
+    ordinary filesystem — and treating "the path exists" as "LazyFS is mounted"
+    is how the durability suite would come to assert fsync semantics against a
+    filesystem that cannot lose an un-fsynced write.
+    """
+    for line in proc_mounts.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == mount_dir and fields[2].startswith("fuse"):
+            return True
+    return False
 
 
 def parse_df(text: str) -> DiskUsage:
@@ -2390,6 +2444,95 @@ def sigstop_checkpointer(container: str, duration_s: float) -> Iterator[StoppedP
         "sigstop_checkpointer",
     ) as handle:
         yield handle
+
+
+def read_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> bool:
+    """Whether `container` has PGDATA on LazyFS right now."""
+    result = exec_in(container, lazyfs_mounts_cmd())
+    if not result.ok:
+        raise FaultInjectionError(f"{container}: could not read /proc/mounts: {result.output}")
+    return parse_lazyfs_mounted(result.stdout, mount_dir)
+
+
+def verify_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> None:
+    """Assert `container` runs PGDATA on LazyFS, with the remediation attached.
+
+    Called before every durability fault. Without LazyFS the crash below is an
+    ordinary SIGKILL against a filesystem whose un-fsynced writes are held in
+    the *host* page cache, which killing a container does not discard — so the
+    assertion "every acked write survived" would hold no matter what
+    PostgreSQL's durability settings were, and would read as evidence.
+    """
+    if not read_lazyfs_mounted(container, mount_dir):
+        raise FaultPreconditionError(
+            f"{container}: {mount_dir} is not a LazyFS mount, so un-fsynced writes "
+            f"cannot be lost and no durability claim can be tested here.\n"
+            f"  Run this suite against docker-compose.lazyfs.yml:\n"
+            f"    COMPOSE_FILE=docker-compose.lazyfs.yml docker compose up -d\n"
+            f"  That file targets the `runtime-lazyfs` image stage and starts each "
+            f"node through the entrypoint that mounts LazyFS at {mount_dir}."
+        )
+
+
+def lazyfs_unsynced_bytes(container: str, path: str) -> int:
+    """Size of `path` as the *backing store* has it, in bytes.
+
+    Reads through ``LAZYFS_ROOT_DIR`` rather than the mount, and the
+    distinction is the whole point: the mount serves un-fsynced data out of
+    LazyFS's cache and would report it as present. Only the backing store
+    knows what a power loss would leave behind.
+    """
+    rel = path[len(PG_DATA_DIR) :].lstrip("/") if path.startswith(PG_DATA_DIR) else path
+    result = exec_in(container, f"stat -c %s {LAZYFS_ROOT_DIR}/{rel} 2>/dev/null || echo -1")
+    return int(result.stdout.strip() or -1)
+
+
+@contextmanager
+def crash_losing_unsynced_writes(container: str, *, mount_dir: str = PG_DATA_DIR) -> Iterator[None]:
+    """SIGKILL `container` after discarding every write it never fsynced.
+
+    PROVES: whether an acknowledged write was durable at the moment it was
+    acknowledged. LazyFS holds un-fsynced writes in its own userspace cache;
+    ``clear-cache`` discards exactly those, and the SIGKILL that follows takes
+    the process with the rest of the cache. What remains in the backing store
+    is precisely what PostgreSQL flushed. This is the only fault in this module
+    that can produce the "fsync returned success without flushing" violation,
+    and therefore the only one that can turn W1 and R2 from asserted into
+    demonstrated.
+
+    DOES NOT PROVE: anything about the Raft store, which lives outside the
+    mount at ``/var/lib/postgresql/raft`` on the ordinary filesystem and so
+    keeps its un-fsynced writes across this fault. openraft's storage
+    conformance suite carries the durability pins for that. Nor does it prove
+    torn-write handling: pages here are lost whole, never half-written, which
+    is H-25's dm-flakey job.
+
+    The container is left dead. The caller restarts it, because what a restart
+    recovers is the measurement.
+    """
+    verify_lazyfs_mounted(container, mount_dir)
+
+    _emit("fault.begin", "crash_losing_unsynced_writes", container, {"mount_dir": mount_dir})
+
+    discard = exec_in(container, lazyfs_control_cmd("lazyfs::clear-cache"))
+    if not discard.ok:
+        raise FaultInjectionError(
+            f"{container}: could not write clear-cache to {LAZYFS_FIFO}: {discard.output}"
+        )
+
+    # SIGKILL, never `docker stop`. A graceful stop gives LazyFS a chance to
+    # unmount, and unmounting flushes — which would quietly write out the very
+    # data the fault exists to destroy.
+    kill = run(f"docker kill --signal=KILL {container_id(container)}")
+    if not kill.ok:
+        raise FaultInjectionError(f"{container}: SIGKILL failed: {kill.output}")
+
+    _wait_for_status(container, "exited")
+    _emit("fault.injected", "crash_losing_unsynced_writes", container, {"mount_dir": mount_dir})
+    try:
+        yield
+    finally:
+        _emit("fault.end", "crash_losing_unsynced_writes", container, {"mount_dir": mount_dir})
 
 
 def _lifecycle(service: str, verb: str) -> CommandResult:

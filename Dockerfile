@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         cargo build --locked && cp target/debug/pgbattery /pgbattery; \
     fi
 
-FROM postgres:18
+FROM postgres:18 AS runtime
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl && rm -rf /var/lib/apt/lists/*
@@ -64,3 +64,86 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["pgbattery", "run"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LazyFS build — durability testing only, never in the default image.
+#
+# `docker-compose.lazyfs.yml` targets the `runtime-lazyfs` stage below; every
+# other compose file targets `runtime` and pays none of this build cost.
+#
+# LazyFS is a FUSE filesystem that holds un-fsynced writes in its own userspace
+# page cache and can be told to discard exactly those. That is the only way to
+# observe lost-unsynced-writes here. The scaffold this replaces proposed
+# libeatmydata, which cannot do it: making fsync() a no-op still leaves the
+# write in the *host* page cache, and SIGKILLing a container does not discard
+# host page cache, so the data is all still there on restart. A durability
+# assertion built on libeatmydata would pass while proving nothing.
+#
+# Built from the same postgres:18 base as the runtime stage so libstdc++ and
+# glibc match exactly, and pinned to a release commit SHA rather than a tag —
+# tags move (see tla/Makefile for what that costs).
+# ─────────────────────────────────────────────────────────────────────────────
+FROM postgres:18 AS lazyfs-builder
+
+ARG LAZYFS_COMMIT=045a0b3a1126725e693934e29d3ba15e08cc39ec
+
+RUN apt-get update && apt-get install -y \
+        g++ cmake make git ca-certificates libfuse3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/dsrhaslab/lazyfs.git /build/lazyfs \
+    && git -C /build/lazyfs checkout --detach "${LAZYFS_COMMIT}" \
+    && test "$(git -C /build/lazyfs rev-parse HEAD)" = "${LAZYFS_COMMIT}"
+
+RUN cd /build/lazyfs/libs/libpcache && ./build.sh
+RUN cd /build/lazyfs/lazyfs && ./build.sh
+
+# The build scripts emit into build/ without an install step, so the binary
+# path is asserted here rather than assumed by a later COPY that would happily
+# copy nothing.
+RUN test -x /build/lazyfs/lazyfs/build/lazyfs
+
+FROM runtime AS runtime-lazyfs
+
+USER root
+
+# `fuse3` brings fusermount3 and pulls the matching runtime libfuse3 as a
+# dependency. The library package is deliberately not named here: its soname
+# suffix tracks the Debian release under postgres:18 and pinning the wrong one
+# fails the build on a base image bump. The ldd check below is what actually
+# guarantees the right library arrived.
+RUN apt-get update && apt-get install -y fuse3 && rm -rf /var/lib/apt/lists/*
+
+# Neither build.sh has an install step, so both artifacts are copied out of
+# the build tree. lazyfs links libpcache through an rpath into that tree, which
+# does not exist here; the loader falls through to the ldconfig cache, so
+# libpcache has to be in a standard path and ldconfig has to have run.
+COPY --from=lazyfs-builder /build/lazyfs/lazyfs/build/lazyfs /usr/local/bin/lazyfs
+COPY --from=lazyfs-builder /build/lazyfs/libs/libpcache/build/libpcache.so /usr/local/lib/libpcache.so
+COPY --from=lazyfs-builder /build/lazyfs/libs/libpcache/build/libpcache.so.0 /usr/local/lib/libpcache.so.0
+
+RUN ldconfig
+
+# postgres must reach a mount made by root, which FUSE forbids unless
+# `user_allow_other` is enabled and the mount passes `-o allow_other`. Without
+# both, the mount succeeds and PGDATA is silently inaccessible to the process
+# that needs it.
+RUN echo "user_allow_other" >> /etc/fuse.conf
+
+COPY testing/lazyfs/entrypoint.sh /usr/local/bin/pgbattery-lazyfs
+COPY testing/lazyfs/lazyfs.toml /etc/lazyfs.toml
+
+RUN chmod 0755 /usr/local/bin/pgbattery-lazyfs
+
+# Same reason as `command -v tc` above: a binary that cannot load turns every
+# durability assertion into a test of nothing. `test -x` is not enough — the
+# failure mode here is an unresolved libpcache, which leaves the file present
+# and executable and failing only at run time, inside a container whose logs
+# nobody reads until the suite has already reported green.
+RUN ldd /usr/local/bin/lazyfs && ! ldd /usr/local/bin/lazyfs | grep -q "not found"
+RUN test -x /usr/local/bin/pgbattery-lazyfs && test -s /etc/lazyfs.toml
+RUN command -v setpriv && command -v fusermount3
+
+# Stays root: the entrypoint mounts FUSE and then drops to postgres itself.
+# PostgreSQL refuses to run as root, so the drop is not optional.
+USER root

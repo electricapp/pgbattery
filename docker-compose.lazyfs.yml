@@ -1,0 +1,121 @@
+# 3-node topology with PGDATA on LazyFS, parallel to `docker-compose.yml`.
+#
+# The only cluster in this repo where an un-fsynced write can actually be lost.
+# Every other compose file runs PGDATA on an ordinary filesystem, where `docker
+# kill` leaves the host page cache intact and therefore cannot discard anything
+# PostgreSQL wrote but did not flush. That is why W1 and R2 have until now
+# rested on construction rather than evidence.
+#
+# Separate project name, subnet, and host ports so this cluster can coexist
+# with the 3-node and 5-node ones and no fault injection can reach across.
+#
+# Requires PGBATTERY_MANAGEMENT_API_TOKEN, like the other compose files.
+#
+# Deliberately omits the libfaketime LD_PRELOAD that the other files set. This
+# suite injects no clock skew, and preloading a time-interception library into
+# the process that owns the page cache would put a second unrelated variable
+# inside the one test whose whole purpose is attributing lost writes.
+name: pgbatterylazyfs
+
+x-lazyfs-node: &lazyfs-node
+  build:
+    context: .
+    target: runtime-lazyfs
+  restart: unless-stopped
+  # Starts as root so the entrypoint can mount FUSE; it drops to postgres
+  # before exec'ing pgbattery, because PostgreSQL refuses to run as root.
+  user: root
+  # SYS_ADMIN plus the fuse device is the minimum for a FUSE mount inside a
+  # container. AppArmor is unconfined because the default docker profile
+  # denies mount(2) outright on hosts that ship it.
+  cap_add: [NET_ADMIN, SYS_ADMIN]
+  devices:
+    - /dev/fuse
+  security_opt:
+    - apparmor:unconfined
+  environment:
+    - RUST_LOG=info
+    - PGBATTERY_MANAGEMENT_API_TOKEN=${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+
+services:
+  node1:
+    <<: *lazyfs-node
+    hostname: node1
+    command:
+      ["pgbattery-lazyfs", "pgbattery", "run", "--bootstrap"]
+    volumes:
+      - ./config/lazyfs/node1.toml:/app/pgbattery.toml:ro
+      - node1_state:/var/lib/postgresql
+    ports:
+      - "5452:5432"
+      - "9291:9090"
+      - "9281:9091"
+    networks:
+      raft_net:
+        ipv4_address: 172.30.0.11
+
+  node2:
+    <<: *lazyfs-node
+    hostname: node2
+    command:
+      [
+        "pgbattery-lazyfs",
+        "pgbattery",
+        "join",
+        "--peer",
+        "172.30.0.11:9091",
+        "--node-id",
+        "2",
+        "--voter",
+      ]
+    volumes:
+      - ./config/lazyfs/node2.toml:/app/pgbattery.toml:ro
+      - node2_state:/var/lib/postgresql
+    ports:
+      - "5453:5432"
+      - "9292:9090"
+      - "9282:9091"
+    networks:
+      raft_net:
+        ipv4_address: 172.30.0.12
+
+  node3:
+    <<: *lazyfs-node
+    hostname: node3
+    command:
+      [
+        "pgbattery-lazyfs",
+        "pgbattery",
+        "join",
+        "--peer",
+        "172.30.0.11:9091",
+        "--node-id",
+        "3",
+        "--voter",
+      ]
+    volumes:
+      - ./config/lazyfs/node3.toml:/app/pgbattery.toml:ro
+      - node3_state:/var/lib/postgresql
+    ports:
+      - "5454:5432"
+      - "9293:9090"
+      - "9283:9091"
+    networks:
+      raft_net:
+        ipv4_address: 172.30.0.13
+
+networks:
+  raft_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+# Ordinary persistent named volumes. The crash test depends on state surviving
+# `docker compose kill` + `start`: the LazyFS backing root lives here, and what
+# it contains after a restart is precisely the evidence the suite collects.
+# A tmpfs variant would come back empty and make every assertion vacuous.
+volumes:
+  node1_state:
+  node2_state:
+  node3_state:

@@ -1,0 +1,34 @@
+# LazyFS configuration for the durability suite. Baked into the
+# `runtime-lazyfs` image stage at /etc/lazyfs.toml.
+#
+# The FIFO is the control channel: the harness writes `lazyfs::clear-cache` to
+# it to discard every write PostgreSQL has issued but not fsynced, which is
+# what a power loss discards. It lives under /tmp because the FUSE mount point
+# and its backing root are both under /var/lib/postgresql and a control channel
+# inside the filesystem being crashed is a control channel that disappears at
+# the moment it is needed.
+
+[faults]
+fifo_path = "/tmp/lazyfs.fifo"
+# Second FIFO reports completion of an async clear-cache. Without it the
+# harness would have to sleep and hope, and a sleep as a gate on a state
+# transition is exactly what this project refuses.
+fifo_path_completed = "/tmp/lazyfs.completed.fifo"
+
+[cache]
+# Real eviction under memory pressure. With eviction off, LazyFS holds every
+# un-fsynced page until the cache fills and then behaves in a way no disk does.
+apply_eviction = false
+
+[cache.simple]
+# Must exceed the un-fsynced working set the suite generates between the drop
+# window opening and the crash, or LazyFS evicts (writes through) early and
+# the writes the test intends to lose are already durable. The suite writes
+# single-row transactions in the low thousands; 1gb is orders of magnitude
+# above that, and the crash assertion is the backstop that would catch it.
+custom_size = "1gb"
+blocks_per_page = 1
+
+[filesystem]
+log_all_operations = false
+logfile = ""

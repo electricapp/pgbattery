@@ -1,0 +1,6 @@
+# LazyFS durability-suite variant of ../node3.toml.
+# Identical except for the 172.30.0.0/16 subnet that keeps this cluster
+# isolated from the 3-node and 5-node ones. pg_data_dir is unchanged: the
+# entrypoint mounts LazyFS *at* /var/lib/postgresql/data, so PostgreSQL is
+# pointed at the same path and reaches the FUSE filesystem instead.
+
