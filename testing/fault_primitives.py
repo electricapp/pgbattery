@@ -2488,8 +2488,10 @@ def lazyfs_unsynced_bytes(container: str, path: str) -> int:
 
 
 @contextmanager
-def crash_losing_unsynced_writes(container: str, *, mount_dir: str = PG_DATA_DIR) -> Iterator[None]:
-    """SIGKILL `container` after discarding every write it never fsynced.
+def crash_losing_unsynced_writes(
+    containers: Sequence[str], *, mount_dir: str = PG_DATA_DIR
+) -> Iterator[None]:
+    """SIGKILL every named container after discarding writes it never fsynced.
 
     PROVES: whether an acknowledged write was durable at the moment it was
     acknowledged. LazyFS holds un-fsynced writes in its own userspace cache;
@@ -2507,32 +2509,90 @@ def crash_losing_unsynced_writes(container: str, *, mount_dir: str = PG_DATA_DIR
     torn-write handling: pages here are lost whole, never half-written, which
     is H-25's dm-flakey job.
 
-    The container is left dead. The caller restarts it, because what a restart
-    recovers is the measurement.
+    Every named container is discarded before any is killed. Killing them one
+    at a time would let the survivors keep accepting writes and re-replicating
+    through the gap, so a whole-cluster crash would quietly degrade into a
+    rolling restart — which the repo already covers and which proves nothing
+    about fsync.
+
+    The containers are left dead. The caller restarts them, because what a
+    restart recovers is the measurement.
     """
-    verify_lazyfs_mounted(container, mount_dir)
+    targets = list(containers)
+    if not targets:
+        raise FaultPreconditionError("crash_losing_unsynced_writes needs at least one container")
 
-    _emit("fault.begin", "crash_losing_unsynced_writes", container, {"mount_dir": mount_dir})
+    for target in targets:
+        verify_lazyfs_mounted(target, mount_dir)
 
-    discard = exec_in(container, lazyfs_control_cmd("lazyfs::clear-cache"))
-    if not discard.ok:
-        raise FaultInjectionError(
-            f"{container}: could not write clear-cache to {LAZYFS_FIFO}: {discard.output}"
-        )
+    # Resolved once, before anything dies. `container_id` goes through
+    # `docker compose ps -q`, which returns nothing while a container is
+    # between incarnations — so re-resolving after the kill races the restart
+    # policy and fails on a fault that landed perfectly.
+    ids = {target: container_id(target) for target in targets}
 
-    # SIGKILL, never `docker stop`. A graceful stop gives LazyFS a chance to
-    # unmount, and unmounting flushes — which would quietly write out the very
-    # data the fault exists to destroy.
-    kill = run(f"docker kill --signal=KILL {container_id(container)}")
-    if not kill.ok:
-        raise FaultInjectionError(f"{container}: SIGKILL failed: {kill.output}")
+    joined = ",".join(targets)
+    _emit("fault.begin", "crash_losing_unsynced_writes", joined, {"mount_dir": mount_dir})
 
-    _wait_for_status(container, "exited")
-    _emit("fault.injected", "crash_losing_unsynced_writes", container, {"mount_dir": mount_dir})
+    # The compose files set `restart: unless-stopped`, which is right for
+    # production and wrong here: Docker would restart the first victim while
+    # the last was still being killed, so the cluster would never actually be
+    # simultaneously dead and a whole-cluster crash would degrade into a
+    # rolling restart. Suspended for the window, restored in `finally`.
+    for target, cid in ids.items():
+        policy = run(f"docker update --restart=no {cid}")
+        if not policy.ok:
+            raise FaultInjectionError(
+                f"{target}: could not suspend restart policy: {policy.output}"
+            )
+
     try:
+        for target in targets:
+            discard = exec_in(target, lazyfs_control_cmd("lazyfs::clear-cache"))
+            if not discard.ok:
+                raise FaultInjectionError(
+                    f"{target}: could not write clear-cache to {LAZYFS_FIFO}: {discard.output}"
+                )
+
+        # SIGKILL, never `docker stop`. A graceful stop gives LazyFS a chance
+        # to unmount, and unmounting flushes — which would quietly write out
+        # the very data the fault exists to destroy.
+        for target, cid in ids.items():
+            kill = run(f"docker kill --signal=KILL {cid}")
+            if not kill.ok:
+                raise FaultInjectionError(f"{target}: SIGKILL failed: {kill.output}")
+
+        for target, cid in ids.items():
+            _await_container_id_status(target, cid, "exited")
+
+        _emit("fault.injected", "crash_losing_unsynced_writes", joined, {"mount_dir": mount_dir})
         yield
     finally:
-        _emit("fault.end", "crash_losing_unsynced_writes", container, {"mount_dir": mount_dir})
+        for cid in ids.values():
+            run(f"docker update --restart=unless-stopped {cid}")
+        _emit("fault.end", "crash_losing_unsynced_writes", joined, {"mount_dir": mount_dir})
+
+
+def _await_container_id_status(
+    service: str, container: str, expected: str, *, timeout_s: float = 60.0
+) -> None:
+    """Poll a container *by id* until it reports `expected`.
+
+    By id rather than by compose service, because compose cannot name a
+    container that is between incarnations, and this is called precisely when
+    that is true.
+    """
+    deadline = time.monotonic() + timeout_s
+    status = "unknown"
+    while time.monotonic() < deadline:
+        probe = run(f"docker inspect -f '{{{{.State.Status}}}}' {container}")
+        status = probe.stdout.strip()
+        if status == expected:
+            return
+        time.sleep(0.5)
+    raise FaultEffectNotObserved(
+        f"{service} ({container}) reported {status!r}, expected {expected!r} within {timeout_s:g}s"
+    )
 
 
 def _lifecycle(service: str, verb: str) -> CommandResult:
