@@ -164,6 +164,7 @@ import sys
 import threading
 import time
 import tomllib
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -240,11 +241,11 @@ LAZYFS_FIFO: Final[str] = "/tmp/lazyfs.fifo"
 in at ``/etc/lazyfs.toml``. Outside PGDATA on purpose: a control channel inside
 the filesystem being crashed vanishes exactly when it is needed."""
 
-LAZYFS_FIFO_COMPLETED: Final[str] = "/tmp/lazyfs.completed.fifo"
-"""LazyFS writes here when an async ``clear-cache`` has finished. Reading it is
-how the crash primitive knows the discard completed, instead of sleeping and
-hoping — the discard must be over before the SIGKILL or the test measures a
-race rather than a durability property."""
+LAZYFS_LOG: Final[str] = "/tmp/lazyfs.log"
+"""Where LazyFS mirrors its log, per ``[filesystem].logfile`` in
+``testing/lazyfs/lazyfs.toml``. The fault worker echoes every command it
+consumes, so this file is the only place that distinguishes "the command was
+written to the FIFO" from "LazyFS acted on it"."""
 
 LAZYFS_ROOT_DIR: Final[str] = f"{PG_STATE_DIR}/pgdata-root"
 """Backing store behind the LazyFS mount, on the persistent named volume. What
@@ -1108,6 +1109,52 @@ def lazyfs_control_cmd(command: str, *, fifo: str = LAZYFS_FIFO) -> str:
     if not command.startswith("lazyfs::"):
         raise ValueError(f"not a lazyfs control command: {command!r}")
     return f"printf '{command}\\n' > {fifo}"
+
+
+def lazyfs_probe_command(nonce: str) -> str:
+    """A control word LazyFS is guaranteed not to implement.
+
+    The fault worker logs every command it fails to recognise, so an unknown
+    word is a round trip with no side effect: writing it proves nothing, but
+    seeing it echoed in the log proves the worker is consuming the FIFO. The
+    nonce keeps one probe's echo from being mistaken for an earlier one's.
+    """
+    if not nonce or not nonce.isalnum():
+        raise ValueError(f"nonce must be non-empty alphanumeric: {nonce!r}")
+    return f"lazyfs::pgbattery-probe-{nonce}"
+
+
+def lazyfs_log_cmd(*, log: str = LAZYFS_LOG) -> str:
+    """Read the LazyFS log, tolerating its absence.
+
+    A missing log must not look like a read failure: LazyFS truncates the file
+    at startup, so there is a window where it does not exist yet, and the
+    caller is polling for a line to appear in it anyway.
+    """
+    return f"cat {log} 2>/dev/null || true"
+
+
+def count_lazyfs_received(log_text: str, command: str) -> int:
+    """How many times the fault worker has logged receiving `command`.
+
+    A count rather than a boolean because the caller compares before against
+    after. Testing for presence would match the previous injection's line and
+    pass without the current command having been read at all.
+    """
+    if not command.startswith("lazyfs::"):
+        raise ValueError(f"not a lazyfs control command: {command!r}")
+    return log_text.count(f"received '{command}'")
+
+
+def parse_lazyfs_consumed(log_text: str, nonce: str) -> bool:
+    """Whether the fault worker echoed the probe carrying `nonce`.
+
+    Matches the worker's own "command unknown" line. Anything weaker — the
+    nonce appearing anywhere in the log — would also match the command being
+    logged on the way in rather than on the way out, which is the distinction
+    the probe exists to draw.
+    """
+    return f"command unknown '{lazyfs_probe_command(nonce)}'" in log_text
 
 
 def lazyfs_mounts_cmd() -> str:
@@ -2473,6 +2520,67 @@ def verify_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> None:
         )
 
 
+def verify_lazyfs_fault_channel(container: str, *, timeout_s: float = 10.0) -> None:
+    """Assert LazyFS is *consuming* the fault FIFO, not merely accepting writes.
+
+    Writing to the FIFO succeeds whenever LazyFS holds it open, which it does
+    from the moment it creates it — before, and independently of, the worker
+    thread that reads it. If that thread stalls, every ``lazyfs::`` command
+    lands in the pipe buffer and is never executed, the shell write reports
+    success, and the durability suite proceeds believing it discarded a cache
+    it never touched.
+
+    This is not hypothetical. Setting ``fifo_path_completed`` in the LazyFS
+    config parks the worker in ``open(O_WRONLY)`` on a FIFO no process ever
+    opens for reading, which is exactly this failure and produced exactly this
+    silence.
+
+    So: send a command LazyFS cannot recognise and wait for it to say so.
+    """
+    nonce = uuid.uuid4().hex
+    probe = exec_in(container, lazyfs_control_cmd(lazyfs_probe_command(nonce)))
+    if not probe.ok:
+        raise FaultPreconditionError(
+            f"{container}: could not write to {LAZYFS_FIFO}: {probe.output}"
+        )
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        log = exec_in(container, lazyfs_log_cmd())
+        if log.ok and parse_lazyfs_consumed(log.stdout, nonce):
+            return
+        time.sleep(0.2)
+
+    raise FaultPreconditionError(
+        f"{container}: LazyFS accepted a write to {LAZYFS_FIFO} but never echoed it "
+        f"within {timeout_s:g}s, so its fault worker is not reading the FIFO. Every "
+        f"fault command would report success and inject nothing.\n"
+        f"  Check {LAZYFS_LOG} in the container for how far startup got, and check "
+        f"that `fifo_path_completed` is unset in testing/lazyfs/lazyfs.toml."
+    )
+
+
+def _lazyfs_received_count(container: str, command: str) -> int:
+    """How many times `container`'s LazyFS has logged receiving `command`."""
+    log = exec_in(container, lazyfs_log_cmd())
+    return count_lazyfs_received(log.stdout, command) if log.ok else 0
+
+
+def _await_lazyfs_received(
+    container: str, command: str, before: int, *, timeout_s: float = 10.0
+) -> None:
+    """Block until LazyFS logs receiving `command` more often than `before`."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _lazyfs_received_count(container, command) > before:
+            return
+        time.sleep(0.2)
+    raise FaultEffectNotObserved(
+        f"{container}: LazyFS never logged receiving {command!r} within {timeout_s:g}s, "
+        f"so the command was written to the FIFO but not executed."
+    )
+
+
 def lazyfs_unsynced_bytes(container: str, path: str) -> int:
     """Size of `path` as the *backing store* has it, in bytes.
 
@@ -2547,11 +2655,18 @@ def crash_losing_unsynced_writes(
 
     try:
         for target in targets:
+            # A write to the FIFO succeeding says nothing about the command
+            # being executed, so establish that the worker is reading before
+            # sending it anything that matters.
+            verify_lazyfs_fault_channel(target)
+
+            before = _lazyfs_received_count(target, "lazyfs::clear-cache")
             discard = exec_in(target, lazyfs_control_cmd("lazyfs::clear-cache"))
             if not discard.ok:
                 raise FaultInjectionError(
                     f"{target}: could not write clear-cache to {LAZYFS_FIFO}: {discard.output}"
                 )
+            _await_lazyfs_received(target, "lazyfs::clear-cache", before)
 
         # SIGKILL, never `docker stop`. A graceful stop gives LazyFS a chance
         # to unmount, and unmounting flushes — which would quietly write out

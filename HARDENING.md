@@ -32,7 +32,7 @@ sorting by component, because each kind needs a different investment.
 
 There are two versions of this. The second is worse, and it is not theoretical.
 
-**A1: the fault silently fails to inject, and the test passes anyway.** Five
+**A1: the fault silently fails to inject, and the test passes anyway.** Six
 confirmed instances, all found by adding effect verification rather than by any
 test going red:
 
@@ -44,11 +44,26 @@ test going red:
 | `correctness_lite.py` had the same literal names under `correctness-lite.yml`'s per-run project                                                             | the partition fault window was empty, making I5 vacuous for it                                                        |
 | `transfer_leader_after` read the API token from a `.env` CI never wrote                                                                                     | `transfer` posted unauthenticated and transferred nothing                                                             |
 
-All five are fixed. The lesson is the durable part: **a fault must verify its own
+All six are fixed. The lesson is the durable part: **a fault must verify its own
 effect and fail loudly, and the harness must not assume its environment.** Every
 one of these passed for months. `docker-compose.yml` sets `name: pgbattery`, so
 literal names work locally and only break under CI's per-run project — the worst
 possible failure shape.
+
+The sixth is the sharpest illustration, because the harness _did_ check
+something: it checked that writing to the FIFO succeeded. It always does. LazyFS
+opens the FIFO `O_RDWR` when it creates it, so a write succeeds whether or not
+the worker thread behind it is alive, and that success was read as confirming the
+fault fired. The distinction is only visible in LazyFS's own log, which is why
+`[filesystem].logfile` is now set and why `verify_lazyfs_fault_channel` sends a
+deliberately unknown command and waits for the worker to echo it back.
+**Checking that a fault was _requested_ is not checking that it was _executed_.**
+
+H-24's measured result survives this: what it demonstrated was the SIGKILL
+destroying the process holding un-fsynced pages in userspace, not the
+`clear-cache` that preceded it, and its inversion went red as required. The
+defect was that the suite carried a command that did nothing while reading as
+though it did.
 
 The related power bug: workers pinned to a killed leader's gateway spun on
 connection-refused at roughly 2800 attempts/second, producing 56,600 of 56,665

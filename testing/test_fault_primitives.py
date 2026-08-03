@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import tomllib
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
@@ -1686,6 +1687,141 @@ class ContainerRunStateTests(unittest.TestCase):
         for field in (".State.Status", ".State.StartedAt", ".RestartCount"):
             self.assertIn(field, cmd)
         self.assertTrue(cmd.endswith("abc123"))
+
+
+class LazyfsFaultChannelTests(RunnerFixture):
+    """The FIFO liveness probe, which exists because a silent LazyFS is the
+    worst failure this suite has: writes to the control FIFO succeed whether or
+    not anything is reading it, so `clear-cache` reported success and discarded
+    nothing for as long as `fifo_path_completed` was set."""
+
+    WORKER_LOG = (
+        "[2026-01-01 00:00:00.000] [console] [info] [lazyfs.faults.worker]: "
+        "waiting for fault commands...\n"
+    )
+
+    def test_probe_command_is_one_lazyfs_cannot_implement(self) -> None:
+        """If the probe were ever a real command it would have side effects,
+        and the liveness check would be injecting a fault to test for one."""
+        probe = fp.lazyfs_probe_command("deadbeef")
+        self.assertTrue(probe.startswith("lazyfs::"))
+        for real in ("clear-cache", "cache-checkpoint", "crash", "torn-op", "torn-seq", "help"):
+            self.assertNotEqual(probe, f"lazyfs::{real}")
+
+    def test_probe_command_rejects_a_nonce_that_could_break_the_grammar(self) -> None:
+        """LazyFS splits commands on `::` and `=`; a nonce carrying either
+        would be parsed as another attribute rather than echoed intact."""
+        for bad in ("", "a::b", "a=b", "with space"):
+            with self.subTest(nonce=bad), self.assertRaises(ValueError):
+                fp.lazyfs_probe_command(bad)
+
+    def test_consumed_requires_the_workers_own_echo(self) -> None:
+        """The nonce appearing somewhere in the log is not evidence. Only the
+        worker's `command unknown` line means the command was read."""
+        nonce = "abc123"
+        probe = fp.lazyfs_probe_command(nonce)
+        self.assertFalse(fp.parse_lazyfs_consumed("", nonce))
+        self.assertFalse(fp.parse_lazyfs_consumed(f"wrote {probe} to the fifo\n", nonce))
+        self.assertFalse(fp.parse_lazyfs_consumed(fp.lazyfs_probe_command("other"), nonce))
+        self.assertTrue(
+            fp.parse_lazyfs_consumed(f"[lazyfs.faults.worker]: command unknown '{probe}'\n", nonce)
+        )
+
+    def test_received_count_distinguishes_this_command_from_the_last(self) -> None:
+        """Presence would match a previous injection's line and pass without
+        the current command having been read at all."""
+        line = "[lazyfs.faults.worker]: received 'lazyfs::clear-cache'\n"
+        self.assertEqual(fp.count_lazyfs_received("", "lazyfs::clear-cache"), 0)
+        self.assertEqual(fp.count_lazyfs_received(line, "lazyfs::clear-cache"), 1)
+        self.assertEqual(fp.count_lazyfs_received(line * 3, "lazyfs::clear-cache"), 3)
+
+    def test_received_count_refuses_a_non_control_word(self) -> None:
+        with self.assertRaises(ValueError):
+            fp.count_lazyfs_received("", "clear-cache")
+
+    def test_log_read_tolerates_a_missing_log(self) -> None:
+        """LazyFS truncates the log at startup, so the caller polls through a
+        window where it does not exist. That must not read as a failure."""
+        self.assertIn("2>/dev/null", fp.lazyfs_log_cmd())
+        self.assertIn("|| true", fp.lazyfs_log_cmd())
+
+    def test_channel_check_fails_when_the_worker_never_echoes(self) -> None:
+        """The red half: a parked worker still accepts FIFO writes. This is
+        precisely the state a set `fifo_path_completed` produces."""
+        runner = self.install(
+            ScriptedRunner(
+                [
+                    ("lazyfs.fifo", ok()),
+                    ("lazyfs.log", ok(self.WORKER_LOG)),
+                ]
+            )
+        )
+        with self.assertRaises(fp.FaultPreconditionError) as caught:
+            fp.verify_lazyfs_fault_channel("node1", timeout_s=0.5)
+        self.assertIn("fifo_path_completed", str(caught.exception))
+        self.assertTrue(runner.matching("lazyfs.fifo"))
+
+    def test_channel_check_passes_when_the_worker_echoes_the_probe(self) -> None:
+        """Green half. The echo has to carry the nonce this call generated,
+        so the fixture derives it from the command the probe actually sent."""
+        sent: list[str] = []
+
+        def scripted(cmd: str, timeout_s: float) -> fp.CommandResult:
+            sent.append(cmd)
+            if "lazyfs.log" in cmd:
+                echoed = [
+                    f"[lazyfs.faults.worker]: command unknown '{probe}'"
+                    for probe in (_probe_in(text) for text in sent)
+                    if probe
+                ]
+                return ok(self.WORKER_LOG + "\n".join(echoed))
+            return ok()
+
+        def _probe_in(text: str) -> str | None:
+            match = re.search(r"lazyfs::pgbattery-probe-[0-9a-f]+", text)
+            return match.group(0) if match else None
+
+        previous = fp.set_command_runner(scripted)
+        self.addCleanup(fp.set_command_runner, previous)
+        fp.verify_lazyfs_fault_channel("node1", timeout_s=5.0)
+
+    def test_channel_check_fails_when_the_fifo_write_itself_fails(self) -> None:
+        self.install(ScriptedRunner([("lazyfs.fifo", fail("No such file or directory"))]))
+        with self.assertRaises(fp.FaultPreconditionError):
+            fp.verify_lazyfs_fault_channel("node1", timeout_s=0.5)
+
+
+class LazyfsConfigTests(unittest.TestCase):
+    """The shipped LazyFS config, checked against what the harness assumes.
+
+    These read the real file rather than a fixture: a config that drifts from
+    the constants in fault_primitives is how the fault worker went silent, and
+    the drift is invisible until a durability run reports perfect results.
+    """
+
+    @property
+    def config(self) -> str:
+        return (Path(__file__).resolve().parent / "lazyfs" / "lazyfs.toml").read_text()
+
+    def test_completed_fifo_stays_unset(self) -> None:
+        """Setting it parks the fault worker in open(O_WRONLY) on a FIFO no
+        process opens for reading, which silently disables every fault."""
+        for line in self.config.splitlines():
+            self.assertFalse(
+                line.strip().startswith("fifo_path_completed"),
+                "fifo_path_completed must stay unset; it parks the LazyFS fault worker",
+            )
+
+    def test_config_paths_match_the_harness_constants(self) -> None:
+        config = tomllib.loads(self.config)
+        self.assertEqual(config["faults"]["fifo_path"], fp.LAZYFS_FIFO)
+        self.assertEqual(config["filesystem"]["logfile"], fp.LAZYFS_LOG)
+
+    def test_logfile_is_set_so_the_worker_can_be_observed(self) -> None:
+        """With no logfile LazyFS logs to the console only, and the harness has
+        no way to tell a consumed command from an unread one."""
+        config = tomllib.loads(self.config)
+        self.assertNotEqual(config["filesystem"]["logfile"], "")
 
 
 if __name__ == "__main__":

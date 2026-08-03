@@ -14,7 +14,10 @@ MOUNT_DIR="${PGBATTERY_LAZYFS_MOUNT:-/var/lib/postgresql/data}"
 ROOT_DIR="${PGBATTERY_LAZYFS_ROOT:-/var/lib/postgresql/pgdata-root}"
 CONFIG="${PGBATTERY_LAZYFS_CONFIG:-/etc/lazyfs.toml}"
 FIFO="${PGBATTERY_LAZYFS_FIFO:-/tmp/lazyfs.fifo}"
-FIFO_DONE="${PGBATTERY_LAZYFS_FIFO_COMPLETED:-/tmp/lazyfs.completed.fifo}"
+# Matches `[filesystem].logfile` in lazyfs.toml. The fault worker announces
+# itself here, which is the only evidence that a command written to the FIFO
+# will actually be read.
+LOGFILE="${PGBATTERY_LAZYFS_LOG:-/tmp/lazyfs.log}"
 MOUNT_TIMEOUT_S="${PGBATTERY_LAZYFS_MOUNT_TIMEOUT_S:-30}"
 
 die() {
@@ -42,7 +45,10 @@ mkdir -p "$ROOT_DIR" "$MOUNT_DIR"
 chown postgres:postgres "$ROOT_DIR" "$MOUNT_DIR"
 chmod 0700 "$ROOT_DIR"
 
-rm -f "$FIFO" "$FIFO_DONE"
+# The log is removed, not just truncated by LazyFS at startup: this container
+# may be a restart, and a previous incarnation's "waiting for fault commands"
+# line would satisfy the check below before LazyFS had truncated the file.
+rm -f "$FIFO" "$LOGFILE"
 
 echo "pgbattery-lazyfs: mounting ${MOUNT_DIR} on LazyFS backed by ${ROOT_DIR}"
 # `-f` keeps FUSE in the foreground so the backgrounded PID is the filesystem
@@ -86,7 +92,24 @@ done
 # The harness reaches the FIFO as an unprivileged exec, so it has to be
 # writable by more than root.
 chmod 0666 "$FIFO"
-[ -p "$FIFO_DONE" ] && chmod 0666 "$FIFO_DONE"
+
+# The FIFO existing does not mean anything is reading it. LazyFS creates it,
+# opens it O_RDWR, and only then enters the loop that consumes commands; if it
+# stalls before that, writes to the FIFO still succeed and every fault sits
+# unread in the pipe buffer. The worker announces the loop, so wait for the
+# announcement rather than for the FIFO.
+deadline=$((SECONDS + MOUNT_TIMEOUT_S))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    if grep -q "waiting for fault commands" "$LOGFILE" 2>/dev/null; then
+        break
+    fi
+    kill -0 "$LAZYFS_PID" 2>/dev/null || die "lazyfs exited before the fault worker started"
+    sleep 0.2
+done
+grep -q "waiting for fault commands" "$LOGFILE" 2>/dev/null \
+    || die "lazyfs fault worker never started consuming commands; faults would inject nothing"
+
+chmod 0644 "$LOGFILE"
 
 # Prove the mount is writable as postgres before handing it PGDATA. A mount
 # that exists but rejects the writes is the same failure wearing a hat.

@@ -10,10 +10,18 @@
 
 [faults]
 fifo_path = "/tmp/lazyfs.fifo"
-# Second FIFO reports completion of an async clear-cache. Without it the
-# harness would have to sleep and hope, and a sleep as a gate on a state
-# transition is exactly what this project refuses.
-fifo_path_completed = "/tmp/lazyfs.completed.fifo"
+# `fifo_path_completed` is deliberately unset. LazyFS opens that second FIFO
+# `O_WRONLY` while starting its fault worker, and opening a FIFO for writing
+# blocks until some process opens the read end. Nothing here ever does, so
+# setting it parks the worker before it reaches its read loop: the control
+# FIFO still accepts writes, because the worker already holds it open
+# `O_RDWR`, and every command sits unread in the pipe buffer. Faults report
+# success and inject nothing.
+#
+# The completion channel only matters for waiting on an async clear-cache
+# without sleeping. `crash_losing_unsynced_writes` does not need it: it
+# verifies the fault channel with a round-trip probe, and its evidence comes
+# from the backing store after the crash, not from a completion message.
 
 [cache]
 # Real eviction under memory pressure. With eviction off, LazyFS holds every
@@ -30,5 +38,11 @@ custom_size = "1gb"
 blocks_per_page = 1
 
 [filesystem]
+# Per-operation logging stays off: it would log every write PostgreSQL issues.
 log_all_operations = false
-logfile = ""
+# With a logfile set, LazyFS installs a console sink *and* a file sink, so the
+# container log keeps everything and the harness gets a file it can grep. That
+# file is how a fault command is confirmed to have been consumed, rather than
+# merely written to a pipe. Under /tmp with the FIFO, not under the mount, for
+# the same reason: it has to outlive the filesystem it describes.
+logfile = "/tmp/lazyfs.log"
