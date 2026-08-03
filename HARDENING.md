@@ -1090,23 +1090,30 @@ violation, and the first thing a Jepsen analysis would reach for.
       `postgres:18` image gives `Data page checksum version: 1` with the exact
       flags `init_db` passes, so the detection half is not a lucky default.
 
+      `testing/torn_write.py` runs exactly that, gated by the `torn-write` job
+      in `durability.yml`. It refuses to report on the real assertion unless the
+      inversion has gone red, and it verifies the tear reached the backing store
+      before asserting anything about recovery — LazyFS's log is the truth
+      source there, never the file size, because a torn write does not change
+      the size. It runs against the `pg` service in `docker-compose.lazyfs.yml`,
+      behind the `tornwrite` profile: one bare PostgreSQL, no pgbattery and no
+      Raft, because a cluster would put a failover, a `pg_rewind` and a possible
+      re-basebackup between the tear and the assertion.
+
       **Still open, and the reason this stays unchecked:**
 
-      - No harness. The above was a probe, so nothing runs in CI. It needs the
-        `durability_crash.py` treatment: a mode flag, `--prove-oracle` running
-        the `full_page_writes=off` inversion first and refusing to report unless
-        it went red, and a workflow.
-      - redb is untouched. The Raft store lives at
-        `/var/lib/postgresql/raft`, outside the LazyFS mount and therefore
-        outside any tear this can inject. Covering it needs a second LazyFS
-        mount for the raft directory — the compose and entrypoint changes are
-        the bulk of the remaining work.
+      - redb is untouched, which is the substantive gap. The Raft store lives
+        at `/var/lib/postgresql/raft`, outside the LazyFS mount and therefore
+        outside any tear that can be injected. Covering it needs a second
+        LazyFS mount for the raft directory; the compose and entrypoint changes
+        are the bulk of the remaining work.
       - Only heap pages. A torn WAL record should be caught by the record CRC
-        and a torn `pg_control` by its own CRC; neither is exercised.
+        and a torn `pg_control` by its own; neither is exercised.
 
       **Done when** a torn write is injected and detected rather than silently
-      accepted, in CI, for both PostgreSQL pages and the Raft store.
-      _Effort_ M for the PostgreSQL half, L with redb
+      accepted, in CI, for both PostgreSQL pages and the Raft store. The first
+      half is done.
+      _Effort_ L remaining, all of it redb
 
 - [ ] **H-26 — ENOSPC at the next WAL segment**, as distinct from a blanket volume
       fill. The data volumes are tmpfs-bounded now, so a fill can genuinely

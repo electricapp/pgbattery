@@ -103,6 +103,52 @@ services:
       raft_net:
         ipv4_address: 172.30.0.13
 
+  # One bare PostgreSQL on LazyFS, for the torn-write suite (H-25). Inert
+  # unless started explicitly:
+  #
+  #   docker compose -f docker-compose.lazyfs.yml --profile tornwrite up -d pg
+  #
+  # It lives here rather than in a file of its own because it needs exactly
+  # this substrate — the same image stage, entrypoint, and LazyFS config as the
+  # durability cluster — and because `topology.py` reads whichever compose file
+  # is active. A service publishing none of the pgbattery ports is skipped there
+  # as a sidecar, so this one is invisible to the node-level harnesses while
+  # node1..node3 still resolve normally.
+  #
+  # No pgbattery and no Raft: what is under test is PostgreSQL's handling of a
+  # half-written page. Running that on the cluster would put a failover, a
+  # pg_rewind and a possible re-basebackup between the tear and the assertion,
+  # any of which could repair the page for reasons unrelated to the property.
+  pg:
+    profiles: [tornwrite]
+    build:
+      context: .
+      target: runtime-lazyfs
+    user: root
+    # The suite runs initdb and the postmaster itself: it needs to create,
+    # tear and recover the cluster under its own control rather than have a
+    # supervisor restart things underneath it.
+    command: ["pgbattery-lazyfs", "sleep", "infinity"]
+    # The runtime stage health-checks pgbattery's management API. Nothing
+    # serves it here, so the inherited check could only ever fail. The
+    # entrypoint already refuses to start unless the mount and the LazyFS
+    # fault worker are both up, which is the readiness that matters.
+    healthcheck:
+      disable: true
+    # No restart policy: the tear kills LazyFS, and a restart would race the
+    # suite's inspection of the backing store, which is the only place the
+    # torn page is visible.
+    cap_add: [SYS_ADMIN]
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - tornwrite_state:/var/lib/postgresql
+    networks:
+      raft_net:
+        ipv4_address: 172.30.0.20
+
 networks:
   raft_net:
     driver: bridge
@@ -118,3 +164,4 @@ volumes:
   node1_state:
   node2_state:
   node3_state:
+  tornwrite_state:

@@ -23,6 +23,7 @@ on:
       - "config/lazyfs/**"
       - "testing/lazyfs/**"
       - "testing/durability_crash.py"
+      - "testing/torn_write.py"
       - "testing/fault_primitives.py"
       - "crates/pgbattery-supervisor/**"
       - "src/governor/**"
@@ -111,3 +112,59 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.lazyfs.yml down -v || true
+
+  torn-write:
+    name: Torn write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      COMPOSE_FILE: docker-compose.lazyfs.yml
+      COMPOSE_PROJECT_NAME: tornwrite-${{ github.run_id }}
+      # Required to interpolate the file, which the node services reference
+      # even when only `pg` is started. Nothing here serves the API.
+      PGBATTERY_MANAGEMENT_API_TOKEN: ci-tornwrite-token
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+
+      - name: Verify FUSE is available on the runner
+        run: test -c /dev/fuse
+
+      # Only the bare-PostgreSQL sidecar. node1..node3 stay down: the property
+      # under test is PostgreSQL's handling of a half-written page, and a
+      # cluster would put a failover and a possible re-basebackup between the
+      # tear and the assertion.
+      - name: Start the torn-write node
+        run: docker compose --profile tornwrite up -d --build --wait pg
+
+      - name: Prove the oracle can fail, then assert torn-write handling
+        run: uv run --project testing python testing/torn_write.py --prove-oracle
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          mkdir -p artifacts
+          docker compose --profile tornwrite logs --no-color pg > artifacts/pg.log 2>&1 || true
+          docker compose --profile tornwrite exec -T --user root pg \
+            sh -c 'cat /tmp/lazyfs.log' > artifacts/lazyfs.log 2>&1 || true
+          docker compose --profile tornwrite exec -T --user root pg \
+            sh -c 'cat /tmp/pg.log' > artifacts/postmaster.log 2>&1 || true
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tornwrite-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile tornwrite down -v || true
