@@ -1157,15 +1157,48 @@ violation, and the first thing a Jepsen analysis would reach for.
       | one torn write, 2048 / 4096 | tolerated — node recovers, all acked writes readable, nothing logged           |
       | mangled beyond repair       | detected — `All roots are corrupted`, the node refuses to start and says why |
 
-      **Still open, and the reason this stays unchecked:**
+      `testing/torn_raft.py` runs this, gated by the `torn-raft` job in
+      `durability.yml`. Three tears, all tolerated, no acked write lost, one
+      leader throughout, with the mangle case proven red first.
 
-      - No suite. The above was a probe, so nothing runs in CI, and one tear at
-        one arbitrary offset is not coverage. A suite wants the tear repeated
-        across offsets and across the leader as well as a follower, with the
-        mangle case as its inversion.
-      - The tolerated case is only established for a tear that lands in an
-        uncommitted page. A tear landing on a committed root is the case that
-        would actually exercise redb's checksums, and nothing yet aims at one.
+      Its pass condition is a disjunction rather than an outcome: tolerated or
+      refused, both fine. What fails is the third state — a node neither
+      healthy nor refusing, still running and still voting on a store nothing
+      vouched for.
+
+      **Refusal is detected behaviourally, from the container restart-looping,
+      not from a log string.** That was learned the hard way across two failed
+      runs. A damaged Raft store reaches an operator in at least three shapes,
+      and matching on text meant every shape not yet seen read as "running
+      fine":
+
+      | Shape                                     | What the operator gets       |
+      | ----------------------------------------- | ---------------------------- |
+      | `Raft DB corrupted — refusing to start`  | the reason and recovery steps |
+      | redb `unreachable!()` panic in the btree   | a backtrace                  |
+      | `Failed to create database: I/O error`     | a generic storage error      |
+
+      All three are safe: the process dies rather than voting on a store nobody
+      vouched for. Only the first is actionable. `storage.rs` writes a genuinely
+      good refusal — it declines to recreate the store and explains that doing
+      so rejoins the node as a voter without its persisted vote and log, risking
+      a double-vote in a term or lost committed entries — and two of the three
+      paths never reach it. **That is a real gap in pgbattery, not in the
+      harness.** A single torn write produced the third shape, so torn writes to
+      redb are not reliably benign either.
+
+      **Still open:**
+
+      - The tears are small. redb's next write after arming is typically a
+        short record — the suite measured 160 bytes persisted of a 320-byte
+        write — so nothing yet lands on a committed root, which is the case
+        that would exercise redb's page checksums. Aiming at one needs the
+        fault armed against a specific offset rather than the next write.
+      - Only a follower, and only PGDATA-side heap pages for PostgreSQL. The
+        leader, torn WAL records, and a torn `pg_control` are unexercised.
+      - Writes issued during the tearing phase are driven but not tracked as
+        acked, so the loss assertion covers the 200 written before the first
+        tear rather than those most at risk.
       - Only heap pages on the PostgreSQL side. A torn WAL record should be
         caught by the record CRC and a torn `pg_control` by its own; neither is
         exercised.
