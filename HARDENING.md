@@ -103,6 +103,17 @@ unestablished precondition looks like from the outside. Thirteen waits across si
 cases now require every follower healthy, and `lint_matrix.py` fails any chained
 transfer that does not.
 
+The precondition shape has a sharper form: the product can discard the fault
+itself, and a harness that does not know its starting state reads that as
+tolerance. `torn_raft.py` mangled a node's Raft store while the cluster's voter
+set was still `{1}` and the node was mid-join. It came back healthy with the
+damage gone — not because anything restored it, but because `run_join_flow` wipes
+the local store and rejoins when the peer does not list this node. The store was
+never opened, so nothing had cause to refuse. A green from the product correctly
+throwing the fault away is indistinguishable from a green from the product
+surviving it. The suite now requires every node to be a committed voter, in every
+node's view, before it damages any of them.
+
 **A2: the fault class does not exist.** Every fault the harness injects is a
 _clean_ fault: SIGKILL, container stop, network disconnect, SIGSTOP.
 `docker kill` leaves the host page cache intact and the kernel still flushes
@@ -1223,6 +1234,28 @@ violation, and the first thing a Jepsen analysis would reach for.
       through a throwaway container on the same volume, and carries a marker
       that is read back. Before that it passed for whichever reason the timing
       happened to supply.
+
+      **A node the cluster has not admitted deletes the damage itself.** The
+      inversion chose its victim from `await_leader`, which returns the moment
+      the bootstrap node calls itself leader — and it does that at a voter set
+      of `{1}`, while the others are still running their initial join. A CI run
+      mangled node2 in that window and node2 came back healthy with the marker
+      gone, which read as the store being restored behind the harness's back.
+      It was not. `run_join_flow` in `src/app.rs` wipes the local Raft store and
+      joins fresh when the peer does not list this node, so pgbattery deleted
+      the damaged store on purpose and never opened it. Nothing had refused
+      because nothing had been read. The suite now waits for every node to be a
+      committed voter in every node's view before damaging any of them, which is
+      the same fact that branch turns on. The overwrite also refuses a path that
+      holds nothing, because `dd of=` creates what it cannot find: against a node
+      whose join has not yet reached redb, the marker would have been written
+      into a file the harness invented and read straight back as damage.
+
+      Both halves of that are worth keeping. Membership is a precondition for
+      damaging a store, not a detail of convergence; and a green that comes from
+      the product correctly discarding the fault is indistinguishable from one
+      that comes from the product surviving it, unless the harness knows which
+      state it started in.
 
       Its pass condition is a disjunction rather than an outcome: tolerated or
       refused, both fine. What fails is the third state — a node neither

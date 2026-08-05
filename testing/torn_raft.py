@@ -280,6 +280,68 @@ def await_leader(timeout_s: float) -> str:
     )
 
 
+def voter_views() -> dict[str, set[str]]:
+    """Each reachable node's view of who the committed voters are.
+
+    Kept per-node rather than reduced to one set, because a node that has not
+    yet applied the membership entry the others have is exactly the state this
+    is waiting out.
+    """
+    views: dict[str, set[str]] = {}
+    for node in topology.NODES:
+        info = mgmt(node, "/cluster/members")
+        if not info:
+            continue
+        views[node] = {
+            f"node{member['node_id']}"
+            for member in info.get("members", [])
+            if member.get("role") == "voter"
+        }
+    return views
+
+
+def await_settled_cluster(timeout_s: float) -> str:
+    """Wait until every node is a committed voter, and name the leader.
+
+    A leader is not enough to damage a node's Raft store against, because
+    `await_leader` returns the moment the bootstrap node calls itself leader --
+    which it does at a voter set of `{1}`, while the others are still running
+    their initial join.
+
+    Damaging a node the cluster does not list is not a test of anything:
+    `run_join_flow` in `src/app.rs` wipes the local store and joins fresh when
+    the peer does not list this node, so the damage is deleted rather than
+    opened and the node comes back healthy having never read it. Membership is
+    the fact that branch turns on, so it is the fact to wait for here.
+
+    Every node must answer, and every answer must name every node a voter. A
+    view collected only from reachable nodes would let a node that cannot
+    serve its own management API count as settled.
+    """
+    expected = set(topology.NODES)
+    deadline = time.monotonic() + timeout_s
+    detail = "nothing was read before the deadline"
+    while True:
+        found = leaders()
+        views = voter_views()
+        every_node_answered = set(views) == expected
+        every_answer_is_full = all(view == expected for view in views.values())
+        if len(found) == 1 and every_node_answered and every_answer_is_full:
+            return found[0]
+        detail = (
+            f"leaders={found or 'none'}, voters="
+            f"{ {node: sorted(v) for node, v in views.items()} or 'no node answered' }"
+        )
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    raise fp.FaultPreconditionError(
+        f"the cluster was not a full voter set within {timeout_s:g}s ({detail}); "
+        f"tearing a node that is not a committed member measures nothing, because "
+        f"pgbattery wipes its own store and rejoins rather than opening it"
+    )
+
+
 def connect(node: str) -> psycopg.Connection[Any]:
     return psycopg.connect(
         host="127.0.0.1",
@@ -414,7 +476,7 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     larger in this workload" would itself be the answer.
     """
     outcome = Outcome()
-    lead = await_leader(CONVERGE_TIMEOUT_S)
+    lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
     ensure_table(lead)
     outcome.acked = write_batch(lead, range(BASELINE_WRITES))
     if len(outcome.acked) < MIN_BASELINE_ACKED:
@@ -505,11 +567,35 @@ def reset_cluster() -> None:
     started = fp.run("docker compose up -d node1 node2 node3", timeout_s=300.0)
     if not started.ok:
         raise fp.FaultPreconditionError(f"could not restart the cluster: {started.output}")
-    await_leader(CONVERGE_TIMEOUT_S)
-    # A leader says nothing about whether the other nodes can receive a fault
-    # yet. Without this the real run reached a node still restarting its
+    await_settled_cluster(CONVERGE_TIMEOUT_S)
+    # A settled voter set says nothing about whether the nodes can receive a
+    # fault yet. Without this the real run reached a node still restarting its
     # LazyFS and failed writing to a control FIFO that did not exist.
     await_fault_readiness()
+
+
+def mangle_script(path: str) -> str:
+    """Overwrite the head of `path`, printing its size and the marker count.
+
+    Refuses a path that does not already hold a store. `dd of=` creates what it
+    cannot find, so against a node whose join has not yet reached redb this
+    would write the marker into a file it invented and read it straight back --
+    reporting a damaged store where there was no store at all.
+
+    A repeating marker rather than /dev/urandom, so the damage can be read
+    back. Random bytes are indistinguishable from redb's own afterwards.
+
+    Free of single quotes, because the caller passes this to `docker compose
+    run` inside a single-quoted `-c` argument and one here would end that
+    argument early.
+    """
+    return (
+        f'if [ ! -s {path} ]; then echo "no raft.db to damage at {path}"; exit 1; fi; '
+        f"wc -c < {path}; "
+        f"yes {MANGLE_MARKER} | head -c {MANGLE_BYTES} | "
+        f"dd of={path} bs={MANGLE_BYTES} count=1 conv=notrunc 2>/dev/null && "
+        f"head -c {MANGLE_BYTES} {path} | grep -ac {MANGLE_MARKER}"
+    )
 
 
 def mangle_raft_db(victim: str) -> None:
@@ -520,21 +606,13 @@ def mangle_raft_db(victim: str) -> None:
     redb rewrites its header on the next commit, and LazyFS flushes its own
     cached copy over whatever is written to the backing store behind it. A
     `dd` that exits 0 against a live node is not a damaged store.
-
-    A repeating marker rather than /dev/urandom, so the damage can be read
-    back. Random bytes are indistinguishable from redb's own afterwards.
     """
     stopped = fp.run(f"docker compose stop {victim}", MANGLE_TIMEOUT_S)
     if not stopped.ok:
         raise fp.FaultPreconditionError(f"could not stop {victim}: {stopped.output}")
 
-    script = (
-        f"yes {MANGLE_MARKER} | head -c {MANGLE_BYTES} | "
-        f"dd of={RAFT_DB} bs={MANGLE_BYTES} count=1 conv=notrunc 2>/dev/null && "
-        f"head -c {MANGLE_BYTES} {RAFT_DB} | grep -ac {MANGLE_MARKER}"
-    )
     mangled = fp.run(
-        f"docker compose run --rm --no-deps --entrypoint sh {victim} -c '{script}'",
+        f"docker compose run --rm --no-deps --entrypoint sh {victim} -c '{mangle_script(RAFT_DB)}'",
         MANGLE_TIMEOUT_S,
     )
     if not mangled.ok or mangled.stdout.strip().splitlines()[-1:] in ([], ["0"]):
@@ -582,7 +660,7 @@ def prove_oracle() -> None:
     without this a green run below could not be told apart from a fault that
     injected nothing.
     """
-    lead = await_leader(CONVERGE_TIMEOUT_S)
+    lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
     victim = next(n for n in topology.NODES if n != lead)
 
     mangle_raft_db(victim)

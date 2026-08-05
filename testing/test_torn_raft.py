@@ -10,12 +10,16 @@ Run with:
 
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import psycopg
 
 import fault_primitives as fp
+import topology
 import torn_raft as tr
 
 
@@ -25,6 +29,140 @@ def outcome(**kwargs: object) -> tr.Outcome:
     for key, value in kwargs.items():
         setattr(result, key, value)
     return result
+
+
+def membership(*voters: str, learners: tuple[str, ...] = ()) -> dict[str, object]:
+    """A `/cluster/members` payload in the shape `list_members` serialises."""
+
+    def entry(node: str, role: str) -> dict[str, object]:
+        return {"node_id": int(node.removeprefix("node")), "addr": "", "role": role}
+
+    members = [entry(node, "voter") for node in voters]
+    members += [entry(node, "learner") for node in learners]
+    return {"success": True, "message": f"{len(members)} members in cluster", "members": members}
+
+
+def mgmt_replies(leader: str | None, members: dict[str, object]) -> object:
+    """Answer both endpoints the readiness gate reads, for every node."""
+
+    def reply(_node: str, path: str) -> object:
+        if path == "/cluster/leader":
+            return {"leader_id": int(leader.removeprefix("node"))} if leader else None
+        return members
+
+    return reply
+
+
+class SettledClusterTest(unittest.TestCase):
+    """A leader is not enough to damage a node's Raft store against.
+
+    `await_leader` returns the moment the bootstrap node calls itself leader,
+    which it does at a voter set of `{1}`. Tearing a node the cluster does not
+    list measures nothing: `run_join_flow` wipes the local store and rejoins
+    when the peer does not list this node, so pgbattery deletes the damage
+    rather than opening it.
+    """
+
+    def settle(self, leader: str | None, members: dict[str, object]) -> str:
+        with (
+            mock.patch.object(tr, "mgmt", side_effect=mgmt_replies(leader, members)),
+            mock.patch("time.sleep"),
+        ):
+            return tr.await_settled_cluster(0.05)
+
+    def test_a_full_voter_set_settles(self) -> None:
+        self.assertEqual(self.settle("node1", membership(*topology.NODES)), "node1")
+
+    def test_a_bootstrap_only_voter_set_does_not_settle(self) -> None:
+        """The exact CI state: node1 leading at `configs: [{1}]` with node2
+        still being added as a learner."""
+        with self.assertRaises(fp.FaultPreconditionError) as caught:
+            self.settle("node1", membership("node1", learners=("node2",)))
+        self.assertIn("full voter set", str(caught.exception))
+
+    def test_a_learner_does_not_count_as_a_voter(self) -> None:
+        with self.assertRaises(fp.FaultPreconditionError):
+            self.settle("node1", membership("node1", "node3", learners=("node2",)))
+
+    def test_a_node_that_cannot_answer_does_not_settle(self) -> None:
+        """A view collected only from reachable nodes would let a node that
+        cannot serve its own management API count as a settled voter."""
+        full = membership(*topology.NODES)
+        silent = topology.NODES[-1]
+
+        def reply(node: str, path: str) -> object:
+            if node == silent:
+                return None
+            return mgmt_replies("node1", full)(node, path)  # type: ignore[operator]
+
+        with (
+            mock.patch.object(tr, "mgmt", side_effect=reply),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError),
+        ):
+            tr.await_settled_cluster(0.05)
+
+
+class ProveOracleTest(unittest.TestCase):
+    """The inversion must not damage a node the cluster has not admitted."""
+
+    def test_an_unsettled_cluster_is_not_mangled(self) -> None:
+        with (
+            mock.patch.object(tr, "mgmt", side_effect=mgmt_replies("node1", membership("node1"))),
+            mock.patch.object(tr, "mangle_raft_db") as mangle,
+            mock.patch.object(tr, "CONVERGE_TIMEOUT_S", 0.05),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError),
+        ):
+            tr.prove_oracle()
+        mangle.assert_not_called()
+
+
+class MangleScriptTest(unittest.TestCase):
+    """Run the real shell. `dd of=` creates what it cannot find, so a store
+    that does not exist yet would be invented, marked, and read straight back
+    as damage."""
+
+    def run_script(self, path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["sh", "-c", tr.mangle_script(str(path))],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_an_absent_store_is_refused_and_not_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "raft.db"
+            result = self.run_script(missing)
+            self.assertNotEqual(result.returncode, 0, "an absent store must not report damage")
+            self.assertFalse(missing.exists(), "the script invented the store it claimed to tear")
+
+    def test_an_empty_store_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "raft.db"
+            empty.touch()
+            self.assertNotEqual(self.run_script(empty).returncode, 0)
+
+    def test_the_script_survives_the_callers_quoting(self) -> None:
+        """`mangle_raft_db` wraps this in a single-quoted `-c` argument, so a
+        single quote in the script would end that argument early and hand the
+        container a truncated command that still exits 0."""
+        self.assertNotIn("'", tr.mangle_script(tr.RAFT_DB))
+
+    def test_a_real_store_is_overwritten_and_reads_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "raft.db"
+            store.write_bytes(b"\0" * (tr.MANGLE_BYTES * 2))
+            result = self.run_script(store)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(result.stdout.strip().splitlines()[-1], ("", "0"))
+            self.assertEqual(
+                store.stat().st_size,
+                tr.MANGLE_BYTES * 2,
+                "conv=notrunc keeps the tail, so only the head is destroyed",
+            )
+            self.assertIn(tr.MANGLE_MARKER.encode(), store.read_bytes()[: tr.MANGLE_BYTES])
 
 
 class TearReadingTest(unittest.TestCase):
@@ -90,7 +228,7 @@ class BaselineAckedTest(unittest.TestCase):
 
     def run_tears_with_baseline(self, acked: list[int]) -> None:
         with (
-            mock.patch.object(tr, "await_leader", return_value="node1"),
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
             mock.patch.object(tr, "ensure_table"),
             mock.patch.object(tr, "write_batch", return_value=acked),
         ):
