@@ -80,19 +80,19 @@ All on port 9091 internally (mapped to 9081/9082/9083).
 
 Independent layers. Know which one covers a change before adding another. For current counts, ask the tools (`./testing/ci_runner.py --list`, `cargo test --workspace`) rather than trusting a number written here.
 
-| Layer                  | Where                                        | What it checks                                                                                                                           |
-| ---------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Rust unit tests        | inline `mod tests`                           | Pure decision functions. Densest in `process.rs`, `gateway/handlers`, `state_machine.rs`.                                                |
-| Property tests         | `proptest!` blocks in the modules they cover | LSN election/promotion gate, `rewind_divergence_decision`, sync-standby quorum intersection over all voter-set sizes.                    |
-| Storage conformance    | `openraft::testing::Suite` in `storage.rs`   | The real `LogStorageAdapter` / `StateMachineStore` against openraft's own suite, plus crash-recovery and durability-pin tests.           |
-| TLA+ model checking    | `tla/` (`make check`)                        | `lease_fencing` (one write authority), `raft_lsn` (election safety, LSN gate can't deadlock), `commit_probing`, `timeline_verification`. |
-| Fuzzing                | `fuzz/` (`cargo fuzz`)                       | PG wire protocol (startup/framing/extended), query analysis into libpg_query, Raft RPC frames, snapshot decode, LSN parsing.             |
-| Docker HA matrix       | `testing/ci_runner.py` + `ci_matrix.yaml`    | Real 3-node cluster, real faults, effect-verified. Every case declares its contract IDs; `lint_matrix.py` enforces it.                   |
-| Transactional anomaly  | `testing/linearizability_register.py` + Elle | Elle (list-append / rw-register) asserting strict serializability; plus an in-tree WGL per-key linearizability checker.                  |
-| Durability/split-brain | `testing/correctness_lite.py`                | History invariants (lost acks, phantom writes, dual leadership, quorum-loss fencing, bank ledger) + log-grep checks.                     |
-| Single-writer oracle   | `testing/dual_writability_prober.py`         | Contract L1 directly: concurrent real writes to all three internal PG ports, at most one may be accepted.                                |
-| Disk exhaustion        | `testing/wal_enospc.py`                      | W1 when the leader cannot allocate the next WAL segment. Bounded tmpfs volumes; refuses a run whose fault had no observable effect.      |
-| Harness self-tests     | `testing/test_*.py`                          | The checkers, oracles, and fault primitives themselves — including that each can actually fail.                                          |
+| Layer                  | Where                                        | What it checks                                                                                                                               |
+| ---------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rust unit tests        | inline `mod tests`                           | Pure decision functions. Densest in `process.rs`, `gateway/handlers`, `state_machine.rs`.                                                    |
+| Property tests         | `proptest!` blocks in the modules they cover | LSN election/promotion gate, `rewind_divergence_decision`, sync-standby quorum intersection over all voter-set sizes.                        |
+| Storage conformance    | `openraft::testing::Suite` in `storage.rs`   | The real `LogStorageAdapter` / `StateMachineStore` against openraft's own suite, plus crash-recovery and durability-pin tests.               |
+| TLA+ model checking    | `tla/` (`make check`)                        | `lease_fencing` (one write authority), `raft_lsn` (election safety, LSN gate can't deadlock), `commit_probing`, `timeline_verification`.     |
+| Fuzzing                | `fuzz/` (`cargo fuzz`)                       | PG wire protocol (startup/framing/extended), query analysis into libpg_query, Raft RPC frames, snapshot decode, LSN parsing.                 |
+| Docker HA matrix       | `testing/ci_runner.py` + `ci_matrix.yaml`    | Real 3-node cluster, real faults, effect-verified. Every case declares its contract IDs; `lint_matrix.py` enforces it.                       |
+| Transactional anomaly  | `testing/linearizability_register.py` + Elle | Elle (list-append / rw-register) asserting strict serializability; plus an in-tree WGL per-key linearizability checker.                      |
+| Durability/split-brain | `testing/correctness_lite.py`                | History invariants (lost acks, phantom writes, dual leadership, quorum-loss fencing, bank ledger) + log-grep checks.                         |
+| Single-writer oracle   | `testing/dual_writability_prober.py`         | Contract L1 directly: concurrent real writes to all three internal PG ports, at most one may be accepted.                                    |
+| Disk exhaustion        | `testing/wal_enospc.py`                      | W1 when the leader cannot allocate the next WAL segment, plus L1 from the prober across the window. Refuses a run whose fault had no effect. |
+| Harness self-tests     | `testing/test_*.py`                          | The checkers, oracles, and fault primitives themselves — including that each can actually fail.                                              |
 
 Contracts live in `docs/CONTRACTS.md` (W1-W3, L1-L3, V1-V2, S1-S2, R1-R2). FATAL contract violations are release-blocking.
 

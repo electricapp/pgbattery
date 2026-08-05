@@ -1320,14 +1320,18 @@ violation, and the first thing a Jepsen analysis would reach for.
       in a cluster nobody touched would mean the same observation under a full
       disk proves nothing about ENOSPC.
 
-      **L1 is not claimed here.** Leader observations are reported, never
-      asserted on: two distinct leader names across the window are a leadership
-      transition, not two leaders at once, and Raft does not promise every node
-      learns of a new leader at the same instant. L1 is about two nodes being
-      simultaneously *writable*, which only concurrent real writes answer.
-      Running `dual_writability_prober.py` inside the full-disk window is the
-      work that would let this suite claim it, and is worth doing — disk
-      exhaustion is a plausible way to stall a leader past its lease.
+      **L1 comes from the prober, not from leader observations.**
+      `dual_writability_prober.py` runs across all three internal PG ports for
+      the whole fill-and-recovery window — disk exhaustion is a plausible way to
+      stall a leader past its lease, and the recovery is included because a
+      victim rejoining after space is freed is as good a chance for two writable
+      nodes as the election that replaced it. Leader observations are still
+      reported and still never asserted on: two distinct leader names across the
+      window are a leadership transition, not two leaders at once, and Raft does
+      not promise every node learns of a new leader at the same instant. A
+      violation fails the run; an oracle too blind to conclude leaves L1 out of
+      the reported contracts rather than claiming it, so "saw no violation"
+      cannot be mistaken for "holds".
       _Closes_ the ENOSPC class at segment allocation
 
 ### Wave 4 — Concurrency gaps (Tier 3.5)

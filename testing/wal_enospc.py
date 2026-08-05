@@ -35,15 +35,15 @@ WHAT IS NOT ASSERTED
     Both are defensible; asserting one before measuring which pgbattery does
     would be writing the test around a guess.
 
-    L1. The leader observations collected here are reported, never asserted on.
-    They cannot carry that weight: two distinct leader names across the window
-    are a leadership *transition* — the victim dying and its successor being
-    elected — not two leaders at once, and Raft does not promise every node
-    learns of a new leader at the same instant, so disagreement between views
-    is normal mid-election. L1 is about two nodes being simultaneously
-    *writable*, which only concurrent real writes can answer:
-    `dual_writability_prober.py` is that oracle, and running it inside this
-    window is the work that would let this suite claim L1.
+    L1 comes from `dual_writability_prober.py`, running concurrently across all
+    three internal PG ports for the whole fill-and-recovery window. Leader
+    observations are still collected but never asserted on: two distinct leader
+    names across the window are a leadership *transition*, not two leaders at
+    once, and Raft does not promise every node learns of a new leader at the
+    same instant. L1 is about two nodes being simultaneously *writable*, which
+    only concurrent real writes answer. A violation fails the run; an oracle
+    that saw too little to conclude leaves L1 out of the reported contracts
+    rather than claiming it.
 
 NO RESTARTS, DELIBERATELY
 
@@ -74,13 +74,20 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Final
 
 import psycopg
 
 import fault_primitives as fp
 import topology
+from dual_writability_prober import (
+    DualWritabilityProber,
+    ProberConfig,
+    ProbeReport,
+    ProberError,
+    Verdict,
+)
 
 PG_USER: Final[str] = "postgres"
 PG_DBNAME: Final[str] = "postgres"
@@ -127,8 +134,20 @@ happened. Election plus lease expiry is the slowest reaction being waited on;
 shorter than that and 'no effect' would just mean 'asked too early'."""
 
 
+PROBE_ROUND_PERIOD_S: Final[float] = 1.0
+"""How often the L1 oracle races a write at all three nodes at once.
+
+Fast enough to land several rounds inside the window between the leader's disk
+filling and its successor being elected, which is the only interval in which
+two nodes could plausibly both accept."""
+
+
 class EnospcViolation(Exception):
     """An acknowledged write did not survive disk exhaustion. Contract W1."""
+
+
+class DualWritability(Exception):
+    """Two nodes accepted a write at once under ENOSPC. Contract L1."""
 
 
 class VacuousRun(Exception):
@@ -140,7 +159,7 @@ class OracleNotProven(Exception):
     attributable to disk exhaustion."""
 
 
-@dataclass
+@dataclass(slots=True)
 class Phase:
     """Writes attempted in one phase of the run."""
 
@@ -150,7 +169,50 @@ class Phase:
     errors: list[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class FillDetail:
+    """What the filler did, as measured rather than as requested."""
+
+    container: str
+    filled_kb: int
+    wal_segment_bytes: int
+    avail_kb_after: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeSummary:
+    """The L1 oracle's finding, reduced to what the run report carries."""
+
+    verdict: str
+    rounds: int
+    violations: int
+    rounds_by_acceptance_count: dict[int, int]
+    indeterminate_rate: float
+    transport: str
+    headline: str
+
+    @classmethod
+    def of(cls, report: ProbeReport | None) -> ProbeSummary:
+        if report is None:
+            return cls("NOT RUN", 0, 0, {}, 0.0, "", "the L1 oracle did not run")
+        return cls(
+            verdict=str(report.verdict),
+            rounds=report.total_rounds,
+            violations=len(report.violations),
+            rounds_by_acceptance_count=report.rounds_by_acceptance_count,
+            indeterminate_rate=round(report.indeterminate_rate, 4),
+            transport=report.transport,
+            headline=report.headline,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class Outcome:
     """Everything the run observed, whether or not it was asserted on."""
 
@@ -162,7 +224,8 @@ class Outcome:
     leadership_moved: bool = False
     writes_refused: int = 0
     recovered: bool = False
-    fill_detail: dict[str, Any] = field(default_factory=dict)
+    fill_detail: FillDetail | None = None
+    probe: ProbeReport | None = None
 
     @property
     def acked(self) -> list[int]:
@@ -177,6 +240,11 @@ class Outcome:
     def had_effect(self) -> bool:
         """Whether the fault changed anything observable."""
         return self.writes_refused > 0 or self.leadership_moved
+
+    @property
+    def l1_established(self) -> bool:
+        """Whether the oracle saw enough to claim L1, not merely fail to break it."""
+        return self.probe is not None and self.probe.verdict is Verdict.PASS
 
     def report(self) -> dict[str, Any]:
         return {
@@ -194,8 +262,9 @@ class Outcome:
                 {"name": p.name, "acked": len(p.acked), "unacked": len(p.unacked)}
                 for p in self.phases
             ],
-            "fill": self.fill_detail,
-            "contracts": ["W1"],
+            "fill": self.fill_detail.as_dict() if self.fill_detail else {},
+            "l1": ProbeSummary.of(self.probe).as_dict(),
+            "contracts": ["W1", "L1"] if self.l1_established else ["W1"],
         }
 
 
@@ -436,6 +505,20 @@ def other_than(node: str) -> str:
     raise fp.FaultPreconditionError("need at least two nodes to run this suite")
 
 
+def watch_leaders(outcome: Outcome, seconds: float) -> None:
+    """Record every node any peer calls leader over `seconds`.
+
+    Runs after the writes because an election the fill triggered may not have
+    resolved by the time the last INSERT returned.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for name in leaders():
+            if name not in outcome.leaders_during:
+                outcome.leaders_during.append(name)
+        time.sleep(1.0)
+
+
 def run_case(*, writes: int, fill: bool) -> Outcome:
     """One pass. `fill=False` is the inversion: identical, minus the fault."""
     outcome = Outcome()
@@ -453,43 +536,37 @@ def run_case(*, writes: int, fill: bool) -> Outcome:
     outcome.phases.append(write_batch(via, range(1, writes + 1), name="before"))
 
     during = range(writes + 1, 2 * writes + 1)
-    if fill:
-        with fp.disk_full_during_wal(victim) as handle:
-            outcome.fill_detail = {
-                "container": handle.container,
-                "filled_kb": handle.filled_kb,
-                "wal_segment_bytes": handle.wal_segment_bytes,
-                "avail_kb_after": handle.usage_after.avail_kb,
-            }
+    # The oracle spans the fill *and* the recovery. The victim rejoining after
+    # space is freed is as good a chance for two writable nodes as the election
+    # that replaced it, and stopping at the filler's release would miss it.
+    with DualWritabilityProber(ProberConfig(round_period_s=PROBE_ROUND_PERIOD_S)) as prober:
+        prober.start()
+        if fill:
+            with fp.disk_full_during_wal(victim) as handle:
+                outcome.fill_detail = FillDetail(
+                    container=handle.container,
+                    filled_kb=handle.filled_kb,
+                    wal_segment_bytes=handle.wal_segment_bytes,
+                    avail_kb_after=handle.usage_after.avail_kb,
+                )
+                outcome.phases.append(
+                    write_batch(via, during, name="during-fill", payload_bytes=PAYLOAD_BYTES)
+                )
+                watch_leaders(outcome, SETTLE_S)
+        else:
             outcome.phases.append(
-                write_batch(via, during, name="during-fill", payload_bytes=PAYLOAD_BYTES)
+                write_batch(via, during, name="during-nofill", payload_bytes=PAYLOAD_BYTES)
             )
-            # Keep watching after the writes: an election triggered by the fill
-            # may not have resolved by the time the last INSERT returned.
-            deadline = time.monotonic() + SETTLE_S
-            while time.monotonic() < deadline:
-                for name in leaders():
-                    if name not in outcome.leaders_during:
-                        outcome.leaders_during.append(name)
-                time.sleep(1.0)
-    else:
-        outcome.phases.append(
-            write_batch(via, during, name="during-nofill", payload_bytes=PAYLOAD_BYTES)
-        )
-        deadline = time.monotonic() + SETTLE_S
-        while time.monotonic() < deadline:
-            for name in leaders():
-                if name not in outcome.leaders_during:
-                    outcome.leaders_during.append(name)
-            time.sleep(1.0)
+            watch_leaders(outcome, SETTLE_S)
 
-    outcome.writes_refused = sum(len(p.unacked) for p in outcome.phases if p.name != "before")
+        outcome.writes_refused = sum(len(p.unacked) for p in outcome.phases if p.name != "before")
 
-    # The filler is released by here. Recovery is measured without restarting
-    # anything: the victim may have restarted itself, which is a legitimate way
-    # to fence, but nothing here restarts it deliberately.
-    outcome.leader_after = await_writable_leader(RECOVERY_TIMEOUT_S, via=via)
-    outcome.recovered = True
+        # The filler is released by here. Recovery is measured without restarting
+        # anything: the victim may have restarted itself, which is a legitimate way
+        # to fence, but nothing here restarts it deliberately.
+        outcome.leader_after = await_writable_leader(RECOVERY_TIMEOUT_S, via=via)
+        outcome.recovered = True
+        outcome.probe = prober.stop()
 
     # Measured over the settle window *and* the end state. A victim that dies
     # under the fault is still nominally leader for as long as its lease runs,
@@ -502,8 +579,25 @@ def run_case(*, writes: int, fill: bool) -> Outcome:
     return outcome
 
 
+def assert_single_writability(outcome: Outcome, label: str) -> None:
+    """L1, from concurrent real writes rather than from leader observations.
+
+    Asserted whenever the oracle saw a violation, including on the control run:
+    two nodes accepting at once is a violation wherever it happens.
+    """
+    probe = outcome.probe
+    if probe is None or not probe.violations:
+        return
+    raise DualWritability(
+        f"L1 ({label}): {len(probe.violations)} of {probe.total_rounds} probe "
+        f"rounds saw two or more nodes accept a write. {probe.headline}"
+    )
+
+
 def assert_contracts(outcome: Outcome) -> None:
     """Everything that must hold when the disk filled."""
+    assert_single_writability(outcome, "enospc")
+
     if outcome.lost:
         raise EnospcViolation(
             f"W1: {len(outcome.lost)} acknowledged write(s) did not survive disk "
@@ -526,6 +620,7 @@ def assert_contracts(outcome: Outcome) -> None:
 def prove_oracle(writes: int) -> Outcome:
     """Run without the fault and require the effect signal to be absent."""
     control = run_case(writes=writes, fill=False)
+    assert_single_writability(control, "control")
     if control.had_effect:
         raise OracleNotProven(
             f"a run with no fill also showed the effect this suite attributes to "
@@ -560,7 +655,15 @@ def main() -> int:
         outcome = run_case(writes=args.writes, fill=True)
         report["enospc"] = outcome.report()
         assert_contracts(outcome)
-    except (EnospcViolation, VacuousRun, OracleNotProven, fp.FaultError, TimeoutError) as exc:
+    except (
+        EnospcViolation,
+        DualWritability,
+        VacuousRun,
+        OracleNotProven,
+        ProberError,
+        fp.FaultError,
+        TimeoutError,
+    ) as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
         print(json.dumps(report, indent=2))
         print(f"\nFAIL: {exc}", file=sys.stderr)
