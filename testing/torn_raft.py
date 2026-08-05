@@ -436,8 +436,12 @@ def prove_oracle() -> None:
     lead = await_leader(CONVERGE_TIMEOUT_S)
     victim = next(n for n in topology.NODES if n != lead)
 
-    mangle = fp.exec_in(
-        victim, f"dd if=/dev/urandom of={RAFT_DB} bs=4096 count=20 conv=notrunc 2>/dev/null"
+    # The victim churns through restarts under this suite, and an exec that
+    # never lands says nothing about whether raft.db could be mangled.
+    mangle = fp.exec_when_deliverable(
+        victim,
+        f"dd if=/dev/urandom of={RAFT_DB} bs=4096 count=20 conv=notrunc 2>/dev/null",
+        timeout_s=MOUNT_TIMEOUT_S,
     )
     if not mangle.ok:
         raise fp.FaultPreconditionError(f"{victim}: could not mangle raft.db: {mangle.output}")

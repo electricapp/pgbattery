@@ -2045,6 +2045,30 @@ class ContainerReachabilityTests(unittest.TestCase):
             fp.read_processes("node9")
         self.assertNotIsInstance(caught.exception, fp.ContainerNotRunning)
 
+    def test_exec_when_deliverable_waits_out_an_undelivered_exec(self) -> None:
+        runner = self.install(
+            SequencedRunner([fail(SETNS_FAILURE), CommandResult(137, "", ""), ok("done")])
+        )
+        with mock.patch("time.sleep"):
+            result = fp.exec_when_deliverable("node2", "dd if=/dev/urandom of=x", timeout_s=30.0)
+        self.assertTrue(result.ok)
+        self.assertEqual(runner.calls, 3)
+
+    def test_exec_when_deliverable_returns_a_command_that_really_failed(self) -> None:
+        """It waits for the exec to land, not for the command to succeed."""
+        runner = self.install(SequencedRunner([fail("dd: No space left on device")]))
+        with mock.patch("time.sleep"):
+            result = fp.exec_when_deliverable("node2", "dd if=/dev/urandom of=x", timeout_s=30.0)
+        self.assertFalse(result.ok)
+        self.assertEqual(runner.calls, 1)
+
+    def test_exec_when_deliverable_gives_up_carrying_the_last_reason(self) -> None:
+        self.install(SequencedRunner([fail(SETNS_FAILURE)]))
+        with mock.patch("time.sleep"):
+            result = fp.exec_when_deliverable("node2", "true", timeout_s=1.0)
+        self.assertFalse(result.ok)
+        self.assertIn("setns", result.output)
+
     def test_the_mount_wait_outlasts_a_restarting_container(self) -> None:
         runner = self.install(
             SequencedRunner([fail(DAEMON_RESTARTING), fail(DAEMON_RESTARTING), ok(LAZYFS_MOUNTS)])

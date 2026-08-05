@@ -1802,6 +1802,24 @@ def read_failure(container: str, what: str, result: CommandResult) -> FaultPreco
     return FaultPreconditionError(f"{container}: {what} failed: {detail}")
 
 
+def exec_when_deliverable(
+    container: str, script: str, *, as_root: bool = True, timeout_s: float = 60.0
+) -> CommandResult:
+    """Run `script` in `container`, waiting out execs that never land.
+
+    For the paths that address a container which may be mid-restart. Returns
+    the first result that actually ran, so a command that ran and failed stays
+    the caller's to interpret; an undeliverable one at the deadline is returned
+    as it is, carrying whatever the daemon last said.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        result = exec_in(container, script, as_root=as_root)
+        if not exec_undelivered(result) or time.monotonic() >= deadline:
+            return result
+        time.sleep(0.5)
+
+
 def read_processes(container: str) -> list[ProcessInfo]:
     """Snapshot every process in `container`."""
     result = exec_in(container, ps_cmd())
@@ -2723,7 +2741,7 @@ ECHO_WAIT_S: Final[float] = 3.0
 
 
 def verify_lazyfs_fault_channel(
-    container: str, *, mount: LazyfsMount = LAZYFS_DATA, timeout_s: float = 10.0
+    container: str, *, mount: LazyfsMount = LAZYFS_DATA, timeout_s: float = 60.0
 ) -> None:
     """Assert LazyFS is *consuming* the fault FIFO, not merely accepting writes.
 
