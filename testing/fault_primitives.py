@@ -367,6 +367,14 @@ class FaultPreconditionError(FaultError):
     """
 
 
+class ContainerNotRunning(FaultPreconditionError):
+    """The container held no process to exec in, so nothing was observed.
+
+    Not the same as observing an absence. A caller waiting for the substrate to
+    settle retries this; one that required a running container fails on it.
+    """
+
+
 class FaultInjectionError(FaultError):
     """The injection command itself failed."""
 
@@ -1749,11 +1757,35 @@ def _resolve_ip(container: str) -> str:
     return ip
 
 
+NOT_RUNNING_MARKERS: Final[tuple[str, ...]] = (
+    "is restarting, wait until the container is running",
+    "is not running",
+)
+"""Daemon refusals meaning the container exists but is not running.
+
+``No such container`` is excluded: a name resolving to nothing is topology
+drift, which must fail rather than be waited on.
+"""
+
+
+def container_not_running(output: str) -> bool:
+    """Whether `output` is the daemon refusing to exec into a stopped container."""
+    return any(marker in output for marker in NOT_RUNNING_MARKERS)
+
+
+def read_failure(container: str, what: str, result: CommandResult) -> FaultPreconditionError:
+    """Classify a failed container read as indeterminate or genuinely bad."""
+    detail = result.stderr.strip() or result.stdout.strip()
+    if container_not_running(detail):
+        return ContainerNotRunning(f"{container}: {what} could not run: {detail}")
+    return FaultPreconditionError(f"{container}: {what} failed: {detail}")
+
+
 def read_processes(container: str) -> list[ProcessInfo]:
     """Snapshot every process in `container`."""
     result = exec_in(container, ps_cmd())
     if not result.ok:
-        raise FaultPreconditionError(f"{container}: ps failed: {result.stderr.strip()}")
+        raise read_failure(container, "ps", result)
     return parse_ps(result.output)
 
 
@@ -1761,7 +1793,7 @@ def read_disk_usage(container: str, path: str = PG_STATE_DIR) -> DiskUsage:
     """Read the filesystem `path` lives on inside `container`."""
     result = exec_in(container, df_cmd(path))
     if not result.ok:
-        raise FaultPreconditionError(f"{container}: df failed: {result.stderr.strip()}")
+        raise read_failure(container, "df", result)
     return parse_df(result.output)
 
 
@@ -2605,7 +2637,7 @@ def read_lazyfs_mounted(container: str, mount_dir: str = PG_DATA_DIR) -> bool:
     """Whether `container` has PGDATA on LazyFS right now."""
     result = exec_in(container, lazyfs_mounts_cmd())
     if not result.ok:
-        raise FaultInjectionError(f"{container}: could not read /proc/mounts: {result.output}")
+        raise read_failure(container, "reading /proc/mounts", result)
     return parse_lazyfs_mounted(result.stdout, mount_dir)
 
 
@@ -2626,18 +2658,34 @@ def verify_lazyfs_mounted(
     is merely early as one that is misconfigured. Waiting weakens nothing: a
     mount that never appears still fails, with the same message.
 
+    A container that cannot be exec'd into is waited through too, and reported
+    as such if the wait expires — a restarting node says nothing about mounts.
+
     The wait belongs here rather than in `docker compose up --wait`. That gate
     depends on compose's health aggregation across services, which reports a
     node still in `health: starting` as unhealthy once a sibling has gone
     healthy, and aborts. This waits on the fact the fault actually needs.
     """
     deadline = time.monotonic() + timeout_s
+    unreachable: ContainerNotRunning | None = None
     while True:
-        if read_lazyfs_mounted(container, mount_dir):
-            return
+        try:
+            if read_lazyfs_mounted(container, mount_dir):
+                return
+            unreachable = None
+        except ContainerNotRunning as exc:
+            unreachable = exc
         if time.monotonic() >= deadline:
             break
         time.sleep(1.0)
+    if unreachable is not None:
+        raise FaultPreconditionError(
+            f"{container}: never stayed running long enough to read its mounts"
+            f"{f' within {timeout_s:g}s' if timeout_s else ''}: {unreachable}.\n"
+            f"  The node is restart-looping, so this says nothing about LazyFS. "
+            f"Read its logs before treating it as a mount problem:\n"
+            f"    docker compose logs {container}"
+        ) from unreachable
     raise FaultPreconditionError(
         f"{container}: {mount_dir} is not a LazyFS mount"
         f"{f' after {timeout_s:g}s' if timeout_s else ''}, so un-fsynced writes "

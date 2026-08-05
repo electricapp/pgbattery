@@ -253,23 +253,39 @@ def await_postgres_running(nodes: list[str], timeout_s: float) -> None:
 
     `checkpointer` and `background writer` run in recovery, so this holds on a
     standby; `walwriter` does not, which is why any one of them suffices.
+
+    A node still restarting counts as pending, not as an error: `cluster-crash`
+    kills all three at once and recovery can outlast a supervisor restart. The
+    last refusal is carried into the timeout message to keep the two distinct.
     """
     deadline = time.monotonic() + timeout_s
     pending = list(nodes)
+    unreachable: dict[str, str] = {}
     while pending and time.monotonic() < deadline:
         still: list[str] = []
         for node in pending:
-            running = fp.read_processes(node)
+            try:
+                running = fp.read_processes(node)
+            except fp.ContainerNotRunning as exc:
+                unreachable[node] = str(exc)
+                still.append(node)
+                continue
+            unreachable.pop(node, None)
             if not any(name in p.args for p in running for name in WAL_FLUSH_PROCESSES):
                 still.append(node)
         pending = still
         if pending:
             time.sleep(1.0)
     if pending:
+        detail = (
+            f"; last seen: {'; '.join(f'{n}: {m}' for n, m in sorted(unreachable.items()))}"
+            if unreachable
+            else ""
+        )
         raise fp.FaultPreconditionError(
             f"{', '.join(pending)}: no PostgreSQL running within {timeout_s:g}s "
             f"(looked for {WAL_FLUSH_PROCESSES}); the run would crash a node that "
-            f"never started and report the result as durability"
+            f"never started and report the result as durability{detail}"
         )
 
 

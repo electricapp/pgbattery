@@ -11,6 +11,10 @@ ignore = [
     # verifies ECDSA cosign signatures and performs no RSA private-key ops, so
     # it is not reachable here. No patched rsa release exists.
     "RUSTSEC-2023-0071",
+    # rkyv: optional feature of rust_decimal (via byte-unit -> openraft) that
+    # nothing enables, so it is in Cargo.lock but not the build graph. No fix
+    # reachable: rust_decimal 1.42.1 (latest) pins ^0.7. CI asserts it stays out.
+    "RUSTSEC-2026-0235",
 ]
 
 [licenses]

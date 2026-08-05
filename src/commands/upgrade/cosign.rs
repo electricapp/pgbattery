@@ -315,7 +315,11 @@ impl CosignVerifier {
         // does not chain to Fulcio — e.g. a self-signed cert an attacker minted
         // — is rejected here. The bundle path anchors at the Rekor integrated
         // time instead; here we have no transparency-log timestamp.
-        let not_before = leaf.tbs_certificate.validity.not_before.to_unix_duration();
+        let not_before = leaf
+            .tbs_certificate()
+            .validity()
+            .not_before
+            .to_unix_duration();
         verify_fulcio_chain_at(
             fulcio_roots,
             &leaf,
@@ -590,16 +594,14 @@ fn verify_fulcio_chain_at(
 /// Extract the Sigstore OIDC-issuer extension value from the leaf certificate.
 fn extract_oidc_issuer(leaf: &X509Certificate) -> Result<String> {
     let extensions = leaf
-        .tbs_certificate
-        .extensions
-        .as_ref()
+        .tbs_certificate()
+        .extensions()
         .context("certificate has no extensions (missing OIDC issuer)")?;
 
     let ext = extensions
         .iter()
-        // `extn_id` is x509-cert 0.2's (const-oid 0.9) ObjectIdentifier while
-        // our constant is const-oid 0.10's; the types don't unify, so compare by
-        // encoded value — identical across const-oid generations for one OID.
+        // By encoded value, not by type: one OID has one DER encoding in every
+        // const-oid generation, and sigstore still carries const-oid 0.9.
         .find(|e| e.extn_id.as_bytes() == SIGSTORE_OIDC_ISSUER_OID.as_bytes())
         .context("certificate is missing the Sigstore OIDC-issuer extension")?;
 
@@ -616,14 +618,13 @@ fn extract_san_identity(leaf: &X509Certificate) -> Result<String> {
     use x509_cert::ext::pkix::name::GeneralName;
 
     let extensions = leaf
-        .tbs_certificate
-        .extensions
-        .as_ref()
+        .tbs_certificate()
+        .extensions()
         .context("certificate has no extensions (missing SAN)")?;
 
     let ext = extensions
         .iter()
-        // Value comparison across const-oid generations (see extract_oidc_issuer).
+        // Compared by encoded value (see extract_oidc_issuer).
         .find(|e| e.extn_id.as_bytes() == SUBJECT_ALT_NAME_OID.as_bytes())
         .context("certificate is missing a Subject Alternative Name")?;
 

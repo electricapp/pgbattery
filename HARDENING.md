@@ -71,6 +71,17 @@ connection-refused at roughly 2800 attempts/second, producing 56,600 of 56,665
 transaction. A nightly Elle run advertised ~10^5 operations and delivered ~385
 real ones.
 
+That lesson has a twin on the reading side. `docker exec` against a restarting
+container answers nothing, and two readers reported that silence as an answer:
+`read_lazyfs_mounted` as "PGDATA is not on LazyFS", `read_processes` as "no
+postmaster". Both were called from loops written to wait for that container, so
+each aborted on its first iteration the wait it existed to perform, failing
+three durability jobs in CI with causes that were not real.
+`ContainerNotRunning` now separates _I could not look_ from _I looked and it is
+absent_; `No such container` stays outside that class, being topology drift.
+**An unreachable node is an absence of evidence, never evidence of absence** —
+read wrong it fails loudly here, and in a checker it would pass while blind.
+
 **A2: the fault class does not exist.** Every fault the harness injects is a
 _clean_ fault: SIGKILL, container stop, network disconnect, SIGSTOP.
 `docker kill` leaves the host page cache intact and the kernel still flushes

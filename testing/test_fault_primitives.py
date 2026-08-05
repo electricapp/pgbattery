@@ -1922,5 +1922,101 @@ class LazyfsConfigTests(unittest.TestCase):
         self.assertNotEqual(config["filesystem"]["logfile"], "")
 
 
+DAEMON_RESTARTING = (
+    "Error response from daemon: Container "
+    "c5bfb91e7a56c74cddfcdbf65701fc85122750713fcb16009f6b60b63c5c846a is restarting, "
+    "wait until the container is running"
+)
+DAEMON_STOPPED = "Error response from daemon: Container 8823f52780b2 is not running"
+DAEMON_NO_SUCH = "Error response from daemon: No such container: node9"
+
+LAZYFS_MOUNTS = (
+    "proc /proc proc rw,relatime 0 0\n"
+    "/dev/vda1 / ext4 rw,relatime 0 0\n"
+    "lazyfs /var/lib/postgresql/data fuse rw,nosuid,nodev,relatime,user_id=0 0 0\n"
+)
+PLAIN_MOUNTS = (
+    "proc /proc proc rw,relatime 0 0\n/dev/vda1 /var/lib/postgresql/data ext4 rw,relatime 0 0\n"
+)
+
+
+class SequencedRunner:
+    """Returns each queued result in turn, repeating the last forever.
+
+    ``ScriptedRunner`` answers a command the same way every time, which cannot
+    express a container that is unreachable now and reachable a moment later.
+    """
+
+    def __init__(self, results: Sequence[CommandResult]) -> None:
+        self.results = list(results)
+        self.calls = 0
+
+    def __call__(self, cmd: str, timeout_s: float) -> CommandResult:
+        index = min(self.calls, len(self.results) - 1)
+        self.calls += 1
+        return self.results[index]
+
+
+class ContainerReachabilityTests(unittest.TestCase):
+    """A container that cannot be exec'd into has told us nothing.
+
+    Both durability suites failed in CI on readers that could not distinguish
+    "I could not look" from "I looked and the answer is no".
+    """
+
+    def install(self, runner: SequencedRunner) -> SequencedRunner:
+        previous = set_command_runner(runner)
+        self.addCleanup(set_command_runner, previous)
+        return runner
+
+    def test_a_restarting_container_makes_a_read_indeterminate(self) -> None:
+        self.install(SequencedRunner([fail(DAEMON_RESTARTING)]))
+        with self.assertRaises(fp.ContainerNotRunning):
+            fp.read_processes("node2")
+
+    def test_a_stopped_container_makes_a_read_indeterminate(self) -> None:
+        self.install(SequencedRunner([fail(DAEMON_STOPPED)]))
+        with self.assertRaises(fp.ContainerNotRunning):
+            fp.read_processes("node2")
+
+    def test_a_command_that_ran_and_failed_is_not_indeterminate(self) -> None:
+        """``ps`` exiting non-zero inside a running container is a real fault."""
+        self.install(SequencedRunner([fail("ps: unrecognized option '--sort'")]))
+        with self.assertRaises(FaultPreconditionError) as caught:
+            fp.read_processes("node2")
+        self.assertNotIsInstance(caught.exception, fp.ContainerNotRunning)
+
+    def test_a_container_that_does_not_exist_is_not_indeterminate(self) -> None:
+        """A name resolving to nothing is topology drift, not a state to wait
+        through."""
+        self.install(SequencedRunner([fail(DAEMON_NO_SUCH)]))
+        with self.assertRaises(FaultPreconditionError) as caught:
+            fp.read_processes("node9")
+        self.assertNotIsInstance(caught.exception, fp.ContainerNotRunning)
+
+    def test_the_mount_wait_outlasts_a_restarting_container(self) -> None:
+        runner = self.install(
+            SequencedRunner([fail(DAEMON_RESTARTING), fail(DAEMON_RESTARTING), ok(LAZYFS_MOUNTS)])
+        )
+        with mock.patch("time.sleep"):
+            fp.verify_lazyfs_mounted("node2", "/var/lib/postgresql/data", timeout_s=30.0)
+        self.assertEqual(runner.calls, 3)
+
+    def test_a_container_that_never_runs_is_reported_as_such(self) -> None:
+        """Not as an unmounted one — the two need different things looked at."""
+        self.install(SequencedRunner([fail(DAEMON_RESTARTING)]))
+        with mock.patch("time.sleep"), self.assertRaises(FaultPreconditionError) as caught:
+            fp.verify_lazyfs_mounted("node2", "/var/lib/postgresql/data", timeout_s=2.0)
+        message = str(caught.exception)
+        self.assertIn("is restarting", message)
+        self.assertNotIn("is not a LazyFS mount", message)
+
+    def test_a_running_container_without_the_mount_still_fails(self) -> None:
+        self.install(SequencedRunner([ok(PLAIN_MOUNTS)]))
+        with mock.patch("time.sleep"), self.assertRaises(FaultPreconditionError) as caught:
+            fp.verify_lazyfs_mounted("node2", "/var/lib/postgresql/data", timeout_s=2.0)
+        self.assertIn("is not a LazyFS mount", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
