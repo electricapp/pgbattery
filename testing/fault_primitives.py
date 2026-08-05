@@ -1820,6 +1820,40 @@ def exec_when_deliverable(
         time.sleep(0.5)
 
 
+def wipe_node_state(service: str, paths: Sequence[str], *, timeout_s: float = 90.0) -> None:
+    """Destroy `paths` inside `service`'s state volume, with the node stopped.
+
+    Through a throwaway container on the same volume rather than an exec, for
+    the reason the Raft-store inversion had to learn: a live node puts back
+    what is taken from underneath it, and `docker exec` needs the very
+    container this is trying to empty.
+
+    The removal is read back. A wipe that silently did nothing would leave the
+    node rejoining with all its state intact, which is a green run measuring a
+    fault that never happened.
+    """
+    _emit("fault.begin", "wipe_node_state", service, {"paths": list(paths)})
+    stopped = run(f"docker compose stop {service}", timeout_s)
+    if not stopped.ok:
+        raise FaultInjectionError(f"could not stop {service} to wipe it: {stopped.output}")
+
+    targets = " ".join(f"{p}/* {p}/.[!.]*" for p in paths)
+    checks = " ".join(paths)
+    script = f"rm -rf {targets} 2>/dev/null; ls -A {checks} 2>/dev/null | head -5"
+    wiped = run(
+        f"docker compose run --rm --no-deps --entrypoint sh {service} -c '{script}'", timeout_s
+    )
+    if not wiped.ok:
+        raise FaultInjectionError(f"{service}: could not wipe {paths}: {wiped.output}")
+    leftover = wiped.stdout.strip()
+    if leftover:
+        raise FaultEffectNotObserved(
+            f"{service}: {paths} still hold entries after being wiped: {leftover!r}. "
+            f"The node would rejoin with the state this meant to destroy."
+        )
+    _emit("fault.injected", "wipe_node_state", service, {"paths": list(paths)})
+
+
 def read_processes(container: str) -> list[ProcessInfo]:
     """Snapshot every process in `container`."""
     result = exec_in(container, ps_cmd())

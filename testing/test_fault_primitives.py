@@ -1995,6 +1995,38 @@ class SequencedRunner:
         return self.results[index]
 
 
+class WipeNodeStateTests(RunnerFixture):
+    """The wipe has to be read back. A removal that silently did nothing leaves
+    the node rejoining with all its state, which is a green run measuring a
+    fault that never happened."""
+
+    def test_a_wipe_that_left_entries_behind_fails(self) -> None:
+        runner = self.install(ScriptedRunner([("docker compose run", ok("PG_VERSION\nbase\n"))]))
+        with self.assertRaises(FaultEffectNotObserved) as caught:
+            fp.wipe_node_state("node2", ["/var/lib/postgresql/data"])
+        self.assertIn("still hold entries", str(caught.exception))
+        self.assertTrue(runner.matching("docker compose stop node2"))
+
+    def test_an_empty_read_back_is_a_wipe(self) -> None:
+        self.install(ScriptedRunner([("docker compose run", ok("  \n"))]))
+        fp.wipe_node_state("node2", ["/var/lib/postgresql/data"])
+        self.assertTrue(any(e["event"] == "fault.injected" for e in self.events))
+
+    def test_a_node_that_will_not_stop_is_not_wiped(self) -> None:
+        runner = self.install(ScriptedRunner([("docker compose stop", fail("no such service"))]))
+        with self.assertRaises(fp.FaultInjectionError):
+            fp.wipe_node_state("node2", ["/var/lib/postgresql/data"])
+        self.assertEqual(runner.matching("docker compose run"), [])
+
+    def test_every_named_path_is_removed_and_checked(self) -> None:
+        runner = self.install(ScriptedRunner([("docker compose run", ok(""))]))
+        fp.wipe_node_state("node2", ["/var/lib/postgresql/data", "/var/lib/postgresql/raft"])
+        script = runner.matching("docker compose run")[0]
+        self.assertIn("/var/lib/postgresql/data/*", script)
+        self.assertIn("/var/lib/postgresql/raft/*", script)
+        self.assertIn("ls -A /var/lib/postgresql/data /var/lib/postgresql/raft", script)
+
+
 class ContainerReachabilityTests(unittest.TestCase):
     """A container that cannot be exec'd into has told us nothing.
 
