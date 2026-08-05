@@ -15,6 +15,8 @@ import unittest
 from collections.abc import Sequence
 from unittest import mock
 
+import psycopg
+
 import durability_crash as dc
 import fault_primitives as fp
 from fault_primitives import CommandResult, set_command_runner
@@ -97,6 +99,49 @@ class AwaitPostgresRunningTests(unittest.TestCase):
             dc.await_postgres_running(["node3"], 30.0)
         self.assertEqual(runner.calls, 1)
         slept.assert_not_called()
+
+
+class EnsureTableTests(unittest.TestCase):
+    """The gateway closes client connections while it re-resolves the leader.
+
+    Common right after a whole-cluster crash-restart, which is exactly where
+    the real run starts when `--prove-oracle` has just run the inversion.
+    """
+
+    def test_a_closed_setup_connection_is_retried_on_the_new_leader(self) -> None:
+        attempts: list[str] = []
+
+        def connect(node: str, *, weaken: bool) -> mock.MagicMock:
+            attempts.append(node)
+            if len(attempts) == 1:
+                raise psycopg.OperationalError("server closed the connection unexpectedly")
+            return mock.MagicMock()
+
+        with (
+            mock.patch.object(dc, "connect_gateway", side_effect=connect),
+            mock.patch.object(dc, "await_writable_leader", return_value="node2"),
+            mock.patch("time.sleep"),
+        ):
+            self.assertEqual(dc.ensure_table("node1"), "node2")
+        self.assertEqual(attempts, ["node1", "node2"])
+
+    def test_a_setup_that_never_lands_fails_loudly(self) -> None:
+        with (
+            mock.patch.object(
+                dc,
+                "connect_gateway",
+                side_effect=psycopg.OperationalError("server closed the connection"),
+            ),
+            mock.patch.object(dc, "await_writable_leader", return_value="node1"),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError) as caught,
+        ):
+            dc.ensure_table("node1", timeout_s=0.0)
+        self.assertIn("server closed the connection", str(caught.exception))
+
+    def test_the_node_that_took_the_ddl_is_the_one_returned(self) -> None:
+        with mock.patch.object(dc, "connect_gateway", return_value=mock.MagicMock()):
+            self.assertEqual(dc.ensure_table("node3"), "node3")
 
 
 if __name__ == "__main__":

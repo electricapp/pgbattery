@@ -63,6 +63,11 @@ cluster-wide crash means every node replays WAL from its last checkpoint, and
 it does so over FUSE, which is slower than the filesystems the other suites
 measured their budgets against."""
 
+SETUP_TIMEOUT_S: Final[float] = 120.0
+"""Budget for the probe table's DDL to land. Shorter than the convergence
+budget because a writable leader has already been found by the time it starts;
+this only covers the gateway dropping the session while leadership settles."""
+
 WAL_FLUSH_PROCESSES: Final[tuple[str, ...]] = ("walwriter", "checkpointer", "background writer")
 """Processes that flush WAL behind the backend's back.
 
@@ -162,10 +167,33 @@ def connect_gateway(node: str, *, weaken: bool) -> psycopg.Connection[Any]:
     return conn
 
 
-def ensure_table(node: str) -> None:
-    with connect_gateway(node, weaken=False) as conn, conn.cursor() as cur:
-        cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
-        cur.execute(f"CREATE TABLE {TABLE} (k int PRIMARY KEY, written_at timestamptz)")
+def ensure_table(node: str, *, timeout_s: float = SETUP_TIMEOUT_S) -> str:
+    """Create the probe table, and name the node that actually accepted it.
+
+    Re-resolves the leader on a dropped connection rather than trusting the one
+    that was writable a moment ago. The gateway closes client sessions while it
+    re-resolves leadership -- contract S2 says so -- and the real run starts
+    right after the inversion has crash-restarted every node, which is when
+    that is most likely. Returning the node that took the DDL keeps the
+    caller's victim list pointing at the leader it really found.
+    """
+    deadline = time.monotonic() + timeout_s
+    target = node
+    while True:
+        try:
+            with connect_gateway(target, weaken=False) as conn, conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
+                cur.execute(f"CREATE TABLE {TABLE} (k int PRIMARY KEY, written_at timestamptz)")
+            return target
+        except (psycopg.Error, OSError) as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise fp.FaultPreconditionError(
+                    f"could not create {TABLE} within {timeout_s:g}s, so the run would "
+                    f"measure durability against a table that was never made. "
+                    f"Last error on {target}: {str(exc).strip()}"
+                ) from exc
+            target = await_writable_leader(remaining)
 
 
 def write_until(node: str, count: int, *, weaken: bool) -> WriteLog:
@@ -305,8 +333,10 @@ def await_postgres_running(nodes: list[str], timeout_s: float) -> None:
 
 
 def run_case(*, mode: str, writes: int, weaken: bool) -> WriteLog:
-    leader = await_writable_leader(CONVERGE_TIMEOUT_S)
-    ensure_table(leader)
+    # The DDL names the victim, not the wait before it: leadership can move
+    # between the two, and killing the node that was leader a moment ago would
+    # leave the real leader running and the crash unmeasured.
+    leader = ensure_table(await_writable_leader(CONVERGE_TIMEOUT_S))
 
     victims = [leader] if mode == "leader-crash" else list(topology.NODES)
     await_postgres_running(victims, CONVERGE_TIMEOUT_S)
