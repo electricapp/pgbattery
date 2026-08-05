@@ -13,6 +13,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import psycopg
+
 import fault_primitives as fp
 import torn_raft as tr
 
@@ -57,6 +59,29 @@ class TearReadingTest(unittest.TestCase):
         reading = self.read(fp.CommandResult(rc=0, stdout=f"{line}\n", stderr=""))
         self.assertEqual(reading.record, (1024, 8192))
         self.assertEqual(reading.unreadable, "")
+
+
+class WriteBatchTest(unittest.TestCase):
+    """Writes driven while a tear is armed race the fault by design."""
+
+    def test_a_connection_lost_under_the_fault_is_not_an_error(self) -> None:
+        """Tearing the leader's store kills it mid-batch, which is the fault
+        working. Before this the whole run died on the dropped connection."""
+        with mock.patch.object(
+            tr, "connect", side_effect=psycopg.OperationalError("server closed the connection")
+        ):
+            self.assertEqual(tr.write_batch("node1", range(5), under_fault=True), [])
+
+    def test_a_connection_lost_with_no_fault_armed_still_raises(self) -> None:
+        """The batch before the first tear establishes the baseline. Swallowing
+        its failure would leave the run measuring an empty acked set."""
+        with (
+            mock.patch.object(
+                tr, "connect", side_effect=psycopg.OperationalError("server closed the connection")
+            ),
+            self.assertRaises(psycopg.Error),
+        ):
+            tr.write_batch("node1", range(5))
 
 
 class DamageEstablishedTest(unittest.TestCase):

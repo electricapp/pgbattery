@@ -287,16 +287,27 @@ def ensure_table(node: str) -> None:
         cur.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (k int PRIMARY KEY)")
 
 
-def write_batch(node: str, keys: range) -> list[int]:
-    """Acked writes only. An INSERT that raised was never promised to anyone."""
+def write_batch(node: str, keys: range, *, under_fault: bool = False) -> list[int]:
+    """Acked writes only. An INSERT that raised was never promised to anyone.
+
+    `under_fault` also tolerates losing the connection itself. Writes driven
+    with a tear armed on the leader race the fault by design: the tear kills
+    that node's Raft store and the gateway drops the session mid-batch, which
+    is the fault working. Without it the baseline batch would swallow the same
+    failure and leave the run measuring an empty acked set.
+    """
     acked: list[int] = []
-    with connect(node) as conn, conn.cursor() as cur:
-        for key in keys:
-            try:
-                cur.execute(f"INSERT INTO {TABLE} VALUES (%s)", (key,))
-                acked.append(key)
-            except psycopg.Error:
-                continue
+    try:
+        with connect(node) as conn, conn.cursor() as cur:
+            for key in keys:
+                try:
+                    cur.execute(f"INSERT INTO {TABLE} VALUES (%s)", (key,))
+                    acked.append(key)
+                except psycopg.Error:
+                    continue
+    except (psycopg.Error, OSError):
+        if not under_fault:
+            raise
     return acked
 
 
@@ -371,7 +382,7 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
     fp.arm_torn_write(victim, RAFT_DB, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT)
     lead = await_leader(CONVERGE_TIMEOUT_S)
     base = 1000 * (index + 1)
-    outcome.acked.extend(write_batch(lead, range(base, base + 50)))
+    outcome.acked.extend(write_batch(lead, range(base, base + 50), under_fault=True))
     time.sleep(3)
 
     log = fp.exec_when_deliverable(

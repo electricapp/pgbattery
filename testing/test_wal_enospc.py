@@ -13,7 +13,9 @@ from __future__ import annotations
 import ast
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import fault_primitives as fp
 import wal_enospc as we
 from dual_writability_prober import ProbeReport, ProbeRound, Verdict
 
@@ -143,6 +145,48 @@ class MainReportsItsOwnFailuresTests(unittest.TestCase):
             set(),
             "defined but never caught, so it would escape as a traceback",
         )
+
+
+class TransferOffBootstrapTests(unittest.TestCase):
+    """The goal is leadership being off the bootstrap node, not a transfer being
+    accepted. A refusal that names a different leader has already answered it."""
+
+    def test_a_refusal_naming_another_leader_ends_the_wait(self) -> None:
+        """The shape that burned 180s in CI.
+
+        Node1 answered every transfer with `421 Not the leader. Current leader:
+        Some(3)` -- node3 was already leading, which is the state the caller
+        wanted. Re-reading `leaders()` only after an accepted transfer meant the
+        loop never noticed.
+        """
+        views = iter([[], ["node3"], ["node3"], ["node3"]])
+
+        with (
+            mock.patch.object(we, "leaders", side_effect=lambda: next(views, ["node3"])),
+            mock.patch.object(we, "is_synced", return_value=True),
+            mock.patch.object(
+                we,
+                "request_transfer",
+                return_value=(False, "HTTP 421: Not the leader. Current leader: Some(3)"),
+            ),
+            mock.patch("time.sleep"),
+        ):
+            self.assertEqual(we.transfer_leadership_off_bootstrap(60.0), "node3")
+
+    def test_leadership_already_elsewhere_is_a_no_op(self) -> None:
+        with mock.patch.object(we, "leaders", return_value=["node2"]):
+            self.assertEqual(we.transfer_leadership_off_bootstrap(60.0), "node2")
+
+    def test_leadership_that_never_moves_still_fails_loudly(self) -> None:
+        with (
+            mock.patch.object(we, "leaders", return_value=[we.BOOTSTRAP_NODE]),
+            mock.patch.object(we, "is_synced", return_value=True),
+            mock.patch.object(we, "request_transfer", return_value=(False, "HTTP 500: boom")),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError) as caught,
+        ):
+            we.transfer_leadership_off_bootstrap(0.05)
+        self.assertIn("did not move off", str(caught.exception))
 
 
 if __name__ == "__main__":

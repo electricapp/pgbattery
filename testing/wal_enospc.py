@@ -477,37 +477,37 @@ def transfer_leadership_off_bootstrap(timeout_s: float) -> str:
     See :data:`BOOTSTRAP_NODE` for why the bootstrap node must never be the
     victim. If leadership is already elsewhere this is a no-op.
     """
-    current = leaders()
-    if len(current) == 1 and current[0] != BOOTSTRAP_NODE:
-        return current[0]
-
     candidates = [n for n in topology.NODES if n != BOOTSTRAP_NODE]
     if not candidates:
         raise fp.FaultPreconditionError("need at least two nodes to run this suite")
 
     attempts: list[str] = []
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    while True:
+        # Read the goal first, every round. A refused transfer is not a reason
+        # to keep asking: the bootstrap node refuses with `421 Not the leader`
+        # precisely when leadership has already moved, which is the state this
+        # is waiting for. Re-reading only after an *accepted* transfer meant
+        # that answer was discarded and the whole timeout burned.
+        found = leaders()
+        if len(found) == 1 and found[0] != BOOTSTRAP_NODE:
+            return found[0]
+        if time.monotonic() >= deadline:
+            break
         for target in candidates:
             if not is_synced(target):
                 attempts.append(f"{target}: not caught up")
                 continue
             accepted, detail = request_transfer(target)
             attempts.append(f"{target}: {'accepted' if accepted else 'refused'} — {detail}")
-            if not accepted:
-                continue
-            settle = time.monotonic() + 30.0
-            while time.monotonic() < settle:
-                found = leaders()
-                if len(found) == 1 and found[0] != BOOTSTRAP_NODE:
-                    return found[0]
-                time.sleep(1.0)
+            if accepted:
+                break
         time.sleep(3.0)
 
     raise fp.FaultPreconditionError(
         f"leadership did not move off {BOOTSTRAP_NODE} within {timeout_s:g}s; filling it "
         f"would let it restart onto an empty tmpfs and bootstrap a fresh cluster. "
-        f"Attempts: {'; '.join(attempts[-6:])}"
+        f"Attempts: {'; '.join(attempts[-6:]) if attempts else 'none made before the deadline'}"
     )
 
 
