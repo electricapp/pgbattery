@@ -574,6 +574,52 @@ def check_matrix_cluster_matches_compose() -> None:
         raise AssertionError("; ".join(problems))
 
 
+def transfers_into_an_unsettled_cluster(
+    cases: list[dict[str, Any]], expected_nodes: int
+) -> list[str]:
+    """Transfers whose preceding wait would pass with a follower still demoting.
+
+    `wait_cluster` returns as soon as the named leader is in place, and the node
+    that just gave leadership up is still restarting PostgreSQL into recovery at
+    that moment. A transfer aimed at it is refused -- `trigger_elect` in
+    `management_api/cluster.rs` returns 503 while the supervisor is busy or PG
+    is down, deliberately, because electing a node mid-demote term-churns the
+    cluster into a leaderless wedge.
+
+    `min_healthy_replicas` is the gate: requiring every follower healthy means
+    the demotion finished before the next transfer is asked for.
+    """
+    required = max(1, expected_nodes - 1)
+    problems: list[str] = []
+    for case in cases:
+        actions = case.get("actions") or []
+        for index, action in enumerate(actions):
+            if index == 0 or action.get("type") != "transfer_leadership":
+                continue
+            previous = actions[index - 1]
+            if previous.get("type") != "wait_cluster":
+                continue
+            if int(previous.get("min_healthy_replicas", 1)) < required:
+                problems.append(
+                    f"{case['id']}: the wait before action {index} "
+                    f"(transfer to node {action.get('target_node_id')}) does not require "
+                    f"min_healthy_replicas >= {required}, so it can pass while the node "
+                    f"that just demoted is still restarting PostgreSQL, and the transfer "
+                    f"is refused with 503"
+                )
+    return problems
+
+
+def check_transfers_wait_for_settled_followers() -> None:
+    """A chained leadership transfer must wait for the demoted node to settle."""
+    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    problems = transfers_into_an_unsettled_cluster(
+        data["cases"], int(data["cluster"]["expected_nodes"])
+    )
+    if problems:
+        raise AssertionError(" | ".join(problems))
+
+
 def implicit_build_targets(compose: dict[str, Any], filename: str) -> list[str]:
     """Services that build from the Dockerfile without naming a stage."""
     problems: list[str] = []
@@ -732,6 +778,10 @@ def lint() -> None:
     check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
     check("Matrix cluster matches docker-compose", check_matrix_cluster_matches_compose)
     check("Compose services pin a build target", check_build_targets_are_explicit)
+    check(
+        "Chained transfers wait for settled followers",
+        check_transfers_wait_for_settled_followers,
+    )
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
 
     table = Table(title="Test Harness Lint", show_lines=False)

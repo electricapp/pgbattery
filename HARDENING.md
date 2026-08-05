@@ -82,6 +82,27 @@ absent_; `No such container` stays outside that class, being topology drift.
 **An unreachable node is an absence of evidence, never evidence of absence** —
 read wrong it fails loudly here, and in a checker it would pass while blind.
 
+A third reader had the same defect where it was hardest to see, because the tear
+being measured is what makes the node unreadable. `torn_raft.py` sized each tear
+from the LazyFS log inside the container, and a torn write kills that container's
+LazyFS; a failed `exec` returned no records, which is what a log holding no tear
+also returns. CI then failed a follower run with "the fault never fired" while
+reporting the victim had refused to start on a store redb could not open. The
+read waits the container out now, an unreadable log is carried as its own
+finding, and a refusal on a store-damage shape establishes the damage without the
+log at all.
+
+There is a fourth shape, on the precondition side rather than the reading side.
+`wait_cluster` returns the moment the named leader is in place, and the node that
+just gave leadership up is still restarting PostgreSQL into recovery then. The
+transfer cascades chained straight off that wait, so the next transfer could be
+aimed at a node mid-demote — which `trigger_elect` refuses with a 503, by design,
+because electing it would term-churn the cluster into a leaderless wedge. The
+case failed two different ways on consecutive CI runs, which is what an
+unestablished precondition looks like from the outside. Thirteen waits across six
+cases now require every follower healthy, and `lint_matrix.py` fails any chained
+transfer that does not.
+
 **A2: the fault class does not exist.** Every fault the harness injects is a
 _clean_ fault: SIGKILL, container stop, network disconnect, SIGSTOP.
 `docker kill` leaves the host page cache intact and the kernel still flushes

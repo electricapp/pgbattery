@@ -957,6 +957,52 @@ def test_every_real_compose_file_pins_its_build_target() -> None:
     lint_matrix.check_build_targets_are_explicit()
 
 
+def _cascade(min_healthy: int | None) -> list[dict[str, object]]:
+    wait: dict[str, object] = {"type": "wait_cluster", "nodes": 3, "leaders": 1}
+    if min_healthy is not None:
+        wait["min_healthy_replicas"] = min_healthy
+    return [
+        {
+            "id": "cascade",
+            "actions": [
+                {"type": "transfer_leadership", "target_node_id": 2},
+                wait,
+                {"type": "transfer_leadership", "target_node_id": 1},
+            ],
+        }
+    ]
+
+
+def test_a_transfer_after_a_leader_only_wait_is_flagged() -> None:
+    """The shape that made the cascade case flaky.
+
+    `wait_cluster` passes the moment the new leader is in place, while the node
+    that just gave leadership up is still restarting PostgreSQL into recovery.
+    Asking that node to take leadership back gets a deliberate 503 from
+    `trigger_elect`, which refuses to elect a node whose PG is mid-demote.
+    """
+    problems = lint_matrix.transfers_into_an_unsettled_cluster(_cascade(None), 3)
+    assert len(problems) == 1
+    assert "cascade" in problems[0]
+    assert "min_healthy_replicas >= 2" in problems[0]
+
+
+def test_a_transfer_that_waits_for_every_follower_passes() -> None:
+    assert lint_matrix.transfers_into_an_unsettled_cluster(_cascade(2), 3) == []
+
+
+def test_a_transfer_not_preceded_by_a_wait_is_not_this_checks_business() -> None:
+    """The first transfer of a case runs against a cluster the runner just
+    brought up and asserted on; only a chained one races a demotion."""
+    cases = [{"id": "first", "actions": [{"type": "transfer_leadership", "target_node_id": 2}]}]
+    assert lint_matrix.transfers_into_an_unsettled_cluster(cases, 3) == []
+
+
+def test_the_real_matrix_waits_for_settled_followers() -> None:
+    """The check against ci_matrix.yaml itself, not a fixture."""
+    lint_matrix.check_transfers_wait_for_settled_followers()
+
+
 def test_contract_violations_flag_missing_declarations() -> None:
     violations = lint_matrix.collect_contract_violations(
         [{"id": "a", "contracts": ["W1"]}, {"id": "b"}, {"id": "c", "contracts": []}],

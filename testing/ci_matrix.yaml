@@ -369,7 +369,8 @@
           "nodes": 3,
           "leaders": 1,
           "leader_equals": 2,
-          "timeout_sec": 30
+          "timeout_sec": 30,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -381,7 +382,8 @@
           "nodes": 3,
           "leaders": 1,
           "leader_equals": 3,
-          "timeout_sec": 30
+          "timeout_sec": 30,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -393,7 +395,8 @@
           "nodes": 3,
           "leaders": 1,
           "leader_equals": 1,
-          "timeout_sec": 30
+          "timeout_sec": 30,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -405,7 +408,8 @@
           "nodes": 3,
           "leaders": 1,
           "leader_equals": 2,
-          "timeout_sec": 30
+          "timeout_sec": 30,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1306,7 +1310,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1331,7 +1336,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1531,7 +1537,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1541,7 +1548,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1551,7 +1559,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1561,7 +1570,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -1571,7 +1581,8 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 120,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -3940,7 +3951,8 @@
           "nodes": 3,
           "leaders": 1,
           "leader_not_var": "vote_progress_mid_leader",
-          "timeout_sec": 60
+          "timeout_sec": 60,
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
@@ -3989,7 +4001,8 @@
           "leaders": 1,
           "leader_not_var": "rewind_test_initial_leader",
           "timeout_sec": 60,
-          "comment": "Graceful transfer \u2014 every node catches up before transfer, so no divergence beyond the in-flight one-WAL-block tolerance. The old leader rewinds (if needed) without tripping the gate."
+          "comment": "Graceful transfer \u2014 every node catches up before transfer, so no divergence beyond the in-flight one-WAL-block tolerance. The old leader rewinds (if needed) without tripping the gate.",
+          "min_healthy_replicas": 2
         },
         {
           "type": "transfer_leadership",
