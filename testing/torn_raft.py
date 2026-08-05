@@ -44,7 +44,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 import psycopg
 
@@ -97,6 +97,35 @@ class OracleNotProven(RuntimeError):
     """The inversion did not go red, so a green result would mean nothing."""
 
 
+class ObservedTear(TypedDict):
+    """One tear as LazyFS actually landed it, not as it was requested."""
+
+    bytes: int
+    offset: int
+
+
+class TornRaftJson(TypedDict):
+    """The run report. CI keeps this, so the keys are a contract with whatever
+    reads it afterwards."""
+
+    target: str
+    victim: str
+    attempts: int
+    tears: int
+    torn_bytes: list[int]
+    torn_offsets: list[int]
+    observed_writes: list[ObservedTear]
+    acked: int
+    surviving: int
+    lost_acked: int
+    lost_keys: list[int]
+    victim_healthy: bool
+    victim_refused: bool
+    refusal_shape: str
+    leaders_after: list[str]
+    contracts: list[str]
+
+
 @dataclass
 class Outcome:
     tears: int = 0
@@ -108,7 +137,7 @@ class Outcome:
     leaders_after: list[str] = field(default_factory=list)
     refusal: str = ""
     torn_offsets: list[int] = field(default_factory=list)
-    observed: list[dict[str, int]] = field(default_factory=list)
+    observed: list[ObservedTear] = field(default_factory=list)
     attempts: int = 0
     victim: str = ""
     target: str = ""
@@ -127,25 +156,25 @@ class Outcome:
         """
         return not self.victim_healthy and not self.victim_refused
 
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "target": self.target,
-            "victim": self.victim,
-            "attempts": self.attempts,
-            "tears": self.tears,
-            "torn_bytes": self.torn_bytes,
-            "torn_offsets": self.torn_offsets,
-            "observed_writes": self.observed,
-            "acked": len(self.acked),
-            "surviving": len(self.surviving),
-            "lost_acked": len(self.lost),
-            "lost_keys": self.lost[:20],
-            "victim_healthy": self.victim_healthy,
-            "victim_refused": self.victim_refused,
-            "refusal_shape": self.refusal,
-            "leaders_after": self.leaders_after,
-            "contracts": ["R2", "L3"],
-        }
+    def as_json(self) -> TornRaftJson:
+        return TornRaftJson(
+            target=self.target,
+            victim=self.victim,
+            attempts=self.attempts,
+            tears=self.tears,
+            torn_bytes=self.torn_bytes,
+            torn_offsets=self.torn_offsets,
+            observed_writes=self.observed,
+            acked=len(self.acked),
+            surviving=len(self.surviving),
+            lost_acked=len(self.lost),
+            lost_keys=self.lost[:20],
+            victim_healthy=self.victim_healthy,
+            victim_refused=self.victim_refused,
+            refusal_shape=self.refusal,
+            leaders_after=self.leaders_after,
+            contracts=["R2", "L3"],
+        )
 
 
 def mgmt(node: str, path: str) -> Any:
@@ -323,7 +352,7 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
         record = tear_once(victim, attempts, outcome)
         if record is not None:
             persisted, offset = record
-            outcome.observed.append({"bytes": persisted, "offset": offset})
+            outcome.observed.append(ObservedTear(bytes=persisted, offset=offset))
             if persisted >= min_torn_bytes:
                 outcome.tears += 1
                 outcome.torn_bytes.append(persisted)
@@ -472,7 +501,7 @@ def main() -> int:
         min_torn_bytes=args.min_torn_bytes,
         max_attempts=args.attempts or args.tears * 4,
     )
-    print(json.dumps(outcome.as_dict(), indent=2))
+    print(json.dumps(outcome.as_json(), indent=2))
 
     if outcome.tears == 0:
         largest = max((w["bytes"] for w in outcome.observed), default=0)

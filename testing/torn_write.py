@@ -39,7 +39,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, TypedDict
 
 import typer
 
@@ -72,6 +72,39 @@ class TornWriteViolation(RuntimeError):
 
 class OracleNotProven(RuntimeError):
     """The inversion did not go red, so a green result would mean nothing."""
+
+
+class HeapTearJson(TypedDict):
+    """Serialised heap-page tear cycle."""
+
+    weakened_durability: bool
+    torn_bytes: int | None
+    tore: bool
+    postgres_started: bool
+    row_value: str | None
+    checksum_error: bool
+    repaired: bool
+    detected: bool
+    notes: list[str]
+    contracts: list[str]
+
+
+class MetadataTearJson(TypedDict):
+    """Serialised WAL / control-file tear cycle. Narrower contract than a heap
+    page: neither structure has a full-page image and neither can be rebuilt
+    from elsewhere in the cluster."""
+
+    target: str
+    mangled: bool
+    file: str
+    torn_bytes: int | None
+    acked_before: int
+    surviving: int
+    lost_acked: list[int]
+    postgres_started: bool
+    complaint: str
+    detected: bool
+    contracts: list[str]
 
 
 @dataclass
@@ -107,19 +140,19 @@ class Outcome:
     def detected(self) -> bool:
         return self.checksum_error
 
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "weakened_durability": self.weakened,
-            "torn_bytes": self.torn_bytes,
-            "tore": self.tore,
-            "postgres_started": self.postgres_started,
-            "row_value": self.row_value,
-            "checksum_error": self.checksum_error,
-            "repaired": self.repaired,
-            "detected": self.detected,
-            "notes": self.notes,
-            "contracts": ["R2"],
-        }
+    def as_json(self) -> HeapTearJson:
+        return HeapTearJson(
+            weakened_durability=self.weakened,
+            torn_bytes=self.torn_bytes,
+            tore=self.tore,
+            postgres_started=self.postgres_started,
+            row_value=self.row_value,
+            checksum_error=self.checksum_error,
+            repaired=self.repaired,
+            detected=self.detected,
+            notes=self.notes,
+            contracts=["R2"],
+        )
 
 
 def psql(sql: str, *, expect_ok: bool = True) -> str:
@@ -342,7 +375,7 @@ def durable_rows() -> set[int]:
     return {int(line) for line in out.splitlines() if line.strip().isdigit()}
 
 
-def run_metadata_cycle(*, target: str, mangle: bool) -> dict[str, object]:
+def run_metadata_cycle(*, target: str, mangle: bool) -> MetadataTearJson:
     """Tear (or mangle) the WAL or the control file, then recover.
 
     Neither structure has PostgreSQL's full-page-image safety net, and neither
@@ -426,19 +459,19 @@ def run_metadata_cycle(*, target: str, mangle: bool) -> dict[str, object]:
                 complaint = marker
                 break
 
-    return {
-        "target": target,
-        "mangled": mangle,
-        "file": relative,
-        "torn_bytes": torn,
-        "acked_before": len(acked),
-        "surviving": len(survived),
-        "lost_acked": sorted(acked - survived)[:20],
-        "postgres_started": started.ok,
-        "complaint": complaint,
-        "detected": bool(complaint),
-        "contracts": ["W1", "R2"],
-    }
+    return MetadataTearJson(
+        target=target,
+        mangled=mangle,
+        file=relative,
+        torn_bytes=torn,
+        acked_before=len(acked),
+        surviving=len(survived),
+        lost_acked=sorted(acked - survived)[:20],
+        postgres_started=started.ok,
+        complaint=complaint,
+        detected=bool(complaint),
+        contracts=["W1", "R2"],
+    )
 
 
 app = typer.Typer(add_completion=False)
@@ -516,7 +549,7 @@ def main(
 
     if prove_oracle:
         weakened = run_cycle(weakened=True)
-        print(json.dumps(weakened.as_dict(), indent=2))
+        print(json.dumps(weakened.as_json(), indent=2))
         if not weakened.tore:
             raise OracleNotProven("the inversion never tore the page")
         if weakened.repaired:
@@ -536,7 +569,7 @@ def main(
         )
 
     outcome = run_cycle(weakened=False)
-    print(json.dumps(outcome.as_dict(), indent=2))
+    print(json.dumps(outcome.as_json(), indent=2))
     assert_not_silently_accepted(outcome)
 
     verdict = "repaired by the full-page image" if outcome.repaired else "detected by checksums"

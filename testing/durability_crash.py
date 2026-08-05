@@ -45,7 +45,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, TypedDict
 
 import psycopg
 
@@ -85,6 +85,21 @@ class DurabilityViolation(Exception):
 
 class OracleNotProven(Exception):
     """The inversion did not go red, so a green result would mean nothing."""
+
+
+class VerdictJson(TypedDict):
+    """The run report. CI keeps this, so the keys are a contract with whatever
+    reads it afterwards."""
+
+    mode: str
+    weakened_durability: bool
+    acked: int
+    unacked: int
+    surviving: int
+    lost_acked: int
+    lost_keys: list[int]
+    phantom: int
+    contracts: list[str]
 
 
 @dataclass
@@ -317,18 +332,18 @@ def run_case(*, mode: str, writes: int, weaken: bool) -> WriteLog:
     return log
 
 
-def verdict(log: WriteLog, *, mode: str, weaken: bool) -> dict[str, object]:
-    return {
-        "mode": mode,
-        "weakened_durability": weaken,
-        "acked": len(log.acked),
-        "unacked": len(log.unacked),
-        "surviving": len(log.surviving),
-        "lost_acked": len(log.lost),
-        "lost_keys": log.lost[:20],
-        "phantom": len(log.phantom),
-        "contracts": ["W1", "R2"] if mode == "cluster-crash" else ["W1"],
-    }
+def verdict(log: WriteLog, *, mode: str, weaken: bool) -> VerdictJson:
+    return VerdictJson(
+        mode=mode,
+        weakened_durability=weaken,
+        acked=len(log.acked),
+        unacked=len(log.unacked),
+        surviving=len(log.surviving),
+        lost_acked=len(log.lost),
+        lost_keys=log.lost[:20],
+        phantom=len(log.phantom),
+        contracts=["W1", "R2"] if mode == "cluster-crash" else ["W1"],
+    )
 
 
 def main() -> int:

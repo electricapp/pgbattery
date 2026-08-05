@@ -103,11 +103,15 @@ class ReportShapeTests(unittest.TestCase):
                 avail_kb_after=8192,
             )
         )
-        self.assertEqual(outcome.report()["fill"]["container"], "node2")
-        self.assertEqual(outcome.report()["fill"]["avail_kb_after"], 8192)
+        fill = outcome.report()["fill"]
+        assert fill is not None
+        self.assertEqual(fill["container"], "node2")
+        self.assertEqual(fill["avail_kb_after"], 8192)
 
-    def test_an_absent_fill_serialises_empty(self) -> None:
-        self.assertEqual(we.Outcome().report()["fill"], {})
+    def test_an_absent_fill_serialises_null(self) -> None:
+        """Null rather than {}: a control run has no fill, and an empty object
+        would read as a fill that measured nothing."""
+        self.assertIsNone(we.Outcome().report()["fill"])
 
 
 class MainReportsItsOwnFailuresTests(unittest.TestCase):

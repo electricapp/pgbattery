@@ -74,8 +74,8 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Final
+from dataclasses import dataclass, field
+from typing import Any, Final, TypedDict
 
 import psycopg
 
@@ -159,6 +159,64 @@ class OracleNotProven(Exception):
     attributable to disk exhaustion."""
 
 
+class FillJson(TypedDict):
+    """Serialised `FillDetail`."""
+
+    container: str
+    filled_kb: int
+    wal_segment_bytes: int
+    avail_kb_after: int
+
+
+class ProbeJson(TypedDict):
+    """Serialised `ProbeSummary`."""
+
+    verdict: str
+    rounds: int
+    violations: int
+    rounds_by_acceptance_count: dict[int, int]
+    indeterminate_rate: float
+    transport: str
+    headline: str
+
+
+class PhaseJson(TypedDict):
+    """One write phase, counted rather than enumerated."""
+
+    name: str
+    acked: int
+    unacked: int
+
+
+class OutcomeJson(TypedDict):
+    """The run report. This is the artifact CI keeps, so the keys are a
+    contract with anything reading them after the fact."""
+
+    acked: int
+    surviving: int
+    lost_acked: int
+    lost_keys: list[int]
+    writes_refused: int
+    leader_before: str
+    leaders_during: list[str]
+    leader_after: str
+    leadership_moved: bool
+    recovered: bool
+    phases: list[PhaseJson]
+    fill: FillJson | None
+    l1: ProbeJson
+    contracts: list[str]
+
+
+class RunJson(TypedDict, total=False):
+    """What `main` prints. Every key is optional: the control run is absent
+    without `--prove-oracle`, and a failure before the fault leaves both out."""
+
+    control: OutcomeJson
+    enospc: OutcomeJson
+    error: str
+
+
 @dataclass(slots=True)
 class Phase:
     """Writes attempted in one phase of the run."""
@@ -167,6 +225,9 @@ class Phase:
     acked: list[int] = field(default_factory=list)
     unacked: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+    def as_json(self) -> PhaseJson:
+        return PhaseJson(name=self.name, acked=len(self.acked), unacked=len(self.unacked))
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,8 +239,13 @@ class FillDetail:
     wal_segment_bytes: int
     avail_kb_after: int
 
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def as_json(self) -> FillJson:
+        return FillJson(
+            container=self.container,
+            filled_kb=self.filled_kb,
+            wal_segment_bytes=self.wal_segment_bytes,
+            avail_kb_after=self.avail_kb_after,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,8 +274,16 @@ class ProbeSummary:
             headline=report.headline,
         )
 
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def as_json(self) -> ProbeJson:
+        return ProbeJson(
+            verdict=self.verdict,
+            rounds=self.rounds,
+            violations=self.violations,
+            rounds_by_acceptance_count=self.rounds_by_acceptance_count,
+            indeterminate_rate=self.indeterminate_rate,
+            transport=self.transport,
+            headline=self.headline,
+        )
 
 
 @dataclass(slots=True)
@@ -246,26 +320,23 @@ class Outcome:
         """Whether the oracle saw enough to claim L1, not merely fail to break it."""
         return self.probe is not None and self.probe.verdict is Verdict.PASS
 
-    def report(self) -> dict[str, Any]:
-        return {
-            "acked": len(self.acked),
-            "surviving": len(self.surviving),
-            "lost_acked": len(self.lost),
-            "lost_keys": self.lost[:20],
-            "writes_refused": self.writes_refused,
-            "leader_before": self.leader_before,
-            "leaders_during": self.leaders_during,
-            "leader_after": self.leader_after,
-            "leadership_moved": self.leadership_moved,
-            "recovered": self.recovered,
-            "phases": [
-                {"name": p.name, "acked": len(p.acked), "unacked": len(p.unacked)}
-                for p in self.phases
-            ],
-            "fill": self.fill_detail.as_dict() if self.fill_detail else {},
-            "l1": ProbeSummary.of(self.probe).as_dict(),
-            "contracts": ["W1", "L1"] if self.l1_established else ["W1"],
-        }
+    def report(self) -> OutcomeJson:
+        return OutcomeJson(
+            acked=len(self.acked),
+            surviving=len(self.surviving),
+            lost_acked=len(self.lost),
+            lost_keys=self.lost[:20],
+            writes_refused=self.writes_refused,
+            leader_before=self.leader_before,
+            leaders_during=self.leaders_during,
+            leader_after=self.leader_after,
+            leadership_moved=self.leadership_moved,
+            recovered=self.recovered,
+            phases=[p.as_json() for p in self.phases],
+            fill=self.fill_detail.as_json() if self.fill_detail else None,
+            l1=ProbeSummary.of(self.probe).as_json(),
+            contracts=["W1", "L1"] if self.l1_established else ["W1"],
+        )
 
 
 GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = dict(
@@ -647,7 +718,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    report: dict[str, Any] = {}
+    report: RunJson = {}
     try:
         if args.prove_oracle:
             control = prove_oracle(args.writes)
