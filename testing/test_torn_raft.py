@@ -84,6 +84,29 @@ class WriteBatchTest(unittest.TestCase):
             tr.write_batch("node1", range(5))
 
 
+class BaselineAckedTest(unittest.TestCase):
+    """`lost` is `acked - surviving`, so an empty acked set makes "no acked write
+    lost" hold for want of anything to lose."""
+
+    def run_tears_with_baseline(self, acked: list[int]) -> None:
+        with (
+            mock.patch.object(tr, "await_leader", return_value="node1"),
+            mock.patch.object(tr, "ensure_table"),
+            mock.patch.object(tr, "write_batch", return_value=acked),
+        ):
+            tr.run_tears(tears=1, target="follower", min_torn_bytes=512, max_attempts=1)
+
+    def test_a_cluster_that_took_no_writes_fails_before_any_tear(self) -> None:
+        with self.assertRaises(fp.FaultPreconditionError) as caught:
+            self.run_tears_with_baseline([])
+        self.assertIn("baseline writes were acked", str(caught.exception))
+
+    def test_a_mostly_failed_baseline_fails_too(self) -> None:
+        with self.assertRaises(fp.FaultPreconditionError) as caught:
+            self.run_tears_with_baseline(list(range(10)))
+        self.assertIn("baseline writes were acked", str(caught.exception))
+
+
 class DamageEstablishedTest(unittest.TestCase):
     """What entitles a run to assert anything about torn-write handling."""
 

@@ -97,6 +97,15 @@ UNKNOWN_REFUSAL: Final[str] = "unknown"
 """The node is down and none of the store-damage markers explain why, so the
 refusal cannot be attributed to the tear."""
 
+BASELINE_WRITES: Final[int] = 200
+MIN_BASELINE_ACKED: Final[int] = 190
+"""How much of the baseline batch must be acked before the first tear.
+
+The cluster is healthy then, so a batch that mostly failed means there was
+never a working cluster to damage. Checked because the durability verdict is
+`acked - surviving`: an empty acked set makes "no acked write lost" hold
+trivially, which is a green measuring nothing."""
+
 LOG_READ_TIMEOUT_S: Final[float] = 45.0
 """How long to keep trying to read the LazyFS log after a tear. The tear kills
 the Raft store's LazyFS, so the container holding the log is usually mid-restart
@@ -407,7 +416,14 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     outcome = Outcome()
     lead = await_leader(CONVERGE_TIMEOUT_S)
     ensure_table(lead)
-    outcome.acked = write_batch(lead, range(200))
+    outcome.acked = write_batch(lead, range(BASELINE_WRITES))
+    if len(outcome.acked) < MIN_BASELINE_ACKED:
+        raise fp.FaultPreconditionError(
+            f"only {len(outcome.acked)} of {BASELINE_WRITES} baseline writes were acked "
+            f"before any tear, so there was no working cluster to damage. `lost` is "
+            f"`acked - surviving`, so the run would report no acked write lost for want "
+            f"of anything to lose."
+        )
 
     # A follower keeps redb's behaviour separate from a promotion happening at
     # the same moment. The leader is the harder case: it is the node whose vote
