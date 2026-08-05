@@ -90,6 +90,18 @@ STORAGE_ERROR_MARKER: Final[str] = "Failed to create database"
 that `storage.rs` treats as creation, which produces a generic storage error
 rather than the refusal written for this case."""
 
+HANDLED_REFUSAL: Final[str] = "handled: refused with recovery instructions"
+PANIC_REFUSAL: Final[str] = "redb panic: unreachable!() in the btree, bypassing the handled path"
+STORAGE_ERROR_REFUSAL: Final[str] = "generic storage error: no recovery instructions"
+UNKNOWN_REFUSAL: Final[str] = "unknown"
+"""The node is down and none of the store-damage markers explain why, so the
+refusal cannot be attributed to the tear."""
+
+LOG_READ_TIMEOUT_S: Final[float] = 45.0
+"""How long to keep trying to read the LazyFS log after a tear. The tear kills
+the Raft store's LazyFS, so the container holding the log is usually mid-restart
+when the read is issued."""
+
 GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = dict(
     zip(topology.NODES, topology.GATEWAY_PORTS, strict=True)
 )
@@ -128,8 +140,24 @@ class TornRaftJson(TypedDict):
     victim_healthy: bool
     victim_refused: bool
     refusal_shape: str
+    unreadable_reads: list[str]
+    damage_established: bool
     leaders_after: list[str]
     contracts: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class TearReading:
+    """What one attempt could establish about its tear.
+
+    `record is None` with an empty `unreadable` means the log was consulted and
+    held no tear. A non-empty `unreadable` means it could not be consulted at
+    all, which is a different finding: collapsing the two reports a fault that
+    fired as one that never did.
+    """
+
+    record: tuple[int, int] | None = None
+    unreadable: str = ""
 
 
 @dataclass
@@ -147,10 +175,27 @@ class Outcome:
     attempts: int = 0
     victim: str = ""
     target: str = ""
+    unreadable: list[str] = field(default_factory=list)
 
     @property
     def lost(self) -> list[int]:
         return sorted(set(self.acked) - self.surviving)
+
+    @property
+    def damage_established(self) -> bool:
+        """Whether this run may assert anything about torn-write handling.
+
+        A tear the LazyFS log sized past the bar establishes it. So does the
+        node refusing to start on a store redb could not open: that is damage
+        no byte threshold would have judged more strictly, and it is the usual
+        way a big tear presents, because killing the Raft store's LazyFS also
+        takes down the container whose log would have sized it.
+
+        A refusal nobody can attribute does not count. A node that is down for
+        reasons none of the store-damage markers explain is not evidence the
+        tear reached the store.
+        """
+        return self.tears > 0 or (self.victim_refused and self.refusal != UNKNOWN_REFUSAL)
 
     @property
     def silent(self) -> bool:
@@ -178,6 +223,8 @@ class Outcome:
             victim_healthy=self.victim_healthy,
             victim_refused=self.victim_refused,
             refusal_shape=self.refusal,
+            unreadable_reads=self.unreadable,
+            damage_established=self.damage_established,
             leaders_after=self.leaders_after,
             contracts=["R2", "L3"],
         )
@@ -287,12 +334,12 @@ def refusal_shape(service: str) -> str:
     logs = fp.run(f"docker compose logs --no-color --tail 2000 {service}")
     haystack = logs.output if logs.ok else ""
     if CORRUPT_MARKER in haystack:
-        return "handled: refused with recovery instructions"
+        return HANDLED_REFUSAL
     if any(marker in haystack for marker in REDB_PANIC_MARKERS):
-        return "redb panic: unreachable!() in the btree, bypassing the handled path"
+        return PANIC_REFUSAL
     if STORAGE_ERROR_MARKER in haystack:
-        return "generic storage error: no recovery instructions"
-    return "unknown"
+        return STORAGE_ERROR_REFUSAL
+    return UNKNOWN_REFUSAL
 
 
 def await_victim_settled(service: str, timeout_s: float) -> tuple[bool, bool]:
@@ -307,12 +354,14 @@ def await_victim_settled(service: str, timeout_s: float) -> tuple[bool, bool]:
     return container_healthy(service), refused_to_start(service)
 
 
-def tear_once(victim: str, index: int, outcome: Outcome) -> tuple[int, int] | None:
+def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
     """Arm one torn write on `victim`'s raft.db, drive traffic, report the tear.
 
-    Returns ``(bytes, offset)``, or None when the tear did not fire -- a real
-    possibility, because the fault is armed for the *next* write to that path
-    and a node that has caught up may not write again promptly.
+    A tear that did not fire is a real possibility, because the fault is armed
+    for the *next* write to that path and a node that has caught up may not
+    write again promptly. So is a log that cannot be read: the tear kills the
+    Raft store's LazyFS, which takes the container holding the log down with
+    it. The two are returned distinctly.
 
     The writes driven here go into `outcome.acked`. They are issued while a
     tear is armed on a live member of the cluster, which makes them the writes
@@ -325,9 +374,13 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> tuple[int, int] | No
     outcome.acked.extend(write_batch(lead, range(base, base + 50)))
     time.sleep(3)
 
-    log = fp.exec_in(victim, fp.lazyfs_log_cmd(log=fp.LAZYFS_RAFT.log))
-    records = fp.parse_lazyfs_torn_records(log.stdout, RAFT_DB) if log.ok else []
-    return records[-1] if records else None
+    log = fp.exec_when_deliverable(
+        victim, fp.lazyfs_log_cmd(log=fp.LAZYFS_RAFT.log), timeout_s=LOG_READ_TIMEOUT_S
+    )
+    if not log.ok:
+        return TearReading(unreadable=log.output.strip() or f"exited {log.rc} in silence")
+    records = fp.parse_lazyfs_torn_records(log.stdout, RAFT_DB)
+    return TearReading(record=records[-1] if records else None)
 
 
 def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int) -> Outcome:
@@ -355,9 +408,11 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     attempts = 0
     while outcome.tears < tears and attempts < max_attempts:
         attempts += 1
-        record = tear_once(victim, attempts, outcome)
-        if record is not None:
-            persisted, offset = record
+        reading = tear_once(victim, attempts, outcome)
+        if reading.unreadable:
+            outcome.unreadable.append(reading.unreadable)
+        elif reading.record is not None:
+            persisted, offset = reading.record
             outcome.observed.append(ObservedTear(bytes=persisted, offset=offset))
             if persisted >= min_torn_bytes:
                 outcome.tears += 1
@@ -519,6 +574,28 @@ def prove_oracle() -> None:
     print("cluster rebuilt for the real run\n")
 
 
+def unobserved_fault_message(outcome: Outcome, *, min_torn_bytes: int) -> str:
+    """Why the run establishes nothing, distinguishing the two ways that happens."""
+    largest = max((w["bytes"] for w in outcome.observed), default=0)
+    head = (
+        f"no torn write met the bar in {outcome.attempts} attempts, so this run "
+        f"asserts nothing about torn-write handling. Largest tear seen was "
+        f"{largest} bytes against a --min-torn-bytes of {min_torn_bytes}."
+    )
+    if outcome.unreadable:
+        return (
+            f"{head} On {len(outcome.unreadable)} of those attempts the LazyFS log "
+            f"could not be read, so the run cannot say whether the fault fired: "
+            f"{outcome.unreadable[-1]}"
+        )
+    return (
+        f"{head} The fault never fired -- it arms for the *next* write to raft.db, "
+        f"and a caught-up node may not write again promptly -- or redb writes "
+        f"nothing that large in this workload, which is worth recording rather "
+        f"than working around."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tears", type=int, default=3, help="torn writes to land in sequence")
@@ -565,16 +642,9 @@ def main() -> int:
     )
     print(json.dumps(outcome.as_json(), indent=2))
 
-    if outcome.tears == 0:
-        largest = max((w["bytes"] for w in outcome.observed), default=0)
+    if not outcome.damage_established:
         raise fp.FaultEffectNotObserved(
-            f"no torn write met the bar in {outcome.attempts} attempts, so this run "
-            f"asserts nothing about torn-write handling. Largest tear seen was "
-            f"{largest} bytes against a --min-torn-bytes of {args.min_torn_bytes}. "
-            f"Either the fault never fired -- it arms for the *next* write to "
-            f"raft.db, and a caught-up node may not write again promptly -- or redb "
-            f"writes nothing that large in this workload, which is worth recording "
-            f"rather than working around."
+            unobserved_fault_message(outcome, min_torn_bytes=args.min_torn_bytes)
         )
     if outcome.lost:
         raise RaftDurabilityViolation(
@@ -594,7 +664,12 @@ def main() -> int:
         )
 
     how = "refused to start" if outcome.victim_refused else "tolerated and rejoined"
-    print(f"{outcome.tears} torn writes to raft.db; the node {how}; no acked write lost")
+    landed = (
+        f"{outcome.tears} torn writes to raft.db"
+        if outcome.tears
+        else "a torn write whose size died with the LazyFS that logged it"
+    )
+    print(f"{landed}; the node {how}; no acked write lost")
     if outcome.victim_refused:
         print(f"  refusal shape -- {outcome.refusal}")
     return 0

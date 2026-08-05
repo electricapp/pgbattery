@@ -1177,6 +1177,22 @@ violation, and the first thing a Jepsen analysis would reach for.
       if none lands, so a run where the fault stopped working reads as a
       failure rather than as tolerance. The mangle case is proven red first.
 
+      **The byte count comes from a log inside the container the tear kills**,
+      which made that hunt read its own blindness as an absent fault. A tear
+      crashes the Raft store's LazyFS and takes the container down with it, so
+      the `exec` that reads the log is issued against a node that is mid-
+      restart. A plain `exec_in` failing there returned no records, which is
+      indistinguishable from a log that recorded no tear, and a follower run in
+      CI failed with "the fault never fired" while reporting the victim refused
+      to start with recovery instructions — a store redb could not open, which
+      is the fault firing about as hard as it can. The read now goes through
+      `exec_when_deliverable` and an unreadable log is carried as its own
+      finding, so the failure message can say which of the two happened. A
+      refusal on a store-damage shape establishes the damage on its own: no
+      threshold on bytes judges a tear more strictly than the node declining to
+      open what it was serving a moment ago. A refusal nobody can attribute to
+      one of those shapes still counts for nothing.
+
       Two things about that inversion were learned the expensive way, and both
       are the Class A1 pattern again. It checked that `dd` exited 0 and never
       that the store had changed — and a store cannot be damaged from under a
