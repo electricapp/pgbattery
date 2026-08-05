@@ -391,9 +391,14 @@ class FaultEffectNotObserved(FaultError):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+TIMED_OUT_RC: Final[int] = -1
+"""Return code for a command the runner killed at its deadline. No real exit
+status is negative, so this cannot collide with one the command produced."""
+
+
 @dataclass(frozen=True)
 class CommandResult:
-    """Outcome of one shell command. ``rc == -1`` means it timed out."""
+    """Outcome of one shell command. ``rc == TIMED_OUT_RC`` means it timed out."""
 
     rc: int
     stdout: str
@@ -422,7 +427,7 @@ def _subprocess_runner(cmd: str, timeout_s: float) -> CommandResult:
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return CommandResult(-1, "", f"timeout after {timeout_s}s")
+        return CommandResult(TIMED_OUT_RC, "", f"timeout after {timeout_s}s")
     return CommandResult(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -1772,15 +1777,27 @@ drift, which must fail rather than be waited on.
 """
 
 
-def exec_unavailable(output: str) -> bool:
-    """Whether `output` means the exec was never delivered to the container."""
-    return any(marker in output for marker in EXEC_UNAVAILABLE_MARKERS)
+def exec_undelivered(result: CommandResult) -> bool:
+    """Whether `result` is a failure that says nothing about the command.
+
+    Three shapes, all meaning the command never ran to an answer: the daemon
+    refusing a container that is not running, runc unable to enter its
+    namespaces, and a non-zero exit carrying no diagnostic on either stream --
+    which a real command failure never does, because the shell reports its own
+    errors. Timeouts count: no answer arrived.
+    """
+    if result.ok:
+        return False
+    if result.rc == TIMED_OUT_RC:
+        return True
+    detail = result.output.strip()
+    return not detail or any(marker in detail for marker in EXEC_UNAVAILABLE_MARKERS)
 
 
 def read_failure(container: str, what: str, result: CommandResult) -> FaultPreconditionError:
     """Classify a failed container read as indeterminate or genuinely bad."""
-    detail = result.stderr.strip() or result.stdout.strip()
-    if exec_unavailable(detail):
+    detail = result.stderr.strip() or result.stdout.strip() or f"exited {result.rc} in silence"
+    if exec_undelivered(result):
         return ContainerNotRunning(f"{container}: {what} could not run: {detail}")
     return FaultPreconditionError(f"{container}: {what} failed: {detail}")
 
@@ -2741,8 +2758,8 @@ def verify_lazyfs_fault_channel(
                     return
                 time.sleep(0.2)
         else:
-            undeliverable = probe.output.strip()
-            if not exec_unavailable(undeliverable):
+            undeliverable = probe.output.strip() or f"exited {probe.rc} in silence"
+            if not exec_undelivered(probe):
                 raise FaultPreconditionError(
                     f"{container}: could not write to {mount.fifo}: {probe.output}"
                 )

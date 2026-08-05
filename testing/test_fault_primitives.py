@@ -1791,16 +1791,19 @@ class LazyfsFaultChannelTests(RunnerFixture):
             fp.verify_lazyfs_fault_channel("node1", timeout_s=0.5)
 
     def test_channel_check_waits_out_an_undeliverable_exec(self) -> None:
-        """runc failing to enter the container's namespaces says nothing about
-        the fault worker, so the gate must retry rather than give up on it."""
+        """An exec that never reached the container says nothing about the fault
+        worker, so the gate must retry rather than give up on it. Both shapes
+        that failed torn-raft in CI: runc unable to enter the namespaces, and a
+        non-zero exit with nothing on either stream."""
         sent: list[str] = []
         attempts = {"fifo": 0}
+        undeliverable = [fail(SETNS_FAILURE), CommandResult(1, "", "")]
 
         def scripted(cmd: str, timeout_s: float) -> fp.CommandResult:
             if "lazyfs.fifo" in cmd:
                 attempts["fifo"] += 1
-                if attempts["fifo"] == 1:
-                    return fail(SETNS_FAILURE)
+                if attempts["fifo"] <= len(undeliverable):
+                    return undeliverable[attempts["fifo"] - 1]
                 sent.append(cmd)
                 return ok()
             if "lazyfs.log" in cmd:
@@ -1819,7 +1822,7 @@ class LazyfsFaultChannelTests(RunnerFixture):
         previous = fp.set_command_runner(scripted)
         self.addCleanup(fp.set_command_runner, previous)
         fp.verify_lazyfs_fault_channel("node1", timeout_s=10.0)
-        self.assertEqual(attempts["fifo"], 2)
+        self.assertEqual(attempts["fifo"], len(undeliverable) + 1)
 
 
 class TornWriteTests(RunnerFixture):
@@ -2011,6 +2014,19 @@ class ContainerReachabilityTests(unittest.TestCase):
 
     def test_a_stopped_container_makes_a_read_indeterminate(self) -> None:
         self.install(SequencedRunner([fail(DAEMON_STOPPED)]))
+        with self.assertRaises(fp.ContainerNotRunning):
+            fp.read_processes("node2")
+
+    def test_a_silent_non_zero_exit_is_indeterminate(self) -> None:
+        """docker exiting non-zero with nothing on either stream. A command that
+        genuinely ran and failed reports why, so silence is docker's, not the
+        command's — this is the shape that failed torn-raft in CI."""
+        self.install(SequencedRunner([CommandResult(1, "", "")]))
+        with self.assertRaises(fp.ContainerNotRunning):
+            fp.read_processes("node2")
+
+    def test_a_timeout_is_indeterminate(self) -> None:
+        self.install(SequencedRunner([CommandResult(fp.TIMED_OUT_RC, "", "timeout after 15.0s")]))
         with self.assertRaises(fp.ContainerNotRunning):
             fp.read_processes("node2")
 
