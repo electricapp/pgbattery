@@ -1757,26 +1757,30 @@ def _resolve_ip(container: str) -> str:
     return ip
 
 
-NOT_RUNNING_MARKERS: Final[tuple[str, ...]] = (
+EXEC_UNAVAILABLE_MARKERS: Final[tuple[str, ...]] = (
     "is restarting, wait until the container is running",
     "is not running",
+    "error executing setns process",
 )
-"""Daemon refusals meaning the container exists but is not running.
+"""Failures that mean the command never reached the container.
+
+The first two are the daemon refusing a stopped container; the third is runc
+unable to enter its namespaces, which happens while a container is coming up.
 
 ``No such container`` is excluded: a name resolving to nothing is topology
 drift, which must fail rather than be waited on.
 """
 
 
-def container_not_running(output: str) -> bool:
-    """Whether `output` is the daemon refusing to exec into a stopped container."""
-    return any(marker in output for marker in NOT_RUNNING_MARKERS)
+def exec_unavailable(output: str) -> bool:
+    """Whether `output` means the exec was never delivered to the container."""
+    return any(marker in output for marker in EXEC_UNAVAILABLE_MARKERS)
 
 
 def read_failure(container: str, what: str, result: CommandResult) -> FaultPreconditionError:
     """Classify a failed container read as indeterminate or genuinely bad."""
     detail = result.stderr.strip() or result.stdout.strip()
-    if container_not_running(detail):
+    if exec_unavailable(detail):
         return ContainerNotRunning(f"{container}: {what} could not run: {detail}")
     return FaultPreconditionError(f"{container}: {what} failed: {detail}")
 
@@ -2697,6 +2701,10 @@ def verify_lazyfs_mounted(
     )
 
 
+ECHO_WAIT_S: Final[float] = 3.0
+"""How long one probe waits for its echo before a fresh one is sent."""
+
+
 def verify_lazyfs_fault_channel(
     container: str, *, mount: LazyfsMount = LAZYFS_DATA, timeout_s: float = 10.0
 ) -> None:
@@ -2716,19 +2724,37 @@ def verify_lazyfs_fault_channel(
 
     So: send a command LazyFS cannot recognise and wait for it to say so.
     """
-    nonce = uuid.uuid4().hex
-    probe = exec_in(container, lazyfs_control_cmd(lazyfs_probe_command(nonce), fifo=mount.fifo))
-    if not probe.ok:
-        raise FaultPreconditionError(
-            f"{container}: could not write to {mount.fifo}: {probe.output}"
-        )
-
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        log = exec_in(container, lazyfs_log_cmd(log=mount.log))
-        if log.ok and parse_lazyfs_consumed(log.stdout, nonce):
-            return
-        time.sleep(0.2)
+    undeliverable = ""
+    while True:
+        # A fresh nonce per attempt: a container that restarted between the
+        # write and the read took the log with it, so the old nonce can never
+        # appear and waiting for it would report a parked worker.
+        nonce = uuid.uuid4().hex
+        probe = exec_in(container, lazyfs_control_cmd(lazyfs_probe_command(nonce), fifo=mount.fifo))
+        if probe.ok:
+            undeliverable = ""
+            echo_deadline = min(deadline, time.monotonic() + ECHO_WAIT_S)
+            while time.monotonic() < echo_deadline:
+                log = exec_in(container, lazyfs_log_cmd(log=mount.log))
+                if log.ok and parse_lazyfs_consumed(log.stdout, nonce):
+                    return
+                time.sleep(0.2)
+        else:
+            undeliverable = probe.output.strip()
+            if not exec_unavailable(undeliverable):
+                raise FaultPreconditionError(
+                    f"{container}: could not write to {mount.fifo}: {probe.output}"
+                )
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+
+    if undeliverable:
+        raise FaultPreconditionError(
+            f"{container}: never became reachable enough to probe {mount.fifo} "
+            f"within {timeout_s:g}s: {undeliverable}"
+        )
 
     raise FaultPreconditionError(
         f"{container}: the {mount.name} LazyFS accepted a write to {mount.fifo} but "

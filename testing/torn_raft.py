@@ -364,14 +364,14 @@ def await_fault_readiness() -> None:
     """Wait until every node can actually receive a fault.
 
     Two facts, neither implying the other: the Raft store must be on LazyFS,
-    and LazyFS's fault worker must be consuming its control FIFO. The mount
-    check carries the timeout because it is the one that has to outlast a
-    container still starting; by the time it passes, the container is running
-    and the FIFO probe can reach it.
+    and LazyFS's fault worker must be consuming its control FIFO. Both carry
+    the full timeout. A mount that is present says nothing about the container
+    a moment later -- a node that restarts between the two checks passes the
+    first and cannot be exec'd into for the second.
     """
     for node in topology.NODES:
         fp.verify_lazyfs_mounted(node, fp.LAZYFS_RAFT.mount_dir, timeout_s=MOUNT_TIMEOUT_S)
-        fp.verify_lazyfs_fault_channel(node, mount=fp.LAZYFS_RAFT)
+        fp.verify_lazyfs_fault_channel(node, mount=fp.LAZYFS_RAFT, timeout_s=MOUNT_TIMEOUT_S)
 
 
 def reset_cluster() -> None:

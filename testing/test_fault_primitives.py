@@ -1790,6 +1790,37 @@ class LazyfsFaultChannelTests(RunnerFixture):
         with self.assertRaises(fp.FaultPreconditionError):
             fp.verify_lazyfs_fault_channel("node1", timeout_s=0.5)
 
+    def test_channel_check_waits_out_an_undeliverable_exec(self) -> None:
+        """runc failing to enter the container's namespaces says nothing about
+        the fault worker, so the gate must retry rather than give up on it."""
+        sent: list[str] = []
+        attempts = {"fifo": 0}
+
+        def scripted(cmd: str, timeout_s: float) -> fp.CommandResult:
+            if "lazyfs.fifo" in cmd:
+                attempts["fifo"] += 1
+                if attempts["fifo"] == 1:
+                    return fail(SETNS_FAILURE)
+                sent.append(cmd)
+                return ok()
+            if "lazyfs.log" in cmd:
+                echoed = [
+                    f"[lazyfs.faults.worker]: command unknown '{probe}'"
+                    for probe in (_probe_in(text) for text in sent)
+                    if probe
+                ]
+                return ok(self.WORKER_LOG + "\n".join(echoed))
+            return ok()
+
+        def _probe_in(text: str) -> str | None:
+            match = re.search(r"lazyfs::pgbattery-probe-[0-9a-f]+", text)
+            return match.group(0) if match else None
+
+        previous = fp.set_command_runner(scripted)
+        self.addCleanup(fp.set_command_runner, previous)
+        fp.verify_lazyfs_fault_channel("node1", timeout_s=10.0)
+        self.assertEqual(attempts["fifo"], 2)
+
 
 class TornWriteTests(RunnerFixture):
     """Torn-write injection (H-25). Every guard here encodes something read out
@@ -1929,6 +1960,10 @@ DAEMON_RESTARTING = (
 )
 DAEMON_STOPPED = "Error response from daemon: Container 8823f52780b2 is not running"
 DAEMON_NO_SUCH = "Error response from daemon: No such container: node9"
+SETNS_FAILURE = (
+    "OCI runtime exec failed: exec failed: unable to start container process: "
+    "error executing setns process: exit status 1"
+)
 
 LAZYFS_MOUNTS = (
     "proc /proc proc rw,relatime 0 0\n"
