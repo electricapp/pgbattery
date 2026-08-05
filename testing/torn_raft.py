@@ -430,44 +430,72 @@ def reset_cluster() -> None:
     await_fault_readiness()
 
 
-def mangle_raft_db(victim: str, timeout_s: float) -> None:
-    """Overwrite the head of `victim`'s raft.db and prove the damage stuck.
+def mangle_raft_db(victim: str) -> None:
+    """Destroy the head of `victim`'s raft.db, with nothing left to undo it.
 
-    The node is live while this runs, and redb rewrites its header on every
-    commit, so a `dd` that exited 0 is not a damaged store: a follower catching
-    up puts a valid header back within the same second, and the node then
-    starts perfectly happily on a store this was supposed to have destroyed.
+    Done with the node stopped, through a throwaway container on the same
+    volume, because both things that hold the store put it back otherwise:
+    redb rewrites its header on the next commit, and LazyFS flushes its own
+    cached copy over whatever is written to the backing store behind it. A
+    `dd` that exits 0 against a live node is not a damaged store.
 
-    A repeating marker rather than /dev/urandom, because random bytes cannot be
-    told apart from redb's own afterwards. It destroys the header just as well.
+    A repeating marker rather than /dev/urandom, so the damage can be read
+    back. Random bytes are indistinguishable from redb's own afterwards.
     """
-    deadline = time.monotonic() + timeout_s
-    while True:
-        fp.exec_when_deliverable(
-            victim,
-            f"yes {MANGLE_MARKER} | head -c {MANGLE_BYTES} > /tmp/mangle.bin && "
-            f"dd if=/tmp/mangle.bin of={RAFT_DB} bs={MANGLE_BYTES} count=1 conv=notrunc",
-            timeout_s=timeout_s,
+    stopped = fp.run(f"docker compose stop {victim}", MANGLE_TIMEOUT_S)
+    if not stopped.ok:
+        raise fp.FaultPreconditionError(f"could not stop {victim}: {stopped.output}")
+
+    script = (
+        f"yes {MANGLE_MARKER} | head -c {MANGLE_BYTES} | "
+        f"dd of={RAFT_DB} bs={MANGLE_BYTES} count=1 conv=notrunc 2>/dev/null && "
+        f"head -c {MANGLE_BYTES} {RAFT_DB} | grep -ac {MANGLE_MARKER}"
+    )
+    mangled = fp.run(
+        f"docker compose run --rm --no-deps --entrypoint sh {victim} -c '{script}'",
+        MANGLE_TIMEOUT_S,
+    )
+    if not mangled.ok or mangled.stdout.strip().splitlines()[-1:] in ([], ["0"]):
+        raise fp.FaultPreconditionError(
+            f"{victim}: raft.db does not carry the overwrite after it was written with "
+            f"the node stopped: {mangled.output.strip() or 'no output'}. The inversion "
+            f"cannot run, because nothing would be measuring a damaged store."
         )
-        stuck = fp.exec_when_deliverable(
-            victim, f"head -c {MANGLE_BYTES} {RAFT_DB} | grep -ac {MANGLE_MARKER} || true"
-        )
-        if stuck.stdout.strip() not in ("", "0"):
-            return
-        if time.monotonic() >= deadline:
-            raise fp.FaultPreconditionError(
-                f"{victim}: raft.db still holds a valid header {timeout_s:g}s after being "
-                f"overwritten, so redb is rewriting it as fast as this damages it. The "
-                f"inversion cannot run: nothing would be measuring a damaged store."
-            )
-        time.sleep(0.5)
+
+
+def describe_store(victim: str) -> str:
+    """Say what became of the overwrite, so a surviving node can be explained.
+
+    Two very different failures reach the same place. If the marker is gone the
+    inversion is aimed at the wrong artifact -- something restores or bypasses
+    the file this damaged, and no amount of overwriting it would ever be seen.
+    If it is still there, the store really is damaged and pgbattery opened it
+    anyway, which is the far more serious reading and not a harness bug at all.
+    """
+    marker = fp.exec_when_deliverable(
+        victim, f"head -c {MANGLE_BYTES} {RAFT_DB} | grep -ac {MANGLE_MARKER} || true"
+    ).stdout.strip()
+    size = fp.exec_when_deliverable(
+        victim, f"stat -c %s {RAFT_DB} 2>/dev/null || echo missing"
+    ).stdout.strip()
+    survived = marker not in ("", "0")
+    reading = (
+        "nothing checks the store before opening it"
+        if survived
+        else "the store is restored on startup, or the damage never reached the file "
+        "pgbattery opens"
+    )
+    return (
+        f"After the restart the overwrite is {'STILL PRESENT' if survived else 'GONE'} "
+        f"({marker or 'no'} marker lines, file {size} bytes), so {reading}."
+    )
 
 
 def prove_oracle() -> None:
     """Show that damage to raft.db is noticed at all.
 
-    Overwrites the head of the store with random bytes -- past what any single
-    torn write does -- and requires the node to stop rather than run on it.
+    Overwrites the head of the store -- past what any single torn write does --
+    and requires the node to stop rather than run on it.
     Most tears land in uncommitted pages and are correctly a non-event, so
     without this a green run below could not be told apart from a fault that
     injected nothing.
@@ -475,17 +503,16 @@ def prove_oracle() -> None:
     lead = await_leader(CONVERGE_TIMEOUT_S)
     victim = next(n for n in topology.NODES if n != lead)
 
-    mangle_raft_db(victim, MANGLE_TIMEOUT_S)
+    mangle_raft_db(victim)
 
     fp.run(f"docker compose up -d --force-recreate {victim}")
     healthy, refused = await_victim_settled(victim, REFUSAL_TIMEOUT_S)
 
     if not refused:
         raise OracleNotProven(
-            f"{victim} kept running on a raft.db overwritten with random bytes "
-            f"(healthy={healthy}). Either the Raft store is not on LazyFS, or nothing "
-            f"checks the store before opening it. A green run below would then be "
-            f"measuring an observable that damage never reaches."
+            f"{victim} kept running on a raft.db this overwrote (healthy={healthy}). "
+            f"{describe_store(victim)} A green run below would be measuring an "
+            f"observable that damage never reaches."
         )
     print(f"oracle proven: {victim} would not run on a corrupted raft.db")
     reset_cluster()
