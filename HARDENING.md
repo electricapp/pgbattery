@@ -1148,13 +1148,13 @@ violation, and the first thing a Jepsen analysis would reach for.
       fault that failed to inject, but a proof that passed for the wrong
       reason.
 
-      redb has been torn, by probe rather than by suite. Arming
-      `arm_torn_write(..., mount=LAZYFS_RAFT)` on a follower's `raft.db` fires
-      on the next append — 2048 bytes of a 4096-byte write persisted — and the
-      node came back healthy in under a minute with every acked write readable
-      and no corruption reported. redb tolerated it, which is the expected
-      shape: its commit protocol rolls back to the last committed state, so a
-      tear in an uncommitted page is a non-event.
+      redb is torn by the suite, on both roles. Arming
+      `arm_torn_write(..., mount=LAZYFS_RAFT)` on `raft.db` fires on the next
+      append — 2048 bytes of a 4096-byte write persisted — and the node comes
+      back healthy in under a minute with every acked write readable and no
+      corruption reported. redb tolerates it, which is the expected shape: its
+      commit protocol rolls back to the last committed state, so a tear in an
+      uncommitted page is a non-event.
 
       A tolerated fault proves nothing on its own, so the observable was
       checked for reachability. With `raft.db` mangled past repair, redb
@@ -1170,8 +1170,22 @@ violation, and the first thing a Jepsen analysis would reach for.
       | mangled beyond repair       | detected — `All roots are corrupted`, the node refuses to start and says why |
 
       `testing/torn_raft.py` runs this, gated by the `torn-raft` job in
-      `durability.yml`. Three tears, all tolerated, no acked write lost, one
-      leader throughout, with the mangle case proven red first.
+      `durability.yml`, matrixed over both roles: a tear in a follower's store
+      and one in the leader's are different failures, since only the leader's
+      loss can take committed entries no one else has yet. Each job hunts a
+      tear of at least 512 persisted bytes over up to twelve attempts and fails
+      if none lands, so a run where the fault stopped working reads as a
+      failure rather than as tolerance. The mangle case is proven red first.
+
+      Two things about that inversion were learned the expensive way, and both
+      are the Class A1 pattern again. It checked that `dd` exited 0 and never
+      that the store had changed — and a store cannot be damaged from under a
+      running node, because redb rewrites its header on the next commit and
+      LazyFS flushes its own cached copy over whatever is written to the
+      backing root behind it. The overwrite now happens with the node stopped,
+      through a throwaway container on the same volume, and carries a marker
+      that is read back. Before that it passed for whichever reason the timing
+      happened to supply.
 
       Its pass condition is a disjunction rather than an outcome: tolerated or
       refused, both fine. What fails is the third state — a node neither

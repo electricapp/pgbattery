@@ -17,7 +17,10 @@ exactly once in the final database state.
 **Violation**: data loss or duplicate write after failover.
 
 **Tests**: `acked-write-durability`, `failover-commit-boundary`, I1/I2/I3 in
-`correctness-lite-invariants`.
+`correctness-lite-invariants`. Under faults the clean matrix cannot produce:
+`testing/durability_crash.py` (un-fsynced writes discarded with the process),
+`testing/torn_write.py` (a half-written WAL segment or control file), and
+`testing/wal_enospc.py` (the leader unable to allocate its next WAL segment).
 
 ---
 
@@ -61,7 +64,9 @@ Two concurrent nodes with valid leases constitute a split-brain violation.
 **Violation**: two nodes both accepting writes concurrently.
 
 **Tests**: `stale-leader-fencing`, `rogue-pg-promote`, I4 in
-`correctness-lite-invariants`.
+`correctness-lite-invariants`. Directly, by racing concurrent writes at all
+three internal PG ports: `testing/dual_writability_prober.py`, run standalone
+and again inside `testing/wal_enospc.py`'s full-disk window.
 
 ---
 
@@ -92,6 +97,9 @@ data loss on promotion.
 
 **Tests**: unit tests in `governor/state_machine.rs`
 (`test_lsn_election_threshold_boundary`, `test_lsn_acceptable_for_election`).
+`testing/torn_raft.py` covers the storage side of the same property: a node
+whose `raft.db` was torn must tolerate the damage cleanly or refuse to start,
+never come back voting on a store nothing vouched for.
 
 ---
 
@@ -168,7 +176,11 @@ write ACK until the write has been flushed to the standby's WAL.
 
 **Violation**: acked write not on standby disk before leader crash.
 
-**Tests**: `acked-write-durability` (sync replication path).
+**Tests**: `acked-write-durability` (sync replication path). The standby's own
+flush is only observable when nothing can cover for it, which is
+`testing/durability_crash.py` in `cluster-crash` mode; `testing/torn_write.py`
+and `testing/torn_raft.py` cover what survives when a write reaches the disk
+only in part.
 
 ---
 
@@ -180,18 +192,18 @@ observed failing is indistinguishable from one that cannot, and a suite full of
 those reports PASS on a broken cluster. `lint_matrix.py` enforces that this
 column is non-empty for every FATAL row.
 
-| Contract                          | Severity | Primary Tests                                                                                           | Inversion (proves the oracle can fail)                                                                    |
-| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| W1                                | FATAL    | `acked-write-durability`, `failover-commit-boundary`, `correctness-lite-invariants` I1/I2               | `assert-sanity-acked`, `assert-sanity-acked-dup`, `assert-sanity-chaos-oracle{,-post,-full}`              |
-| W2                                | FATAL    | `concurrent-writes-failover`, `rogue-pg-promote`, `correctness-lite-invariants` I3/B3/B4                | `assert-sanity-concurrent`, `assert-sanity-cascade-atomicity`, unit: `test_duplicate_ledger_row_flags_b3` |
-| W3                                | FATAL    | `ddl-failover`                                                                                          | `assert-sanity-ddl`                                                                                       |
-| L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4, `dual-writability-prober` | unit: `test_two_confirmed_acceptances_is_a_fatal_violation`, `test_split_brain_signal_flags_l2`           |
-| L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5                          | unit: `test_contained_ack_is_fatal_i5`, `test_fence_failure_signal_flags_l2`                              |
-| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`                                                            | unit: `test_emergency_fence_without_confirmation_flags_l3`, LSN-gate proptest                             |
-| Linearizability (single-register) | FATAL    | `linearizability-register`                                                                              | `testing/test_checker_sanity.py` — every `assert_flagged` case                                            |
-| V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                                      | —                                                                                                         |
-| V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                                     | `assert-sanity-diverged`                                                                                  |
-| S1                                | FATAL    | `failover-commit-boundary`, `prepared-transaction-semantics`                                            | `assert-sanity-commit-boundary`                                                                           |
-| S2                                | SLO      | `gateway-connection-survival`, `session-semantics-contract`                                             | `assert-sanity-gateway-migration`                                                                         |
-| R1                                | FATAL    | `replication-slot-no-leak`                                                                              | `assert-sanity-slot-leak`                                                                                 |
-| R2                                | FATAL    | `acked-write-durability` (sync path)                                                                    | `assert-sanity-acked-dup`                                                                                 |
+| Contract                          | Severity | Primary Tests                                                                                                                                                                            | Inversion (proves the oracle can fail)                                                                                                                                                                                                                  |
+| --------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| W1                                | FATAL    | `acked-write-durability`, `failover-commit-boundary`, `correctness-lite-invariants` I1/I2, `testing/durability_crash.py`, `testing/torn_write.py` (WAL/control), `testing/wal_enospc.py` | `assert-sanity-acked`, `assert-sanity-acked-dup`, `assert-sanity-chaos-oracle{,-post,-full}`, plus each durability suite's own inverted mode: `testing/durability_crash.py` weakened, `testing/torn_write.py` mangled, `testing/wal_enospc.py` unfilled |
+| W2                                | FATAL    | `concurrent-writes-failover`, `rogue-pg-promote`, `correctness-lite-invariants` I3/B3/B4                                                                                                 | `assert-sanity-concurrent`, `assert-sanity-cascade-atomicity`, unit: `test_duplicate_ledger_row_flags_b3`                                                                                                                                               |
+| W3                                | FATAL    | `ddl-failover`                                                                                                                                                                           | `assert-sanity-ddl`                                                                                                                                                                                                                                     |
+| L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4, `dual-writability-prober`, `testing/wal_enospc.py` (prober across the full-disk window)                    | unit: `test_two_confirmed_acceptances_is_a_fatal_violation`, `test_split_brain_signal_flags_l2`                                                                                                                                                         |
+| L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5                                                                                                           | unit: `test_contained_ack_is_fatal_i5`, `test_fence_failure_signal_flags_l2`                                                                                                                                                                            |
+| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`, `testing/torn_raft.py` — a torn `raft.db` must tolerate or refuse, never vote on a store nothing vouched for                               | unit: `test_emergency_fence_without_confirmation_flags_l3`, LSN-gate proptest, `testing/torn_raft.py` run with the store mangled past repair                                                                                                            |
+| Linearizability (single-register) | FATAL    | `linearizability-register`                                                                                                                                                               | `testing/test_checker_sanity.py` — every `assert_flagged` case                                                                                                                                                                                          |
+| V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                                                                                                                       | —                                                                                                                                                                                                                                                       |
+| V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                                                                                                                      | `assert-sanity-diverged`                                                                                                                                                                                                                                |
+| S1                                | FATAL    | `failover-commit-boundary`, `prepared-transaction-semantics`                                                                                                                             | `assert-sanity-commit-boundary`                                                                                                                                                                                                                         |
+| S2                                | SLO      | `gateway-connection-survival`, `session-semantics-contract`                                                                                                                              | `assert-sanity-gateway-migration`                                                                                                                                                                                                                       |
+| R1                                | FATAL    | `replication-slot-no-leak`                                                                                                                                                               | `assert-sanity-slot-leak`                                                                                                                                                                                                                               |
+| R2                                | FATAL    | `acked-write-durability` (sync path), `testing/durability_crash.py` cluster-crash, `testing/torn_write.py`, `testing/torn_raft.py`                                                       | `assert-sanity-acked-dup`, `testing/durability_crash.py` weakened under cluster-crash, `testing/torn_write.py` with full_page_writes off, `testing/torn_raft.py` mangled                                                                                |
