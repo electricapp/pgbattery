@@ -2030,20 +2030,28 @@ impl App {
     }
 
     fn ensure_join_data_dir_ready(&self) -> Result<()> {
-        let data_dir = &self.config.pg_data_dir;
-        if data_dir.exists() {
-            let entries = std::fs::read_dir(data_dir)?;
-            if entries.count() > 0 {
-                anyhow::bail!(
-                    "Data directory {} is not empty. Remove it first or use an empty directory.",
-                    data_dir.display()
-                );
-            }
-            return Ok(());
-        }
+        ensure_data_dir_ready(&self.config.pg_data_dir)
+    }
 
-        std::fs::create_dir_all(data_dir)?;
-        Ok(())
+    /// Discard a partial basebackup so the next start can retry the join.
+    ///
+    /// Safe to remove without inspection: [`ensure_data_dir_ready`] has already
+    /// established the directory was empty, so everything in it now was written
+    /// by the attempt that just failed.
+    fn discard_partial_join_data(&self) {
+        let data_dir = &self.config.pg_data_dir;
+        match clear_dir_contents(data_dir) {
+            Ok(()) => info!(
+                data_dir = %data_dir.display(),
+                "Discarded partial join data so the next start can retry"
+            ),
+            Err(e) => error!(
+                data_dir = %data_dir.display(),
+                error = %e,
+                "Could not discard partial join data; this node will refuse to start until \
+                 the directory is emptied by hand"
+            ),
+        }
     }
 
     async fn register_as_learner(
@@ -2431,6 +2439,11 @@ impl App {
                 "Join failed after learner registration, rolling back membership"
             );
             Self::rollback_join_registration(&client, &leader.mgmt_addr, self.config.node_id).await;
+            // Both halves, or the rollback is not one. A basebackup that dies
+            // mid-stream leaves PGDATA populated, and the emptiness check on the
+            // next start would then fail forever: a transient replication error
+            // would cost the node permanently.
+            self.discard_partial_join_data();
             return Err(e);
         }
 
@@ -2474,6 +2487,44 @@ impl App {
 /// a wall-clock source would let a forward time adjustment satisfy the gate
 /// while the deposed leader's lease is still valid. An anchor in the future
 /// clamps to zero elapsed, which only defers promotion.
+/// Require `data_dir` to exist and be empty, creating it when absent.
+///
+/// A join clones the leader's whole cluster into this directory, so anything
+/// already there would be silently mixed with it.
+fn ensure_data_dir_ready(data_dir: &std::path::Path) -> Result<()> {
+    if data_dir.exists() {
+        if std::fs::read_dir(data_dir)?.count() > 0 {
+            anyhow::bail!(
+                "Data directory {} is not empty. Remove it first or use an empty directory.",
+                data_dir.display()
+            );
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(data_dir)?;
+    Ok(())
+}
+
+/// Remove everything inside `data_dir`, leaving the directory itself.
+///
+/// The directory is kept because compose mounts a volume at that path; removing
+/// and recreating it would detach the mount.
+fn clear_dir_contents(data_dir: &std::path::Path) -> Result<()> {
+    if !data_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(data_dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn promotion_lease_holddown(
     failover_started_at: Option<Instant>,
     now: Instant,
@@ -2536,8 +2587,61 @@ fn are_paths_on_same_mount(_path1: &PathBuf, _path2: &PathBuf) -> Result<bool> {
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
-    use super::promotion_lease_holddown;
+    use super::{clear_dir_contents, ensure_data_dir_ready, promotion_lease_holddown};
     use std::time::{Duration, Instant};
+
+    /// A join that dies partway leaves PGDATA populated, and the emptiness
+    /// check on the next start then fails forever. Observed in CI: a
+    /// `pg_basebackup` whose replication stream terminated left node3
+    /// restart-looping on "Data directory is not empty", so a transient error
+    /// during the clone cost the node permanently.
+    mod partial_join_cleanup {
+        use super::{clear_dir_contents, ensure_data_dir_ready};
+
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("pgbattery-join-{name}"));
+            drop(std::fs::remove_dir_all(&dir));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn a_partial_clone_leaves_the_node_able_to_retry() {
+            let dir = scratch("retry");
+            std::fs::write(dir.join("PG_VERSION"), "16").unwrap();
+            std::fs::create_dir_all(dir.join("base/1")).unwrap();
+            std::fs::write(dir.join("base/1/2601"), [0u8; 64]).unwrap();
+            assert!(ensure_data_dir_ready(&dir).is_err());
+
+            clear_dir_contents(&dir).unwrap();
+
+            assert!(ensure_data_dir_ready(&dir).is_ok());
+            assert!(dir.exists(), "the mount point itself must survive");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn clearing_an_absent_directory_is_not_an_error() {
+            let dir = scratch("absent");
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(clear_dir_contents(&dir).is_ok());
+        }
+
+        #[test]
+        fn an_empty_directory_is_already_ready() {
+            let dir = scratch("empty");
+            assert!(ensure_data_dir_ready(&dir).is_ok());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_missing_directory_is_created() {
+            let dir = scratch("created").join("nested");
+            assert!(ensure_data_dir_ready(&dir).is_ok());
+            assert!(dir.is_dir());
+            std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        }
+    }
 
     const LEASE: Duration = Duration::from_secs(2);
 
