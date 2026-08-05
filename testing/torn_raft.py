@@ -60,6 +60,12 @@ REFUSAL_TIMEOUT_S: Final[float] = 90.0
 # The entrypoint gives itself 30s per mount and there are two, so this covers
 # a slow runner without ever masking a mount that is genuinely absent.
 MOUNT_TIMEOUT_S: Final[float] = 90.0
+MANGLE_TIMEOUT_S: Final[float] = 30.0
+MANGLE_MARKER: Final[str] = "PGBATTERYMANGLE"
+"""Written over raft.db's head by the inversion. Recognisable on read-back, so
+the damage can be confirmed rather than assumed."""
+MANGLE_BYTES: Final[int] = 81920
+
 CORRUPT_MARKER: Final[str] = "Raft DB corrupted"
 """Emitted by `src/governor/storage.rs` when redb returns an error opening the
 store. Matched rather than a redb string so a change in redb's wording surfaces
@@ -424,6 +430,39 @@ def reset_cluster() -> None:
     await_fault_readiness()
 
 
+def mangle_raft_db(victim: str, timeout_s: float) -> None:
+    """Overwrite the head of `victim`'s raft.db and prove the damage stuck.
+
+    The node is live while this runs, and redb rewrites its header on every
+    commit, so a `dd` that exited 0 is not a damaged store: a follower catching
+    up puts a valid header back within the same second, and the node then
+    starts perfectly happily on a store this was supposed to have destroyed.
+
+    A repeating marker rather than /dev/urandom, because random bytes cannot be
+    told apart from redb's own afterwards. It destroys the header just as well.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        fp.exec_when_deliverable(
+            victim,
+            f"yes {MANGLE_MARKER} | head -c {MANGLE_BYTES} > /tmp/mangle.bin && "
+            f"dd if=/tmp/mangle.bin of={RAFT_DB} bs={MANGLE_BYTES} count=1 conv=notrunc",
+            timeout_s=timeout_s,
+        )
+        stuck = fp.exec_when_deliverable(
+            victim, f"head -c {MANGLE_BYTES} {RAFT_DB} | grep -ac {MANGLE_MARKER} || true"
+        )
+        if stuck.stdout.strip() not in ("", "0"):
+            return
+        if time.monotonic() >= deadline:
+            raise fp.FaultPreconditionError(
+                f"{victim}: raft.db still holds a valid header {timeout_s:g}s after being "
+                f"overwritten, so redb is rewriting it as fast as this damages it. The "
+                f"inversion cannot run: nothing would be measuring a damaged store."
+            )
+        time.sleep(0.5)
+
+
 def prove_oracle() -> None:
     """Show that damage to raft.db is noticed at all.
 
@@ -436,15 +475,7 @@ def prove_oracle() -> None:
     lead = await_leader(CONVERGE_TIMEOUT_S)
     victim = next(n for n in topology.NODES if n != lead)
 
-    # The victim churns through restarts under this suite, and an exec that
-    # never lands says nothing about whether raft.db could be mangled.
-    mangle = fp.exec_when_deliverable(
-        victim,
-        f"dd if=/dev/urandom of={RAFT_DB} bs=4096 count=20 conv=notrunc 2>/dev/null",
-        timeout_s=MOUNT_TIMEOUT_S,
-    )
-    if not mangle.ok:
-        raise fp.FaultPreconditionError(f"{victim}: could not mangle raft.db: {mangle.output}")
+    mangle_raft_db(victim, MANGLE_TIMEOUT_S)
 
     fp.run(f"docker compose up -d --force-recreate {victim}")
     healthy, refused = await_victim_settled(victim, REFUSAL_TIMEOUT_S)
