@@ -118,3 +118,14 @@ Every state transition is driven by a **definitive source of truth** — never b
 - **SQL budget**: every probe inside `lease_enforcement_tick` is wrapped in `tokio::time::timeout(LEASE_TICK_SQL_BUDGET = 1 s)`; overruns are treated as failed probes and fail-closed (fence).
 - **Fence escalation**: `default_transaction_read_only = 'on'` only changes the _default_ — existing sessions and `BEGIN READ WRITE` bypass it. After the GUC applies, the emergency fence terminates client backends (`pg_terminate_backend` over `backend_type = 'client backend'`), so in-flight sessions on a deposed primary cannot keep committing writes that a later rewind destroys.
 - **Cache**: none. Every tick re-queries PG. Failed probes are treated as "PG might be writable" (fail-closed). After `FENCE_FAILURE_SHUTDOWN_THRESHOLD` (= 5) consecutive fence failures, the loop signals process shutdown so Docker's `restart: on-failure` brings us back with a clean slate.
+
+### 9. Leadership transfer — the lame-duck window
+
+- **Purpose**: hand leadership to a chosen target without the cluster electing someone else.
+- **States**: `heartbeating → silent (draining) → silent (handing off) → heartbeating`. `HeartbeatGuard`'s `Drop` restores the last edge on every exit, including a cancelled handler future or a panic.
+- **Source of truth**: `RaftMetrics::current_leader`, re-read after the drain — leadership can move while this node is silent, and triggering an election then would bump a term against a cluster that already has a leader.
+- **Code**: `src/observability/management_api/cluster.rs` — `transfer_leadership`, `elect_readiness`, `trigger_elect`.
+- **The drain is what removes the protection.** openraft refuses to grant a vote while a follower's lease for the current leader is live, so no follower can elect during the drain itself. The moment it expires every follower is eligible and its election timer starts. Everything the leader does after the drain is therefore a race it can lose, and losing it is a third node taking the term mid-transfer.
+- **Budget**: `lame_duck_budget_after_drain_ms()` sums every post-drain cost — the lease safety overshoot, the trigger-elect client timeout, and the handover observation. A constants test pins it below `DEFAULT_ELECTION_TIMEOUT_MS`. Anything that can block for longer than that budget must happen **before** heartbeats stop, or it is not a transfer, it is an outage.
+- **Readiness is asked outside the window.** A target mid-demote holds its supervisor lock for seconds; `elect_readiness` waits that out while the leader is still heartbeating and refuses the transfer outright if the target cannot serve. `trigger_elect` re-checks the same condition inside the window under a short bound, because only "did this change during the drain" is still open by then.
+- **Cache**: none. Readiness is re-derived on both calls; the second is not trusted to the first.

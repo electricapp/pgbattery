@@ -24,9 +24,11 @@ use tracing::{error, info, warn};
 
 use crate::cluster::{AdvertisedAddresses, JoinRequest, MemberRole};
 use crate::config::constants::{
+    ELECT_READINESS_CLIENT_TIMEOUT_SECS, ELECT_READINESS_SUPERVISOR_WAIT_SECS,
     LEADERSHIP_TRANSFER_CATCHUP_TOLERANCE, LEADERSHIP_TRANSFER_LEASE_SAFETY_MS,
-    MEMBERSHIP_APPLY_TIMEOUT_SECS, MGMT_API_JOIN_MAX_RETRIES, MGMT_API_JOIN_RETRY_DELAY_MS,
-    TRIGGER_ELECT_CLIENT_TIMEOUT_SECS, TRIGGER_ELECT_SUPERVISOR_WAIT_SECS,
+    LEADERSHIP_TRANSFER_OBSERVE_MS, MEMBERSHIP_APPLY_TIMEOUT_SECS, MGMT_API_JOIN_MAX_RETRIES,
+    MGMT_API_JOIN_RETRY_DELAY_MS, TRIGGER_ELECT_CLIENT_TIMEOUT_MS,
+    TRIGGER_ELECT_SUPERVISOR_WAIT_MS,
 };
 use crate::governor::DEFAULT_LEASE_DURATION;
 use crate::governor::state_machine::NodeId;
@@ -837,10 +839,64 @@ pub(super) async fn remove_node(
     }
 }
 
+/// Why this node could not win an election right now, or `None` if it can.
+///
+/// Electing a node whose PG is mid-demote puts it in leader state while
+/// `PostgreSQL` is still restarting to follow the old leader: the lease can't be
+/// established, it steps down again, and the cluster term-churns.
+///
+/// `lock_wait` is the caller's budget — generous for the readiness probe, which
+/// runs while the leader still heartbeats, short for the trigger, which does
+/// not.
+async fn elect_blocker(state: &ManagementApiState, lock_wait: Duration) -> Option<String> {
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        // A witness has no database, so electing it would route clients
+        // nowhere.
+        return Some("node runs no PostgreSQL (witness)".to_string());
+    };
+    let Ok(mut pg) = tokio::time::timeout(lock_wait, pg.lock()).await else {
+        return Some(format!(
+            "supervisor busy for >{}ms (demote/rewind in progress?)",
+            lock_wait.as_millis()
+        ));
+    };
+    let liveness = pg.is_alive();
+    drop(pg);
+    match liveness {
+        Ok(true) => None,
+        Ok(false) => Some("PostgreSQL not running".to_string()),
+        // Unknown PG state — not-ready rather than lead on a broken node.
+        Err(e) => Some(format!("PostgreSQL liveness probe failed: {e}")),
+    }
+}
+
+/// Report whether this node can take leadership, without taking it.
+///
+/// The leader asks before it stops heartbeating, so this wait costs the cluster
+/// nothing. Waiting inside the lame-duck window instead is what let a busy
+/// target hold the leader silent past a follower's election timeout.
+pub(super) async fn elect_readiness(
+    State(state): State<Arc<ManagementApiState>>,
+) -> impl IntoResponse {
+    let wait = Duration::from_secs(ELECT_READINESS_SUPERVISOR_WAIT_SECS);
+    elect_blocker(&state, wait).await.map_or_else(
+        || StatusCode::OK.into_response(),
+        |reason| {
+            warn!(
+                node_id = state.node_id,
+                reason, "Not ready to take leadership"
+            );
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        },
+    )
+}
+
 /// Trigger an immediate Raft election on this node.
 ///
-/// Called by the leader on a target follower during leadership transfer.
-/// Protected by the management token — not intended for external callers.
+/// Called by the leader on a target follower during leadership transfer, inside
+/// the lame-duck window. The readiness re-check is short-bounded for that
+/// reason: `elect_readiness` established it before the drain, and this only
+/// confirms nothing changed during it.
 pub(super) async fn trigger_elect(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
@@ -848,65 +904,9 @@ pub(super) async fn trigger_elect(
         node_id = state.node_id,
         "Triggering Raft election on request"
     );
-    // Don't accept an election trigger while our local PG is mid-operation
-    // (e.g. a standby-reconfigure / pg_rewind triggered by the *previous*
-    // leadership change is still in progress).  Winning an election here
-    // would put us into leader state while PG is still restarting to follow
-    // the old leader — the lease can't be established, we'd immediately
-    // step down, and the cluster term-churns into leaderless wedge.
-    if let Some(pg) = state.postgres_manager.as_ref() {
-        // Bound the wait at 10s.
-        //
-        // Fast-path operations (config check, single SQL probes) hold
-        // the supervisor lock for ~10-100 ms. Slow-path operations
-        // (pg_rewind, stop/start cycle) hold it for several seconds.
-        // A bare `try_lock` would 503 on the fast-path contention
-        // window — turning every rapid leadership cascade into a flake.
-        // Waiting up to 10s covers any legitimate operation; if the
-        // lock is still held after that, the supervisor is genuinely
-        // stuck and we *should* refuse.
-        let Ok(mut pg) = tokio::time::timeout(
-            Duration::from_secs(TRIGGER_ELECT_SUPERVISOR_WAIT_SECS),
-            pg.lock(),
-        )
-        .await
-        else {
-            warn!(
-                node_id = state.node_id,
-                "Refusing election trigger: supervisor busy for >10s (stuck demote/rewind?)"
-            );
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let liveness = pg.is_alive();
-        drop(pg);
-        match liveness {
-            Ok(true) => {}
-            Ok(false) => {
-                warn!(
-                    node_id = state.node_id,
-                    "Refusing election trigger: PostgreSQL not running"
-                );
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            Err(e) => {
-                // Unknown PG state — treat as not-ready rather than
-                // becoming leader on a node whose PG might be broken.
-                warn!(
-                    node_id = state.node_id,
-                    error = %e,
-                    "Refusing election trigger: PostgreSQL liveness probe failed"
-                );
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-        }
-    } else {
-        // No PostgreSQL here (witness): electing it would route clients to a
-        // node with no database. Refuse so a misdirected trigger/transfer fails
-        // cleanly instead of electing a primary-less leader.
-        warn!(
-            node_id = state.node_id,
-            "Refusing election trigger: node runs no PostgreSQL (witness) — cannot serve as primary"
-        );
+    let wait = Duration::from_millis(TRIGGER_ELECT_SUPERVISOR_WAIT_MS);
+    if let Some(reason) = elect_blocker(&state, wait).await {
+        warn!(node_id = state.node_id, reason, "Refusing election trigger");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     match state.raft.trigger().elect().await {
@@ -1160,6 +1160,31 @@ pub(super) async fn transfer_leadership(
         }
     }
 
+    // Establish that the target can actually take the election BEFORE going
+    // silent. A target mid-demote holds its supervisor lock for seconds, and
+    // waiting for it inside the lame-duck window is what let a third node
+    // elect itself while this leader sat quiet.
+    if let Err(e) =
+        confirm_target_ready(target_mgmt_addr, state.management_api_token.as_deref()).await
+    {
+        warn!(target_node_id, error = %e, "Refusing leadership transfer: target not ready");
+        // A refusal is "not yet" — the target is demoting and will be able to
+        // take it shortly, so callers retry. Being unable to reach it at all is
+        // not the same answer and must not read as one.
+        let status = match e {
+            TriggerElectError::Refused(_) => StatusCode::CONFLICT,
+            TriggerElectError::Transport(_) => StatusCode::BAD_GATEWAY,
+        };
+        return (
+            status,
+            Json(TransferResponse {
+                success: false,
+                message: format!("Node {target_node_id} cannot take leadership: {e}"),
+                new_leader_id: Some(state.node_id),
+            }),
+        );
+    }
+
     // openraft (CheckQuorum) won't let a follower vote for a new candidate
     // while the follower's *leader lease* (2s) for the current leader is
     // still valid.  That means if we trigger an election on the target too
@@ -1169,14 +1194,13 @@ pub(super) async fn transfer_leadership(
     // cluster.  So: stop heartbeats, wait for the lease to drain on
     // followers, *then* tell the target to elect.
     //
-    // Followers won't start their own elections during this window —
-    // openraft gates follower election start on lease expiration too, so
-    // the gap is a controlled lame-duck interval rather than chaos.
-    // Restore heartbeats on ANY exit from the lame-duck window below —
-    // including a cancelled handler future (the client disconnecting aborts
-    // this future mid-await) or a panic. Without this an interrupted transfer
-    // would leave a non-heartbeating leader and the cluster goes leaderless
-    // until an election timeout.
+    // The drain is also what un-gates follower elections: they are held off by
+    // that same lease. Everything after it is a race against their election
+    // timers, which is why `lame_duck_budget_after_drain_ms` bounds the rest of
+    // this window and a constants test pins it below `election_timeout_min`.
+    // Restore heartbeats on ANY exit from the window — including a cancelled
+    // handler future (the client disconnecting aborts this future mid-await)
+    // or a panic — or an interrupted transfer leaves a non-heartbeating leader.
     state.raft.runtime_config().heartbeat(false);
     let hb_guard = HeartbeatGuard(state.raft.as_ref());
     tokio::time::sleep(
@@ -1213,11 +1237,28 @@ pub(super) async fn transfer_leadership(
     let elect_result =
         trigger_election_on_node(target_mgmt_addr, state.management_api_token.as_deref()).await;
 
+    if let Err(e) = elect_result {
+        // Resume heartbeats now rather than after the observe loop: nothing is
+        // coming, and every further millisecond of silence is one a follower
+        // can spend timing out.
+        drop(hb_guard);
+        error!(error = %e, target_node_id, "Failed to trigger election on target");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(TransferResponse {
+                success: false,
+                message: format!("Failed to contact node {target_node_id}: {e}"),
+                new_leader_id: Some(state.node_id),
+            }),
+        );
+    }
+
     // Poll the leader watch until it either clears (someone else won) or
     // stays as us for too long (target's election failed).  This is much
     // tighter than blindly sleeping: as soon as we see a leader change we
     // stop, so heartbeats are off for the minimum possible window.
-    let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let wait_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(LEADERSHIP_TRANSFER_OBSERVE_MS);
     loop {
         let now_leader = state.raft.metrics().borrow().current_leader;
         if now_leader != Some(state.node_id) {
@@ -1235,18 +1276,6 @@ pub(super) async fn transfer_leadership(
     // heartbeats from the new leader dominate and the *other* follower gets
     // its election timeout reset, preventing a split-vote cascade.
     drop(hb_guard);
-
-    if let Err(e) = elect_result {
-        error!(error = %e, target_node_id, "Failed to trigger election on target");
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(TransferResponse {
-                success: false,
-                message: format!("Failed to contact node {target_node_id}: {e}"),
-                new_leader_id: Some(state.node_id),
-            }),
-        );
-    }
 
     // Poll until leadership changes.
     let new_leader = poll_for_leader_change(&state.raft, state.node_id).await;
@@ -1322,20 +1351,14 @@ fn trigger_elect_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
-async fn trigger_election_on_node(
+async fn post_internal(
     target_mgmt_addr: std::net::SocketAddr,
+    path: &str,
     token: Option<&str>,
+    timeout: Duration,
 ) -> Result<(), TriggerElectError> {
-    // The client timeout MUST be greater than the server's internal
-    // supervisor-lock wait ([`TRIGGER_ELECT_SUPERVISOR_WAIT_SECS`]); a
-    // tighter client timeout surfaces legitimate slow-path work
-    // (pg_rewind, follow-restart after a step-down) as a spurious
-    // transport error during rapid leadership churn. Constants enforce
-    // the invariant at compile-time (test in config::constants).
-    let url = format!("http://{target_mgmt_addr}/internal/trigger-elect");
-    let mut req = trigger_elect_client()
-        .post(&url)
-        .timeout(Duration::from_secs(TRIGGER_ELECT_CLIENT_TIMEOUT_SECS));
+    let url = format!("http://{target_mgmt_addr}/internal/{path}");
+    let mut req = trigger_elect_client().post(&url).timeout(timeout);
     if let Some(t) = token {
         req = req.header("x-pgbattery-token", t);
     }
@@ -1345,6 +1368,36 @@ async fn trigger_election_on_node(
         return Ok(());
     }
     Err(TriggerElectError::Refused(status))
+}
+
+/// Ask the target whether it can take leadership. Runs before heartbeats stop,
+/// so it may wait out a slow supervisor.
+async fn confirm_target_ready(
+    target_mgmt_addr: std::net::SocketAddr,
+    token: Option<&str>,
+) -> Result<(), TriggerElectError> {
+    post_internal(
+        target_mgmt_addr,
+        "elect-readiness",
+        token,
+        Duration::from_secs(ELECT_READINESS_CLIENT_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// Tell the target to elect. Runs inside the lame-duck window, so the timeout
+/// is part of `lame_duck_budget_after_drain_ms`.
+async fn trigger_election_on_node(
+    target_mgmt_addr: std::net::SocketAddr,
+    token: Option<&str>,
+) -> Result<(), TriggerElectError> {
+    post_internal(
+        target_mgmt_addr,
+        "trigger-elect",
+        token,
+        Duration::from_millis(TRIGGER_ELECT_CLIENT_TIMEOUT_MS),
+    )
+    .await
 }
 
 /// Poll Raft metrics until a different node becomes leader, or 10 s elapses.

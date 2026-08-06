@@ -63,6 +63,13 @@ LINEARIZABILITY_PATH = TESTING_DIR / "linearizability_register.py"
 UNIT_TEST_PATH = TESTING_DIR / "test_ci_runner_units.py"
 CONTRACTS_PATH = PROJECT_ROOT / "docs" / "CONTRACTS.md"
 
+DEFAULT_TRANSFER_RETRY_SEC = 60
+"""`ci_runner.py`'s default `retry_sec` for a transfer_leadership step."""
+
+MIN_TRANSFER_RETRY_SEC = 30
+"""Floor for that budget: a demote stops PostgreSQL, may run pg_rewind, and
+restarts into recovery, and the target refuses the transfer throughout."""
+
 # Optional scripts are checked only if they exist (skeletons during build-out).
 _OPTIONAL_SCRIPTS = [LINEARIZABILITY_PATH, UNIT_TEST_PATH]
 PYTHON_SCRIPTS = [RUNNER_PATH, CORRECTNESS_LITE_PATH, OVERNIGHT_PATH] + [
@@ -574,48 +581,67 @@ def check_matrix_cluster_matches_compose() -> None:
         raise AssertionError("; ".join(problems))
 
 
-def transfers_into_an_unsettled_cluster(
-    cases: list[dict[str, Any]], expected_nodes: int
+def transfers_that_cannot_wait_out_a_demote(
+    cases: list[dict[str, Any]], min_retry_sec: int
 ) -> list[str]:
-    """Transfers whose preceding wait would pass with a follower still demoting.
+    """Transfers that give up before the target could finish demoting.
 
-    `wait_cluster` returns as soon as the named leader is in place, and the node
-    that just gave leadership up is still restarting PostgreSQL into recovery at
-    that moment. A transfer aimed at it is refused -- `trigger_elect` in
-    `management_api/cluster.rs` returns 503 while the supervisor is busy or PG
-    is down, deliberately, because electing a node mid-demote term-churns the
-    cluster into a leaderless wedge.
+    A target still demoting refuses with 409 and the leader keeps heartbeating
+    (`transfer_leadership` in `management_api/cluster.rs` asks readiness before
+    it goes silent). The refusal means "not yet", so the runner retries within
+    `retry_sec`; a budget shorter than a demote turns a working safety gate into
+    a failed case.
 
-    `min_healthy_replicas` is the gate: requiring every follower healthy means
-    the demotion finished before the next transfer is asked for.
+    No wait can substitute for this. `min_healthy_replicas` reads the leader's
+    replication view, which still shows the outgoing leader healthy for as long
+    as it takes that node to notice it must demote.
     """
-    required = max(1, expected_nodes - 1)
     problems: list[str] = []
     for case in cases:
-        actions = case.get("actions") or []
-        for index, action in enumerate(actions):
-            if index == 0 or action.get("type") != "transfer_leadership":
+        for index, action in enumerate(case.get("actions") or []):
+            if action.get("type") != "transfer_leadership":
                 continue
-            previous = actions[index - 1]
-            if previous.get("type") != "wait_cluster":
-                continue
-            if int(previous.get("min_healthy_replicas", 1)) < required:
+            retry_sec = int(action.get("retry_sec", DEFAULT_TRANSFER_RETRY_SEC))
+            if retry_sec < min_retry_sec:
                 problems.append(
-                    f"{case['id']}: the wait before action {index} "
-                    f"(transfer to node {action.get('target_node_id')}) does not require "
-                    f"min_healthy_replicas >= {required}, so it can pass while the node "
-                    f"that just demoted is still restarting PostgreSQL, and the transfer "
-                    f"is refused with 503"
+                    f"{case['id']}: the transfer at action {index} (to node "
+                    f"{action.get('target_node_id')}) retries for only {retry_sec}s, "
+                    f"under the {min_retry_sec}s a target needs to finish demoting; "
+                    f"a 409 means not-yet, and giving up on it fails the case for "
+                    f"the gate working"
                 )
     return problems
 
 
-def check_transfers_wait_for_settled_followers() -> None:
-    """A chained leadership transfer must wait for the demoted node to settle."""
-    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
-    problems = transfers_into_an_unsettled_cluster(
-        data["cases"], int(data["cluster"]["expected_nodes"])
+def runner_transfer_retry_default() -> int:
+    """The default `retry_sec` as `ci_runner.py` actually reads it.
+
+    Read rather than restated. A gate this file names but never checks against
+    its source is how `min_healthy_replicas: 2` came to be documented as a
+    settling guarantee it did not provide.
+    """
+    match = re.search(
+        r"""step\.get\(\s*["']retry_sec["']\s*,\s*(\d+)\s*\)""",
+        RUNNER_PATH.read_text(encoding="utf-8"),
     )
+    if match is None:
+        raise AssertionError(
+            "could not find the retry_sec default in ci_runner.py; this check would "
+            "otherwise pass while measuring a constant nothing reads"
+        )
+    return int(match.group(1))
+
+
+def check_transfers_can_wait_out_a_demote() -> None:
+    """A leadership transfer must outlast the target's demote before failing."""
+    actual = runner_transfer_retry_default()
+    if actual != DEFAULT_TRANSFER_RETRY_SEC:
+        raise AssertionError(
+            f"ci_runner.py defaults retry_sec to {actual}s, not the "
+            f"{DEFAULT_TRANSFER_RETRY_SEC}s this lint assumes"
+        )
+    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    problems = transfers_that_cannot_wait_out_a_demote(data["cases"], MIN_TRANSFER_RETRY_SEC)
     if problems:
         raise AssertionError(" | ".join(problems))
 
@@ -778,10 +804,7 @@ def lint() -> None:
     check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
     check("Matrix cluster matches docker-compose", check_matrix_cluster_matches_compose)
     check("Compose services pin a build target", check_build_targets_are_explicit)
-    check(
-        "Chained transfers wait for settled followers",
-        check_transfers_wait_for_settled_followers,
-    )
+    check("Transfers can wait out a demote", check_transfers_can_wait_out_a_demote)
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
 
     table = Table(title="Test Harness Lint", show_lines=False)

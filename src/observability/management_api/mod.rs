@@ -272,6 +272,7 @@ pub async fn start_management_api(
             "/api/v1/cluster/transfer-leadership/{target_node_id}",
             post(cluster::transfer_leadership),
         )
+        .route("/internal/elect-readiness", post(cluster::elect_readiness))
         .route("/internal/trigger-elect", post(cluster::trigger_elect))
         .route("/api/v1/cluster/join", post(cluster::join_cluster))
         // LSN reporting is a write path (updates Raft state), so protect it too.

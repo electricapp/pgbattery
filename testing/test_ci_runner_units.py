@@ -23,6 +23,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from pydantic import ValidationError
 from rich.console import Console
@@ -957,50 +958,84 @@ def test_every_real_compose_file_pins_its_build_target() -> None:
     lint_matrix.check_build_targets_are_explicit()
 
 
-def _cascade(min_healthy: int | None) -> list[dict[str, object]]:
-    wait: dict[str, object] = {"type": "wait_cluster", "nodes": 3, "leaders": 1}
-    if min_healthy is not None:
-        wait["min_healthy_replicas"] = min_healthy
-    return [
-        {
-            "id": "cascade",
-            "actions": [
-                {"type": "transfer_leadership", "target_node_id": 2},
-                wait,
-                {"type": "transfer_leadership", "target_node_id": 1},
-            ],
-        }
-    ]
+def _transfer_replies(runner: StubRunner, replies: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Drive one transfer step against canned HTTP replies, recording each."""
+    seen: list[tuple[int, str]] = []
+    pending = iter(replies)
+
+    def http(
+        method: str, url: str, timeout_sec: int = 15, headers: dict[str, str] | None = None
+    ) -> tuple[int, str]:
+        reply = next(pending)
+        seen.append(reply)
+        return reply
+
+    log = runner.artifact_dir / "transfer.log"
+    with (
+        mock.patch.object(runner, "_get_leader_id", return_value=1),
+        mock.patch.object(runner, "_http_request", side_effect=http),
+        mock.patch("time.sleep"),
+    ):
+        runner._execute_transfer_leadership(
+            {"type": "transfer_leadership", "target_node_id": 2}, log
+        )
+    return seen
 
 
-def test_a_transfer_after_a_leader_only_wait_is_flagged() -> None:
-    """The shape that made the cascade case flaky.
+def test_a_target_that_is_not_ready_yet_is_retried() -> None:
+    """A demoting target answers 409 while the leader keeps heartbeating. That
+    is the safety gate working, and it means not-yet, not no."""
+    runner = make_runner()
+    seen = _transfer_replies(
+        runner,
+        [
+            (409, '{"success":false,"message":"Node 2 cannot take leadership"}'),
+            (409, '{"success":false,"message":"Node 2 cannot take leadership"}'),
+            (200, '{"success":true,"message":"Leadership transferred to node 2"}'),
+        ],
+    )
+    assert [status for status, _ in seen] == [409, 409, 200]
 
-    `wait_cluster` passes the moment the new leader is in place, while the node
-    that just gave leadership up is still restarting PostgreSQL into recovery.
-    Asking that node to take leadership back gets a deliberate 503 from
-    `trigger_elect`, which refuses to elect a node whose PG is mid-demote.
-    """
-    problems = lint_matrix.transfers_into_an_unsettled_cluster(_cascade(None), 3)
+
+def test_an_unreachable_target_is_not_retried() -> None:
+    """502 is a different answer from 409: the leader could not reach the
+    target at all, which retrying will not resolve."""
+    runner = make_runner()
+    assert_raises(
+        ci_runner.RunnerError,
+        lambda: _transfer_replies(runner, [(502, '{"success":false,"message":"transport error"}')]),
+        "502",
+    )
+
+
+def _transfers(retry_sec: int | None) -> list[dict[str, object]]:
+    action: dict[str, object] = {"type": "transfer_leadership", "target_node_id": 2}
+    if retry_sec is not None:
+        action["retry_sec"] = retry_sec
+    return [{"id": "cascade", "actions": [action]}]
+
+
+def test_a_transfer_that_gives_up_before_a_demote_finishes_is_flagged() -> None:
+    """A 409 means not-yet. Giving up on it fails the case for the safety gate
+    doing its job."""
+    problems = lint_matrix.transfers_that_cannot_wait_out_a_demote(_transfers(5), 30)
     assert len(problems) == 1
     assert "cascade" in problems[0]
-    assert "min_healthy_replicas >= 2" in problems[0]
+    assert "retries for only 5s" in problems[0]
 
 
-def test_a_transfer_that_waits_for_every_follower_passes() -> None:
-    assert lint_matrix.transfers_into_an_unsettled_cluster(_cascade(2), 3) == []
+def test_the_runner_default_is_budget_enough() -> None:
+    assert lint_matrix.transfers_that_cannot_wait_out_a_demote(_transfers(None), 30) == []
 
 
-def test_a_transfer_not_preceded_by_a_wait_is_not_this_checks_business() -> None:
-    """The first transfer of a case runs against a cluster the runner just
-    brought up and asserted on; only a chained one races a demotion."""
-    cases = [{"id": "first", "actions": [{"type": "transfer_leadership", "target_node_id": 2}]}]
-    assert lint_matrix.transfers_into_an_unsettled_cluster(cases, 3) == []
+def test_the_retry_default_is_read_from_the_runner_not_restated() -> None:
+    """The mistake this replaces: naming a gate without checking it is live."""
+    assert lint_matrix.runner_transfer_retry_default() == lint_matrix.DEFAULT_TRANSFER_RETRY_SEC
 
 
-def test_the_real_matrix_waits_for_settled_followers() -> None:
+def test_the_real_matrix_can_wait_out_a_demote() -> None:
     """The check against ci_matrix.yaml itself, not a fixture."""
-    lint_matrix.check_transfers_wait_for_settled_followers()
+    lint_matrix.check_transfers_can_wait_out_a_demote()
 
 
 def test_contract_violations_flag_missing_declarations() -> None:

@@ -413,6 +413,20 @@ impl Config {
             );
         }
 
+        // A leadership transfer drains the follower leases and then goes on
+        // being silent while it hands over. The drain un-gates follower
+        // elections, so everything after it must fit inside one election
+        // timeout or a third node takes the term mid-transfer.
+        let lame_duck_ms = crate::config::constants::lame_duck_budget_after_drain_ms();
+        if self.election_timeout_ms <= lame_duck_ms {
+            anyhow::bail!(
+                "election_timeout_ms ({}) must exceed the {lame_duck_ms} ms a leadership \
+                 transfer stays silent after draining the follower leases, or a third node \
+                 elects itself while the handover is still in flight",
+                self.election_timeout_ms
+            );
+        }
+
         // A zero cap would reject every connection, bricking the gateway.
         if self.max_connections == 0 {
             anyhow::bail!("max_connections must be > 0");
@@ -1044,6 +1058,30 @@ mod tests {
         let result = Config::load_from(file.path().to_str().unwrap());
         let message = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(message.contains("watchdog"), "got: {message}");
+    }
+
+    #[test]
+    fn test_election_timeout_under_the_transfer_silence_rejected() {
+        // A transfer drains the follower leases and keeps quiet while handing
+        // over. Configure an election timeout shorter than that silence and a
+        // third node elects itself mid-transfer, every time.
+        let toml = r#"
+            node_id = 1
+            listen_addr = "0.0.0.0:5432"
+            raft_addr = "0.0.0.0:5433"
+            metrics_addr = "0.0.0.0:9090"
+            management_api_token = "test-token"
+            pg_bin_dir = "/usr/lib/postgresql/16/bin"
+            pg_data_dir = "/var/lib/postgresql/data"
+            election_timeout_ms = 300
+            heartbeat_interval_ms = 100
+        "#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(toml.as_bytes()).unwrap();
+        let result = Config::load_from(file.path().to_str().unwrap());
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(message.contains("stays silent"), "got: {message}");
     }
 
     #[test]

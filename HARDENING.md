@@ -92,16 +92,27 @@ read waits the container out now, an unreadable log is carried as its own
 finding, and a refusal on a store-damage shape establishes the damage without the
 log at all.
 
-There is a fourth shape, on the precondition side rather than the reading side.
-`wait_cluster` returns the moment the named leader is in place, and the node that
-just gave leadership up is still restarting PostgreSQL into recovery then. The
-transfer cascades chained straight off that wait, so the next transfer could be
-aimed at a node mid-demote — which `trigger_elect` refuses with a 503, by design,
-because electing it would term-churn the cluster into a leaderless wedge. The
-case failed two different ways on consecutive CI runs, which is what an
-unestablished precondition looks like from the outside. Thirteen waits across six
-cases now require every follower healthy, and `lint_matrix.py` fails any chained
-transfer that does not.
+There is a fourth shape, and it is the most expensive one here: a harness gate
+that makes a failure rarer without touching what caused it. The transfer cascades
+chain straight off a `wait_cluster`, and when the next transfer was refused those
+waits were given `min_healthy_replicas: 2` on the theory that the node which just
+demoted had not settled. The theory was wrong and the gate was a placebo — the
+leader's replication view still shows the outgoing leader healthy for as long as
+it takes that node to notice it must demote, so the wait returned in
+`elapsed_sec=0.0` and measured nothing. Worse, a `lint_matrix.py` rule was added
+to enforce it, which certified a settling guarantee that did not exist.
+
+What the case had actually found was a product bug: `transfer_leadership`
+disabled the leader's heartbeats and then waited on the target's supervisor lock,
+so a target mid-demote could hold the leader silent for over ten seconds against
+a one-second election timeout. See the leadership-transfer section below. The
+placebo rule is gone; the invariant it should have been is now a constants test
+in `config::constants`, and the lint rule that replaced it reads
+`ci_runner.py`'s own retry default rather than restating it.
+
+**A gate that changes a failure rate without naming a mechanism is a placebo
+until proven otherwise.** The tell was available and ignored: the gate's own log
+line said it waited zero seconds.
 
 The precondition shape has a sharper form: the product can discard the fault
 itself, and a harness that does not know its starting state reads that as
@@ -945,6 +956,38 @@ No new infrastructure. Highest confidence per unit of effort.
       **Done when** the stall is measured first, then removed, and a test asserts
       the lease tick keeps its period during a demote.
       _Closes_ RW-9 · _Effort_ M
+
+- [x] **H-26 — The lame-duck window must outlive nothing.** A leadership
+      transfer stops the leader's heartbeats and sleeps a full lease so the
+      target's vote is not rejected. That drain is safe by construction —
+      openraft refuses votes while a follower's lease is live. It is also
+      exactly what makes every follower eligible the moment it ends, and the
+      code then spent up to `TRIGGER_ELECT_CLIENT_TIMEOUT_SECS` (12 s) plus a
+      2 s poll inside that window, waiting on the target's supervisor lock.
+
+      Against a one-second `election_timeout_min` this is not a race, it is a
+      certainty whenever the target is busy. CI caught it as
+      `rapid-leadership-transfer-cascade` failing with a 502: node2 became
+      leader, took the next transfer 32 ms later, went silent, and node3 elected
+      itself 3.7 s in. node1 — the transfer target, mid-demote — had pinned
+      node2 as its `pg_rewind` source, waited 10 s for a node that had stopped
+      being leader, left PostgreSQL stopped, and was killed by its own health
+      watchdog.
+
+      The readiness wait now happens **before** heartbeats stop, over
+      `/internal/elect-readiness`, where it costs the cluster nothing;
+      `/internal/trigger-elect` keeps the same check under a 250 ms bound
+      because only "did this change during the drain" is still open by then.
+      `lame_duck_budget_after_drain_ms()` sums what remains and a constants test
+      pins it under `DEFAULT_ELECTION_TIMEOUT_MS`. A target that cannot serve is
+      refused with a 409 and the leader never goes quiet, which is the clean
+      refusal the cascade case should have been asserting all along.
+
+      The comment that had made it look safe is worth keeping as a warning:
+      _"Followers won't start their own elections during this window — openraft
+      gates follower election start on lease expiration too."_ True, and
+      backwards: draining the lease is what removes that gate.
+      _Related_ RW-9 / H-15, which is the same mutex seen from the demote side.
 
 - [ ] **H-16 — Join and rejoin edges.** Basebackup against a leader that gets
       deposed mid-copy, orphan slots pinning WAL, and a learner registration

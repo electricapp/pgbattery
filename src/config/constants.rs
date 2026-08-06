@@ -264,24 +264,45 @@ pub const LEADERSHIP_TRANSFER_LEASE_SAFETY_MS: u64 = 100;
 /// WAL before it can safely start serving writes.
 pub const LEADERSHIP_TRANSFER_CATCHUP_TOLERANCE: u64 = 5;
 
-/// Max time the `/internal/trigger-elect` handler will block waiting on the
-/// local supervisor lock before refusing with 503.
+/// Max supervisor-lock wait in `/internal/elect-readiness`.
 ///
-/// Slow-path supervisor operations (`pg_rewind`, restart-to-follow, sync GUC
-/// reload) can legitimately hold the lock for several seconds, especially
-/// right after a step-down. A bare `try_lock` would 503 every rapid cascade;
-/// blocking up to this duration lets legitimate ongoing work finish first.
-pub const TRIGGER_ELECT_SUPERVISOR_WAIT_SECS: u64 = 10;
+/// Affordable because it runs before the leader stops heartbeating;
+/// `pg_rewind` and restart-to-follow hold the lock for seconds.
+pub const ELECT_READINESS_SUPERVISOR_WAIT_SECS: u64 = 10;
 
-/// Client-side timeout for the leader's HTTP call to a target's
-/// `/internal/trigger-elect`.
+/// Client timeout for the readiness call. Must exceed
+/// [`ELECT_READINESS_SUPERVISOR_WAIT_SECS`] so a busy target answers rather
+/// than times out.
+pub const ELECT_READINESS_CLIENT_TIMEOUT_SECS: u64 = 12;
+
+/// Max supervisor-lock wait in `/internal/trigger-elect` before refusing 503.
 ///
-/// MUST be strictly greater than [`TRIGGER_ELECT_SUPERVISOR_WAIT_SECS`] so the
-/// target has time to either complete the lock acquisition + election trigger,
-/// or to respond 503 itself. A shorter client timeout surfaces as a spurious
-/// "transport error" during rapid leadership churn even though the target's
-/// state machine is doing exactly the right thing.
-pub const TRIGGER_ELECT_CLIENT_TIMEOUT_SECS: u64 = 12;
+/// Short because the leader is silent while it waits — see
+/// [`lame_duck_budget_after_drain_ms`]. Readiness was established before the
+/// drain; this only re-checks nothing changed during it.
+pub const TRIGGER_ELECT_SUPERVISOR_WAIT_MS: u64 = 250;
+
+/// Client timeout for the trigger call, spent inside the lame-duck window.
+/// Must exceed [`TRIGGER_ELECT_SUPERVISOR_WAIT_MS`] so a refusal arrives as a
+/// 503 rather than a timeout.
+pub const TRIGGER_ELECT_CLIENT_TIMEOUT_MS: u64 = 400;
+
+/// How long the leader waits to see the handover after triggering the target's
+/// election. Spent silent, so it counts against the lame-duck budget.
+pub const LEADERSHIP_TRANSFER_OBSERVE_MS: u64 = 200;
+
+/// Worst-case leader silence *after* the lease drain during a transfer.
+///
+/// The drain is safe by construction — openraft refuses votes while a
+/// follower's lease is live. Draining it is what makes every follower eligible,
+/// so only what comes after races their election timers. The safety margin
+/// counts: the drain oversleeps the lease by it.
+#[must_use]
+pub const fn lame_duck_budget_after_drain_ms() -> u64 {
+    LEADERSHIP_TRANSFER_LEASE_SAFETY_MS
+        .saturating_add(TRIGGER_ELECT_CLIENT_TIMEOUT_MS)
+        .saturating_add(LEADERSHIP_TRANSFER_OBSERVE_MS)
+}
 
 #[cfg(test)]
 #[allow(
@@ -405,15 +426,40 @@ mod tests {
 
     #[test]
     fn test_trigger_elect_timeouts_coordinated() {
-        // Client must wait strictly longer than the server's internal lock-wait
-        // so legitimate slow-path supervisor work (pg_rewind, follow-restart)
-        // surfaces as a 503 from the server rather than a transport error at
-        // the caller.  See cluster.rs:trigger_elect / trigger_election_on_node.
-        let server_wait = black_box(TRIGGER_ELECT_SUPERVISOR_WAIT_SECS);
-        let client_timeout = black_box(TRIGGER_ELECT_CLIENT_TIMEOUT_SECS);
+        // Each client must outwait its server's lock-wait, so a busy target
+        // answers rather than timing out at the caller.
         assert!(
-            client_timeout > server_wait,
-            "client timeout ({client_timeout}s) must exceed server wait ({server_wait}s)"
+            black_box(ELECT_READINESS_CLIENT_TIMEOUT_SECS)
+                > black_box(ELECT_READINESS_SUPERVISOR_WAIT_SECS),
+            "readiness client timeout must exceed its server wait"
+        );
+        assert!(
+            black_box(TRIGGER_ELECT_CLIENT_TIMEOUT_MS)
+                > black_box(TRIGGER_ELECT_SUPERVISOR_WAIT_MS),
+            "trigger client timeout must exceed its server wait"
+        );
+    }
+
+    #[test]
+    fn test_lame_duck_window_cannot_outlast_a_follower_election_timeout() {
+        // A leadership transfer stops the leader's heartbeats and drains the
+        // follower leases so the target's vote request is not rejected. The
+        // drain is safe: no follower may elect while its lease is live. What is
+        // not safe is anything the leader does *after* it, because the drain is
+        // exactly what makes every follower eligible again.
+        //
+        // A follower's election timer fires `DEFAULT_ELECTION_TIMEOUT_MS` after
+        // its lease expires, so the whole post-drain window -- triggering the
+        // target's election and observing the handover -- has to fit inside
+        // that. It does not fit if the trigger is allowed to block on the
+        // target's supervisor lock: a target mid-demote holds it for seconds,
+        // the leader stays silent throughout, and a third node takes the term.
+        let after_drain_ms = black_box(lame_duck_budget_after_drain_ms());
+        let election_min_ms = black_box(DEFAULT_ELECTION_TIMEOUT_MS);
+        assert!(
+            after_drain_ms < election_min_ms,
+            "post-drain silence ({after_drain_ms} ms) must be < a follower's election \
+             timeout ({election_min_ms} ms), or a third node elects itself mid-transfer"
         );
     }
 
