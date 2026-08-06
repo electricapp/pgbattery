@@ -260,7 +260,7 @@ jobs:
 
       - name: Check for typos
         # v1.46.1 (released 2026-05-08) is <7 days old per org dependency policy.
-        uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
+        uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
 
   unused-deps:
     name: Unused Dependencies
@@ -279,7 +279,7 @@ jobs:
           toolchain: "1.97"
 
       - name: Install cargo-machete
-        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
         with:
           tool: cargo-machete
 
