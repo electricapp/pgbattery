@@ -144,6 +144,11 @@ path until the operator confirms success.
 - Disk headroom, computed and reported by doctor against the selected transfer
   mode (see below): clone and link need catalog-scale free space, copy needs a
   second full copy of the database.
+- WAL archiving on. `archive_mode` is `off` today and backups are full
+  basebackups, so restore-from-backup rewinds to the last full backup rather
+  than to the moment before the upgrade. That is the only abort path under
+  `--link` and the only one at all past `--confirm`, which makes
+  `--accept-write-loss` cover hours instead of seconds.
 
 ### Transfer mode
 
@@ -196,8 +201,12 @@ transfer, which is strictly worse than link mode for this flow's purposes.
      post-upgrade verification gate re-checks that each extension loads.
    - Transfer mode resolved and probed: reflink support confirmed by an actual
      clone attempt in the target directory, not by filesystem type.
-   - Fresh full backup (pg_verifybackup-clean) unless `--allow-no-backup`,
-     which `--accept-no-rollback` forbids.
+   - Fresh backup, restored into a scratch cluster and started, unless
+     `--allow-no-backup`, which `--accept-no-rollback` forbids.
+     `pg_verifybackup` proves the archive is internally intact, not that it
+     yields a cluster that starts and accepts a write. A backup that has never
+     been restored is the same failure mode as a rollback path that has never
+     been exercised.
 2. Freeze: gateway enters hold mode (below). Demote nothing; stop standbys
    cleanly (their data dirs are about to be replaced anyway). The cluster now
    has no redundancy, not merely no availability: from here until a standby is
@@ -320,6 +329,9 @@ concentrates in hold-mode edge cases and mid-upgrade crash recovery, not in
 the pg_upgrade mechanics. The earlier 2-4 week figure assumed rollback was
 free because `--link` preserved the old datadir; it does not, and building a
 rollback path that is actually exercised is most of the difference.
+
+The WAL archiving and verified-restore prerequisite is not inside that figure.
+It is about a week on its own and is worth having without any upgrade work.
 
 ## Track C: logical blue/green major upgrades
 
@@ -622,21 +634,27 @@ Anyone quoting weeks for this is quoting the happy path.
 1. Track A compatibility contracts (frame version byte, store schema key) —
    small, and they de-risk every future release immediately.
 2. Track A orchestration loop.
-3. Track B preflight (`upgrade postgres --check`) — independently useful as
+3. WAL archiving and PITR, with a scheduled restore-and-start proof. Track B's
+   abort path is restore-from-backup, and so is Track C's once reverse
+   replication is forfeited; neither is worth much if it rewinds to last
+   night. The proof is the same machinery the ci_runner already is — stand up
+   a cluster, restore into it, assert, tear it down — pointed at a real
+   backup instead of a fixture.
+4. Track B preflight (`upgrade postgres --check`) — independently useful as
    a "can I upgrade" doctor extension, ships value before the full flow.
-4. Track B full flow behind an explicit experimental flag, chaos-tested.
-5. Track B gateway hold mode last: the flow works with plain
+5. Track B full flow behind an explicit experimental flag, chaos-tested.
+6. Track B gateway hold mode last: the flow works with plain
    refuse-during-window semantics first, hold mode upgrades the experience.
-6. Track C preflight, which is most of the feasibility answer and ships on its
+7. Track C preflight, which is most of the feasibility answer and ships on its
    own: `upgrade postgres --to N --blue-green --check` tells an operator
    whether their database can take the logical path and names every blocker.
    Useful even to someone who then does the migration by hand.
-7. Track C cutover protocol, specified and model-checked in TLA+ before it is
+8. Track C cutover protocol, specified and model-checked in TLA+ before it is
    implemented. The protocol is the product here; the provisioning around it
    is ordinary work.
-8. Track C end to end, then reverse replication and post-cutover rollback.
+9. Track C end to end, then reverse replication and post-cutover rollback.
 
-Track C's value does not depend on finishing it. Step 6 is a week or two and
+Track C's value does not depend on finishing it. Step 7 is a week or two and
 answers the question people actually ask, and the epoch-widened authority
-identity from step 7 makes the invariant that matters explicit inside a single
+identity from step 8 makes the invariant that matters explicit inside a single
 cluster too.
