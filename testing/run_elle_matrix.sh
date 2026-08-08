@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # Run Elle × attack matrix.
 #
+# Host prerequisites, none of which CI needs saying because its image has them.
+# Each missing one costs a whole run: the matrix reports an infrastructure ERROR
+# and the cause is a single line inside an artifact.
+#   lein       builds the Elle uberjar          brew install leiningen
+#   java       the checker runs from a jar      PATH=/opt/homebrew/opt/openjdk/bin:$PATH
+#              macOS ships a stub at /usr/bin/java that answers `lein version`
+#              and then fails the checker with "Unable to locate a Java Runtime".
+#   psql       the workload shells out to it    brew install libpq && brew link --force libpq
+#   timeout    macOS has none; gtimeout serves  brew install coreutils
+#   .env       PGBATTERY_MANAGEMENT_API_TOKEN, or export it
+#
 # Usage:
 #   testing/run_elle_matrix.sh                   # every attack in ALL_ATTACKS (16)
 #   testing/run_elle_matrix.sh kill              # single attack
@@ -153,6 +164,18 @@ fi
 # Workers come in multiples of 3 because the harness pins worker i to gateway
 # port i % 3; an uneven count loads one gateway (and one node) harder than the
 # others and biases which workers get wedged when a node dies.
+# macOS ships no `timeout`; coreutils installs it as `gtimeout`. Without this
+# the harness dies rc=127 and the matrix reports an infrastructure ERROR whose
+# cause is one line deep in a log.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=gtimeout
+else
+  echo "[ERR] no timeout(1) on PATH. Install GNU coreutils (brew install coreutils)." >&2
+  exit 2
+fi
+
 PROFILE="${ELLE_PROFILE:-full}"
 case "$PROFILE" in
   full)
@@ -475,7 +498,7 @@ PY
   wave_pid=$!
 
   set +e
-  timeout "$TIMEOUT" uv run --project testing testing/linearizability_register.py \
+  "$TIMEOUT_BIN" "$TIMEOUT" uv run --project testing testing/linearizability_register.py \
     --workload "$WORKLOAD" \
     --check elle \
     --attack "$attack" \
