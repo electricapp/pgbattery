@@ -1038,6 +1038,68 @@ def test_the_real_matrix_can_wait_out_a_demote() -> None:
     lint_matrix.check_transfers_can_wait_out_a_demote()
 
 
+ELLE_DRIVER_SNIPPET = """\
+run_thing() {
+  log="$artifact_dir/harness.log"
+  uv run python - <<'PY' || true
+import linearizability_register as harness
+
+harness.start_killed_nodes()
+PY
+}
+uv run python - "$attack" <<'PY' &
+import linearizability_register as harness
+
+leader, _ = harness.find_leader()
+harness.ATTACK_DISPATCH[attack](0.0)
+PY
+"""
+
+
+def test_shell_variables_are_not_mistaken_for_attribute_access() -> None:
+    """`harness.log` is a filename in the shell, not a name on the module."""
+    used = lint_matrix.harness_names_used(ELLE_DRIVER_SNIPPET)
+    assert used == {"start_killed_nodes", "find_leader", "ATTACK_DISPATCH"}
+
+
+def test_a_name_the_module_dropped_is_reported() -> None:
+    """The nightly failure, as a unit: `linreg`'s split left `find_leader` behind."""
+    missing = lint_matrix.missing_harness_names(
+        lint_matrix.harness_names_used(ELLE_DRIVER_SNIPPET),
+        lint_matrix.module_exports("from linreg.cluster import wait_cluster_healthy\n"),
+    )
+    assert missing == ["ATTACK_DISPATCH", "find_leader", "start_killed_nodes"]
+
+
+def test_a_script_with_no_embedded_python_is_refused() -> None:
+    """A check that silently matches nothing is the defect it exists to catch."""
+    assert_raises(
+        AssertionError,
+        lambda: lint_matrix.harness_names_used("echo hello\n"),
+        "no embedded Python blocks",
+    )
+
+
+def test_module_exports_sees_every_top_level_binding() -> None:
+    exports = lint_matrix.module_exports(
+        "import os\n"
+        "from a import b as c\n"
+        "D = 1\n"
+        "E: int = 2\n"
+        "def f(): pass\n"
+        "class G: pass\n"
+        "def _inner_only():\n"
+        "    hidden = 3\n"
+    )
+    assert {"os", "c", "D", "E", "f", "G", "_inner_only"} <= exports
+    assert "hidden" not in exports
+
+
+def test_the_real_elle_matrix_driver_resolves() -> None:
+    """The check against run_elle_matrix.sh itself, not a fixture."""
+    lint_matrix.check_elle_driver_names_resolve()
+
+
 def test_contract_violations_flag_missing_declarations() -> None:
     violations = lint_matrix.collect_contract_violations(
         [{"id": "a", "contracts": ["W1"]}, {"id": "b"}, {"id": "c", "contracts": []}],

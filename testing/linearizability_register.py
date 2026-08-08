@@ -116,9 +116,11 @@ from linreg.checkers import (
     _is_linearizable,
     _is_weakly_consistent,
 )
-from linreg.cluster import (
-    wait_cluster_healthy,
-)
+
+# `find_leader` is re-exported, not used here: the Elle matrix's fault-wave
+# driver reaches it through this module. `lint_matrix.py` pins that.
+from linreg.cluster import find_leader as find_leader
+from linreg.cluster import wait_cluster_healthy
 from linreg.config import (
     CHAOS_STORM_DURATION,
     DEFAULT_KILL_LEADER_AFTER_SECONDS,

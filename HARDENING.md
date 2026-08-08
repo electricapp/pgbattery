@@ -957,7 +957,7 @@ No new infrastructure. Highest confidence per unit of effort.
       the lease tick keeps its period during a demote.
       _Closes_ RW-9 · _Effort_ M
 
-- [x] **H-26 — The lame-duck window must outlive nothing.** A leadership
+- [x] **H-45 — The lame-duck window must outlive nothing.** A leadership
       transfer stops the leader's heartbeats and sleeps a full lease so the
       target's vote is not rejected. That drain is safe by construction —
       openraft refuses votes while a follower's lease is live. It is also
@@ -988,6 +988,25 @@ No new infrastructure. Highest confidence per unit of effort.
       gates follower election start on lease expiration too."_ True, and
       backwards: draining the lease is what removes that gate.
       _Related_ RW-9 / H-15, which is the same mutex seen from the demote side.
+
+- [x] **H-46 — Pin the names one harness calls on another.** `run_elle_matrix.sh`
+      drives fault waves 2..N from a sibling process that imports
+      `linearizability_register` and calls into it by attribute. Nothing joined
+      the two files, so H-03's split into `linreg/` left `find_leader` out of the
+      re-exports and every attack died on `AttributeError`.
+
+      The verdict logic behaved: each attack reported ERROR rather than a
+      verdict, and the run exited 2. What failed is when. The wave driver runs
+      only under `ELLE_PROFILE=full`, which is nightly, so PR CI exercised a
+      different path and stayed green across the refactor and every commit after
+      it. Coverage that only one profile reaches is coverage a refactor can
+      remove without argument.
+
+      `lint_matrix.py` now parses the script's embedded Python and checks every
+      attribute it reaches for against the module's top-level bindings, read from
+      the source rather than imported so the check does not need psycopg to run.
+      It refuses a script it finds no Python in, because a name check that
+      matches nothing is the defect it exists to catch.
 
 - [ ] **H-16 — Join and rejoin edges.** Basebackup against a leader that gets
       deposed mid-copy, orphan slots pinning WAL, and a learner registration

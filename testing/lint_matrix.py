@@ -41,7 +41,7 @@ from __future__ import annotations
 import ast
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
@@ -60,6 +60,7 @@ RUNNER_PATH = TESTING_DIR / "ci_runner.py"
 CORRECTNESS_LITE_PATH = TESTING_DIR / "correctness_lite.py"
 OVERNIGHT_PATH = TESTING_DIR / "overnight_test.py"
 LINEARIZABILITY_PATH = TESTING_DIR / "linearizability_register.py"
+ELLE_MATRIX_PATH = TESTING_DIR / "run_elle_matrix.sh"
 UNIT_TEST_PATH = TESTING_DIR / "test_ci_runner_units.py"
 CONTRACTS_PATH = PROJECT_ROOT / "docs" / "CONTRACTS.md"
 
@@ -746,6 +747,96 @@ def check_log_markers_still_exist() -> None:
         )
 
 
+def embedded_python(script: str) -> list[str]:
+    """The `<<'PY' ... PY` blocks a shell script feeds to an interpreter."""
+    return re.findall(r"<<'PY'[^\n]*\n(.*?)\n^PY$", script, re.S | re.M)
+
+
+def harness_names_used(script: str) -> set[str]:
+    """Names the Elle matrix reaches for on `linearizability_register`.
+
+    The embedded blocks are parsed rather than grepped, so a shell variable that
+    happens to be spelled `harness.log` is not mistaken for an attribute access.
+    The alias comes from the `import ... as` line rather than being assumed,
+    because renaming it would otherwise leave this check matching nothing.
+    """
+    blocks = embedded_python(script)
+    if not blocks:
+        raise AssertionError(
+            f"{ELLE_MATRIX_PATH.name} has no embedded Python blocks; this check would "
+            "match nothing and pass while blind"
+        )
+    used: set[str] = set()
+    for block in blocks:
+        tree = ast.parse(block)
+        aliases = {
+            alias.asname
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "linearizability_register" and alias.asname
+        }
+        used.update(
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in aliases
+        )
+    return used
+
+
+def module_exports(source: str) -> set[str]:
+    """Top-level names a module binds: imports, defs, classes, assignments.
+
+    Read rather than imported. Importing `linearizability_register` drags in
+    psycopg and every other runtime dependency, which would make this check fail
+    for reasons that have nothing to do with the names it is pinning.
+    """
+    exports: set[str] = set()
+    for node in ast.parse(source).body:
+        match node:
+            case ast.Import() | ast.ImportFrom():
+                exports.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+            case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.ClassDef():
+                exports.add(node.name)
+            case ast.Assign():
+                exports.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            case ast.AnnAssign(target=ast.Name(id=name)):
+                exports.add(name)
+    return exports
+
+
+def missing_harness_names(names: Iterable[str], exported: Container[str]) -> list[str]:
+    """Names used by the matrix that the module does not export."""
+    return sorted(name for name in names if name not in exported)
+
+
+def check_elle_driver_names_resolve() -> None:
+    """Every name the Elle matrix calls on the harness must still exist.
+
+    `run_elle_matrix.sh` drives fault waves 2..N from a sibling process that
+    imports `linearizability_register` and calls into it by attribute. The two
+    files are joined by nothing, so `linreg`'s split left `find_leader` behind
+    and the driver raised `AttributeError` on every attack for as long as it
+    took a nightly run to say so.
+
+    The direction that hurts is silence: the driver runs only under
+    `ELLE_PROFILE=full`, which is nightly, so the PR smoke never exercises it.
+    """
+    missing = missing_harness_names(
+        harness_names_used(ELLE_MATRIX_PATH.read_text(encoding="utf-8")),
+        module_exports(LINEARIZABILITY_PATH.read_text(encoding="utf-8")),
+    )
+    if missing:
+        raise AssertionError(
+            f"{ELLE_MATRIX_PATH.name} calls names linearizability_register does not export: "
+            + ", ".join(missing)
+            + ". The fault-wave driver dies on AttributeError and every attack reports an "
+            "infrastructure error instead of a verdict."
+        )
+
+
 def check_fault_injection_confined() -> None:
     """Keep direct fault injection confined to the modules already tracked for it.
 
@@ -806,6 +897,7 @@ def lint() -> None:
     check("Compose services pin a build target", check_build_targets_are_explicit)
     check("Transfers can wait out a demote", check_transfers_can_wait_out_a_demote)
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
+    check("Elle matrix driver names resolve", check_elle_driver_names_resolve)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")
