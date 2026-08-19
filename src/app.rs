@@ -1993,6 +1993,12 @@ impl App {
         raft_db_path.exists()
     }
 
+    /// Whether a `PostgreSQL` data directory exists here. Same marker
+    /// `ensure_data_dir_ready` uses, so the two cannot disagree.
+    fn has_existing_pg_data(&self) -> bool {
+        self.config.pg_data_dir.join("PG_VERSION").exists()
+    }
+
     /// Check whether this `node_id` is in the cluster's committed membership.
     ///
     /// Returns `Ok(true)` if the peer reports our node as a current member
@@ -2100,6 +2106,20 @@ impl App {
     }
 
     fn ensure_join_data_dir_ready(&self) -> Result<()> {
+        // A join that died mid-basebackup leaves the directory populated, and
+        // the emptiness check would then refuse every later start — a transient
+        // replication error costing the node permanently. Debris is
+        // recognisable: files but no PG_VERSION is not a data directory any
+        // PostgreSQL would open, so it can only be the remains of an attempt.
+        // A directory with PG_VERSION is never touched here.
+        if !self.has_existing_pg_data() && !dir_is_empty(&self.config.pg_data_dir)? {
+            warn!(
+                data_dir = %self.config.pg_data_dir.display(),
+                "Data directory holds no PG_VERSION — discarding the remains of an \
+                 interrupted join before retrying"
+            );
+            clear_dir_contents(&self.config.pg_data_dir)?;
+        }
         ensure_data_dir_ready(&self.config.pg_data_dir)
     }
 
@@ -2461,11 +2481,35 @@ impl App {
         // rejoining node would reject all heartbeats from the current leader.
         if self.has_existing_raft_state() {
             match self.is_in_committed_membership(&client, &peer_addr).await {
-                Ok(true) => {
+                Ok(true) if self.has_existing_pg_data() => {
                     info!(
                         node_id = self.config.node_id,
                         "Existing Raft state matches committed membership - resuming"
                     );
+                    return self.run(false).await;
+                }
+                Ok(true) => {
+                    // Still a member, but the data directory is gone. Provision
+                    // it from the leader and resume under the same identity —
+                    // no learner registration, this node is already in the
+                    // membership. Without this the node exited on every start,
+                    // advising `pgbattery join --peer`, which is what it was
+                    // already running.
+                    warn!(
+                        node_id = self.config.node_id,
+                        data_dir = %self.config.pg_data_dir.display(),
+                        "Raft state matches membership but the data directory is empty - \
+                         re-provisioning from the leader"
+                    );
+                    let leader = self.discover_join_leader(&client, &peer_addr).await?;
+                    self.ensure_join_data_dir_ready()?;
+                    if let Err(e) = self.prepare_join_data(&leader).await {
+                        // A basebackup that dies mid-stream leaves PGDATA
+                        // populated, and the emptiness check would then fail
+                        // forever.
+                        self.discard_partial_join_data();
+                        return Err(e);
+                    }
                     return self.run(false).await;
                 }
                 Ok(false) => {
@@ -2561,6 +2605,14 @@ impl App {
 ///
 /// A join clones the leader's whole cluster into this directory, so anything
 /// already there would be silently mixed with it.
+/// Whether `data_dir` holds nothing. A missing directory counts as empty.
+fn dir_is_empty(data_dir: &std::path::Path) -> Result<bool> {
+    if !data_dir.exists() {
+        return Ok(true);
+    }
+    Ok(std::fs::read_dir(data_dir)?.next().is_none())
+}
+
 fn ensure_data_dir_ready(data_dir: &std::path::Path) -> Result<()> {
     if data_dir.exists() {
         if std::fs::read_dir(data_dir)?.count() > 0 {
@@ -2688,6 +2740,39 @@ mod tests {
             assert!(ensure_data_dir_ready(&dir).is_ok());
             assert!(dir.exists(), "the mount point itself must survive");
             std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn debris_is_told_apart_from_a_real_data_directory() {
+            // What `ensure_join_data_dir_ready` keys on. Files without
+            // PG_VERSION cannot be a data directory PostgreSQL would open, so
+            // they can only be the remains of an interrupted clone and are safe
+            // to clear; PG_VERSION present means real data and must not be.
+            let dir = scratch("debris");
+            std::fs::create_dir_all(dir.join("base/1")).unwrap();
+            std::fs::write(dir.join("base/1/2601"), [0u8; 64]).unwrap();
+            assert!(!super::super::dir_is_empty(&dir).unwrap());
+            assert!(!dir.join("PG_VERSION").exists(), "debris has no PG_VERSION");
+
+            std::fs::write(dir.join("PG_VERSION"), "16").unwrap();
+            assert!(
+                dir.join("PG_VERSION").exists(),
+                "a real data directory does"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn an_empty_directory_reads_as_empty() {
+            let dir = scratch("isempty");
+            assert!(super::super::dir_is_empty(&dir).unwrap());
+            std::fs::write(dir.join("stray"), b"x").unwrap();
+            assert!(!super::super::dir_is_empty(&dir).unwrap());
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(
+                super::super::dir_is_empty(&dir).unwrap(),
+                "a missing directory holds nothing"
+            );
         }
 
         #[test]

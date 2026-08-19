@@ -1,32 +1,20 @@
 #!/usr/bin/env -S uv run --project testing python
 """H-08: clock steps across the failover boundary, in both directions.
 
-The clock skew this repo shipped with was forward-only and coarse — +30 s and
-+300 s, both far outside any boundary the system actually reasons about. Two
-things were missing: steps small enough to land *near* a boundary rather than
-past it, and steps that go **backwards**, which is the harder case because
-elapsed-time arithmetic on an unsigned clock can wrap, and because a timestamp
-recorded before the step reads as being in the future afterwards.
+The skew this repo shipped with was forward-only and coarse (+30 s / +300 s),
+so it never landed near a boundary and never went backwards — the harder
+direction, since a timestamp recorded before the step reads as future-dated
+afterwards.
 
-Both wall-clock-sensitive paths in the system are supposed to be immune:
+Two wall-clock-sensitive paths should be immune: the promotion hold-down (now
+`Instant` with `checked_duration_since`), and the LSN staleness filter, which
+caps future-dated entries at age 0 rather than dropping them and weakening the
+election gate. `pgbattery_lsn_future_skew_total` is how that path reports it
+was reached.
 
-  - The promotion hold-down measures with `Instant` (monotonic) and
-    `checked_duration_since(...).unwrap_or(ZERO)`, so a wall-clock step of
-    either sign cannot shorten it. It was not always this way, which is why
-    `clock_skew_at_lease_boundary` exists at all.
-  - The LSN staleness filter does read the wall clock (`unix_now_secs`). A
-    backward step makes every LSN report look future-dated; the filter caps
-    those at age 0 rather than dropping them, so the gate stays strict instead
-    of collapsing to the bootstrap-permissive fallback. The
-    `pgbattery_lsn_future_skew_total` counter is how that path proves it was
-    reached, and this sweep reads it.
-
-"Supposed to be immune" is a claim about code. This sweep is the evidence:
-every step runs against a live failover with `dual_writability_prober`
-attached, and the prober is the L1 oracle — it writes to all three internal
-PostgreSQL ports concurrently and fails if two ever accept. A step that does
-not land inside the window raises rather than passing, because a skew applied
-after the window closed proves nothing about the boundary.
+Each step runs inside a live failover with `dual_writability_prober` attached
+as the L1 oracle. A step that lands outside the window raises rather than
+passing.
 """
 
 from __future__ import annotations
@@ -42,23 +30,22 @@ from rich.console import Console
 from rich.table import Table
 
 import fault_primitives as fp
+from dual_writability_prober import PROBE_TABLE
 
 app = typer.Typer(add_completion=False)
 console = Console()
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR: Final[Path] = PROJECT_ROOT / "testing" / "artifacts" / "clock-skew-sweep"
-PROBE_TABLE: Final[str] = "dual_write_probe"
 INTERNAL_PG_PORT: Final[int] = 5434
 
-# The prober has to outlive the whole window: the failover it is watching, the
-# skew inside it, and the recovery afterwards.
-WINDOW_S: Final[float] = 75.0
+# Must outlive the whole step — edge, election, skew, promotion — or the
+# interesting part goes unobserved rather than failing.
+WINDOW_S: Final[float] = 150.0
 RECOVERY_TIMEOUT_S: Final[float] = 240.0
 
-# Steps small enough to sit inside a boundary rather than past it. The
-# boundary-relative values come from `sweep_around`, so retuning a constant
-# retunes the sweep instead of silently leaving it straddling nothing.
+# Small enough to land inside a boundary; the rest come from `sweep_around`, so
+# retuning a constant retunes the sweep.
 SUB_SECOND_MS: Final[tuple[int, ...]] = (100, 250, 500)
 
 
@@ -103,11 +90,7 @@ def _sh(cmd: str, timeout: float = 60.0) -> tuple[int, str, str]:
 
 
 def skew_plan(timings: fp.SystemTimings, *, quick: bool) -> list[int]:
-    """Every step this sweep applies, both signs, deduped and ordered.
-
-    Ordered by magnitude with the sign interleaved so a run that is cut short
-    has still covered both directions at every scale it reached.
-    """
+    """Every step, both signs, sign-interleaved so a cut-short run still covers both."""
     magnitudes: set[int] = set(SUB_SECOND_MS)
     magnitudes.update(fp.sweep_around(timings.lease_duration_ms))
     magnitudes.update(fp.sweep_around(timings.election_timeout_ms))
@@ -127,10 +110,8 @@ def skew_plan(timings: fp.SystemTimings, *, quick: bool) -> list[int]:
 def await_healthy_cluster(timeout_s: float) -> None:
     """One leader, and every node's PostgreSQL answering.
 
-    The prober's setup DDL needs a writable leader, and a node stranded by the
-    previous step can serve its management API while its PostgreSQL refuses
-    connections — counting that node healthy would put a dead node on one side
-    of the next skew.
+    PostgreSQL too, not just the management API: a stranded node answers the
+    latter while refusing connections, and would count as healthy.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -168,13 +149,7 @@ def start_prober(duration_s: float, label: str) -> subprocess.Popen[str]:
 
 
 def await_prober_running(proc: subprocess.Popen[str]) -> None:
-    """Block until the prober has landed at least one probe.
-
-    A row in its table means a round completed against a real PostgreSQL.
-    Waiting for that rather than sleeping keeps "the oracle was watching"
-    a fact instead of an assumption — a skew applied before the prober is up
-    is a step nobody was measuring.
-    """
+    """Block until the prober has landed a probe — a skew applied before that is unwatched."""
     deadline = time.monotonic() + 90.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -207,13 +182,8 @@ def finish_prober(proc: subprocess.Popen[str]) -> None:
 
 
 def _future_skew_total() -> float:
-    """`pgbattery_lsn_future_skew_total` summed across reachable nodes.
-
-    A backward step makes every recorded LSN timestamp look future-dated, and
-    this counter is how the LSN staleness filter says it saw that and capped
-    the age at zero rather than dropping the entry. Summed, because the step
-    lands on whichever node won the election.
-    """
+    """`pgbattery_lsn_future_skew_total` across the cluster — proof a backward step
+    reached the staleness filter. Summed, since the step lands on the election winner."""
     total = 0.0
     for node in fp.NODES:
         value = fp.read_metric(node, "pgbattery_lsn_future_skew_total")
@@ -240,9 +210,7 @@ def run_step(skew_ms: int, aim: fp.Aim, timings: fp.SystemTimings) -> StepResult
             trigger=lambda: fp.kill_container(leader),
             timings=timings,
         ) as handle:
-            # Hold the skew across the rest of the hold-down and the promotion
-            # that follows it, so the prober is watching the window the step
-            # was aimed at rather than the recovery after it.
+            # Hold across the rest of the hold-down and the promotion after it.
             time.sleep(timings.lease_duration_ms / 1_000.0 + 5.0)
         finish_prober(proc)
         verdict = "PASS"

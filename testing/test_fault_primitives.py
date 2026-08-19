@@ -2044,7 +2044,19 @@ class WipeNodeStateTests(RunnerFixture):
         script = runner.matching("docker compose run")[0]
         self.assertIn("/var/lib/postgresql/data/*", script)
         self.assertIn("/var/lib/postgresql/raft/*", script)
-        self.assertIn("ls -A /var/lib/postgresql/data /var/lib/postgresql/raft", script)
+        # One `ls -A` per directory. Passing several at once makes `ls` print a
+        # `dir:` header before each listing, so the read-back is never empty and
+        # a multi-path wipe can never be verified — every one would fail as
+        # "still hold entries" with the header as the evidence.
+        self.assertIn('ls -A "/var/lib/postgresql/data"', script)
+        self.assertIn('ls -A "/var/lib/postgresql/raft"', script)
+        self.assertNotIn("ls -A /var/lib/postgresql/data /var/lib/postgresql/raft", script)
+
+    def test_a_multi_path_wipe_can_read_back_empty(self) -> None:
+        """The regression: two paths must be verifiable, not just one."""
+        self.install(ScriptedRunner([("docker compose run", ok(""))]))
+        fp.wipe_node_state("node2", ["/var/lib/postgresql/data", "/var/lib/postgresql/raft"])
+        self.assertTrue(any(e["event"] == "fault.injected" for e in self.events))
 
 
 class ContainerReachabilityTests(unittest.TestCase):

@@ -1846,8 +1846,11 @@ def wipe_node_state(service: str, paths: Sequence[str], *, timeout_s: float = 90
         raise FaultInjectionError(f"could not stop {service} to wipe it: {stopped.output}")
 
     targets = " ".join(f"{p}/* {p}/.[!.]*" for p in paths)
-    checks = " ".join(paths)
-    script = f"rm -rf {targets} 2>/dev/null; ls -A {checks} 2>/dev/null | head -5"
+    # One `ls -A` per directory. Given several at once it prints a `dir:` header
+    # before each listing, so the read-back was never empty and a multi-path
+    # wipe could not be verified at all.
+    checks = "; ".join(f'ls -A "{p}" 2>/dev/null' for p in paths)
+    script = f"rm -rf {targets} 2>/dev/null; {{ {checks}; }} | head -5"
     wiped = run(
         f"docker compose run --rm --no-deps --entrypoint sh {service} -c '{script}'", timeout_s
     )

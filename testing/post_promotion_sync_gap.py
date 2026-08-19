@@ -1,40 +1,21 @@
 #!/usr/bin/env -S uv run --project testing python
 """RW-2: the post-promotion window, entered on protocol state rather than a sleep.
 
-`Supervisor::promote` rewrites `synchronous_standby_names` as part of becoming
-primary. Between `pg_ctl promote` returning and the replication manager's next
-reconcile tick, whatever value sits in that GUC is the durability contract the
-new primary is running under. If it is empty, the primary acknowledges commits
-that no standby holds, and a crash in that window loses an acknowledged write —
-contracts W1 and R2.
+Between `pg_ctl promote` and the replication manager's next tick, whatever sits
+in `synchronous_standby_names` is the durability contract the new primary runs
+under. If nothing is holding the commit, a crash there loses an acknowledged
+write (W1, R2).
 
-The window is short. Measured on a live three-node cluster it was ~120 ms, which
-is why a `sleep` cannot address it: by the time a fixed delay expires the window
-has closed, and the test reports on steady state while believing it tested the
-transition. So the probe waits on the protocol state itself — a session opened
-on each standby *before* the failover parks on `pg_is_in_recovery()` and issues
-its commit the instant that flips. The commit costs no connect round trip
-because the session already exists.
+The window measured ~120 ms on a live cluster, so a `sleep` cannot reach it. A
+session opened on each standby before the failover parks on
+`pg_is_in_recovery()` and commits the instant it flips.
 
-The verdict is on the commit, per the contract this closes:
+Verdicts: BLOCKED (waited), REFUSED (fenced read-only), SYNC_ACK (a sync standby
+held it) all pass; UNBACKED is RW-2 open. No promotion observed is
+INDETERMINATE, never a pass.
 
-  BLOCKED   the commit refused to acknowledge without a standby. Safe: the
-            primary is running under a non-empty sync list and no standby has
-            connected yet, so it waits rather than promising durability it
-            cannot deliver.
-  SYNC_ACK  the commit acknowledged and a synchronous standby's flush_lsn
-            covered it. Safe: the ack was backed by a second copy.
-  UNBACKED  the commit acknowledged and no standby held it. This is RW-2 open.
-
-A run that never sees a promotion is `INDETERMINATE`, never a pass: the fault is
-required to have had its effect before any verdict means anything. That rule is
-the whole reason this file exists — an earlier draft bounded the wait loop with
-`statement_timeout`, so the cancelled loop fell through to a marker that claimed
-a promotion which had not happened.
-
-`classify` is pure and separately tested in `test_post_promotion_sync_gap.py`,
-including that it calls the unfixed behaviour a violation. A checker that cannot
-fail is worse than no checker.
+`classify` is pure and tested in `test_post_promotion_sync_gap.py`, including
+that it calls the unfixed behaviour a violation.
 """
 
 from __future__ import annotations
@@ -120,12 +101,9 @@ class ProbeResult:
 
     @property
     def entered_empty_window(self) -> bool:
-        """Whether this node was writable under no synchronous requirement.
+        """Out of recovery with an empty sync list — RW-2's precondition.
 
-        True when the node is out of recovery and its sync list is empty at
-        either observation point. That is RW-2's precondition; the verdict
-        still rests on what the commit did, because an empty list with no
-        client write in flight harms nobody.
+        Diagnostic only; the verdict rests on what the commit did.
         """
         if not self.promoted:
             return False
@@ -133,12 +111,7 @@ class ProbeResult:
 
 
 def parse_probe(service: str, text: str) -> ProbeResult:
-    """Read one probe session's markers.
-
-    Tolerant of the surrounding psql chatter and of a session that errored:
-    every field defaults to "not observed" rather than to a value that would
-    read as evidence.
-    """
+    """Read one probe session's markers; every field defaults to "not observed"."""
     promoted = False
     sync_list_at_promotion: str | None = None
     standbys_at_promotion: int | None = None
@@ -211,11 +184,7 @@ def _maybe_int(text: str) -> int | None:
 
 
 def classify(results: list[ProbeResult]) -> tuple[Verdict, str]:
-    """The verdict for a run, from every probe's observations.
-
-    Pure, so the inversion tests can hand it the unfixed cluster's behaviour and
-    require a violation back.
-    """
+    """The verdict for a run. Pure, so the inversion tests can require a failure back."""
     promoted = [r for r in results if r.promoted]
     if not promoted:
         return (
@@ -263,12 +232,9 @@ def classify(results: list[ProbeResult]) -> tuple[Verdict, str]:
             f"{probe.service} acknowledged the commit but the standby-ack count "
             "was never read, so the ack cannot be shown to be backed",
         )
-    # PostgreSQL's own contract carries the verdict: with synchronous_commit on
-    # and a standby designated `sync`, a commit does not return until that
-    # standby has flushed it. The LSN-covering count corroborates but cannot
-    # convict on its own — `commit_lsn` is read after the commit and drifts
-    # past the commit record, so a standby that genuinely holds this write can
-    # report a smaller flush_lsn.
+    # A designated sync standby is the verdict: with synchronous_commit on, the
+    # commit could not have returned without it. The LSN count only corroborates
+    # — `commit_lsn` is read after the commit and drifts past the record.
     if (probe.sync_standbys_at_ack or 0) > 0 or (probe.sync_acks or 0) > 0:
         return (
             Verdict.SYNC_ACK,
@@ -294,12 +260,7 @@ def _compose_env() -> dict[str, str]:
 
 
 def arm_probe(service: str, sink: dict[str, str]) -> threading.Thread:
-    """Open a probe session on `service` and let it park on protocol state.
-
-    Returns immediately; the thread collects the session's output. Sessions are
-    opened before the fault so the commit under test costs no connect round
-    trip — a connect inside a ~120 ms window would be measuring the connect.
-    """
+    """Park a probe session on `service` before the fault, so the commit costs no connect."""
 
     def _run() -> None:
         try:
@@ -474,12 +435,7 @@ def run(
 
 
 def _await_probes_parked(services: list[str]) -> None:
-    """Wait until every probe session is visible in `pg_stat_activity`.
-
-    Asserting the session exists, rather than sleeping and hoping, is the same
-    discipline the fault primitives use: the probe is a precondition of the
-    test, so its absence must fail loudly rather than silently weaken the run.
-    """
+    """Wait until every probe session is in `pg_stat_activity` — a missing one must fail loudly."""
 
     def _parked() -> bool:
         for service in services:

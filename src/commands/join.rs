@@ -83,6 +83,28 @@ fn write_node_id_marker(raft_dir: &Path, node_id: u64) -> Result<()> {
 /// created. A conflicting explicit `--node-id` or config `node_id` means the
 /// operator is about to resume under a *different* node's consensus identity
 /// (duplicate-identity split-brain), so it is a hard error, not a fallback.
+/// What `join` does with whatever survived on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinStart {
+    /// Both stores present: keep the identity and the data, skip the fetch.
+    Resume,
+    /// Raft state without a data directory. The node still has a consensus
+    /// identity and nothing to serve, so it re-provisions from the cluster
+    /// under that identity instead of exiting.
+    Reprovision,
+    /// Nothing local: ask the peer for an identity and basebackup.
+    FreshJoin,
+}
+
+/// Resuming needs both stores; either one alone is not a resume.
+const fn join_start(has_raft_state: bool, has_pg_data: bool) -> JoinStart {
+    match (has_raft_state, has_pg_data) {
+        (true, true) => JoinStart::Resume,
+        (true, false) => JoinStart::Reprovision,
+        (false, _) => JoinStart::FreshJoin,
+    }
+}
+
 fn resolve_resume_node_id(
     raft_dir: &Path,
     cli_node_id: Option<u64>,
@@ -205,14 +227,36 @@ pub async fn run_join(
     // peer is down. The identity comes from the marker, never from a
     // possibly-stale config node_id.
     let raft_dir = config.get_raft_data_dir();
-    if raft_dir.join("raft.db").exists() {
-        config.node_id = resolve_resume_node_id(&raft_dir, node_id, config.node_id)?;
+    // PG_VERSION is what `App` treats as "there is a data directory here", so
+    // the two agree by construction.
+    let start = join_start(
+        raft_dir.join("raft.db").exists(),
+        config.pg_data_dir.join("PG_VERSION").exists(),
+    );
+
+    let resume_node_id = match start {
+        JoinStart::FreshJoin => None,
+        JoinStart::Resume | JoinStart::Reprovision => {
+            Some(resolve_resume_node_id(&raft_dir, node_id, config.node_id)?)
+        }
+    };
+
+    if start == JoinStart::Resume {
+        config.node_id = resume_node_id.unwrap_or(config.node_id);
         info!(
             node_id = config.node_id,
             "Existing Raft state found - resuming (skipping join-info fetch)"
         );
         let app = crate::app::App::new(config);
         return app.run_join_flow(peer, voter).await;
+    }
+    if start == JoinStart::Reprovision {
+        warn!(
+            node_id = resume_node_id.unwrap_or_default(),
+            pg_data_dir = %config.pg_data_dir.display(),
+            "Raft state present but the PostgreSQL data directory is empty — \
+             re-provisioning from the cluster under the existing node id"
+        );
     }
 
     // Fresh-join path: fetch cluster info to discover peers and node_id.
@@ -232,7 +276,10 @@ pub async fn run_join(
     info!(peer = %peer, "Fetching cluster information");
     let join_info = fetch_join_info(&client, &peer).await?;
 
-    let actual_node_id = node_id.unwrap_or(join_info.next_node_id);
+    // A node re-provisioning its data directory keeps the identity its Raft
+    // state already carries; a freshly assigned one would enrol it twice and
+    // strand the old member.
+    let actual_node_id = resume_node_id.or(node_id).unwrap_or(join_info.next_node_id);
     if actual_node_id == 0 {
         anyhow::bail!(
             "Cluster returned next_node_id 0 (the auto-assign sentinel); refusing to join \
@@ -370,6 +417,19 @@ fn write_join_config(output_path: &str, node_id: u64, join_info: &JoinInfoRespon
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_start_needs_both_stores_to_resume() {
+        assert_eq!(join_start(true, true), JoinStart::Resume);
+        assert_eq!(join_start(false, false), JoinStart::FreshJoin);
+        // Raft state without a data directory used to take the resume path and
+        // exit with "No PostgreSQL data found — use `pgbattery join --peer`",
+        // which is the command the node was already running. It re-provisions.
+        assert_eq!(join_start(true, false), JoinStart::Reprovision);
+        // Data without consensus state is a fresh join: the identity has to
+        // come from the cluster, since nothing local carries one.
+        assert_eq!(join_start(false, true), JoinStart::FreshJoin);
+    }
 
     #[test]
     fn marker_format_parse_roundtrip() {

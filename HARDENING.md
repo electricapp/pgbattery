@@ -915,13 +915,48 @@ No new infrastructure. Highest confidence per unit of effort.
       the cluster on each step, so a backward step that never reached that path
       is visible rather than assumed.
 
-- [ ] **H-09 — Wiped-node rejoin.** Destroy one node's volume and rejoin under
-      the same node id — the canonical Raft persisted-vote violation. Plus the
-      asymmetric cases: Raft store lost with PostgreSQL data intact, and the
-      reverse.
+- [x] **H-09 — Wiped-node rejoin.** `wiped_rejoin.py` drives all three variants
+      and samples `pgbattery_raft_is_leader` + `pgbattery_raft_term` across the
+      window, so the assertion is that no two nodes claim leadership in the same
+      term. Acked rows written before the wipe are counted back afterwards.
       **Done when** all three variants either rejoin cleanly or refuse, and
       neither votes twice in one term.
       _Blocked by_ H-02 · _Effort_ M
+
+      Outcomes: `both` and `pgdata-only` rejoin cleanly; `raft-only` on a
+      `join`-configured node refuses, which is the safe answer — a voter with no
+      memory of the votes it cast must not silently vote again.
+
+      Two product bugs fell out, both of which wedged a node permanently:
+
+      1. `pgdata-only` never recovered. `join` found Raft state, took the resume
+         fast path, and exited with "No PostgreSQL data found — use
+         `pgbattery join --peer <addr>`", which is the command it was already
+         running. Resuming now requires both stores (`join_start`); with Raft
+         state and no data directory the node re-provisions from the leader
+         under its existing identity — no learner registration, since it is
+         already a member. Measured: 321 s wedged before, 28 s to rejoin after.
+      2. A join that died mid-basebackup left PGDATA populated, and the
+         emptiness precondition then refused every later start — a transient
+         replication error costing the node permanently, which the code's own
+         comment predicted. `ensure_join_data_dir_ready` now tells debris from
+         data: files without `PG_VERSION` cannot be a directory PostgreSQL
+         would open, so they are cleared; a directory with `PG_VERSION` is never
+         touched.
+
+      And one harness bug that explains why `wipe_node_state` had never been
+      driven: its read-back ran `ls -A` over all paths at once, which prints a
+      `dir:` header per directory, so a multi-path wipe could never verify as
+      empty. Every `both` run failed as "still hold entries" with the header as
+      the evidence.
+
+      Left for H-16, which owns the join and rejoin edges: `raft-only` on a
+      join-configured node has valid PostgreSQL data and no consensus identity,
+      and the fresh-join path demands an empty directory, so the `pg_rewind`
+      rejoin path — which exists, and is reached when Raft state is present but
+      membership has dropped the node — is unreachable here. Refusing is safe,
+      but re-provisioning would be kinder than requiring the operator to clear
+      the volume.
 
 - [ ] **H-10 — Follower reads and read-only transactions in the Elle workload**,
       so staleness, long fork, and phantoms enter the test universe at all.
