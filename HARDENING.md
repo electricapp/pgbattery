@@ -958,11 +958,43 @@ No new infrastructure. Highest confidence per unit of effort.
       but re-provisioning would be kinder than requiring the operator to clear
       the volume.
 
-- [ ] **H-10 — Follower reads and read-only transactions in the Elle workload**,
-      so staleness, long fork, and phantoms enter the test universe at all.
-      **Done when** Elle checks a history containing follower reads and predicate
-      reads, and the checker is shown to reject an injected stale read.
+- [x] **H-10 — Follower reads and read-only transactions**, so staleness, long
+      fork, and phantoms enter the test universe at all.
+      **Done when** a history containing follower reads and predicate reads is
+      checked, and the checker is shown to reject an injected stale read.
       _Closes_ part of Class B · _Effort_ M
+
+      Every operation used to go through the gateway, so every read was a leader
+      read and staleness could not arise. `follower_read_workload.py` writes
+      through the leader and reads from each standby, and each read carries that
+      standby's `pg_last_wal_replay_lsn()` at the instant it ran. That is what
+      makes a follower read checkable rather than merely stale: lagging is
+      legal, but a standby that has replayed past a commit and still serves the
+      older value has a visibility bug. Predicate reads (`WHERE val > n`) run
+      alongside, because a point read cannot express a phantom — a phantom is a
+      row entering a *set*.
+
+      Five properties, all pure functions in `linreg/follower_reads.py`, each
+      shown rejecting its own violation in `test_follower_reads.py`: no invented
+      values, monotonic per-standby reads, replayed writes are visible (the
+      injected stale read), no long fork between standbys, and predicate matches
+      explained by a write. Live: 25 writes, 50 follower reads, 18 predicate
+      reads, all five held.
+
+      The commit position has to be read in a statement of its own. Asking for
+      it in the same one as the `UPDATE` puts both in one implicit transaction,
+      so it comes back from before the commit record — and a standby replayed to
+      exactly there reads as a visibility bug that did not happen. The first run
+      reported precisely that, with the write's LSN and the replay LSN
+      identical.
+
+      Not done here: routing these operations into the Elle history itself.
+      Elle checks strict serializability, and a follower read is legitimately
+      stale under `synchronous_commit = on` (remote flush, not remote apply), so
+      feeding raw follower reads to Elle would manufacture anomalies the system
+      never promised to avoid. The replay-position contract above is the
+      checkable claim; making follower reads Elle-checkable needs
+      `remote_apply`, which is a durability/latency change, not a test change.
 
 - [x] **H-11 — RW-7 as a safety test.** The existing case asserts election
       _succeeds_ (liveness). Restore a node from a stale basebackup, keep its Raft
