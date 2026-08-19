@@ -9,6 +9,7 @@ pub(crate) mod common;
 mod doctor;
 mod init;
 mod join;
+mod render;
 mod status;
 mod upgrade;
 

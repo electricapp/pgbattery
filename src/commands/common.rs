@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 use std::time::Duration;
-use terminal_size::{Width, terminal_size};
 
 pub(crate) const MANAGEMENT_API_TOKEN_HEADER: &str = "x-pgbattery-token";
 
@@ -63,13 +62,22 @@ fn env_disables_color() -> bool {
 }
 
 /// Whether colored output should be written to stdout.
+///
+/// Cached because none of the inputs can change mid-process, and resolving it
+/// per call costs an `isatty` plus an allocating `TERM` lookup on every line.
 pub(crate) fn stdout_color() -> bool {
-    !globals().no_color && !env_disables_color() && std::io::stdout().is_terminal()
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !globals().no_color && !env_disables_color() && std::io::stdout().is_terminal()
+    })
 }
 
-/// Whether colored output should be written to stderr.
+/// Whether colored output should be written to stderr. Cached, as [`stdout_color`].
 pub(crate) fn stderr_color() -> bool {
-    !globals().no_color && !env_disables_color() && std::io::stderr().is_terminal()
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !globals().no_color && !env_disables_color() && std::io::stderr().is_terminal()
+    })
 }
 
 /// Remove ANSI CSI escape sequences (e.g. `\x1b[32m`) from a string.
@@ -282,64 +290,6 @@ pub(super) fn parse_prometheus_metrics_map(body: &str) -> HashMap<String, f64> {
     metrics
 }
 
-/// Get terminal width, with sensible defaults.
-pub(super) fn get_terminal_width() -> usize {
-    terminal_size()
-        .map_or(80, |(Width(w), _)| w as usize)
-        .max(60) // minimum usable width
-}
-
-/// Truncate a string to `max_len`, adding "..." if truncated.
-pub(super) fn truncate(s: &str, max_len: usize) -> String {
-    if max_len == 0 {
-        return String::new();
-    }
-    if s.len() <= max_len {
-        s.to_string()
-    } else if max_len <= 3 {
-        ".".repeat(max_len)
-    } else {
-        let mut out: String = s.chars().take(max_len - 3).collect();
-        out.push_str("...");
-        out
-    }
-}
-
-/// Format bytes as a `PostgreSQL` LSN (X/YYYYYYYY).
-pub(super) fn format_lsn(bytes: u64) -> String {
-    let high = bytes >> 32;
-    let low = bytes & 0xFFFF_FFFF;
-    format!("{high:X}/{low:08X}")
-}
-
-/// Format large numbers with K/M suffixes.
-pub(super) fn format_number(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000)
-    } else if n >= 1_000 {
-        format!("{}.{}k", n / 1_000, (n % 1_000) / 100)
-    } else {
-        n.to_string()
-    }
-}
-
-/// Format bytes as human-readable size.
-pub(super) fn format_size(bytes: u64) -> String {
-    if bytes > 1_000_000_000 {
-        format!(
-            "{}.{} GB",
-            bytes / 1_000_000_000,
-            (bytes % 1_000_000_000) / 100_000_000
-        )
-    } else if bytes > 1_000_000 {
-        format!("{}.{} MB", bytes / 1_000_000, (bytes % 1_000_000) / 100_000)
-    } else if bytes > 1_000 {
-        format!("{}.{} KB", bytes / 1_000, (bytes % 1_000) / 100)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 /// fsync a directory so a just-completed rename inside it survives power
 /// loss. Without this the kernel can replay the old directory entry on
 /// recovery, resurrecting the pre-rename state.
@@ -514,52 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_short_string() {
-        assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_long_string() {
-        assert_eq!(truncate("hello world", 8), "hello...");
-    }
-
-    #[test]
-    fn test_truncate_exact_length() {
-        assert_eq!(truncate("hello", 5), "hello");
-    }
-
-    #[test]
-    fn test_truncate_tiny_width() {
-        assert_eq!(truncate("hello", 2), "..");
-        assert_eq!(truncate("hello", 0), "");
-    }
-
-    #[test]
-    fn test_format_lsn() {
-        // 0/0 -> "0/00000000"
-        assert_eq!(format_lsn(0), "0/00000000");
-
-        // High 32 bits = 1, low 32 bits = 0x12345678
-        let lsn = (1u64 << 32) | 0x1234_5678;
-        assert_eq!(format_lsn(lsn), "1/12345678");
-    }
-
-    #[test]
-    fn test_format_number() {
-        assert_eq!(format_number(500), "500");
-        assert_eq!(format_number(1500), "1.5k");
-        assert_eq!(format_number(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(500), "500 B");
-        assert_eq!(format_size(1500), "1.5 KB");
-        assert_eq!(format_size(1_500_000), "1.5 MB");
-        assert_eq!(format_size(1_500_000_000), "1.5 GB");
-    }
-
-    #[test]
     fn test_try_http_client_succeeds() {
         // Should succeed with normal timeout
         let result = try_http_client(30);
@@ -571,13 +475,6 @@ mod tests {
         // Should succeed with normal timeout
         let result = http_client(30);
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_terminal_width_has_minimum() {
-        // Even without a real terminal, should return at least 60
-        let width = get_terminal_width();
-        assert!(width >= 60);
     }
 
     #[test]

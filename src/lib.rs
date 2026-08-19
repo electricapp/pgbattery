@@ -2,6 +2,15 @@
 //!
 //! Library root for testing and reuse.
 
+/// Test-only allocation counter. Installed as the global allocator for the
+/// library test binary so hot paths can assert an allocation budget.
+#[cfg(test)]
+mod alloc_meter;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: alloc_meter::CountingAllocator = alloc_meter::CountingAllocator;
+
 pub mod app;
 pub mod cli;
 pub mod cluster;

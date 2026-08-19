@@ -3,9 +3,10 @@
 use anyhow::Result;
 
 use super::common::{
-    MANAGEMENT_API_TOKEN_HEADER, ceprintln, colors, confirm, cprintln, format_size, hints,
-    http_client, management_api_token, resolve_node_addr, with_spinner,
+    MANAGEMENT_API_TOKEN_HEADER, ceprintln, colors, confirm, cprintln, hints, http_client,
+    management_api_token, resolve_node_addr, with_spinner,
 };
+use super::render::format_size;
 use crate::cli::BackupTypeArg;
 use crate::cluster::client::management_api_failure;
 

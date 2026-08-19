@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::common::{
-    colors, cprintln, format_size, hints, http_client, metric_to_u64, parse_prometheus_metric_line,
+    colors, cprintln, hints, http_client, metric_to_u64, parse_prometheus_metric_line,
     parse_prometheus_metrics_map,
 };
+use super::render::format_size;
 use crate::cli::OutputFormat;
 
 /// Check result status.
