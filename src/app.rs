@@ -3280,6 +3280,50 @@ mod tests {
                 elapsed < crate::governor::lease::LEASE_CHECK_INTERVAL * 3,
                 "tick blocked for {elapsed:?} on a held lock; it must give up within its period"
             );
+            assert_eq!(
+                fence_failures, 0,
+                "a skipped tick was counted as a failed fence; a demote long enough to \
+                 skip FENCE_FAILURE_SHUTDOWN_THRESHOLD ticks would then shut the node down"
+            );
+        }
+
+        /// The other half of the skip: once the lock frees, the next tick
+        /// fences. Without this, "gives up within its period" is equally
+        /// satisfied by a loop that gave up permanently.
+        #[tokio::test]
+        async fn the_tick_after_the_lock_frees_fences_normally() {
+            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            let held = pg.clone().lock_owned().await;
+            App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
+            drop(held);
+
+            App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
+
+            let guard = pg.lock().await;
+            assert!(
+                guard.is_readonly(),
+                "the tick after the lock freed left PostgreSQL writable: {:?}",
+                guard.calls()
+            );
         }
 
         #[tokio::test]

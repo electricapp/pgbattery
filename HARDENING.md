@@ -1148,6 +1148,17 @@ No new infrastructure. Highest confidence per unit of effort.
       both weaker attempts rather than reporting a partition that never
       happened.
 
+      Reconfirmed since at a different width: 30 acknowledged in the fallback
+      window, node2 deposed, node1 elected, **30 of 30 destroyed**. The bound is
+      the window, not the count.
+
+      `test_rewind_loss.py` covers the verdict logic, and specifically its three
+      refusals. The measurement is only meaningful when the fallback actually
+      engaged, leadership actually moved, and something was actually
+      acknowledged; each of those reports SKIP, and a SKIP must never render as
+      "MEASURED: 0", which is what a run that tested nothing would otherwise
+      look like.
+
 - [x] **H-15 — Unblock the supervisor mutex in `demote()`.** It was held across
       stop, rewind, and recovery, so the 100 ms lease tick stalled behind it.
       **Done when** the stall is measured first, then removed, and a test asserts
@@ -1173,6 +1184,13 @@ No new infrastructure. Highest confidence per unit of effort.
       100 ms bound — and **273 ticks in 25 s**, so the cadence is kept.
       `a_held_supervisor_lock_does_not_stall_the_tick` pins it, and goes red
       (blocking 10 s) against an unbounded acquisition.
+
+      Two things that test did not say, now asserted alongside it. A skipped
+      tick must not count as a _failed_ fence: a demote long enough to skip
+      `FENCE_FAILURE_SHUTDOWN_THRESHOLD` ticks would otherwise shut the node
+      down for being busy. And the tick after the lock frees must actually
+      fence — `the_tick_after_the_lock_frees_fences_normally` — since "gives up
+      within its period" is equally satisfied by a loop that gave up for good.
 
 - [x] **H-45 — The lame-duck window must outlive nothing.** A leadership
       transfer stops the leader's heartbeats and sleeps a full lease so the
