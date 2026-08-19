@@ -13,10 +13,11 @@
 -- reporting a promotion that never happened.
 --
 -- Markers:
---   PROMOTED|<clock>|<synchronous_standby_names>|<connected standbys>
+--   PROMOTED|<clock>|<synchronous_standby_names>|<connected standbys>|<read_only>
 --   NOTPROMOTED|<clock>|...        (this node stayed a standby; not a verdict)
---   ACKED|<clock>|<commit lsn>|<synchronous_standby_names at ack>
---   SYNCACK|<sync standbys whose flush_lsn covers the commit>
+--   ACKED|<clock>|<commit lsn>|<synchronous_standby_names at ack>|<read_only>
+--   SYNCNOW|<standbys designated sync at ack — the durability answer>
+--   SYNCACK|<sync standbys whose flush_lsn covers the commit — corroboration>
 -- A commit that never acknowledges produces no ACKED line; psql reports the
 -- statement timeout instead — the safe outcome, and the point of the test.
 
@@ -46,25 +47,42 @@ END $$;
 SELECT CASE WHEN pg_is_in_recovery() THEN 'NOTPROMOTED' ELSE 'PROMOTED' END,
        clock_timestamp(),
        current_setting('synchronous_standby_names'),
-       (SELECT count(*) FROM pg_stat_replication);
+       (SELECT count(*) FROM pg_stat_replication),
+       -- Both flags: `default_transaction_read_only` is what the supervisor
+       -- writes, `transaction_read_only` is what actually governs this
+       -- statement. They can disagree, and only the second one refuses a write.
+       current_setting('default_transaction_read_only')
+         || '/' || current_setting('transaction_read_only');
 
 -- Bound the commit only. A commit that waits this long has demonstrably
 -- refused to acknowledge without a standby, which is the passing behaviour.
 SET statement_timeout = '20s';
 
--- The commit under test.
-INSERT INTO rw2_probe(tag) VALUES ('gap-write');
-
--- One LSN value, captured once and reused: re-reading it would drift past the
--- commit record and could under-report a standby that does hold the commit.
-SELECT pg_current_wal_lsn() AS commit_lsn \gset
+-- The commit under test. The LSN comes back from the INSERT itself, not from a
+-- following statement: a refused write leaves `commit_lsn` unset, so the ACKED
+-- marker below cannot print. Read separately it would still have succeeded —
+-- a read-only transaction happily runs SELECTs — and the probe would announce
+-- an acknowledgement for a commit that never happened.
+INSERT INTO rw2_probe(tag) VALUES ('gap-write')
+RETURNING pg_current_wal_lsn() AS commit_lsn \gset
 
 SELECT 'ACKED', clock_timestamp(), :'commit_lsn',
-       current_setting('synchronous_standby_names');
+       current_setting('synchronous_standby_names'),
+       current_setting('default_transaction_read_only');
 
--- Did a synchronous standby actually hold the commit at ack time? This is the
--- durability question: a non-zero count means the ack was backed by a standby
--- flush; zero means the primary acknowledged a write only it held.
+-- Was a synchronous standby designated when the commit ran? With
+-- synchronous_commit = on this is the durability answer: PostgreSQL does not
+-- return from a commit until a designated sync standby has flushed it, so a
+-- standby in sync_state = 'sync' means the acknowledgement was backed. Zero
+-- means the primary acknowledged a write only it held — RW-2 open.
+SELECT 'SYNCNOW', count(*) FROM pg_stat_replication WHERE sync_state = 'sync';
+
+-- Corroboration only, never the verdict on its own. `commit_lsn` is
+-- pg_current_wal_lsn() read after the commit, so it sits at or past the commit
+-- record's end; any WAL written in between (a checkpoint, the replication
+-- manager's own statements) leaves a standby that genuinely flushed this
+-- commit reporting a smaller flush_lsn. Treating that as "no standby held it"
+-- would report a violation that did not happen.
 SELECT 'SYNCACK', count(*)
 FROM pg_stat_replication
 WHERE sync_state = 'sync'

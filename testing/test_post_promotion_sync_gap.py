@@ -25,6 +25,7 @@ Field separator is "|".
 PROMOTED|2026-08-19 00:17:44.61205+00|FIRST 1 (pgbattery_node_1, pgbattery_node_2)|0
 SET
 ACKED|2026-08-19 00:17:44.675566+00|0/412EEE0|
+SYNCNOW|0
 SYNCACK|0
 """
 
@@ -42,12 +43,33 @@ SET
 ERROR:  canceling statement due to statement timeout
 """
 
+# The primary refused the write outright: promoted, but fenced read-only until
+# its synchronous configuration is in force.
+REFUSED_PROBE = """PROMOTED|2026-08-19 01:02:03.1+00|FIRST 1 (pgbattery_node_2, pgbattery_node_3)|0
+SET
+ERROR:  cannot execute INSERT in a read-only transaction
+"""
+
 # The commit acknowledged and a synchronous standby held it.
 BACKED_PROBE = """PROMOTED|2026-08-19 01:02:03.1+00|FIRST 1 (pgbattery_node_1, pgbattery_node_3)|1
 SET
 ACKED|2026-08-19 01:02:03.2+00|0/5000000|FIRST 1 (pgbattery_node_1, pgbattery_node_3)
+SYNCNOW|1
 SYNCACK|1
 """
+
+# A standby was designated sync and the commit returned — so PostgreSQL waited
+# for it — but the position read back after the commit has already drifted past
+# what that standby has flushed. Convicting on the LSN comparison alone would
+# report a violation that did not happen.
+BACKED_BUT_LSN_DRIFTED_PROBE = (
+    "PROMOTED|2026-08-19 01:02:03.1+00|FIRST 1 (pgbattery_node_1, pgbattery_node_3)|1|off\n"
+    "SET\n"
+    "ACKED|2026-08-19 01:02:03.2+00|0/5000100|"
+    "FIRST 1 (pgbattery_node_1, pgbattery_node_3)|off\n"
+    "SYNCNOW|1\n"
+    "SYNCACK|0\n"
+)
 
 
 class ClassifierTests(unittest.TestCase):
@@ -73,10 +95,68 @@ class ClassifierTests(unittest.TestCase):
         self.assertIs(verdict, ppsg.Verdict.BLOCKED, detail)
         self.assertTrue(verdict.is_pass)
 
+    def test_a_read_only_refusal_passes(self) -> None:
+        """A refusal is the strongest safe outcome, not an incomplete run.
+
+        The commit never acknowledged and never hung: the node was primary but
+        fenced until its sync configuration was in force, so the client got an
+        immediate error instead of a promise nothing was holding.
+        """
+        results = [
+            ppsg.parse_probe("node3", REFUSED_PROBE),
+            ppsg.parse_probe("node1", NOT_PROMOTED_PROBE),
+        ]
+        verdict, detail = ppsg.classify(results)
+        self.assertIs(verdict, ppsg.Verdict.REFUSED, detail)
+        self.assertTrue(verdict.is_pass)
+
+    def test_a_standby_refusing_is_not_a_verdict(self) -> None:
+        """Only the promoted node's outcome counts.
+
+        Every standby refuses writes, so a run where nothing was promoted must
+        stay indeterminate rather than borrowing a standby's refusal as a pass.
+        """
+        results = [
+            ppsg.parse_probe("node1", NOT_PROMOTED_PROBE),
+            ppsg.parse_probe("node3", NOT_PROMOTED_PROBE),
+        ]
+        verdict, detail = ppsg.classify(results)
+        self.assertIs(verdict, ppsg.Verdict.INDETERMINATE, detail)
+        self.assertFalse(verdict.is_pass)
+
     def test_a_standby_backed_ack_passes(self) -> None:
         verdict, detail = ppsg.classify([ppsg.parse_probe("node3", BACKED_PROBE)])
         self.assertIs(verdict, ppsg.Verdict.SYNC_ACK, detail)
         self.assertTrue(verdict.is_pass)
+
+    def test_a_drifted_commit_position_is_not_a_violation(self) -> None:
+        """The checker must not convict on the LSN comparison alone.
+
+        `commit_lsn` is read after the commit, so it sits past the commit
+        record; any WAL written in between leaves a standby that genuinely
+        flushed the commit reporting a smaller flush_lsn. PostgreSQL having
+        designated a sync standby is what makes the acknowledgement backed.
+        """
+        verdict, detail = ppsg.classify([ppsg.parse_probe("node3", BACKED_BUT_LSN_DRIFTED_PROBE)])
+        self.assertIs(verdict, ppsg.Verdict.SYNC_ACK, detail)
+        self.assertTrue(verdict.is_pass)
+
+    def test_a_refused_write_never_reads_as_an_acknowledgement(self) -> None:
+        """The phantom-ack regression.
+
+        An earlier probe read the commit position in a statement of its own,
+        after the INSERT. A read-only transaction runs SELECTs perfectly well,
+        so a refused write still produced a commit position and the probe
+        announced an acknowledgement that had not happened — reported as
+        UNBACKED, a violation invented by the harness. The marker now comes
+        back from the INSERT's own RETURNING, so a refusal prints no ACKED
+        line at all.
+        """
+        probe = ppsg.parse_probe("node3", REFUSED_PROBE)
+        self.assertFalse(probe.acked, "a refused write must not read as acked")
+        self.assertTrue(probe.refused_read_only)
+        verdict, detail = ppsg.classify([probe])
+        self.assertIs(verdict, ppsg.Verdict.REFUSED, detail)
 
     def test_no_promotion_is_never_a_pass(self) -> None:
         """A fault that produced no failover tested nothing about the window."""

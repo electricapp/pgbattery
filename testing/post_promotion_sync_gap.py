@@ -76,6 +76,13 @@ RECOVERY_TIMEOUT_S: Final[float] = 180.0
 
 TIMEOUT_MARKER: Final[str] = "canceling statement due to statement timeout"
 
+# The primary refused the write outright rather than acknowledging it. This is
+# the strongest safe outcome: a node that is primary but not yet honouring its
+# synchronous configuration is fenced read-only, so a client gets an immediate
+# error instead of an acknowledgement no standby holds — or an unbounded wait,
+# which is what an ungated commit turns into once the wait engages.
+READ_ONLY_MARKER: Final[str] = "read-only transaction"
+
 
 class GapError(RuntimeError):
     """The run could not be carried out as specified."""
@@ -83,13 +90,14 @@ class GapError(RuntimeError):
 
 class Verdict(StrEnum):
     BLOCKED = "BLOCKED"
+    REFUSED = "REFUSED"
     SYNC_ACK = "SYNC_ACK"
     UNBACKED = "UNBACKED"
     INDETERMINATE = "INDETERMINATE"
 
     @property
     def is_pass(self) -> bool:
-        return self in (Verdict.BLOCKED, Verdict.SYNC_ACK)
+        return self in (Verdict.BLOCKED, Verdict.REFUSED, Verdict.SYNC_ACK)
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,10 @@ class ProbeResult:
     sync_list_at_ack: str | None
     sync_acks: int | None
     timed_out: bool
+    refused_read_only: bool
+    sync_standbys_at_ack: int | None = None
+    read_only_at_promotion: str | None = None
+    read_only_at_ack: str | None = None
     raw: str = field(repr=False, default="")
 
     @property
@@ -130,8 +142,11 @@ def parse_probe(service: str, text: str) -> ProbeResult:
     promoted = False
     sync_list_at_promotion: str | None = None
     standbys_at_promotion: int | None = None
+    read_only_at_promotion: str | None = None
     acked = False
     sync_list_at_ack: str | None = None
+    read_only_at_ack: str | None = None
+    sync_standbys_at_ack: int | None = None
     sync_acks: int | None = None
 
     for line in text.splitlines():
@@ -141,9 +156,15 @@ def parse_probe(service: str, text: str) -> ProbeResult:
             promoted = True
             sync_list_at_promotion = parts[2]
             standbys_at_promotion = _maybe_int(parts[3])
+            if len(parts) >= 5:
+                read_only_at_promotion = parts[4].strip()
         elif head == "ACKED" and len(parts) >= 4:
             acked = True
             sync_list_at_ack = parts[3]
+            if len(parts) >= 5:
+                read_only_at_ack = parts[4].strip()
+        elif head == "SYNCNOW" and len(parts) >= 2:
+            sync_standbys_at_ack = _maybe_int(parts[1])
         elif head == "SYNCACK" and len(parts) >= 2:
             sync_acks = _maybe_int(parts[1])
 
@@ -152,12 +173,34 @@ def parse_probe(service: str, text: str) -> ProbeResult:
         promoted=promoted,
         sync_list_at_promotion=sync_list_at_promotion,
         standbys_at_promotion=standbys_at_promotion,
+        read_only_at_promotion=read_only_at_promotion,
         acked=acked,
         sync_list_at_ack=sync_list_at_ack,
+        read_only_at_ack=read_only_at_ack,
+        sync_standbys_at_ack=sync_standbys_at_ack,
         sync_acks=sync_acks,
         timed_out=TIMEOUT_MARKER in text,
+        refused_read_only=READ_ONLY_MARKER in text,
         raw=text,
     )
+
+
+def _tristate(value: bool | None) -> str:
+    """Render an observation that may not have been made at all."""
+    if value is None:
+        return "-"
+    return "yes" if value else "no"
+
+
+def _acked_cell(probe: ProbeResult) -> str:
+    """How the commit ended, for the summary table."""
+    if probe.acked:
+        return "yes"
+    if probe.refused_read_only:
+        return "refused (read-only)"
+    if probe.timed_out:
+        return "timed out"
+    return "no"
 
 
 def _maybe_int(text: str) -> int | None:
@@ -192,6 +235,14 @@ def classify(results: list[ProbeResult]) -> tuple[Verdict, str]:
 
     probe = promoted[0]
     if not probe.acked:
+        if probe.refused_read_only:
+            return (
+                Verdict.REFUSED,
+                f"{probe.service} refused the write outright — primary but "
+                "fenced read-only until its synchronous configuration is in "
+                f"force (sync list at promotion: {probe.sync_list_at_promotion!r}, "
+                f"{probe.standbys_at_promotion} standbys connected)",
+            )
         if probe.timed_out:
             return (
                 Verdict.BLOCKED,
@@ -201,21 +252,29 @@ def classify(results: list[ProbeResult]) -> tuple[Verdict, str]:
             )
         return (
             Verdict.INDETERMINATE,
-            f"{probe.service} was promoted but the commit neither acknowledged "
-            "nor timed out; the probe session did not run to completion",
+            f"{probe.service} was promoted but the commit neither acknowledged, "
+            "timed out, nor was refused; the probe session did not run to "
+            "completion",
         )
 
-    if probe.sync_acks is None:
+    if probe.sync_standbys_at_ack is None and probe.sync_acks is None:
         return (
             Verdict.INDETERMINATE,
             f"{probe.service} acknowledged the commit but the standby-ack count "
             "was never read, so the ack cannot be shown to be backed",
         )
-    if probe.sync_acks > 0:
+    # PostgreSQL's own contract carries the verdict: with synchronous_commit on
+    # and a standby designated `sync`, a commit does not return until that
+    # standby has flushed it. The LSN-covering count corroborates but cannot
+    # convict on its own — `commit_lsn` is read after the commit and drifts
+    # past the commit record, so a standby that genuinely holds this write can
+    # report a smaller flush_lsn.
+    if (probe.sync_standbys_at_ack or 0) > 0 or (probe.sync_acks or 0) > 0:
         return (
             Verdict.SYNC_ACK,
-            f"{probe.service} acknowledged the commit with {probe.sync_acks} "
-            "synchronous standby(s) holding it",
+            f"{probe.service} acknowledged the commit with "
+            f"{probe.sync_standbys_at_ack} standby(s) designated sync "
+            f"({probe.sync_acks} of them already past the commit position)",
         )
     return (
         Verdict.UNBACKED,
@@ -383,16 +442,20 @@ def run(
     table.add_column("Promoted")
     table.add_column("Sync list at promotion")
     table.add_column("Standbys")
+    table.add_column("Fenced at promotion")
+    table.add_column("Fenced at ack")
     table.add_column("Acked")
-    table.add_column("Standby acks")
+    table.add_column("Sync standbys at ack")
     for r in results:
         table.add_row(
             r.service,
             "yes" if r.promoted else "no",
             "(empty)" if r.sync_list_at_promotion == "" else str(r.sync_list_at_promotion),
             "-" if r.standbys_at_promotion is None else str(r.standbys_at_promotion),
-            "yes" if r.acked else ("timed out" if r.timed_out else "no"),
-            "-" if r.sync_acks is None else str(r.sync_acks),
+            r.read_only_at_promotion or "-",
+            r.read_only_at_ack or "-",
+            _acked_cell(r),
+            "-" if r.sync_standbys_at_ack is None else str(r.sync_standbys_at_ack),
         )
     console.print(table)
 

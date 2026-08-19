@@ -866,16 +866,23 @@ impl Supervisor {
         // check surface the conflict.
         let proc_dir_exists = fs::metadata(format!("/proc/{pid}")).await.is_ok();
         let proc_status = fs::read_to_string(format!("/proc/{pid}/status")).await.ok();
-        let positively_dead = if proc_dir_exists {
-            proc_status.as_ref().is_some_and(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("State:"))
-                    .is_some_and(|l| l.contains('Z') || l.contains('X'))
-            })
-        } else {
-            // The process directory is absent, so the pid no longer exists.
-            true
-        };
+        let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .await
+            .ok()
+            .map(|raw| raw.replace('\0', " "));
+        let positively_dead = postmaster_pid_is_stale(
+            proc_dir_exists,
+            proc_status.as_deref(),
+            cmdline.as_deref(),
+            pid,
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "a pid always fits in i32 on the platforms we run"
+            )]
+            {
+                std::process::id() as i32
+            },
+        );
         if !positively_dead {
             tracing::warn!(
                 pid,
@@ -1770,6 +1777,21 @@ host all all ::/0 {auth_method}
 
         tracing::info!("Promoting standby to primary");
 
+        // Everything that decides what the new primary may do is armed here,
+        // while this node is still a standby and cannot take a write either
+        // way. Promotion becomes visible to clients the instant
+        // `pg_is_in_recovery()` flips inside `pg_ctl promote`; any
+        // configuration applied after that call returns is necessarily later
+        // than the first moment a client can write. Measured with a session
+        // parked on the flip at 2 ms resolution: it observed the node
+        // unfenced, with a commit acknowledged and no standby holding it.
+        //
+        // Failures here are not fatal to the promotion — the cluster still
+        // needs a primary, and the lease loop reaches the same state on its
+        // next tick — but they are the difference between a window that
+        // cannot be entered and one that can, so they are counted.
+        self.arm_promotion_write_gate(sync_standby_names).await;
+
         // `-w` asks pg_ctl to wait until promotion is effective before
         // returning. Trust pg_ctl's own wait semantics; do not poll on top.
         // The outer timeout sits above pg_ctl's own 60 s wait so it only
@@ -1841,38 +1863,6 @@ host all all ::/0 {auth_method}
                 "Promotion succeeded but standby.signal removal failed: {e} \
                      (refusing to claim success to avoid split-brain on restart)"
             )));
-        }
-
-        // Replace the inherited synchronous_standby_names with the value the
-        // caller computed from the *current* voter set. A standby that was
-        // previously a primary carries the old term's list forward, which may
-        // name nodes that are no longer voters but are still reachable on
-        // `application_name` — acking commits against a quorum this cluster
-        // never agreed to.
-        //
-        // The replacement is never empty while peers exist (see
-        // `sync_standby_list`): an empty list makes the new primary
-        // acknowledge commits that no standby holds, and until
-        // ReplicationManager's next tick rewrites it that window is a real
-        // acked-but-unreplicated hole (RW-2). Writing the correct list here
-        // means the node is never writable under a list it did not choose,
-        // and a commit before any standby connects blocks instead of
-        // silently ack'ing at RPO>0. This is the same invariant
-        // `configure_standby` enforces in the other direction.
-        if let Err(e) = self.set_sync_standby_names(sync_standby_names).await {
-            // Don't fail the whole promotion — the freshly promoted primary
-            // is still functional, and the inherited list it keeps is
-            // non-empty in exactly the cases this write would have been,
-            // so the durability gate stays closed until ReplicationManager
-            // rewrites it. Log loudly so a chronic failure is noticed.
-            tracing::warn!(
-                error = %e,
-                sync_standby_names,
-                "Failed to set synchronous_standby_names on promotion — \
-                 sync replication keeps the inherited list until \
-                 ReplicationManager rewrites it on the next tick"
-            );
-            metrics::counter!("pgbattery_promotion_sync_reset_failures").increment(1);
         }
 
         tracing::info!("Promotion complete, now primary");
@@ -2730,6 +2720,71 @@ host all all ::/0 {auth_method}
             return Ok(());
         }
 
+        self.write_readonly_guc(readonly).await
+    }
+
+    /// Arm the write gate a promotion will emerge under, while still a standby.
+    ///
+    /// Two settings, both applied before `pg_ctl promote`:
+    ///
+    /// - `synchronous_standby_names` from the caller's current voter set. A
+    ///   standby that used to be primary carries the previous term's list
+    ///   forward, which can name nodes that are no longer voters but are still
+    ///   reachable on `application_name` — acknowledging against a quorum this
+    ///   cluster never agreed to. The replacement is never empty while peers
+    ///   exist, because empty means no acknowledgement is required at all.
+    /// - `default_transaction_read_only`, whenever an acknowledgement is
+    ///   required. `PostgreSQL` does not begin honouring the sync list the
+    ///   instant it is written, so a primary can carry a correct list and still
+    ///   acknowledge a commit nothing else holds. The lease loop lifts the flag
+    ///   once a standby is designated `sync`, or once the replication manager
+    ///   deliberately falls back to async; until then a client gets a clean
+    ///   read-only error rather than a promise that can vanish.
+    ///
+    /// Neither failure aborts the promotion — the cluster still needs a
+    /// primary, and both settings are reconciled by loops that run every tick.
+    /// They are counted because they are the difference between a window that
+    /// cannot be entered and one that can.
+    async fn arm_promotion_write_gate(&self, sync_standby_names: &str) {
+        if let Err(e) = self.set_sync_standby_names(sync_standby_names).await {
+            tracing::warn!(
+                error = %e,
+                sync_standby_names,
+                "Failed to set synchronous_standby_names before promotion — \
+                 the new primary keeps the inherited list until \
+                 ReplicationManager rewrites it on its next tick"
+            );
+            metrics::counter!("pgbattery_promotion_sync_reset_failures").increment(1);
+        }
+
+        // An empty list means no acknowledgement is required — a lone voter —
+        // and fencing there would be a write outage with nothing to wait for.
+        if sync_standby_names.is_empty() {
+            return;
+        }
+        if let Err(e) = self.write_readonly_guc(true).await {
+            tracing::warn!(
+                error = %e,
+                "Failed to fence before promotion — the new primary may \
+                 acknowledge writes before synchronous replication is in force, \
+                 until the lease loop fences it"
+            );
+            metrics::counter!("pgbattery_promotion_fence_failures").increment(1);
+        }
+    }
+
+    /// Write `default_transaction_read_only` and prove it took effect.
+    ///
+    /// Split out of [`Self::set_readonly`] because promotion needs it on a node
+    /// that is still a standby, where `set_readonly` deliberately short-circuits:
+    /// a standby cannot take writes, so setting the flag there looks pointless.
+    /// It is not pointless in the moment before `pg_ctl promote`. Promotion
+    /// becomes visible to clients when `pg_is_in_recovery()` flips, and anything
+    /// the supervisor does afterwards is necessarily later than that — measured
+    /// with a probe parked on the flip at 2 ms resolution, which saw the node
+    /// writable every time. Arming the flag first is the only way the primary
+    /// exists fenced rather than becoming fenced.
+    async fn write_readonly_guc(&self, readonly: bool) -> Result<()> {
         // Live-GUC idempotency: if the cluster setting already matches the
         // intent, skip the ALTER SYSTEM + reload + verify round-trip. The
         // 2s reconcile loop and the 100ms lease loop both call this every
@@ -3488,22 +3543,108 @@ host all all ::/0 {auth_method}
     ///
     /// # Errors
     /// Returns an error if the query fails or returns an unexpected shape.
-    pub async fn probe_role_and_readonly(&self) -> Result<(bool, bool)> {
+    pub async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
         let result = self
             .execute_sql(
-                "SELECT pg_is_in_recovery()::text || ',' || setting \
-                 FROM pg_settings WHERE name = 'default_transaction_read_only';",
+                "SELECT pg_is_in_recovery()::text || ',' \
+                 || (SELECT setting FROM pg_settings \
+                     WHERE name = 'default_transaction_read_only') || ',' \
+                 || CASE WHEN current_setting('synchronous_standby_names') = '' \
+                         THEN 'empty' ELSE 'set' END || ',' \
+                 || (SELECT count(*) FROM pg_stat_replication \
+                     WHERE sync_state = 'sync')::text;",
             )
             .await?;
         parse_role_readonly(&result)
     }
 }
 
-/// Parse the combined role/readonly probe row produced by
-/// [`Supervisor::probe_role_and_readonly`]: `true,on` / `false,off` style.
-fn parse_role_readonly(raw: &str) -> Result<(bool, bool)> {
+/// What one lease tick needs to know about `PostgreSQL`'s write path.
+///
+/// Read in a single round trip so the fields describe one instant: deciding
+/// from a role read taken before a readonly read taken before a replication
+/// read would let the role change underneath the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgWriteState {
+    /// `pg_is_in_recovery()`. True for a standby.
+    pub in_recovery: bool,
+    /// `default_transaction_read_only`.
+    pub read_only: bool,
+    /// Whether `synchronous_standby_names` is empty — i.e. this primary
+    /// requires no standby acknowledgement at all. True for a lone voter and
+    /// for the replication manager's deliberate async fallback, both of which
+    /// are states where a commit acknowledged by the primary alone is the
+    /// agreed durability rather than a surprise.
+    pub sync_list_empty: bool,
+    /// Standbys `PostgreSQL` currently reports as `sync_state = 'sync'`.
+    ///
+    /// The count matters rather than the GUC text: a freshly promoted primary
+    /// can carry a correct, non-empty `synchronous_standby_names` and still
+    /// acknowledge commits no standby holds, because the wait is gated on
+    /// state that lags promotion. A standby designated `sync` is the point at
+    /// which the configured durability is actually being delivered.
+    pub sync_standbys: usize,
+}
+
+/// Whether a `postmaster.pid` entry can be positively confirmed stale.
+///
+/// Fail closed: everything ambiguous returns `false`, leaving the file for
+/// `PostgreSQL`'s own startup check to arbitrate. Deleting the pid file of a
+/// postmaster that is actually running would hand two postmasters one data
+/// directory.
+///
+/// Positive confirmations, in order of how directly they answer the question:
+///
+/// - The process directory is gone, so the pid does not exist.
+/// - The process is a zombie or dead (`State: Z` / `X`), which is what an
+///   orphaned postmaster reparented to tini looks like — and which
+///   `kill(pid, 0)` reports as alive, so `PostgreSQL` will not start on it.
+/// - The pid is **our own**. A supervisor is not a postmaster, so the recorded
+///   one is gone and the pid has been reused. This is not hypothetical: after
+///   a container is recreated the supervisor reliably lands on a low pid, and
+///   a pid file written by the previous incarnation's postmaster can name it
+///   exactly. Left alone, the node never starts again — `PostgreSQL` refuses
+///   the data directory, the health check fails, the container restarts, and
+///   the new supervisor takes the same pid.
+/// - The cmdline is readable and does not name the `postgres` binary. A
+///   postmaster always execs `postgres`, so a readable cmdline that is
+///   something else is proof of pid reuse rather than a guess. An unreadable
+///   cmdline stays ambiguous — under `hidepid`, a live foreign postmaster
+///   reads the same as a dead one.
+fn postmaster_pid_is_stale(
+    proc_dir_exists: bool,
+    proc_status: Option<&str>,
+    cmdline: Option<&str>,
+    recorded_pid: i32,
+    our_pid: i32,
+) -> bool {
+    if !proc_dir_exists {
+        return true;
+    }
+    let zombie = proc_status.is_some_and(|s| {
+        s.lines()
+            .find(|l| l.starts_with("State:"))
+            .is_some_and(|l| l.contains('Z') || l.contains('X'))
+    });
+    if zombie {
+        return true;
+    }
+    if recorded_pid == our_pid {
+        return true;
+    }
+    match cmdline {
+        Some(cmd) if !cmd.trim().is_empty() => !cmd.contains("postgres"),
+        // Unreadable or empty (a kernel thread) — not evidence either way.
+        _ => false,
+    }
+}
+
+/// Parse the combined write-state probe row produced by
+/// [`Supervisor::probe_role_and_readonly`]: `true,on,set,1` style.
+fn parse_role_readonly(raw: &str) -> Result<PgWriteState> {
     let trimmed = raw.trim();
-    let Some((recovery, readonly)) = trimmed.split_once(',') else {
+    let fields: Vec<&str> = trimmed.split(',').collect();
+    let [recovery, readonly, sync_list, sync_count] = fields.as_slice() else {
         return Err(Error::Postgres(format!(
             "Unexpected role/readonly probe result: {trimmed:?}"
         )));
@@ -3517,7 +3658,27 @@ fn parse_role_readonly(raw: &str) -> Result<(bool, bool)> {
             )));
         }
     };
-    Ok((in_recovery, readonly.trim().eq_ignore_ascii_case("on")))
+    let sync_list_empty = match sync_list.trim() {
+        "empty" => true,
+        "set" => false,
+        other => {
+            return Err(Error::Postgres(format!(
+                "Unexpected synchronous_standby_names marker in role/readonly probe: {other:?}"
+            )));
+        }
+    };
+    let sync_standbys = sync_count.trim().parse::<usize>().map_err(|_| {
+        Error::Postgres(format!(
+            "Unexpected sync standby count in role/readonly probe: {:?}",
+            sync_count.trim()
+        ))
+    })?;
+    Ok(PgWriteState {
+        in_recovery,
+        read_only: readonly.trim().eq_ignore_ascii_case("on"),
+        sync_list_empty,
+        sync_standbys,
+    })
 }
 
 /// `PostgreSQL` replication state from `pg_stat_replication`.
@@ -4221,35 +4382,179 @@ mod tests {
         )));
     }
 
+    // ── postmaster_pid_is_stale ───────────────────────────────────────────
+
+    /// A live postmaster's cmdline, as `/proc/<pid>/cmdline` renders it once
+    /// the NUL separators are replaced.
+    const POSTMASTER_CMDLINE: &str =
+        "/usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/data ";
+    const RUNNING: &str = "Name:\tpostgres\nState:\tS (sleeping)\n";
+    const ZOMBIE: &str = "Name:\tpostgres\nState:\tZ (zombie)\n";
+
+    #[test]
+    fn test_a_missing_process_directory_is_stale() {
+        assert!(postmaster_pid_is_stale(false, None, None, 19, 7));
+    }
+
+    #[test]
+    fn test_a_zombie_is_stale() {
+        // The orphaned-postmaster case: kill(pid, 0) says alive, so PG will
+        // not start until the pid file goes.
+        assert!(postmaster_pid_is_stale(
+            true,
+            Some(ZOMBIE),
+            Some(POSTMASTER_CMDLINE),
+            19,
+            7
+        ));
+    }
+
+    #[test]
+    fn test_our_own_pid_is_stale() {
+        // A recreated container hands the supervisor a low pid, which the
+        // previous incarnation's pid file can name. Treating that as a live
+        // postmaster wedges the node permanently: PG refuses the data
+        // directory, the container restarts, and the pid is taken again.
+        // cmdline unreadable, so only the identity of the pid can settle it —
+        // otherwise the cmdline rule below would decide this case and the
+        // self-pid rule could be deleted without any test noticing.
+        assert!(
+            postmaster_pid_is_stale(true, Some(RUNNING), None, 19, 19),
+            "the supervisor read its own pid as a possibly-live postmaster"
+        );
+        // And with a readable cmdline it is still stale, by either route.
+        assert!(postmaster_pid_is_stale(
+            true,
+            Some(RUNNING),
+            Some("pgbattery run --bootstrap "),
+            19,
+            19
+        ));
+    }
+
+    #[test]
+    fn test_a_reused_pid_is_stale() {
+        // Any readable cmdline that is not the postgres binary is proof the
+        // recorded postmaster is gone, not a guess.
+        assert!(postmaster_pid_is_stale(
+            true,
+            Some(RUNNING),
+            Some("/usr/bin/tini -- pgbattery run "),
+            19,
+            7
+        ));
+    }
+
+    #[test]
+    fn test_a_live_postmaster_is_never_stale() {
+        // The one answer that must never be wrong: deleting this pid file
+        // would put two postmasters on one data directory.
+        assert!(!postmaster_pid_is_stale(
+            true,
+            Some(RUNNING),
+            Some(POSTMASTER_CMDLINE),
+            19,
+            7
+        ));
+    }
+
+    #[test]
+    fn test_an_unreadable_cmdline_stays_ambiguous() {
+        // Under hidepid a live foreign postmaster reads exactly like a dead
+        // one, so fail closed and let PG's own check arbitrate.
+        assert!(!postmaster_pid_is_stale(true, Some(RUNNING), None, 19, 7));
+        assert!(!postmaster_pid_is_stale(true, None, None, 19, 7));
+        assert!(!postmaster_pid_is_stale(
+            true,
+            Some(RUNNING),
+            Some("   "),
+            19,
+            7
+        ));
+    }
+
     // ── parse_role_readonly ───────────────────────────────────────────────
 
     #[test]
     fn test_parse_role_readonly_primary_writable() {
-        assert_eq!(parse_role_readonly("false,off").unwrap(), (false, false));
+        assert_eq!(
+            parse_role_readonly("false,off,set,1").unwrap(),
+            PgWriteState {
+                in_recovery: false,
+                read_only: false,
+                sync_list_empty: false,
+                sync_standbys: 1,
+            }
+        );
     }
 
     #[test]
     fn test_parse_role_readonly_primary_fenced() {
-        assert_eq!(parse_role_readonly("false,on").unwrap(), (false, true));
+        assert_eq!(
+            parse_role_readonly("false,on,set,0").unwrap(),
+            PgWriteState {
+                in_recovery: false,
+                read_only: true,
+                sync_list_empty: false,
+                sync_standbys: 0,
+            }
+        );
     }
 
     #[test]
     fn test_parse_role_readonly_standby() {
-        assert_eq!(parse_role_readonly("true,off").unwrap(), (true, false));
-        assert_eq!(parse_role_readonly("true,on").unwrap(), (true, true));
+        // A standby reports an empty sync list of its own accord; that is not
+        // the async fallback, which is why the caller pairs it with the role.
+        assert_eq!(
+            parse_role_readonly("true,off,empty,0").unwrap(),
+            PgWriteState {
+                in_recovery: true,
+                read_only: false,
+                sync_list_empty: true,
+                sync_standbys: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_role_readonly_async_fallback() {
+        // The replication manager's deliberate RPO>0 state: no ack required.
+        assert_eq!(
+            parse_role_readonly("false,off,empty,0").unwrap(),
+            PgWriteState {
+                in_recovery: false,
+                read_only: false,
+                sync_list_empty: true,
+                sync_standbys: 0,
+            }
+        );
     }
 
     #[test]
     fn test_parse_role_readonly_whitespace() {
-        assert_eq!(parse_role_readonly(" true,on \n").unwrap(), (true, true));
+        assert_eq!(
+            parse_role_readonly(" true,on,set,2 \n").unwrap(),
+            PgWriteState {
+                in_recovery: true,
+                read_only: true,
+                sync_list_empty: false,
+                sync_standbys: 2,
+            }
+        );
     }
 
     #[test]
     fn test_parse_role_readonly_malformed() {
         assert!(parse_role_readonly("").is_err());
         assert!(parse_role_readonly("true").is_err());
-        assert!(parse_role_readonly("t,on").is_err());
-        assert!(parse_role_readonly("maybe,on").is_err());
+        assert!(parse_role_readonly("t,on,set,0").is_err());
+        assert!(parse_role_readonly("maybe,on,set,0").is_err());
+        // Short rows must not parse to a state that reads as evidence.
+        assert!(parse_role_readonly("false,off").is_err());
+        assert!(parse_role_readonly("false,off,set").is_err());
+        // An unreadable sync marker or count is a failed probe, not a default.
+        assert!(parse_role_readonly("false,off,maybe,0").is_err());
+        assert!(parse_role_readonly("false,off,set,many").is_err());
     }
 
     /// Property tests over the pure `pg_rewind` data-loss gate.

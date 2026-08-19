@@ -190,7 +190,7 @@ fn sync_state_confirmed(repl_stats: &[ReplicationStat], expected_sync_names: &[S
 /// | 4          | 3     | 1        |
 /// | 5          | 4     | 2        |
 /// | 7          | 6     | 3        |
-const fn required_sync_standbys(other_voter_count: usize) -> usize {
+pub(crate) const fn required_sync_standbys(other_voter_count: usize) -> usize {
     other_voter_count / 2
 }
 

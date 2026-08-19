@@ -196,6 +196,10 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
         "pg_ctl promote succeeded but the post-promotion standby.signal file could not be removed; promotion was refused to avoid split-brain on the next restart"
     );
     describe_counter!(
+        "pgbattery_promotion_fence_failures",
+        "Failed attempts to fence a freshly promoted primary read-only until synchronous replication is in force; the lease loop fences on its next tick"
+    );
+    describe_counter!(
         "pgbattery_promotion_sync_reset_failures",
         "Failed attempts to clear synchronous_standby_names on the freshly promoted primary; replication manager will rewrite on its next tick"
     );

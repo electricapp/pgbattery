@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 
 use pgbattery_core::{NodeId, Result};
 
-use crate::supervisor::TimelineInfo;
+use crate::supervisor::{PgWriteState, TimelineInfo};
 
 /// The `PostgreSQL` operations the orchestration layer performs.
 ///
@@ -64,7 +64,7 @@ pub trait PgControl: Send + Sync {
     fn get_reportable_lsn(&self) -> impl Future<Output = Result<String>> + Send;
 
     /// `(in_recovery, read_only)` in one round trip, for the lease tick.
-    fn probe_role_and_readonly(&self) -> impl Future<Output = Result<(bool, bool)>> + Send;
+    fn probe_role_and_readonly(&self) -> impl Future<Output = Result<PgWriteState>> + Send;
 
     /// Sever every client backend, returning how many were terminated.
     ///
@@ -118,7 +118,7 @@ impl PgControl for crate::supervisor::Supervisor {
         Self::get_reportable_lsn(self).await
     }
 
-    async fn probe_role_and_readonly(&self) -> Result<(bool, bool)> {
+    async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
         Self::probe_role_and_readonly(self).await
     }
 
@@ -170,7 +170,7 @@ impl PgControl for crate::supervisor::Supervisor {
 /// "future simulation harnesses" would need it, but a test double in the
 /// shipping binary earns its place when something ships it, not before.
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModelPg {
     pub in_recovery: bool,
     /// Which operation, if any, this model refuses. One field rather than a
@@ -180,12 +180,40 @@ pub struct ModelPg {
     /// What `pg_stat_replication` reports. The async-fallback gate counts
     /// healthy standbys from this, so a test scripts RPO scenarios here.
     pub replication_stats: Vec<crate::supervisor::ReplicationStat>,
+    /// Whether `synchronous_standby_names` is empty, as the write-state probe
+    /// sees it. Defaults to true so a test that says nothing about replication
+    /// gets the "no acknowledgement required" case rather than a primary
+    /// wedged read-only for want of a standby it never configured.
+    pub sync_list_empty: bool,
+    /// Standbys `PostgreSQL` reports as `sync_state = 'sync'`.
+    pub sync_standbys: usize,
     // Behind a `Mutex` because the commands that change them take `&self`,
     // like their real counterparts. `pub(crate)` only so `..Default::default()`
     // works at the call sites; construct them through the builders below.
     pub(crate) readonly: std::sync::Mutex<bool>,
     pub(crate) slots: std::sync::Mutex<std::collections::HashSet<String>>,
     pub(crate) calls: std::sync::Mutex<Vec<String>>,
+}
+
+/// Hand-written rather than derived for one field: `sync_list_empty` must
+/// default to `true`. `bool`'s derived default would say "a sync list is
+/// configured" with zero standbys holding it, which is the one state that
+/// keeps a primary fenced — so every test that said nothing about replication
+/// would silently stop exercising write recovery.
+#[cfg(test)]
+impl Default for ModelPg {
+    fn default() -> Self {
+        Self {
+            in_recovery: false,
+            fails: None,
+            replication_stats: Vec::new(),
+            sync_list_empty: true,
+            sync_standbys: 0,
+            readonly: std::sync::Mutex::new(false),
+            slots: std::sync::Mutex::new(std::collections::HashSet::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
 }
 
 /// The operation a `ModelPg` can be told to fail.
@@ -301,9 +329,14 @@ impl PgControl for ModelPg {
         Ok("0/1000000".to_string())
     }
 
-    async fn probe_role_and_readonly(&self) -> Result<(bool, bool)> {
+    async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
         self.note("probe_role_and_readonly");
-        Ok((self.in_recovery, self.is_readonly()))
+        Ok(PgWriteState {
+            in_recovery: self.in_recovery,
+            read_only: self.is_readonly(),
+            sync_list_empty: self.sync_list_empty,
+            sync_standbys: self.sync_standbys,
+        })
     }
 
     async fn terminate_client_backends(&self) -> Result<String> {

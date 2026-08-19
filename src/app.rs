@@ -553,6 +553,8 @@ impl App {
         // write to the same buffer the HTTP handlers read.
         let debug_events = Arc::new(crate::observability::debug_events::DebugEventBuffer::new());
         let observer_node_id = self.config.node_id;
+        let lease_cluster_state = cluster_state.clone();
+        let lease_node_id = self.config.node_id;
         let observer_shutdown_rx = shutdown_rx.clone();
         let mgmt_state = self.build_management_state(
             &raft,
@@ -590,6 +592,8 @@ impl App {
             lease_enforcement: Self::spawn_lease_enforcement_loop(
                 lease_state,
                 postgres_manager,
+                lease_cluster_state,
+                lease_node_id,
                 lease_shutdown_tx,
                 lease_shutdown_rx,
             ),
@@ -1511,6 +1515,8 @@ impl App {
     fn spawn_lease_enforcement_loop(
         lease: crate::governor::SharedLeaseState,
         postgres: Arc<tokio::sync::Mutex<Supervisor>>,
+        cluster_state: Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        node_id: NodeId,
         shutdown_tx: watch::Sender<bool>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
@@ -1537,6 +1543,8 @@ impl App {
                         if Self::lease_enforcement_tick(
                             &postgres,
                             &lease,
+                            &cluster_state,
+                            node_id,
                             &mut fence_failures,
                             &shutdown_tx,
                         ).await {
@@ -1581,11 +1589,23 @@ impl App {
     async fn lease_enforcement_tick<P: crate::governor::pg_control::PgControl>(
         postgres: &Arc<tokio::sync::Mutex<P>>,
         lease: &crate::governor::SharedLeaseState,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        node_id: NodeId,
         fence_failures: &mut u32,
         shutdown_tx: &watch::Sender<bool>,
     ) -> bool {
         let pg = postgres.lock().await;
-        let (in_recovery, pg_writable) = Self::probe_pg_state(&*pg).await;
+        let (in_recovery, pg_writable, sync_observation) = Self::probe_pg_state(&*pg).await;
+
+        // What this cluster's voter set requires, from the same derivation the
+        // replication manager and promotion use.
+        let required_sync = {
+            let state = cluster_state.read();
+            let peers =
+                crate::governor::replication_manager::peer_voter_names(&state.voter_ids, node_id);
+            crate::governor::replication_manager::required_sync_standbys(peers.len())
+        };
+        let sync_in_force = Self::sync_durability_in_force(sync_observation, required_sync);
 
         // Read the lease AFTER the lock wait and the probes, immediately
         // before choosing a path. Acquiring the supervisor lock can block
@@ -1598,7 +1618,7 @@ impl App {
         // prevent.
         let lease_valid = lease.read().is_valid();
 
-        match Self::lease_enforcement_action(lease_valid, pg_writable, in_recovery) {
+        match Self::lease_enforcement_action(lease_valid, pg_writable, in_recovery, sync_in_force) {
             LeaseAction::EmergencyFence => {
                 // GUC not yet read-only (or the probe failed → fail-closed): set
                 // it and evict client backends. `handle_emergency_fence`
@@ -1665,6 +1685,7 @@ impl App {
         lease_valid: bool,
         pg_writable: bool,
         in_recovery: Option<bool>,
+        sync_in_force: bool,
     ) -> LeaseAction {
         if !lease_valid {
             if pg_writable {
@@ -1676,26 +1697,61 @@ impl App {
                 // A standby (or unknown but not writable): no client can write.
                 LeaseAction::None
             }
-        } else if !pg_writable && matches!(in_recovery, Some(false)) {
+        } else if !pg_writable && matches!(in_recovery, Some(false)) && sync_in_force {
             LeaseAction::RecoverWrites
         } else {
             LeaseAction::None
         }
     }
 
+    /// Whether the durability `synchronous_standby_names` promises is actually
+    /// being delivered right now.
+    ///
+    /// This is the gate between a primary existing and a primary accepting
+    /// writes. A freshly promoted node can carry a correct, non-empty sync list
+    /// and still acknowledge commits no standby holds, because `PostgreSQL`
+    /// does not begin waiting the moment the value is written — measured
+    /// directly: promoted under `FIRST 1 (...)` with no standby connected, the
+    /// commit returned with nothing holding it. So the GUC text is not the
+    /// evidence; a standby PostgreSQL has designated `sync` is.
+    ///
+    /// - Probe failed (`None`): not in force. Writes stay fenced rather than
+    ///   recovered on a state nobody read.
+    /// - Empty list: in force. No acknowledgement is required at all — a lone
+    ///   voter, or the replication manager's deliberate async fallback, which
+    ///   is the agreed RPO>0 state rather than a surprise.
+    /// - Otherwise: in force once at least `required` standbys report `sync`.
+    ///
+    /// Costs no availability. With a non-empty list and no `sync` standby a
+    /// commit blocks at the PostgreSQL level anyway once the wait engages, so
+    /// this converts an unbounded hang — or worse, an unbacked acknowledgement
+    /// — into a clean read-only error.
+    const fn sync_durability_in_force(observation: Option<(bool, usize)>, required: usize) -> bool {
+        match observation {
+            None => false,
+            Some((true, _)) => true,
+            Some((false, sync_standbys)) => sync_standbys >= required,
+        }
+    }
+
     /// Truth-source probe: ask PG every tick. Failures are fail-closed: we
-    /// assume "writable" so the policy then fences. One SQL round trip for
-    /// the `(in_recovery, readonly)` pair — this runs every 100 ms under the
-    /// supervisor lock, and the pair must come from one consistent snapshot.
+    /// assume "writable" so the policy then fences, and report no replication
+    /// observation so writes are not recovered on a state we could not read.
+    /// One SQL round trip — this runs every 100 ms under the supervisor lock,
+    /// and the fields must come from one consistent snapshot.
     /// Budgeted: a hung postmaster must not pin the lock past one tick.
     async fn probe_pg_state<P: crate::governor::pg_control::PgControl>(
         pg: &P,
-    ) -> (Option<bool>, bool) {
+    ) -> (Option<bool>, bool, Option<(bool, usize)>) {
         match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.probe_role_and_readonly()).await
         {
-            Ok(Ok((in_recovery, is_readonly))) => {
+            Ok(Ok(state)) => {
                 // A standby is never client-writable regardless of the GUC.
-                (Some(in_recovery), !in_recovery && !is_readonly)
+                (
+                    Some(state.in_recovery),
+                    !state.in_recovery && !state.read_only,
+                    Some((state.sync_list_empty, state.sync_standbys)),
+                )
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1706,7 +1762,7 @@ impl App {
                 // unknown — keep both per-question counters live for alerts.
                 metrics::counter!("pgbattery_recovery_probe_failures").increment(1);
                 metrics::counter!("pgbattery_readonly_probe_failures").increment(1);
-                (None, true)
+                (None, true, None)
             }
             Err(_) => {
                 tracing::warn!(
@@ -1715,7 +1771,7 @@ impl App {
                 );
                 metrics::counter!("pgbattery_recovery_probe_failures").increment(1);
                 metrics::counter!("pgbattery_readonly_probe_failures").increment(1);
-                (None, true)
+                (None, true, None)
             }
         }
     }
@@ -2796,6 +2852,15 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::watch;
 
+        /// A three-voter cluster, which is what makes the tick require one
+        /// synchronous acknowledgement before it will recover writes.
+        fn three_voters() -> Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>
+        {
+            let mut state = crate::governor::state_machine::ClusterState::default();
+            state.voter_ids = [1, 2, 3].into_iter().collect();
+            Arc::new(parking_lot::RwLock::new(state))
+        }
+
         /// A leader whose lease has expired, holding a writable primary.
         fn expired_lease_over_a_writable_primary(
             model: ModelPg,
@@ -2822,8 +2887,15 @@ mod tests {
             let (shutdown_tx, _shutdown_rx) = watch::channel(false);
             let mut fence_failures = 0;
 
-            let should_stop =
-                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+            let should_stop = App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
 
             assert!(!should_stop, "one fence attempt must not stop the loop");
             let (readonly, calls) = {
@@ -2858,7 +2930,15 @@ mod tests {
             let mut stopped = false;
             while ticks < App::FENCE_FAILURE_SHUTDOWN_THRESHOLD * 2 {
                 ticks += 1;
-                if App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await
+                if App::lease_enforcement_tick(
+                    &pg,
+                    &lease,
+                    &three_voters(),
+                    1,
+                    &mut fence_failures,
+                    &shutdown_tx,
+                )
+                .await
                 {
                     stopped = true;
                     break;
@@ -2897,17 +2977,133 @@ mod tests {
             let (shutdown_tx, _shutdown_rx) = watch::channel(false);
             let mut fence_failures = 0;
             for _ in 0..App::FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1 {
-                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+                App::lease_enforcement_tick(
+                    &pg,
+                    &lease,
+                    &three_voters(),
+                    1,
+                    &mut fence_failures,
+                    &shutdown_tx,
+                )
+                .await;
             }
             assert_eq!(fence_failures, App::FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1);
 
             pg.lock().await.fails = None;
-            let should_stop =
-                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+            let should_stop = App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
 
             assert!(!should_stop);
             assert_eq!(fence_failures, 0, "consecutive-failure count did not reset");
             assert!(pg.lock().await.is_readonly());
+        }
+
+        /// A valid lease over a fenced primary, which is the state a node is
+        /// in immediately after `promote` installs a non-empty sync list.
+        fn valid_lease_over_a_fenced_primary(
+            model: ModelPg,
+        ) -> (
+            Arc<tokio::sync::Mutex<ModelPg>>,
+            crate::governor::SharedLeaseState,
+        ) {
+            let mut lease = LeaseState::new();
+            lease.update_from_raft(true, true, std::time::Duration::ZERO);
+            assert!(lease.is_valid(), "fixture must start with a valid lease");
+            let model = ModelPg {
+                readonly: std::sync::Mutex::new(true),
+                ..model
+            };
+            (
+                Arc::new(tokio::sync::Mutex::new(model)),
+                Arc::new(parking_lot::RwLock::new(lease)),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_promoted_primary_stays_fenced_until_a_standby_is_sync() {
+            // RW-2 end to end through the tick, not just the decision table:
+            // the node holds the lease and is primary, but the sync list it
+            // was promoted under has nobody holding it yet.
+            let (pg, lease) = valid_lease_over_a_fenced_primary(ModelPg {
+                sync_list_empty: false,
+                sync_standbys: 0,
+                ..ModelPg::default()
+            });
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
+
+            assert!(
+                pg.lock().await.is_readonly(),
+                "unfenced a primary that was not yet honouring its sync list"
+            );
+        }
+
+        #[tokio::test]
+        async fn writes_recover_once_a_standby_is_sync() {
+            // The other side of the same gate: the moment PostgreSQL reports a
+            // standby as sync, the acknowledgement is backed and writes belong
+            // to clients again.
+            let (pg, lease) = valid_lease_over_a_fenced_primary(ModelPg {
+                sync_list_empty: false,
+                sync_standbys: 1,
+                ..ModelPg::default()
+            });
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
+
+            assert!(
+                !pg.lock().await.is_readonly(),
+                "left a primary fenced although its sync standby was holding writes"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_lone_voter_recovers_writes_with_no_standby() {
+            // A single-voter cluster requires no acknowledgement, so the gate
+            // must not wait for a standby that cannot exist.
+            let (pg, lease) = valid_lease_over_a_fenced_primary(ModelPg::default());
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+            let lone = {
+                let mut state = crate::governor::state_machine::ClusterState::default();
+                state.voter_ids = [1].into_iter().collect();
+                Arc::new(parking_lot::RwLock::new(state))
+            };
+
+            App::lease_enforcement_tick(&pg, &lease, &lone, 1, &mut fence_failures, &shutdown_tx)
+                .await;
+
+            assert!(
+                !pg.lock().await.is_readonly(),
+                "a lone voter was fenced waiting for a standby it can never have"
+            );
         }
 
         #[tokio::test]
@@ -2923,8 +3119,15 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let mut fence_failures = 0;
 
-            let should_stop =
-                App::lease_enforcement_tick(&pg, &lease, &mut fence_failures, &shutdown_tx).await;
+            let should_stop = App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
 
             assert!(!should_stop);
             assert!(!*shutdown_rx.borrow(), "fenced a standby into shutdown");
@@ -3146,11 +3349,11 @@ mod tests {
     fn test_lease_enforcement_action_matrix() {
         // Invalid lease, writable (GUC off or probe failed) → set GUC + evict.
         assert_eq!(
-            App::lease_enforcement_action(false, true, Some(false)),
+            App::lease_enforcement_action(false, true, Some(false), true),
             LeaseAction::EmergencyFence
         );
         assert_eq!(
-            App::lease_enforcement_action(false, true, None),
+            App::lease_enforcement_action(false, true, None, true),
             LeaseAction::EmergencyFence,
             "a failed probe (fail-closed) must still fence"
         );
@@ -3160,31 +3363,93 @@ mod tests {
         // commit past the GUC, so eviction must repeat every tick, not fire
         // once on the fence edge.
         assert_eq!(
-            App::lease_enforcement_action(false, false, Some(false)),
+            App::lease_enforcement_action(false, false, Some(false), true),
             LeaseAction::TerminateBypassers
         );
 
         // Invalid lease but PG is a standby: no client can write, nothing to do.
         assert_eq!(
-            App::lease_enforcement_action(false, false, Some(true)),
+            App::lease_enforcement_action(false, false, Some(true), true),
             LeaseAction::None
         );
 
         // Valid lease + read-only primary → recover writes.
         assert_eq!(
-            App::lease_enforcement_action(true, false, Some(false)),
+            App::lease_enforcement_action(true, false, Some(false), true),
             LeaseAction::RecoverWrites
         );
         // Valid lease, already writable → nothing.
         assert_eq!(
-            App::lease_enforcement_action(true, true, Some(false)),
+            App::lease_enforcement_action(true, true, Some(false), true),
             LeaseAction::None
         );
         // Valid lease on a standby → nothing (set_readonly is a no-op there).
         assert_eq!(
-            App::lease_enforcement_action(true, false, Some(true)),
+            App::lease_enforcement_action(true, false, Some(true), true),
             LeaseAction::None
         );
+    }
+
+    #[test]
+    fn test_writes_are_not_recovered_before_replication_is_in_force() {
+        // RW-2. A freshly promoted primary holds a valid lease and is fenced
+        // read-only; recovering writes here would let it acknowledge commits
+        // no standby holds, which is exactly the window this gate exists for.
+        assert_eq!(
+            App::lease_enforcement_action(true, false, Some(false), false),
+            LeaseAction::None,
+            "recovered writes while the configured durability was not in force"
+        );
+        // And the moment it is in force, the same state recovers.
+        assert_eq!(
+            App::lease_enforcement_action(true, false, Some(false), true),
+            LeaseAction::RecoverWrites
+        );
+    }
+
+    #[test]
+    fn test_the_gate_never_delays_a_fence() {
+        // The gate is on recovery only. A node that must fence still fences
+        // whatever replication is doing — durability cannot buy write
+        // authority a lost lease has taken away.
+        assert_eq!(
+            App::lease_enforcement_action(false, true, Some(false), true),
+            LeaseAction::EmergencyFence
+        );
+        assert_eq!(
+            App::lease_enforcement_action(false, true, Some(false), false),
+            LeaseAction::EmergencyFence
+        );
+        assert_eq!(
+            App::lease_enforcement_action(false, false, Some(false), false),
+            LeaseAction::TerminateBypassers
+        );
+    }
+
+    #[test]
+    fn test_sync_durability_in_force() {
+        // A probe nobody could read is not evidence of durability.
+        assert!(
+            !App::sync_durability_in_force(None, 0),
+            "an unreadable probe must not unfence a primary"
+        );
+        assert!(!App::sync_durability_in_force(None, 1));
+
+        // Empty list: no acknowledgement is required, so it is trivially in
+        // force — a lone voter, or the deliberate async fallback.
+        assert!(App::sync_durability_in_force(Some((true, 0)), 0));
+        assert!(App::sync_durability_in_force(Some((true, 0)), 1));
+
+        // Non-empty list: the standbys PostgreSQL designates `sync` are the
+        // evidence, not the text of the GUC.
+        assert!(
+            !App::sync_durability_in_force(Some((false, 0)), 1),
+            "a configured but undelivered sync requirement is not in force"
+        );
+        assert!(App::sync_durability_in_force(Some((false, 1)), 1));
+        // Five voters need two acknowledgements; one is not enough.
+        assert!(!App::sync_durability_in_force(Some((false, 1)), 2));
+        assert!(App::sync_durability_in_force(Some((false, 2)), 2));
     }
 
     #[test]
