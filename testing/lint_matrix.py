@@ -124,7 +124,14 @@ def check_python_syntax() -> None:
 
 
 def check_sql_references() -> None:
-    """Verify every SQL file referenced by the matrix exists, and vice versa."""
+    """Verify every SQL file referenced by the matrix exists, and vice versa.
+
+    The matrix is not the only caller. Standalone harnesses — the ones that
+    drive a scenario the matrix has no step type for — reference their SQL by
+    filename too, and a file used by one of those is not orphaned. Both
+    directions still hold: a matrix reference with no file fails, and a file no
+    caller anywhere names fails.
+    """
     data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     referenced: set[str] = set()
     for case in data["cases"]:
@@ -135,14 +142,22 @@ def check_sql_references() -> None:
 
     on_disk = {f.name for f in SQL_DIR.iterdir() if f.suffix == ".sql"}
 
+    # Anything a harness script names by filename counts as a reference.
+    harness_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(TESTING_DIR.glob("*.py"))
+        if path.name != "lint_matrix.py"
+    )
+    referenced_by_harness = {name for name in on_disk if name in harness_text}
+
     missing = referenced - on_disk
-    orphaned = on_disk - referenced
+    orphaned = on_disk - referenced - referenced_by_harness
 
     msgs: list[str] = []
     if missing:
         msgs.append(f"referenced but missing on disk: {sorted(missing)}")
     if orphaned:
-        msgs.append(f"on disk but not referenced by matrix: {sorted(orphaned)}")
+        msgs.append(f"on disk but named by neither the matrix nor a harness: {sorted(orphaned)}")
     if msgs:
         raise AssertionError("; ".join(msgs))
 

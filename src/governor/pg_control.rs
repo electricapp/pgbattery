@@ -45,7 +45,14 @@ pub trait PgControl: Send + Sync {
     fn verify_promotion_safe(&self) -> impl Future<Output = Result<TimelineInfo>> + Send;
 
     /// Promote this node to primary. Idempotent: a no-op if already primary.
-    fn promote(&mut self) -> impl Future<Output = Result<()>> + Send;
+    ///
+    /// `sync_standby_names` is the value to install as the new primary's
+    /// `synchronous_standby_names`, computed by the caller from the current
+    /// voter set. Promotion installs it as part of becoming primary so the
+    /// node is never writable under a sync configuration it did not choose:
+    /// the inherited value names the previous term's peers, and clearing it
+    /// to empty would make the node acknowledge commits no standby holds.
+    fn promote(&mut self, sync_standby_names: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Reconfigure as a standby of `leader_addr`, rewinding if diverged.
     fn demote(&mut self, leader_addr: SocketAddr) -> impl Future<Output = Result<()>> + Send;
@@ -95,8 +102,8 @@ impl PgControl for crate::supervisor::Supervisor {
         Self::verify_promotion_safe(self).await
     }
 
-    async fn promote(&mut self) -> Result<()> {
-        Self::promote(self).await
+    async fn promote(&mut self, sync_standby_names: &str) -> Result<()> {
+        Self::promote(self, sync_standby_names).await
     }
 
     async fn demote(&mut self, leader_addr: SocketAddr) -> Result<()> {
@@ -254,8 +261,8 @@ impl PgControl for ModelPg {
         })
     }
 
-    async fn promote(&mut self) -> Result<()> {
-        self.note("promote");
+    async fn promote(&mut self, sync_standby_names: &str) -> Result<()> {
+        self.note(&format!("promote({sync_standby_names})"));
         if self.fails == Some(ModelOp::Promote) {
             return Err(pgbattery_core::Error::Postgres(
                 "model: promote failed".to_string(),

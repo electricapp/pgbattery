@@ -535,13 +535,21 @@ def parse_container_networks(text: str) -> dict[str, str]:
 
 
 def container_id(service: str) -> str:
-    """Resolve a compose service to its container id.
+    """Resolve a compose service to its container id, running or not.
 
     Asks compose rather than string-building a name, so a change to its naming
     convention surfaces as a precondition failure instead of an unresolvable
     name that the fault then shrugs off.
+
+    `-a` is load-bearing. Without it compose reports nothing for a container
+    that is not running, which is the state every healing verb is called in:
+    `start_container` after `kill_container` could never resolve its own
+    target. It also restores the already-dead guard in `kill_container` — with
+    the state unreadable that check was skipped, so the one thing it exists to
+    catch (killing a container that was already down, a silent no-op fault)
+    reached it as an unresolvable name instead.
     """
-    result = run(f"docker compose ps -q {service}")
+    result = run(f"docker compose ps -aq {service}")
     cid = result.stdout.strip().split("\n")[-1].strip() if result.ok else ""
     if not cid:
         raise FaultPreconditionError(

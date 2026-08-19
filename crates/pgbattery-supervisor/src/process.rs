@@ -1750,7 +1750,7 @@ host all all ::/0 {auth_method}
     /// # Errors
     /// Returns an error if the recovery-state probe fails, the node is not a
     /// standby, or `pg_ctl promote` fails or does not exit recovery in time.
-    pub async fn promote(&mut self) -> Result<()> {
+    pub async fn promote(&mut self, sync_standby_names: &str) -> Result<()> {
         // Truth source: pg_is_in_recovery(). A probe failure here must be
         // fatal — proceeding to `pg_ctl promote` without knowing the current
         // state can double-promote a primary, or silently no-op a real
@@ -1843,26 +1843,33 @@ host all all ::/0 {auth_method}
             )));
         }
 
-        // Clear stale synchronous_standby_names inherited from
-        // postgresql.auto.conf. A standby that was previously a primary may
-        // carry the old value forward; if we don't reset it, the brand-new
-        // primary will use it for the ~1s window before ReplicationManager
-        // rewrites it, ack'ing commits under a sync configuration that
-        // references nodes that no longer exist (or *worse*, are no longer
-        // voters but happen to be reachable on `application_name`). Setting
-        // to empty here makes the post-promote window async (no quorum
-        // guarantee yet); ReplicationManager re-enables sync once replicas
-        // actually connect under the new term. This is the same invariant
+        // Replace the inherited synchronous_standby_names with the value the
+        // caller computed from the *current* voter set. A standby that was
+        // previously a primary carries the old term's list forward, which may
+        // name nodes that are no longer voters but are still reachable on
+        // `application_name` — acking commits against a quorum this cluster
+        // never agreed to.
+        //
+        // The replacement is never empty while peers exist (see
+        // `sync_standby_list`): an empty list makes the new primary
+        // acknowledge commits that no standby holds, and until
+        // ReplicationManager's next tick rewrites it that window is a real
+        // acked-but-unreplicated hole (RW-2). Writing the correct list here
+        // means the node is never writable under a list it did not choose,
+        // and a commit before any standby connects blocks instead of
+        // silently ack'ing at RPO>0. This is the same invariant
         // `configure_standby` enforces in the other direction.
-        if let Err(e) = self.set_sync_standby_names("").await {
+        if let Err(e) = self.set_sync_standby_names(sync_standby_names).await {
             // Don't fail the whole promotion — the freshly promoted primary
-            // is still functional, just with a stale sync config for ~1s
-            // until ReplicationManager rewrites it. Log loudly so a chronic
-            // failure is noticed.
+            // is still functional, and the inherited list it keeps is
+            // non-empty in exactly the cases this write would have been,
+            // so the durability gate stays closed until ReplicationManager
+            // rewrites it. Log loudly so a chronic failure is noticed.
             tracing::warn!(
                 error = %e,
-                "Failed to clear synchronous_standby_names on promotion — \
-                 sync replication may briefly use stale config until \
+                sync_standby_names,
+                "Failed to set synchronous_standby_names on promotion — \
+                 sync replication keeps the inherited list until \
                  ReplicationManager rewrites it on the next tick"
             );
             metrics::counter!("pgbattery_promotion_sync_reset_failures").increment(1);

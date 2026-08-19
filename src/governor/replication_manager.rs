@@ -82,6 +82,36 @@ const SLOT_DROP_FAILURE_STUCK_THRESHOLD: u32 = 10;
 /// Returning both from one function keeps the GUC decision and the
 /// RPO-degraded signal (gauge + edge logging) in lockstep by
 /// construction.
+/// The `synchronous_standby_names` value that makes this leader's write set
+/// intersect every Raft majority, given the peer voter application names.
+///
+/// Empty only when no ack is required (a one- or two-voter cluster, where
+/// `required_sync_standbys` is zero). At three or more voters this never
+/// returns empty, which is what keeps a freshly promoted primary from
+/// acknowledging a commit no standby holds — see `Supervisor::promote`.
+pub(crate) fn sync_standby_list(all_voter_names: &[String]) -> String {
+    let required = required_sync_standbys(all_voter_names.len());
+    if required == 0 {
+        String::new()
+    } else {
+        format!("FIRST {required} ({})", all_voter_names.join(", "))
+    }
+}
+
+/// Deterministic `application_name` for every voter except this node, sorted.
+///
+/// Derived from the voter ids rather than `pg_stat_replication`, so the list
+/// is the same whether or not a replica happens to be connected right now.
+pub(crate) fn peer_voter_names(voter_ids: &HashSet<NodeId>, self_id: NodeId) -> Vec<String> {
+    let mut names: Vec<String> = voter_ids
+        .iter()
+        .filter(|id| **id != self_id)
+        .map(|id| format!("pgbattery_node_{id}"))
+        .collect();
+    names.sort();
+    names
+}
+
 fn plan_sync_replication(
     all_voter_names: &[String],
     healthy_voter_count: usize,
@@ -94,12 +124,7 @@ fn plan_sync_replication(
     // at >=5 it acks a write on leader + 1 standby = 2 of >=5 nodes, and a
     // failover to the other majority silently loses it. See
     // `required_sync_standbys`.
-    let required = required_sync_standbys(all_voter_names.len());
-    let sync_list = if required == 0 {
-        String::new()
-    } else {
-        format!("FIRST {required} ({})", all_voter_names.join(", "))
-    };
+    let sync_list = sync_standby_list(all_voter_names);
 
     if healthy_voter_count == 0 && has_quorum && !in_leader_grace {
         // Quorum intact but no replica streaming: fall back to async
@@ -622,13 +647,7 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         // All voter replicas (excluding self) → sync standby name list.
         // Construct deterministic application_name from node_id so we don't
         // depend on the replica currently being in pg_stat_replication.
-        let mut all_voter_names: Vec<String> = cluster
-            .voter_ids
-            .iter()
-            .filter(|id| **id != self.node_id)
-            .map(|id| format!("pgbattery_node_{id}"))
-            .collect();
-        all_voter_names.sort();
+        let all_voter_names = peer_voter_names(&cluster.voter_ids, self.node_id);
 
         // Healthy streaming voters → drives the sync/async decision.
         let healthy_voter_count = status_map
@@ -1324,6 +1343,65 @@ mod tests {
                         k - 1
                     );
                 }
+            }
+
+            /// The list promotion installs is exactly the list steady state
+            /// would choose for the same voter set, whenever steady state is
+            /// not in its degraded async fallback. Promotion computes it from
+            /// `ClusterState::voter_ids` and ReplicationManager recomputes it
+            /// every tick; if these two derivations could disagree, a freshly
+            /// promoted primary would run under one quorum and the tick that
+            /// followed would silently widen or narrow it.
+            #[test]
+            fn prop_promotion_list_matches_steady_state(others in 0usize..=64) {
+                let names = voter_names(others);
+                let promotion = sync_standby_list(&names);
+                // A leader inside its grace window keeps the sync list rather
+                // than falling back to async, which is the state a node is in
+                // immediately after promotion.
+                let (steady, _) = plan_sync_replication(&names, 0, true, true);
+                prop_assert_eq!(
+                    promotion,
+                    steady,
+                    "promotion and steady state disagree at {} peers",
+                    others
+                );
+            }
+
+            /// RW-2: with a peer voter to ack, the list promotion installs is
+            /// never empty. An empty list makes the new primary acknowledge a
+            /// commit no standby holds, and that window is only closed by the
+            /// next ReplicationManager tick.
+            #[test]
+            fn prop_promotion_list_is_never_empty_when_an_ack_is_required(
+                others in 2usize..=64,
+            ) {
+                let names = voter_names(others);
+                let plan = sync_standby_list(&names);
+                prop_assert!(
+                    !plan.is_empty(),
+                    "{others} peers require an ack but the promotion list was empty"
+                );
+            }
+
+            /// `peer_voter_names` never names the node itself — a primary
+            /// listed in its own `synchronous_standby_names` waits for an ack
+            /// that can only arrive from a standby it is not.
+            #[test]
+            fn prop_peer_voter_names_excludes_self(
+                voters in prop::collection::hash_set(1u64..=64, 1..16),
+                self_id in 1u64..=64,
+            ) {
+                let names = peer_voter_names(&voters, self_id);
+                prop_assert!(
+                    !names.contains(&format!("pgbattery_node_{self_id}")),
+                    "self {self_id} appeared in its own sync list: {names:?}"
+                );
+                prop_assert_eq!(
+                    names.len(),
+                    voters.iter().filter(|v| **v != self_id).count(),
+                    "peers were dropped or duplicated"
+                );
             }
 
             /// The planned GUC either names exactly

@@ -1308,7 +1308,7 @@ class NetworkRunner:
 
     def __call__(self, cmd: str, timeout_s: float) -> CommandResult:
         self.calls.append(cmd)
-        if "docker compose ps -q" in cmd:
+        if "docker compose ps -aq" in cmd:
             return CommandResult(0, f"{self.cid}\n", "")
         if "docker inspect" in cmd:
             idx = min(self.inspects, len(self.attached_sequence) - 1)
@@ -1417,12 +1417,32 @@ class NetworkDetachedTests(unittest.TestCase):
         self.assertIn(("inject", "network_detached"), kinds)
         self.assertIn(("heal", "network_detached"), kinds)
 
+    def test_a_stopped_container_still_resolves(self) -> None:
+        """`start_container` has to name a container that is not running.
+
+        Compose reports nothing for a stopped container without `-a`, so a
+        resolution that omitted it could never heal a `kill_container`: the
+        service is stopped by definition at that point. This mock answers only
+        the `-aq` form, which is exactly the asymmetry the real docker CLI has.
+        """
+
+        def runner(cmd: str, timeout_s: float) -> CommandResult:
+            if "docker compose ps -aq" in cmd:
+                return CommandResult(0, "deadbeefcafe\n", "")
+            if "docker compose ps -q" in cmd:
+                return CommandResult(0, "\n", "")
+            return CommandResult(0, "", "")
+
+        previous = set_command_runner(runner)
+        self.addCleanup(set_command_runner, previous)
+        self.assertEqual(container_id("node1"), "deadbeefcafe")
+
     def test_unresolvable_service_is_a_precondition_failure(self) -> None:
         """No container id means the project is wrong or the cluster is down —
         either way nothing can be injected."""
 
         def runner(cmd: str, timeout_s: float) -> CommandResult:
-            if "docker compose ps -q" in cmd:
+            if "docker compose ps -aq" in cmd:
                 return CommandResult(0, "\n", "")
             return CommandResult(0, "", "")
 

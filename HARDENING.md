@@ -183,20 +183,20 @@ Ranked by expected severity. "Reachable" means the current harness can actually
 produce the conditions, not that a test asserts the right thing. "Tracked by"
 names the task that closes the window, so no row is open without an owner.
 
-| #     | Window                                                                                                                                                                                                     | Contract   | Reachable today                                                                      | Tracked by        |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------ | ----------------- |
-| RW-1  | Deposed leader retains a quorum excluding the election winner; the promotion hold-down is vacuous and safety rests on the quorum-loss self-fence plus sync replication refusing acks                       | L1         | No — needs 5-node asymmetric partition shapes                                        | H-06 (needs H-04) |
-| RW-2  | Post-promotion window where `synchronous_standby_names` is cleared before the replication manager reinstates it: commits ack with zero standby acks                                                        | W1, R2     | No — needs injection triggered by protocol state, not a sleep                        | H-07              |
-| RW-3  | Async fallback then `pg_rewind` discarding up to the divergence threshold of genuinely acked WAL. The threshold's justification assumes sync replication is active, which is exactly false during fallback | W1         | Partially — the fallback is reachable, but nothing measures what rewind destroys     | H-14              |
-| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                  | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured | H-13              |
-| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                          | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution  | covered           |
-| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                        | W1         | Partially — never driven through a _follower_ gateway specifically                   | H-05              |
-| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win      | L3         | Closed — aged-LSN tiebreak; `test_stale_restored_node_loses_a_leaderless_election`   | H-11 (done)       |
-| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                          | L1         | Partially — pure functions are unit-tested; the live coalescing race is not          | H-18              |
-| RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                    | L1         | No                                                                                   | H-15              |
-| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash                                                 | R1, V2     | Partially                                                                            | H-16              |
-| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                     | W1, L3     | No                                                                                   | H-05              |
-| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                             | W1, W2, S1 | Partially — one fixed timing, no sweep                                               | H-17              |
+| #     | Window                                                                                                                                                                                                                                                                                    | Contract   | Reachable today                                                                      | Tracked by        |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------ | ----------------- |
+| RW-1  | Deposed leader retains a quorum excluding the election winner; the promotion hold-down is vacuous and safety rests on the quorum-loss self-fence plus sync replication refusing acks                                                                                                      | L1         | No — needs 5-node asymmetric partition shapes                                        | H-06 (needs H-04) |
+| RW-2  | Post-promotion window: a freshly promoted primary acknowledges commits with zero standby acks. Measured, not inferred — see H-07. Writing the correct `synchronous_standby_names` at promotion is necessary but not sufficient, because PostgreSQL's own enforcement of it lags promotion | W1, R2     | Yes — `post_promotion_sync_gap.py` enters the window on protocol state               | H-07 (open)       |
+| RW-3  | Async fallback then `pg_rewind` discarding up to the divergence threshold of genuinely acked WAL. The threshold's justification assumes sync replication is active, which is exactly false during fallback                                                                                | W1         | Partially — the fallback is reachable, but nothing measures what rewind destroys     | H-14              |
+| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                                                                                                 | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured | H-13              |
+| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                                                                                                         | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution  | covered           |
+| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                                                                                                       | W1         | Partially — never driven through a _follower_ gateway specifically                   | H-05              |
+| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win                                                                                     | L3         | Closed — aged-LSN tiebreak; `test_stale_restored_node_loses_a_leaderless_election`   | H-11 (done)       |
+| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                                                                                                         | L1         | Partially — pure functions are unit-tested; the live coalescing race is not          | H-18              |
+| RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                                                                                                   | L1         | No                                                                                   | H-15              |
+| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash                                                                                                                                | R1, V2     | Partially                                                                            | H-16              |
+| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                                                                                                    | W1, L3     | No                                                                                   | H-05              |
+| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                                                                                                            | W1, W2, S1 | Partially — one fixed timing, no sweep                                               | H-17              |
 
 The pattern worth noting: the harness is densest exactly where the design is
 already strongest, and thinnest where the design documents its own residual
@@ -794,11 +794,60 @@ No new infrastructure. Highest confidence per unit of effort.
 - [ ] **H-07 — Trigger faults on protocol state, not wall-clock offsets.** Replace
       `sleep 4` with injection keyed off observed state: mid-rewind,
       mid-basebackup, inside the promotion hold-down, and inside the
-      post-promotion window where `synchronous_standby_names` is cleared before
-      the replication manager reinstates it.
+      post-promotion window.
       **Done when** the post-promotion sync gap is entered deliberately and a
       commit during it is proven either to block or to carry a standby ack.
       _Closes_ RW-2 · _Blocked by_ H-02 · _Effort_ M
+
+      The window is entered, and what it found is worse than the description it
+      was filed under. `testing/post_promotion_sync_gap.py` opens a session on
+      every standby before the fault, parks it on `pg_is_in_recovery()`, and
+      commits the instant that flips — no sleep anywhere, so the probe lands
+      inside a window whose measured width was ~120 ms.
+
+      Two findings, in order of discovery:
+
+      1. Promotion cleared `synchronous_standby_names` to empty. The value it
+         replaced — the previous term's inherited list — was *safer*: it names
+         peers that are not connected, so a commit blocks, while empty means
+         no ack is required at all. On the build before the fix the probe
+         caught exactly that: promoted at `00:17:44.612` under the inherited
+         list, acknowledged 63 ms later with the list already empty and
+         `SYNCACK 0` — an acknowledged commit no standby held.
+         `Supervisor::promote` now takes the list the caller derives from the
+         current voter set (`sync_standby_list`/`peer_voter_names`, the same
+         derivation ReplicationManager uses every tick, pinned together by
+         `prop_promotion_list_matches_steady_state`), so the node is never
+         writable under a list it did not choose and never under an empty one.
+
+      2. That fix is necessary and **not sufficient**, which the same probe
+         then showed on the fixed build: promoted under a correct, non-empty
+         `FIRST 1 (...)` with zero standbys connected, and the commit still
+         acknowledged with `SYNCACK 0`. PostgreSQL gates the synchronous wait
+         on a shared-memory flag, not on the GUC text a backend can read: the
+         contrast is decisive, because the identical unsatisfiable list on a
+         *long-running* primary blocked a commit for 10 s. So a freshly
+         promoted primary does not enforce synchronous replication yet, however
+         correct the value in front of it, and writing a better value cannot
+         close the window on its own.
+
+      Two things fall out for the harness itself. `statement_timeout` does not
+      bound a synchronous-replication wait — the 10 s block above happened under
+      a 300 ms timeout — so "the commit blocked" cannot be detected by a
+      timeout alone. And a checker must never read an empty
+      `synchronous_standby_names` as evidence of the window: a standby reports
+      empty too, so the marker only means anything paired with
+      `pg_is_in_recovery()` being false. An earlier draft of the probe bounded
+      its own wait loop with `statement_timeout`, and the cancelled loop fell
+      through to a marker announcing a promotion that had not happened.
+
+      What remains for RW-2 is the writability gate: the node must not accept
+      client writes until the replication configuration in force is the one
+      ReplicationManager intends — either sync confirmed
+      (`pgbattery_sync_state_verifications`) or the deliberate async fallback,
+      which is the operator-visible RPO>0 state. That touches the lease and
+      read-only state machines, so it lands with `docs/STATE_MACHINE.md` in the
+      same commit.
 
 - [ ] **H-08 — Backward clock jumps and sub-second skew.** Current skew is
       forward-only and coarse (+30 s / +300 s). Backward steps are the harder

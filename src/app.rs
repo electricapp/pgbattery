@@ -1045,7 +1045,7 @@ impl App {
             return;
         };
         if leader_id == node_id {
-            Self::promote_local_postgres(postgres, cluster_state, lease).await;
+            Self::promote_local_postgres(postgres, cluster_state, lease, node_id).await;
             return;
         }
 
@@ -1081,6 +1081,7 @@ impl App {
         postgres: &Arc<tokio::sync::Mutex<P>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         lease: &crate::governor::SharedLeaseState,
+        node_id: NodeId,
     ) {
         let mut pg = postgres.lock().await;
         // Fast-path idempotency: if PG is already primary we have nothing to
@@ -1199,7 +1200,19 @@ impl App {
             return;
         }
 
-        match pg.promote().await {
+        // The sync list the new primary must run under, from the voter set
+        // this node currently believes in — the same derivation
+        // ReplicationManager uses on every tick, so promotion and steady
+        // state cannot disagree. Computed before `promote` so the node is
+        // never writable under the previous term's inherited list.
+        let sync_standby_names = {
+            let state = cluster_state.read();
+            let peers =
+                crate::governor::replication_manager::peer_voter_names(&state.voter_ids, node_id);
+            crate::governor::replication_manager::sync_standby_list(&peers)
+        };
+
+        match pg.promote(&sync_standby_names).await {
             Ok(()) => {
                 if let Some(started_at) = failover_started_at {
                     // clock-lint: allow — histogram sample, not a gate.
@@ -2678,7 +2691,7 @@ mod tests {
                 in_recovery: false,
                 ..ModelPg::default()
             });
-            App::promote_local_postgres(&pg, &cluster, &lease).await;
+            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert_eq!(calls, vec!["is_in_recovery"], "did more than probe");
         }
@@ -2689,21 +2702,62 @@ mod tests {
                 in_recovery: true,
                 ..ModelPg::default()
             });
-            App::promote_local_postgres(&pg, &cluster, &lease).await;
+            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
                 calls.contains(&"verify_promotion_safe".to_string()),
                 "promoted without the safety check: {calls:?}"
             );
             assert!(
-                calls.contains(&"promote".to_string()),
+                calls.iter().any(|c| c.starts_with("promote(")),
                 "never promoted: {calls:?}"
             );
             let verify = calls.iter().position(|c| c == "verify_promotion_safe");
-            let promote = calls.iter().position(|c| c == "promote");
+            let promote = calls.iter().position(|c| c.starts_with("promote("));
             assert!(
                 verify < promote,
                 "checked safety after promoting: {calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn promotion_installs_the_sync_list_of_the_current_voter_set() {
+            // RW-2. Promotion used to clear `synchronous_standby_names` to
+            // empty, so between `pg_ctl promote` and ReplicationManager's next
+            // tick the new primary acknowledged commits that no standby held —
+            // a real acked-but-unreplicated window (measured at ~120 ms on a
+            // live three-node cluster). Promotion must install the list the
+            // current voter set implies instead, so a commit before any
+            // standby connects blocks rather than ack'ing at RPO>0.
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                ..ModelPg::default()
+            });
+            cluster.write().voter_ids = [1, 2, 3].into_iter().collect();
+            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            let calls = pg.lock().await.calls();
+            assert!(
+                calls
+                    .contains(&"promote(FIRST 1 (pgbattery_node_2, pgbattery_node_3))".to_string()),
+                "promoted under the wrong sync list: {calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_lone_voter_promotes_without_a_sync_list() {
+            // The other direction: with no peer voters there is no standby ack
+            // to wait for, so an empty list is correct and must not become a
+            // write that blocks forever on a standby that cannot exist.
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                ..ModelPg::default()
+            });
+            cluster.write().voter_ids = [1].into_iter().collect();
+            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            let calls = pg.lock().await.calls();
+            assert!(
+                calls.contains(&"promote()".to_string()),
+                "a single voter should promote with an empty sync list: {calls:?}"
             );
         }
 
@@ -2717,10 +2771,10 @@ mod tests {
                 fails: Some(ModelOp::VerifyPromotionSafe),
                 ..ModelPg::default()
             });
-            App::promote_local_postgres(&pg, &cluster, &lease).await;
+            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
-                !calls.contains(&"promote".to_string()),
+                !calls.iter().any(|c| c.starts_with("promote(")),
                 "promoted despite a failed safety check: {calls:?}"
             );
         }
