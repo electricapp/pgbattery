@@ -1208,13 +1208,45 @@ No new infrastructure. Highest confidence per unit of effort.
       bounded rather than assumed.
       _Closes_ RW-10 · _Effort_ M
 
-- [ ] **H-17 — Sweep commit-probe correctness around COMMIT.** A wrong answer
-      manufactures a phantom commit or a duplicate retry. One fixed timing is
-      tested; the byte offsets around the commit record are not.
+- [x] **H-17 — Sweep commit-probe correctness around COMMIT.** A wrong answer
+      manufactures a phantom commit or a duplicate retry.
       **Done when** the probe is exercised at every offset in the neighbourhood of
-      COMMIT and each answer is checked against ground truth from
-      `txid_status()`.
+      COMMIT and each answer is checked against ground truth.
       _Closes_ RW-12 · _Effort_ M
+
+      **The probe had never worked.** `txid_status()` takes `bigint`, and the
+      SQL handed it the `xid8` its own xmax guard compares against, so every
+      call raised "function txid_status(xid8) does not exist" and the endpoint
+      answered `500` with `status: null` — for every transaction, always. A
+      client whose connection died mid-COMMIT could not learn whether its write
+      landed, which is exactly the position RW-12 describes. `pg_xact_status`
+      is the `xid8` variant and answers correctly.
+
+      The existing unit test asserted the SQL's *shape* — guard before call,
+      digits-only interpolation — and a shape is not an execution, so it passed
+      throughout. It now also pins the function name and its argument type.
+
+      `commit_probe_sweep.py` severs the backend at a sweep of offsets past the
+      moment COMMIT starts, and compares the probe's answer to whether the row
+      is actually there: `committed` must mean present, `aborted` must mean
+      absent. The trigger is protocol state —
+      `pg_stat_activity.query ILIKE 'COMMIT%'` — because timing the sever by
+      wall clock includes `docker exec` startup and put every sever well past
+      the commit record. Twelve offsets from 0 to 250 ms, twelve definite
+      answers, all matching.
+
+      Two harness faults on the way, both of which invented disagreements:
+      statements sent as one `-c` string arrive as a single query, so COMMIT
+      could not be seen starting; and trial tags repeated across runs against a
+      table that was never truncated, so a row from a previous sweep answered
+      "did this transaction land" for one that had just aborted.
+
+      Not exercised live: the `aborted` arm. Commits here are fast enough that a
+      sever at these offsets always lands after the record is durable, so every
+      trial committed. `test_commit_probe_sweep.py` covers both wrong answers
+      directly; producing a live abort needs the commit slowed inside its
+      critical section, which is a fault-injection capability the harness does
+      not have yet.
 
 - [ ] **H-18 — Drive the failover-anchor coalescing race live.** The pure
       functions are unit-tested; a missed clear or missed re-stamp under coalesced

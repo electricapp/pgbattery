@@ -401,9 +401,16 @@ pub(super) async fn get_txid_status(
 /// for a future value; `pg_current_snapshot()` reads the snapshot without
 /// assigning a txid.
 fn txid_status_sql(txid: u64) -> String {
+    // `pg_xact_status`, not `txid_status`: the latter takes `bigint`, so
+    // passing the `xid8` the guard compares against raised "function
+    // txid_status(xid8) does not exist" on every call and the endpoint
+    // answered 500 with `status: null` — for every transaction, always. A
+    // client asking whether its severed commit landed could never find out.
+    // The string-shape test below did not catch it because a shape is not an
+    // execution; `commit_probe_sweep.py` runs the query against a live node.
     format!(
         "SELECT CASE WHEN '{txid}'::xid8 >= pg_snapshot_xmax(pg_current_snapshot()) \
-         THEN '' ELSE COALESCE(txid_status('{txid}'::xid8)::text, '') END;"
+         THEN '' ELSE COALESCE(pg_xact_status('{txid}'::xid8)::text, '') END;"
     )
 }
 
@@ -421,8 +428,16 @@ mod tests {
         // The guard must run BEFORE txid_status so a future xid cannot raise
         // and kill the shared psql session.
         let guard_pos = sql.find("pg_snapshot_xmax(pg_current_snapshot())").unwrap();
-        let call_pos = sql.find("txid_status(").unwrap();
+        let call_pos = sql.find("pg_xact_status(").unwrap();
         assert!(guard_pos < call_pos);
+        // The status function has to accept what the guard compares: an xid8.
+        // `txid_status` takes bigint, so the pairing below raised on every
+        // call and the endpoint answered 500 for every transaction.
+        assert!(
+            !sql.contains("txid_status("),
+            "txid_status takes bigint and cannot be handed the xid8 the guard uses"
+        );
+        assert!(sql.contains("pg_xact_status('12345'::xid8)"));
         // NULL (too-old txid) folds to the same empty "unknown" answer.
         assert!(sql.contains("COALESCE"));
         // u64 formatting is the injection barrier: the interpolated value
