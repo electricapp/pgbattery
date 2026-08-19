@@ -187,7 +187,7 @@ names the task that closes the window, so no row is open without an owner.
 | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------ | ----------------- |
 | RW-1  | Deposed leader retains a quorum excluding the election winner; the promotion hold-down is vacuous and safety rests on the quorum-loss self-fence plus sync replication refusing acks                                                                                                                                                            | L1         | No — needs 5-node asymmetric partition shapes                                                    | H-06 (needs H-04) |
 | RW-2  | Post-promotion window: a freshly promoted primary acknowledged commits with zero standby acks. Closed by arming the sync list and the read-only fence before `pg_ctl promote`, and gating write recovery on a standby actually designated `sync` — the GUC's text was never the evidence, because PostgreSQL's enforcement of it lags promotion | W1, R2     | Closed — `post_promotion_sync_gap.py` enters the window on protocol state; the commit is refused | H-07 (done)       |
-| RW-3  | Async fallback then `pg_rewind` discarding up to the divergence threshold of genuinely acked WAL. The threshold's justification assumes sync replication is active, which is exactly false during fallback                                                                                                                                      | W1         | Partially — the fallback is reachable, but nothing measures what rewind destroys                 | H-14              |
+| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL. **Measured, not bounded away: 20 of 20 acknowledged writes destroyed** (`rewind_loss.py`). Every write acknowledged while `synchronous_standby_names` is empty can be lost, up to 16 MiB of diverged WAL — the deliberate availability trade, now counted rather than asserted  | W1         | Yes — `rewind_loss.py` forces the fallback and counts the survivors                              | H-14 (measured)   |
 | RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                                                                                                                                                       | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured             | H-13              |
 | RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                                                                                                                                                               | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution              | covered           |
 | RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                                                                                                                                                             | W1         | Partially — never driven through a _follower_ gateway specifically                               | H-05              |
@@ -1115,14 +1115,37 @@ No new infrastructure. Highest confidence per unit of effort.
       provides.
       _Closes_ RW-4 · _Effort_ M
 
-- [ ] **H-14 — Measure what `pg_rewind` discards.** Async fallback then rewind can
-      discard up to the divergence threshold of genuinely acked WAL, and the
-      threshold's justification assumes sync replication is active — exactly false
-      during fallback. The fallback is reachable but nothing measures the loss.
+- [x] **H-14 — Measure what `pg_rewind` discards.**
       **Done when** a case records acked writes, forces async fallback and rewind,
       and reports how many acked writes were destroyed. That number either is zero
       or becomes a documented RPO bound.
       _Closes_ RW-3 · _Effort_ M
+
+      **It is not zero. Measured: 20 of 20 acknowledged writes destroyed.**
+
+      `rewind_loss.py` severs streaming replication with `partition_channel`
+      while leaving Raft healthy, waits for `pgbattery_replication_sync` to
+      report the async fallback, writes acknowledged rows in that window,
+      deposes the leader, lets the survivors elect, and counts how many of those
+      rows exist afterwards. On a live three-node cluster: fallback engaged, 20
+      rows acknowledged, node3 deposed, node2 elected, **zero survivors**.
+
+      So the documented RPO bound for the fallback window is: _every write
+      acknowledged while `synchronous_standby_names` is empty can be lost_,
+      bounded not by zero but by `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES` (16 MiB)
+      of diverged WAL. That is the trade the fallback makes deliberately —
+      availability over durability when no replica is streaming — but the cost
+      was previously asserted rather than counted, and the rewind threshold's
+      justification ("synchronous replication is holding these elsewhere") is
+      false in exactly this window.
+
+      The fault has to be installed on the standby and with real WAL in flight:
+      the leader streams continuously while a standby answers only every
+      `wal_receiver_status_interval`, and a row-at-a-time load through
+      `docker exec` is about one write a second — far too little for the DROP
+      rule to match anything inside its settle window. The primitive refused
+      both weaker attempts rather than reporting a partition that never
+      happened.
 
 - [x] **H-15 — Unblock the supervisor mutex in `demote()`.** It was held across
       stop, rewind, and recovery, so the 100 ms lease tick stalled behind it.
