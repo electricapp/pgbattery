@@ -2029,32 +2029,46 @@ nothing detects drift.
       counterexample.
       _Effort_ L
 
-- [ ] **H-36 — Larger models nightly**: 5 nodes and higher term bounds. Current
+- [x] **H-36 — Larger models nightly**: 5 nodes and higher term bounds. Current
       configs are 3 nodes with small bounds, and `raft_lsn.tla` abstracts the Raft
       log away entirely, so its `ElectionSafety` is the textbook Raft theorem
       rather than a statement about openraft.
       **Done when** the nightly job checks the larger configs within its budget.
 
-      Deferred, but the tractability question is answered — measured locally
-      (M4, `-workers auto`) so nobody has to rediscover it:
+      Every spec now has a `<spec>.large.cfg` beside its PR config, run by
+      `make -C tla check-large` from a nightly job at 03:40 UTC. Measured on an
+      M4 with `-workers auto`, all four clean:
 
-      | Spec             | Config                     | Distinct states | Time    |
-      | ---------------- | -------------------------- | --------------- | ------- |
-      | `lease_fencing`  | 5 nodes, MaxTerm 5         | 4.8M            | 13 s    |
-      | `lease_fencing`  | 5 nodes, MaxTerm 4         | 1.1M            | 3 s     |
-      | `raft_lsn`       | 3 nodes, MaxTerm 5         | 283 k           | 1 s     |
-      | `raft_lsn`       | 4 nodes, MaxTerm 3         | 1.6M            | 6 s     |
-      | `raft_lsn`       | 4 nodes, MaxTerm 3, LSN 3  | 7.0M            | 28 s    |
-      | `raft_lsn`       | 5 nodes, MaxTerm 3         | intractable     | >180 s  |
-      | `raft_lsn`       | 5 nodes, MaxTerm 4         | intractable     | >10 min |
+      | Spec                     | Nightly config              | Distinct states | Time   |
+      | ------------------------ | --------------------------- | --------------- | ------ |
+      | `lease_fencing`          | 5 nodes, MaxTerm 5          | 4.8M            | 14 s   |
+      | `raft_lsn`               | 4 nodes, MaxTerm 3, MaxLSN 3 | 7.0M            | 31 s   |
+      | `commit_probing`         | 3 connections, MaxTxid 4    | 7.8M            | 29 s   |
+      | `timeline_verification`  | 4 nodes, MaxTimeline 4      | 1.1M            | 5 s    |
 
-      `lease_fencing` scales to 5 nodes cheaply, which is the config that matters
-      for RW-1. `raft_lsn` does not: it carries a per-node LSN and term, so the
-      state space multiplies on several dimensions at once and the queue grows
-      faster than TLC drains it — at 5 nodes it was still 66M states from done
-      after ten minutes. Its realistic ceiling is 4 nodes, and raising `MaxLSN`
-      buys more than raising the node count. Any future attempt should move one
-      axis at a time and run under a hard timeout.
+      Node count is not the axis to push everywhere, which is the substance of
+      the earlier measurements and of two more taken since. `raft_lsn` carries a
+      term and an LSN per node, so at 5 nodes TLC was still 66M states from done
+      after ten minutes; `MaxLSN` buys more, and a third LSN value is what makes
+      "behind by more than the threshold" and "behind by exactly the threshold"
+      both reachable in one behaviour. `timeline_verification` at 5 nodes and
+      MaxTimeline 4 completes but costs 58.5M states and 4.5 minutes on an M4 —
+      an order of magnitude past the 4-node model for no new shape, and far past
+      what a 2-core runner should spend. `lease_fencing` is the one that scales
+      cheaply to 5 nodes, and it is also the one where five matters: it admits
+      quorum shapes three cannot, including a deposed leader holding a quorum
+      that excludes the eventual winner, which is the shape RW-1 turns on.
+
+      Two properties keep the target honest. A hard per-spec timeout (900 s)
+      distinguishes "this model outgrew its budget" from a stuck runner, and a
+      spec with no large config fails the target rather than being skipped —
+      checking three of four would otherwise read as coverage the next time
+      somebody adds a spec.
+
+      Still true, and not addressed here: `raft_lsn` abstracts the Raft log
+      away, so its `ElectionSafety` remains the textbook theorem rather than a
+      statement about openraft. Closing that is H-34's business, not a bigger
+      model's.
       _Effort_ M
 
 ### Wave 7 — Real Jepsen (Tier 6)

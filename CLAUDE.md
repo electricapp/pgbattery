@@ -108,10 +108,10 @@ All Python test scripts use a uv shebang (`#!/usr/bin/env -S uv run --project te
 | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | `ha-ci.yml`                                            | harness lint + self-tests, `ha-sequential`, `ha-parallel` (matrixed), `ha-controlplane-pr`, `ha-assert-sanity` | `ha-controlplane-nightly` at 04:15 UTC                         |
 | `elle.yml`                                             | `kill` attack only (~90 s smoke)                                                                               | full attack matrix, sharded, random seed per run, at 03:00 UTC |
-| `tla.yml`                                              | all 4 specs                                                                                                    | —                                                              |
+| `tla.yml`                                              | all 4 specs                                                                                                    | the same 4 at more nodes / wider bounds, at 03:40 UTC          |
 | `correctness-lite.yml`, `fuzz.yml`, `supply-chain.yml` | see workflow                                                                                                   | —                                                              |
 
-Run locally: `./testing/ci_runner.py --suite <suite> [--case <id>]`, `testing/run_elle_matrix.sh [attack...]`, `cd tla && make check`.
+Run locally: `./testing/ci_runner.py --suite <suite> [--case <id>]`, `testing/run_elle_matrix.sh [attack...]`, `cd tla && make check` (or `make check-large` for the nightly models).
 
 ### Known-incomplete harnesses
 

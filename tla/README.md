@@ -12,6 +12,7 @@ Formal models of pgbattery's core safety properties, **machine-checked** with TL
 ```bash
 cd tla/
 make check                      # download (pinned) + check ALL specs
+make check-large                # the nightly models (more nodes, wider bounds)
 make check-lease_fencing        # one spec, full TLC output
 make tools                      # just fetch + verify the jar
 make clean                      # remove downloaded jar + TLC state
@@ -19,7 +20,16 @@ make clean                      # remove downloaded jar + TLC state
 
 Requires a JDK ≥ 11. The `Makefile` auto-detects a working `java`, else Homebrew
 `openjdk@21`. On macOS install it with **`brew install openjdk@21`** (a formula —
-no `sudo`; the `--cask`/Toolbox needs root and isn't required).
+no `sudo`; the `--cask`/Toolbox needs root and isn't required). `check-large`
+also needs `timeout(1)` — macOS ships none, so `brew install coreutils`.
+
+Each spec has two models. `<spec>.cfg` is what every PR runs: the smallest model
+that can exhibit the property at all. `<spec>.large.cfg` is the nightly one, and
+its header says which axis it widens, why that axis rather than another, and the
+measurement behind the choice. Node count is not always the right axis —
+`raft_lsn` carries a term and an LSN per node and becomes intractable at five,
+where a wider `MaxLSN` buys more. `check-large` fails rather than skips when a
+spec has no large config.
 
 ## What each spec checks
 

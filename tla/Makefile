@@ -1,6 +1,7 @@
 # TLA+ model checking — reproducible, scripted.
 #
 #   make check          # download (if needed) + check ALL specs; fails on violation
+#   make check-large    # the nightly models: more nodes, wider bounds
 #   make check-lease_fencing   # check one spec (full TLC output)
 #   make tools          # just fetch + verify the pinned TLC jar
 #   make clean          # remove the downloaded jar + TLC state
@@ -41,7 +42,20 @@ JAVA ?= $(shell \
 
 TLC := "$(JAVA)" -XX:+UseParallelGC -cp "$(JAR)" tlc2.TLC
 
-.PHONY: check tools clean $(addprefix check-,$(SPECS))
+# Per-spec wall-clock cap for the nightly models. Every large config was
+# measured well inside this; a spec that grows past it has changed shape and
+# should be re-measured rather than left to run until the job's own timeout,
+# where it looks like a stuck runner instead of an intractable model.
+LARGE_TIMEOUT_SECS := 900
+
+# macOS ships no `timeout`; coreutils installs it as `gtimeout`. Resolved once
+# so a missing binary is a clear message rather than rc=127 mid-run.
+TIMEOUT_BIN := $(shell \
+  if command -v timeout >/dev/null 2>&1; then echo timeout; \
+  elif command -v gtimeout >/dev/null 2>&1; then echo gtimeout; \
+  else echo ""; fi)
+
+.PHONY: check check-large tools clean $(addprefix check-,$(SPECS))
 
 check: tools
 	@mkdir -p $(STATES)
@@ -55,6 +69,40 @@ check: tools
 	done; \
 	if [ $$fail -ne 0 ]; then echo "TLA validation FAILED"; exit 1; fi; \
 	echo "All TLA specs passed."
+
+# The nightly models: more nodes and wider bounds than a PR can afford. Each
+# spec's `<spec>.large.cfg` says what it widens and why, and carries the
+# measurement that justified the choice.
+#
+# A spec with no large config is an error, not a skip: the whole point of this
+# target is that it covers every spec, and silently checking three of four
+# would read as coverage the next time somebody adds one.
+check-large: tools
+	@if [ -z "$(TIMEOUT_BIN)" ]; then \
+	  echo "no timeout(1) on PATH. Install GNU coreutils (brew install coreutils)."; exit 2; \
+	fi
+	@mkdir -p $(STATES)
+	@missing=""; for s in $(SPECS); do \
+	  [ -f $$s.large.cfg ] || missing="$$missing $$s"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	  echo "no large config for:$$missing — add <spec>.large.cfg or this target checks less than it claims"; \
+	  exit 1; \
+	fi
+	@fail=0; for s in $(SPECS); do \
+	  echo "=== $$s (large) ==="; \
+	  if $(TIMEOUT_BIN) $(LARGE_TIMEOUT_SECS) $(TLC) -config $$s.large.cfg -workers auto \
+	       -metadir $(STATES)/$$s-large $$s.tla > $(STATES)/$$s-large.log 2>&1; then \
+	    grep -E "Model checking completed|distinct states found" $(STATES)/$$s-large.log | sed 's/^/  /'; \
+	  elif [ $$? -eq 124 ]; then \
+	    echo "  TIMED OUT after $(LARGE_TIMEOUT_SECS)s — the model outgrew its budget:"; \
+	    tail -5 $(STATES)/$$s-large.log | sed 's/^/  /'; fail=1; \
+	  else \
+	    echo "  FAILED — invariant violated or error:"; tail -40 $(STATES)/$$s-large.log | sed 's/^/  /'; fail=1; \
+	  fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "TLA nightly validation FAILED"; exit 1; fi; \
+	echo "All large TLA models passed."
 
 # Single spec, full TLC output (e.g. `make check-lease_fencing`).
 check-%: tools

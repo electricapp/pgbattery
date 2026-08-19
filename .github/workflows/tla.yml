@@ -16,6 +16,10 @@ on:
       - "!tla/**/*.md" # docs never trigger model checking
       - ".github/workflows/tla.yml"
   workflow_dispatch:
+  schedule:
+    # 03:40 UTC, between the Elle matrix (03:00) and the control-plane
+    # nightly (04:15), so the three do not contend for runners.
+    - cron: "40 3 * * *"
 
 # Deny-all by default; each job re-grants only the scopes it needs.
 permissions: {}
@@ -27,6 +31,7 @@ concurrency:
 jobs:
   tlc:
     name: Model-check TLA+ specs
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -41,3 +46,32 @@ jobs:
           java-version: "21"
       - name: Model-check all specs (downloads + verifies pinned TLC jar)
         run: make -C tla check
+
+  # The models a PR cannot afford: five nodes for lease_fencing, four for
+  # raft_lsn and timeline_verification, a third connection for commit_probing.
+  # Each `<spec>.large.cfg` records what it widens and the measurement behind
+  # the choice; `check-large` refuses to run if any spec lacks one.
+  tlc-large:
+    name: Model-check the nightly TLA+ models
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Model-check the large configs
+        run: make -C tla check-large
+      - name: Upload TLC logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tlc-large-logs
+          path: tla/.tools/states/*-large.log
+          if-no-files-found: error
