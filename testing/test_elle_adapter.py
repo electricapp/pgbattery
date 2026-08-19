@@ -21,32 +21,35 @@ from pathlib import Path
 
 from elle_adapter import (
     ElleError,
-    _parse_anomalies,
-    _parse_valid,
+    ElleOutput,
     check_with_elle,
 )
 
 
+def _parse(raw: dict[str, object]) -> ElleOutput:
+    return ElleOutput.model_validate(raw)
+
+
 class ParseValidTests(unittest.TestCase):
     def test_valid_true(self) -> None:
-        self.assertIs(_parse_valid({"valid?": True}), True)
+        self.assertIs(_parse({"valid?": True}).valid, True)
 
     def test_valid_false(self) -> None:
-        self.assertIs(_parse_valid({"valid?": False}), False)
+        self.assertIs(_parse({"valid?": False}).valid, False)
 
     def test_valid_unknown(self) -> None:
-        self.assertIsNone(_parse_valid({"valid?": "unknown"}))
+        self.assertIsNone(_parse({"valid?": "unknown"}).valid)
 
     def test_valid_missing(self) -> None:
-        self.assertIsNone(_parse_valid({}))
+        self.assertIsNone(_parse({}).valid)
 
 
 class ParseAnomaliesTests(unittest.TestCase):
     def test_no_anomalies(self) -> None:
-        self.assertEqual(_parse_anomalies({"anomalies": {}}), [])
+        self.assertEqual(_parse({"anomalies": {}}).flat_anomalies, [])
 
     def test_missing_anomalies_key(self) -> None:
-        self.assertEqual(_parse_anomalies({}), [])
+        self.assertEqual(_parse({}).flat_anomalies, [])
 
     def test_anomalies_with_cycles(self) -> None:
         raw: dict[str, object] = {
@@ -55,17 +58,36 @@ class ParseAnomaliesTests(unittest.TestCase):
                 "G2-item": [{"cycle": [1, 2, 1]}, {"cycle": [4, 5, 4]}],
             }
         }
-        anomalies = _parse_anomalies(raw)
+        anomalies = _parse(raw).flat_anomalies
         self.assertEqual(len(anomalies), 3)
         names = sorted(a.name for a in anomalies)
         self.assertEqual(names, ["G-single", "G2-item", "G2-item"])
         g_single = next(a for a in anomalies if a.name == "G-single")
         self.assertEqual(g_single.cycle, [3, 7, 9, 3])
 
+    def test_steps_are_read_as_a_cycle(self) -> None:
+        """Elle spells the same thing `steps` for some anomaly classes."""
+        anomalies = _parse({"anomalies": {"G0": [{"steps": [2, 4, 2]}]}}).flat_anomalies
+        self.assertEqual(anomalies[0].cycle, [2, 4, 2])
+
+    def test_an_op_map_in_a_cycle_is_not_carried_as_an_index(self) -> None:
+        """A whole op map is not an index, and printing one as an index would
+        put a number in the report that identifies nothing."""
+        anomalies = _parse(
+            {"anomalies": {"G-single": [{"cycle": [3, {"process": 1}, 5]}]}}
+        ).flat_anomalies
+        self.assertEqual(anomalies[0].cycle, [3, 5])
+
     def test_scalar_anomaly_payload(self) -> None:
-        anomalies = _parse_anomalies({"anomalies": {"some-flag": True}})
+        anomalies = _parse({"anomalies": {"some-flag": True}}).flat_anomalies
         self.assertEqual(len(anomalies), 1)
         self.assertEqual(anomalies[0].name, "some-flag")
+        self.assertEqual(anomalies[0].detail["payload"], True)
+
+    def test_meta_op_count_and_elapsed(self) -> None:
+        parsed = _parse({"_meta": {"op-count": 4_200}, "elapsed-ms": 12})
+        self.assertEqual(parsed.meta.op_count, 4_200)
+        self.assertEqual(parsed.elapsed_ms, 12.0)
 
 
 class SubprocessErrorTests(unittest.TestCase):

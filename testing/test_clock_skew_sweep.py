@@ -27,6 +27,7 @@ def timings(*, lease_duration_ms: int = 2_000) -> fp.SystemTimings:
         metrics_watchdog_timeout_ms=1_500,
         lsn_staleness_threshold_ms=30_000,
         leadership_transfer_lease_safety_ms=500,
+        slot_ensure_interval_ms=30_000,
         election_timeout_source="constants.rs",
     )
 

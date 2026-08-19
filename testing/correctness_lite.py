@@ -457,6 +457,29 @@ class Violation:
 
 
 @dataclass
+class ContentionRun:
+    """What the contention burst (step 9) acked, per key.
+
+    `skipped` is not the same as empty: a step that could not set its table up
+    has nothing to say about the counters, while one that ran and acked nothing
+    does.
+    """
+
+    skipped: bool = False
+    acked: dict[int, int] = field(default_factory=dict)
+    indeterminate: dict[int, int] = field(default_factory=dict)
+
+
+@dataclass
+class MonotonicRun:
+    """The reads step 10 recorded, and the writes it got acks for."""
+
+    skipped: bool = False
+    observations: list[tuple[int, int]] = field(default_factory=list)
+    acked: list[int] = field(default_factory=list)
+
+
+@dataclass
 class History:
     """Accumulated record of the entire test run, shared across threads."""
 
@@ -477,6 +500,12 @@ class History:
     indeterminate, which is sound — but it means the outcome taxonomy has a gap
     worth a new entry in INDETERMINATE_PATTERNS or SERVER_REJECTION_PATTERNS.
     """
+
+    contention: ContentionRun | None = None
+    """What step 9 observed, or `None` if it never ran."""
+
+    monotonic: MonotonicRun | None = None
+    """What step 10 observed, or `None` if it never ran."""
 
     _counter: int = field(default=0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -1546,7 +1575,7 @@ def step_concurrent_contention(history: History, console: Console) -> None:
             break
     if not setup_ok:
         console.print("  [yellow]WARNING:[/] could not create counters table — skipping step 9")
-        history.contention_skipped = True  # type: ignore[attr-defined]
+        history.contention = ContentionRun(skipped=True)
         return
 
     leader, _ = find_leader()
@@ -1592,8 +1621,7 @@ def step_concurrent_contention(history: History, console: Console) -> None:
             acked_per_key[op.key] += 1
         elif op.outcome == "indeterminate":
             indet_per_key[op.key] += 1
-    history.contention_acked = acked_per_key  # type: ignore[attr-defined]
-    history.contention_indeterminate = indet_per_key  # type: ignore[attr-defined]
+    history.contention = ContentionRun(acked=acked_per_key, indeterminate=indet_per_key)
 
     summary = ", ".join(
         f"k{k}: {acked_per_key[k]}+{indet_per_key[k]}?" for k in range(CONTENTION_KEYS)
@@ -1624,10 +1652,10 @@ def check_contention_invariant() -> list[Violation]:
 def _check_contention_against_db(db_val: dict[int, int]) -> list[Violation]:
     """Compare DB values against the in-memory acked / indeterminate counts."""
     violations: list[Violation] = []
-    acked: dict[int, int] = getattr(_LAST_HISTORY, "contention_acked", {})
-    indet: dict[int, int] = getattr(_LAST_HISTORY, "contention_indeterminate", {})
-    if getattr(_LAST_HISTORY, "contention_skipped", False):
+    run = _LAST_HISTORY.contention if _LAST_HISTORY is not None else None
+    if run is None or run.skipped:
         return violations  # step itself didn't run
+    acked, indet = run.acked, run.indeterminate
     if not acked and not indet:
         return violations  # nothing to compare
     for key in range(CONTENTION_KEYS):
@@ -1739,7 +1767,7 @@ def step_monotonic_read_session(history: History, console: Console) -> None:
             break
     if not setup_ok:
         console.print("  [yellow]WARNING:[/] could not create monotonic table — skipping step 10")
-        history.monotonic_skipped = True  # type: ignore[attr-defined]
+        history.monotonic = MonotonicRun(skipped=True)
         return
 
     observations: list[tuple[int, int]] = []  # (write_iter, observed_max_after_read)
@@ -1770,8 +1798,7 @@ def step_monotonic_read_session(history: History, console: Console) -> None:
             history.close_fault(fw)
 
     # Persist for the checker.
-    history.monotonic_observations = observations  # type: ignore[attr-defined]
-    history.monotonic_acked = acked  # type: ignore[attr-defined]
+    history.monotonic = MonotonicRun(observations=observations, acked=acked)
     console.print(f"  acked {len(acked)}/{MONOTONIC_WRITES}, recorded {len(observations)} reads")
 
 
@@ -1783,11 +1810,10 @@ def check_monotonic_read_invariant() -> list[Violation]:
     that returns less than a previously-observed value.
     """
     violations: list[Violation] = []
-    if _LAST_HISTORY is None:
+    run = _LAST_HISTORY.monotonic if _LAST_HISTORY is not None else None
+    if run is None or run.skipped:
         return violations
-    if getattr(_LAST_HISTORY, "monotonic_skipped", False):
-        return violations
-    obs: list[tuple[int, int]] = getattr(_LAST_HISTORY, "monotonic_observations", [])
+    obs = run.observations
     if not obs:
         return violations
     regressions: list[tuple[int, int, int, int]] = []  # (i, max_i, j, max_j)
@@ -1810,7 +1836,7 @@ def check_monotonic_read_invariant() -> list[Violation]:
     # Also: the FINAL read should be >= every acked write.
     if obs:
         final_max = max(m for _, m in obs)
-        acked: list[int] = getattr(_LAST_HISTORY, "monotonic_acked", [])
+        acked = run.acked
         if acked and final_max < max(acked):
             violations.append(
                 Violation(

@@ -21,6 +21,18 @@ pub struct LeaderResponse {
     pub leader_mgmt_addr: Option<String>,
 }
 
+/// Which cluster this node's data belongs to.
+///
+/// The lineage is the `PostgreSQL` system identifier: `initdb` mints it once
+/// and `pg_basebackup` carries it to every node, so two nodes share it exactly
+/// when they share a data history. `None` when this node has no data directory
+/// to read — a witness, or a node not yet provisioned.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClusterIdentityResponse {
+    pub node_id: u64,
+    pub cluster_lineage: Option<u64>,
+}
+
 /// Node info for discovery (includes management API address)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeDiscoveryInfo {
@@ -106,6 +118,29 @@ pub(super) async fn get_leader(
 /// from `RaftMetrics::current_leader` (live), never from
 /// `cluster_state.leader_id` (the Raft-log-applied mirror — lags during
 /// transitions and persists after `RaftCore` shutdown).
+/// Report which cluster this node's data belongs to.
+///
+/// Read from the control file rather than from a running `PostgreSQL`: the
+/// caller that needs this is deciding, at startup, whether the cluster
+/// answering it is its own, and neither end is necessarily serving yet.
+pub(super) async fn get_cluster_identity(
+    State(state): State<Arc<ManagementApiState>>,
+) -> Json<ClusterIdentityResponse> {
+    let cluster_lineage = match &state.pg_paths {
+        Some(paths) => crate::supervisor::read_system_identifier(&paths.bin_dir, &paths.data_dir)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Could not read this node's cluster lineage");
+                None
+            }),
+        None => None,
+    };
+    Json(ClusterIdentityResponse {
+        node_id: state.node_id,
+        cluster_lineage,
+    })
+}
+
 pub(super) async fn get_nodes(State(state): State<Arc<ManagementApiState>>) -> Json<NodesResponse> {
     let leader_id = state.raft.metrics().borrow().current_leader;
     let cluster_state = state.cluster_state.read();

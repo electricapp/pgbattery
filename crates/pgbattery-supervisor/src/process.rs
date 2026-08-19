@@ -481,6 +481,13 @@ const fn rewind_divergence_decision(
 /// timeline, so no amount of waiting will make them diverge.
 const REWIND_SAME_TIMELINE_MARKER: &str = "source and target cluster are on the same timeline";
 
+/// `pg_rewind`'s verdict when the target data directory was never part of the
+/// source's cluster. It compares control files immediately after connecting,
+/// so the target is untouched, and it is terminal in a stronger sense than the
+/// same-timeline case: no amount of waiting gives two lineages a common
+/// ancestor.
+const REWIND_FOREIGN_LINEAGE_MARKER: &str = "are from different systems";
+
 /// How a failed `pg_rewind` run relates to the target data directory and the
 /// retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,7 +525,8 @@ fn classify_pg_rewind_failure(stderr: &str) -> PreCopyOutcome {
         "target server must be shut down cleanly",
     ];
     let lower = stderr.to_ascii_lowercase();
-    if lower.contains(REWIND_SAME_TIMELINE_MARKER) {
+    if lower.contains(REWIND_SAME_TIMELINE_MARKER) || lower.contains(REWIND_FOREIGN_LINEAGE_MARKER)
+    {
         return PreCopyOutcome::Terminal;
     }
     if RETRYABLE_MARKERS.iter().any(|m| lower.contains(m)) {
@@ -546,7 +554,10 @@ fn pg_rewind_failure_is_pre_copy(stderr: &str) -> bool {
 /// wall-clock budget timeout matches no marker and so counts as touched —
 /// it can kill a copy mid-flight.
 fn rewind_failure_left_target_untouched(error: &Error) -> bool {
-    if matches!(error, Error::RewindDataLossRisk { .. }) {
+    if matches!(
+        error,
+        Error::RewindDataLossRisk { .. } | Error::ForeignDataDirectory { .. }
+    ) {
         return true;
     }
     let msg = error.to_string();
@@ -558,6 +569,28 @@ fn rewind_failure_left_target_untouched(error: &Error) -> bool {
         return true;
     }
     pg_rewind_failure_is_pre_copy(&msg)
+}
+
+/// Remove everything inside `dir`, leaving the directory itself.
+///
+/// The directory is kept because deployments mount a volume at that path, and
+/// removing it would detach the mount. Async because a PGDATA can hold
+/// gigabytes and unlinking it on the runtime thread would stall every other
+/// task, including the lease tick.
+async fn clear_dir_contents(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if entry.file_type().await?.is_dir() {
+            fs::remove_dir_all(&path).await?;
+        } else {
+            fs::remove_file(&path).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Durably install `bytes` at `path`, atomically. Returns `true` when the
@@ -638,6 +671,67 @@ async fn write_file_durably_in(
     .await
     .map_err(|e| Error::Postgres(format!("fsync task panicked: {e}")))??;
     Ok(true)
+}
+
+/// The `pg_controldata` field naming the lineage a data directory belongs to.
+const CONTROLDATA_SYSTEM_IDENTIFIER: &str = "Database system identifier";
+
+/// The lineage of the `PostgreSQL` data directory at `pg_data_dir`, or `None`
+/// when there is no readable directory there.
+///
+/// `initdb` mints this once and `pg_basebackup` carries it to every node, so
+/// two nodes share it exactly when they share a data history. It is the only
+/// evidence available before `PostgreSQL` is running, which is when a
+/// starting node has to decide whether the cluster answering it is its own.
+///
+/// # Errors
+/// Returns an error only when `pg_controldata` ran and produced something this
+/// cannot read; an absent data directory is `Ok(None)`, since a node that has
+/// not been provisioned yet has no lineage rather than a broken one.
+pub async fn read_system_identifier(
+    pg_bin_dir: &std::path::Path,
+    pg_data_dir: &std::path::Path,
+) -> Result<Option<u64>> {
+    if !pg_data_dir.join("global/pg_control").exists() {
+        return Ok(None);
+    }
+    let command = Command::new(pg_bin_dir.join("pg_controldata"))
+        .env("LC_ALL", "C")
+        .arg("-D")
+        .arg(pg_data_dir)
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(
+        Duration::from_millis(PG_CONTROLDATA_TIMEOUT_MS),
+        command,
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(Error::Postgres(format!("Failed to run pg_controldata: {e}"))),
+        Err(_) => {
+            metrics::counter!("pgbattery_pg_controldata_timeouts").increment(1);
+            return Err(Error::Postgres(format!(
+                "pg_controldata exceeded {PG_CONTROLDATA_TIMEOUT_MS} ms reading the system identifier"
+            )));
+        }
+    };
+    if !output.status.success() {
+        return Err(Error::Postgres(format!(
+            "pg_controldata failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_controldata_fields(&stdout)
+        .get(CONTROLDATA_SYSTEM_IDENTIFIER)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Error::Postgres(format!(
+                "pg_controldata output carries no readable {CONTROLDATA_SYSTEM_IDENTIFIER}"
+            ))
+        })
 }
 
 fn parse_controldata_fields(output: &str) -> std::collections::HashMap<&str, &str> {
@@ -2071,6 +2165,12 @@ host all all ::/0 {auth_method}
                 );
                 if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
                     tracing::error!(error = %e, "pg_rewind failed while following new leader");
+                    if matches!(e, Error::ForeignDataDirectory { .. }) {
+                        // No retry can relate two lineages, so retrying is a
+                        // restart loop rather than recovery. Replace the
+                        // directory instead — see `reprovision_from`.
+                        return self.reprovision_from(new_leader_addr).await;
+                    }
                     if rewind_failure_left_target_untouched(&e) {
                         // The failure preceded any modification, so the
                         // standby state on disk is intact — bring PG back
@@ -2122,7 +2222,15 @@ host all all ::/0 {auth_method}
         // 2. Run pg_rewind to sync with new primary's timeline
         //    This is necessary because the former primary may have WAL on a different timeline
         tracing::info!("Running pg_rewind to sync timelines");
-        self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await?;
+        if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
+            // A directory from another cluster has no common ancestor to
+            // rewind to, on this path as on the in-recovery one: replace it
+            // rather than retry forever. See `reprovision_from`.
+            if matches!(e, Error::ForeignDataDirectory { .. }) {
+                return self.reprovision_from(new_leader_addr).await;
+            }
+            return Err(e);
+        }
 
         // 3. Create standby.signal (pg_rewind does not manage this — see ensure_standby_signal)
         self.ensure_standby_signal().await?;
@@ -2424,6 +2532,86 @@ host all all ::/0 {auth_method}
     ///
     /// `pre_stop_local_lsn` feeds the divergence gate — see
     /// [`Self::check_rewind_divergence_safe`].
+    /// Replace this node's data directory with one taken from `source_addr`.
+    ///
+    /// Only for a directory that belongs to a different `PostgreSQL` cluster.
+    /// `pg_rewind` rebases a diverged history onto the source's, but two
+    /// lineages have no common ancestor and no retry ever gives them one: the
+    /// node would fail to fence, restart, and repeat once a minute forever —
+    /// a dead voter with a confusing error, and, if it happens to be the node
+    /// its peers were configured to join through, one that answers membership
+    /// questions for a cluster of one.
+    ///
+    /// Discarding the directory is safe precisely because it is foreign: a
+    /// lineage this cluster never wrote to cannot hold a write this cluster
+    /// acknowledged. Anything else — a diverged but related history — goes
+    /// through the rewind gate, which refuses rather than discards.
+    ///
+    /// `PostgreSQL` is already stopped when this runs (the demote path stops
+    /// it before rewinding), and the caller holds the supervisor lock, so no
+    /// lease tick can observe a half-replaced directory.
+    async fn reprovision_from(&mut self, source_addr: SocketAddr) -> Result<()> {
+        metrics::counter!("pgbattery_reprovision_foreign_data_dir").increment(1);
+        tracing::warn!(
+            source = %source_addr,
+            data_dir = %self.config.pg_data_dir.display(),
+            "Discarding a data directory from another cluster and re-provisioning from the leader"
+        );
+        self.stop().await?;
+        clear_dir_contents(&self.config.pg_data_dir).await?;
+        if let Err(e) = self.run_pg_basebackup(source_addr).await {
+            // A basebackup that dies mid-stream leaves debris that is not a
+            // data directory. Clear it so the next attempt starts from empty
+            // rather than wedging on a half-copy.
+            if let Err(cleanup) = clear_dir_contents(&self.config.pg_data_dir).await {
+                tracing::error!(error = %cleanup, "Could not discard a partial re-provision");
+            }
+            return Err(e);
+        }
+        self.ensure_standby_signal().await?;
+        self.configure_standby(source_addr).await?;
+        self.start().await?;
+        tracing::info!(
+            source = %source_addr,
+            "Re-provisioned from the leader and restarted as a standby"
+        );
+        Ok(())
+    }
+
+    /// Clone `source_addr`'s data directory into ours.
+    ///
+    /// Streams WAL (`-Xs`) against this node's own replication slot, so the
+    /// source cannot recycle WAL the copy still needs.
+    async fn run_pg_basebackup(&self, source_addr: SocketAddr) -> Result<()> {
+        let slot = ReplicationSlot::for_node(self.config.node_id).to_string();
+        let status = Command::new(self.config.pg_bin_dir.join("pg_basebackup"))
+            .arg("-w")
+            .arg("-h")
+            .arg(source_addr.ip().to_string())
+            .arg("-p")
+            .arg(source_addr.port().to_string())
+            .arg("-U")
+            .arg(&self.config.pg_user)
+            .arg("-D")
+            .arg(&self.config.pg_data_dir)
+            .arg("-Fp")
+            .arg("-Xs")
+            .arg("-R")
+            .arg("-S")
+            .arg(&slot)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .map_err(|e| Error::Postgres(format!("Failed to run pg_basebackup: {e}")))?;
+        if !status.success() {
+            return Err(Error::Postgres(format!(
+                "pg_basebackup from {source_addr} failed with exit code {:?}",
+                status.code()
+            )));
+        }
+        Ok(())
+    }
+
     async fn run_pg_rewind(
         &self,
         source_addr: SocketAddr,
@@ -2573,6 +2761,26 @@ host all all ::/0 {auth_method}
                     );
                     sleep(Duration::from_millis(PG_REWIND_RETRY_DELAY_MS)).await;
                     continue;
+                }
+
+                // A foreign lineage is its own error, not a string the caller
+                // has to grep for: it is the one rewind failure the caller can
+                // resolve, by re-provisioning a directory that cannot hold any
+                // write this cluster acknowledged.
+                if stderr
+                    .to_ascii_lowercase()
+                    .contains(REWIND_FOREIGN_LINEAGE_MARKER)
+                {
+                    metrics::counter!("pgbattery_pg_rewind_foreign_lineage").increment(1);
+                    tracing::error!(
+                        source = %source_addr,
+                        stderr = %stderr,
+                        "This data directory belongs to a different PostgreSQL cluster than the leader"
+                    );
+                    return Err(Error::ForeignDataDirectory {
+                        rewind_source: source_addr.to_string(),
+                        detail: stderr.trim().to_string(),
+                    });
                 }
 
                 // Terminal pre-copy, non-retryable error, or max attempts
@@ -4380,6 +4588,58 @@ mod tests {
             "pg_rewind failed: pg_rewind: error: source and target cluster are on the same timeline"
                 .to_string()
         )));
+    }
+
+    /// pg_rewind's exact wording when the target was never part of the
+    /// source's cluster. Verbatim from a node whose data directory had been
+    /// re-initdb'd while the cluster still listed it as a member.
+    const FOREIGN_LINEAGE_STDERR: &str =
+        "pg_rewind: connected to server\npg_rewind: error: source and target clusters are from \
+         different systems";
+
+    #[test]
+    fn test_a_foreign_lineage_is_terminal_and_untouched() {
+        // Terminal, because no wait gives two lineages a common ancestor —
+        // retrying is a restart loop, not recovery. Untouched, because
+        // pg_rewind compares control files before it writes anything.
+        assert_eq!(
+            classify_pg_rewind_failure(FOREIGN_LINEAGE_STDERR),
+            PreCopyOutcome::Terminal
+        );
+        assert!(pg_rewind_failure_is_pre_copy(FOREIGN_LINEAGE_STDERR));
+        assert!(rewind_failure_left_target_untouched(
+            &Error::ForeignDataDirectory {
+                rewind_source: "172.28.0.13:5434".to_string(),
+                detail: FOREIGN_LINEAGE_STDERR.to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn test_a_foreign_lineage_is_not_a_plain_rewind_failure() {
+        // The demote path re-provisions on this error and only on this error,
+        // so it must not collapse into `Postgres` with every other stderr.
+        let foreign = Error::ForeignDataDirectory {
+            rewind_source: "172.28.0.13:5434".to_string(),
+            detail: FOREIGN_LINEAGE_STDERR.to_string(),
+        };
+        assert!(matches!(foreign, Error::ForeignDataDirectory { .. }));
+        assert!(!matches!(
+            Error::Postgres("pg_rewind failed: something else".to_string()),
+            Error::ForeignDataDirectory { .. }
+        ));
+        // A diverged-but-related history must never take the re-provision
+        // path: that directory can hold acked writes, and the divergence gate
+        // is what decides its fate.
+        assert!(!matches!(
+            Error::RewindDataLossRisk {
+                local_lsn_bytes: 200,
+                source_lsn_bytes: 100,
+                divergence_bytes: 100,
+                threshold_bytes: 8_192,
+            },
+            Error::ForeignDataDirectory { .. }
+        ));
     }
 
     // ── postmaster_pid_is_stale ───────────────────────────────────────────

@@ -76,7 +76,9 @@ The fuzz crate lives outside the workspace; if you touch it, also run
 ## Commit and PR conventions
 
 - Keep commits focused; write commit messages that explain the **why**.
-- Reference any bug/anomaly you fix or discover in `BUGS.md`.
+- Fix a defect in the change that found it, and say in the commit message what
+  it was. There is no bug list: one that is understood and left is one the next
+  run hits.
 - CI must be green. If a chaos/HA case fails, investigate it — don't re-run to
   "fix" it.
 

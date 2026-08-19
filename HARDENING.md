@@ -194,7 +194,7 @@ names the task that closes the window, so no row is open without an owner.
 | RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win                                                                                                                                           | L3         | Closed — aged-LSN tiebreak; `test_stale_restored_node_loses_a_leaderless_election`               | H-11 (done)       |
 | RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                                                                                                                                                               | L1         | Partially — pure functions are unit-tested; the live coalescing race is not                      | H-18              |
 | RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                                                                                                                                                         | L1         | No                                                                                               | H-15              |
-| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash                                                                                                                                                                                      | R1, V2     | Partially                                                                                        | H-16              |
+| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash, a wiped bootstrap node impersonating the cluster                                                                                                                                    | R1, V2     | Yes — `join_edges.py` drives four cases; orphan-slot pinning is bounded, not assumed             | H-16 (closed)     |
 | RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                                                                                                                                                          | W1, L3     | No                                                                                               | H-05              |
 | RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                                                                                                                                                                  | W1, W2, S1 | Partially — one fixed timing, no sweep                                                           | H-17              |
 
@@ -950,13 +950,14 @@ No new infrastructure. Highest confidence per unit of effort.
       empty. Every `both` run failed as "still hold entries" with the header as
       the evidence.
 
-      Left for H-16, which owns the join and rejoin edges: `raft-only` on a
-      join-configured node has valid PostgreSQL data and no consensus identity,
-      and the fresh-join path demands an empty directory, so the `pg_rewind`
-      rejoin path — which exists, and is reached when Raft state is present but
-      membership has dropped the node — is unreachable here. Refusing is safe,
-      but re-provisioning would be kinder than requiring the operator to clear
-      the volume.
+      `raft-only` on a join-configured node has valid PostgreSQL data and no
+      consensus identity, and the fresh-join path demands an empty directory, so
+      the `pg_rewind` rejoin path — which exists, and is reached when Raft state
+      is present but membership has dropped the node — is unreachable here.
+      Refusing is safe, but re-provisioning would be kinder than requiring the
+      operator to clear the volume. H-16 covers the neighbouring case, a node
+      whose data directory is from another cluster entirely, which now
+      re-provisions rather than refusing.
 
 - [x] **H-10 — Follower reads and read-only transactions**, so staleness, long
       fork, and phantoms enter the test universe at all.
@@ -1224,12 +1225,61 @@ No new infrastructure. Highest confidence per unit of effort.
       It refuses a script it finds no Python in, because a name check that
       matches nothing is the defect it exists to catch.
 
-- [ ] **H-16 — Join and rejoin edges.** Basebackup against a leader that gets
+- [x] **H-16 — Join and rejoin edges.** Basebackup against a leader that gets
       deposed mid-copy, orphan slots pinning WAL, and a learner registration
       surviving a mid-join crash.
       **Done when** each edge has a case, and orphan-slot WAL pinning is asserted
       bounded rather than assumed.
       _Closes_ RW-10 · _Effort_ M
+
+      `join_edges.py` drives four cases. Orphan-slot pinning is bounded against
+      the reconciler's own interval, read from `constants.rs` rather than
+      restated: a slot for a node id that is not in membership is dropped in
+      13 s against a 90 s budget, and an operator's slot beside it is left
+      alone. The case is deliberately two slots, because the first version
+      created `pgbattery_node_99` — a name this cluster never mints — and
+      reported a product failure that was entirely its own: the reconciler is
+      built not to touch what it did not create.
+
+      **A wiped bootstrap node impersonated the cluster.** `deposed-mid-copy`
+      wiped `node1`, whose deployment command carries a standing `--bootstrap`.
+      An empty state directory sends that down the `initdb` branch, so it came
+      back holding a PostgreSQL lineage the cluster had never written to, under
+      the node id the cluster still listed, on the address the other two are
+      configured to join through. Two failures followed.
+
+      Its own data directory could never follow: `pg_rewind` compares control
+      files on connect and refuses two lineages outright ("source and target
+      clusters are from different systems"). That failure is pre-copy, so the
+      demote path restarted PostgreSQL and retried, the lease expired against a
+      postmaster that was not up, `Fence failures exceeded threshold` shut the
+      process down, and the supervisor restarted it — once a minute, forever.
+      Observed identifiers: cluster `7675741024400711708`, impostor
+      `7675750886508929058` on timeline 1.
+
+      Worse, `node2` believed it. Resuming from its own valid Raft state, it
+      asked its configured peer whether it was still in the committed
+      membership; the impostor's cluster of one said no; `node2` deleted
+      `raft.db` and fell through to the fresh-join path, which needs `join-info`
+      from the peer that was restart-looping. One node with an empty disk took a
+      healthy node's consensus state with it, and the cluster lost quorum.
+
+      Both are fixed. `Error::ForeignDataDirectory` is now its own error rather
+      than a string in `Error::Postgres`, and it is the one rewind failure the
+      supervisor resolves rather than reports: `reprovision_from` discards the
+      directory and clones the leader's. Safe precisely because it is foreign —
+      a lineage this cluster never wrote to cannot hold a write this cluster
+      acknowledged — and a diverged _but related_ history still goes to the
+      divergence gate, which refuses rather than discards. Separately,
+      `GET /api/v1/cluster/identity` publishes each node's lineage from its
+      control file, and a node will not act on a membership answer from a peer
+      whose lineage differs from its own: unknown on either side is not a
+      mismatch, so a witness and an unprovisioned node still rejoin normally.
+
+      `bootstrap-wiped` is the regression case: wipe the bootstrap node and
+      require it back on the cluster's lineage, with membership unchanged and
+      every peer still serving. It fails against the previous binary — the node
+      never leaves its own lineage — which is what makes it worth running.
 
 - [x] **H-17 — Sweep commit-probe correctness around COMMIT.** A wrong answer
       manufactures a phantom commit or a duplicate retry.

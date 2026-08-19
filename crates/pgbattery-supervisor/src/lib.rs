@@ -13,5 +13,5 @@ mod process;
 pub use backup::BackupManager;
 pub use process::{
     PgWriteState, ReplicationStat, ReplicationState, Supervisor, SupervisorConfig, SyncState,
-    TimelineInfo,
+    TimelineInfo, read_system_identifier,
 };

@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ci_runner
 import fault_primitives as fp
 import lint_matrix
+import topology
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MATRIX_PATH = PROJECT_ROOT / "testing" / "ci_matrix.yaml"
@@ -921,7 +922,8 @@ def test_implicit_build_target_is_flagged() -> None:
     refused to run as root.
     """
     problems = lint_matrix.implicit_build_targets(
-        {"services": {"node1": {"build": "."}}}, "docker-compose.yml"
+        topology.ComposeDocument.model_validate({"services": {"node1": {"build": "."}}}),
+        "docker-compose.yml",
     )
     assert len(problems) == 1
     assert "node1" in problems[0]
@@ -931,7 +933,10 @@ def test_implicit_build_target_is_flagged() -> None:
 def test_build_target_dict_without_target_is_flagged() -> None:
     """A long-form build is no safer if it omits the stage."""
     problems = lint_matrix.implicit_build_targets(
-        {"services": {"node1": {"build": {"context": "."}}}}, "docker-compose.yml"
+        topology.ComposeDocument.model_validate(
+            {"services": {"node1": {"build": {"context": "."}}}}
+        ),
+        "docker-compose.yml",
     )
     assert len(problems) == 1
     assert "node1" in problems[0]
@@ -941,12 +946,14 @@ def test_pinned_build_target_and_non_building_services_pass() -> None:
     """A named stage is fine, and a service with no `build` has nothing to pin."""
     assert (
         lint_matrix.implicit_build_targets(
-            {
-                "services": {
-                    "node1": {"build": {"context": ".", "target": "runtime"}},
-                    "sidecar": {"image": "postgres:18"},
+            topology.ComposeDocument.model_validate(
+                {
+                    "services": {
+                        "node1": {"build": {"context": ".", "target": "runtime"}},
+                        "sidecar": {"image": "postgres:18"},
+                    }
                 }
-            },
+            ),
             "docker-compose.yml",
         )
         == []

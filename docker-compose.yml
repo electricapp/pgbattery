@@ -20,8 +20,8 @@ services:
     # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
     # — rapid failover triggering pg_rewind loops that each exit non-zero —
     # never exhausts a finite restart budget and leaves the container dead.
-    # See BUGS.md history: the 5-retry cap caused permanent node loss on
-    # any chaos sequence that exceeded the budget. Verified by ci case
+    # A 5-retry cap caused permanent node loss on any chaos sequence that
+    # exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
@@ -55,8 +55,8 @@ services:
     # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
     # — rapid failover triggering pg_rewind loops that each exit non-zero —
     # never exhausts a finite restart budget and leaves the container dead.
-    # See BUGS.md history: the 5-retry cap caused permanent node loss on
-    # any chaos sequence that exceeded the budget. Verified by ci case
+    # A 5-retry cap caused permanent node loss on any chaos sequence that
+    # exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 2 --voter"]
@@ -88,8 +88,8 @@ services:
     # `unless-stopped` (not `on-failure:5`) so a sustained PG-death scenario
     # — rapid failover triggering pg_rewind loops that each exit non-zero —
     # never exhausts a finite restart budget and leaves the container dead.
-    # See BUGS.md history: the 5-retry cap caused permanent node loss on
-    # any chaos sequence that exceeded the budget. Verified by ci case
+    # A 5-retry cap caused permanent node loss on any chaos sequence that
+    # exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
     command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 3 --voter"]

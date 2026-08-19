@@ -172,9 +172,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
+import pydantic
 import typer
 from rich.console import Console
 
+import api_models
 import topology
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,6 +191,11 @@ import topology
 NODES: Final[tuple[str, ...]] = topology.NODES
 """Voter services, in Raft node-id order. Learners (the witness) are excluded:
 counting one as a voter makes every quorum assertion vacuous."""
+
+JOINING_NODES: Final[tuple[str, ...]] = topology.JOINING_NODES
+"""Voters that reach the cluster by joining it — the only valid targets for a
+wipe-and-rejoin. Wiping the bootstrap node makes it `initdb` a new lineage
+under an id the cluster still lists — see H-16 in HARDENING.md."""
 
 NODE_IPS: Final[dict[str, str]] = topology.NODE_IPS
 """Static addresses on the cluster network, for peer-level faults."""
@@ -703,6 +710,19 @@ def _emit(event: str, primitive: str, target: str, detail: dict[str, object]) ->
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class PinnedTimings(pydantic.BaseModel):
+    """The timing keys a node config may override.
+
+    Everything else in the file is ignored on purpose — this model exists to
+    give the two values that matter a declared type at the point they are read.
+    """
+
+    model_config = pydantic.ConfigDict(extra="ignore")
+
+    election_timeout_ms: int | None = None
+    heartbeat_interval_ms: int | None = None
+
+
 @dataclass(frozen=True)
 class SystemTimings:
     """The pgbattery timing constants a fault duration may need to straddle.
@@ -720,6 +740,7 @@ class SystemTimings:
     metrics_watchdog_timeout_ms: int
     lsn_staleness_threshold_ms: int
     leadership_transfer_lease_safety_ms: int
+    slot_ensure_interval_ms: int
     election_timeout_source: str
     """``constants.rs`` or the config file that overrides it."""
 
@@ -774,6 +795,30 @@ def parse_rust_u64_const(source: str, name: str) -> int:
     return int(match.group(1).replace("_", ""))
 
 
+def parse_rust_str_const(source: str, name: str) -> str:
+    """Extract ``const <name>: &'static str = "<value>";``."""
+    match = re.search(rf"const\s+{re.escape(name)}\s*:\s*&'static\s+str\s*=\s*\"([^\"]*)\"", source)
+    if match is None:
+        raise FaultPreconditionError(
+            f"Rust string constant {name} not found. A harness that minted names by "
+            "its own spelling would exercise a name the cluster never owns."
+        )
+    return match.group(1)
+
+
+def replication_slot_prefix(repo_root: Path | None = None) -> str:
+    """The prefix of every slot name this cluster mints.
+
+    Read from `ReplicationSlot::PREFIX`, because a slot named anything else is
+    a foreign slot the reconciler deliberately never touches — a harness that
+    spelled it itself would be asserting against a name nothing owns.
+    """
+    path = _repo_root(repo_root) / "crates" / "pgbattery-core" / "src" / "types.rs"
+    if not path.is_file():
+        raise FaultPreconditionError(f"{path} not found — cannot derive the slot name format.")
+    return parse_rust_str_const(path.read_text(encoding="utf-8"), "PREFIX")
+
+
 def parse_rust_duration_const_ms(source: str, name: str) -> int:
     """Extract ``pub const <name>: Duration = Duration::from_{secs,millis}(N);``."""
     match = re.search(
@@ -816,14 +861,17 @@ def read_system_timings(repo_root: Path | None = None) -> SystemTimings:
 
     node_config = root / "config" / "node1.toml"
     if node_config.is_file():
-        pinned = tomllib.loads(node_config.read_text(encoding="utf-8"))
-        configured_election = pinned.get("election_timeout_ms")
-        configured_heartbeat = pinned.get("heartbeat_interval_ms")
-        if isinstance(configured_election, int):
-            election_ms = configured_election
+        # Parsed into a model, so a key that changes type is an error here
+        # rather than a silently ignored override that leaves every sweep
+        # straddling the wrong boundary.
+        pinned = PinnedTimings.model_validate(
+            tomllib.loads(node_config.read_text(encoding="utf-8"))
+        )
+        if pinned.election_timeout_ms is not None:
+            election_ms = pinned.election_timeout_ms
             election_source = "config/node1.toml"
-        if isinstance(configured_heartbeat, int):
-            heartbeat_ms = configured_heartbeat
+        if pinned.heartbeat_interval_ms is not None:
+            heartbeat_ms = pinned.heartbeat_interval_ms
 
     return SystemTimings(
         lease_duration_ms=parse_rust_duration_const_ms(lease, "DEFAULT_LEASE_DURATION"),
@@ -837,6 +885,10 @@ def read_system_timings(repo_root: Path | None = None) -> SystemTimings:
         leadership_transfer_lease_safety_ms=parse_rust_u64_const(
             constants, "LEADERSHIP_TRANSFER_LEASE_SAFETY_MS"
         ),
+        slot_ensure_interval_ms=parse_rust_u64_const(
+            constants, "REPLICATION_SLOT_ENSURE_INTERVAL_SECS"
+        )
+        * 1_000,
         election_timeout_source=election_source,
     )
 
@@ -3196,10 +3248,9 @@ def find_raft_leader(nodes: Sequence[str] = NODES) -> str | None:
         )
         if not result.ok:
             continue
-        with suppress(json.JSONDecodeError, ValueError, TypeError):
-            leader_id = json.loads(result.stdout).get("leader_id")
-            if isinstance(leader_id, int) and 1 <= leader_id <= len(NODES):
-                return NODES[leader_id - 1]
+        info = api_models.parse_or_none(api_models.LeaderInfo, result.stdout)
+        if info is not None and info.leader_id is not None and 1 <= info.leader_id <= len(NODES):
+            return NODES[info.leader_id - 1]
     return None
 
 

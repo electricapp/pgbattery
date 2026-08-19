@@ -45,6 +45,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
+from pydantic import BaseModel, ConfigDict, RootModel
+
+import artifact_models as am
+
 ARTIFACT_ROOT = Path("testing/artifacts")
 SUMMARY_OUT = ARTIFACT_ROOT / "elle-summary.md"
 
@@ -80,13 +84,25 @@ history is close to vacuous."""
 _TYPE_LINE_PREFIX: Final[str] = '"type": "'
 
 
+class _JepsenRecordType(BaseModel):
+    """One history record, read only for the field the count needs."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = ""
+
+
+class _RecordTypes(RootModel[list[_JepsenRecordType]]):
+    """A whole history, when the line scan found nothing to count."""
+
+
 def _format_anomalies(summary: dict[str, int]) -> str:
     if not summary:
         return "-"
     return ", ".join(f"{name}x{count}" for name, count in sorted(summary.items()))
 
 
-def _verdict_label(valid: object) -> str:
+def _verdict_label(valid: bool | None) -> str:
     if valid is True:
         return "PASS"
     if valid is False:
@@ -115,16 +131,6 @@ def _fixed_width_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
-def _load_json(path: Path) -> dict[str, object]:
-    if not path.exists():
-        return {}
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
 def _count_record_types(path: Path) -> dict[str, int]:
     """Count Jepsen record types in an Elle history without loading it.
 
@@ -141,17 +147,14 @@ def _count_record_types(path: Path) -> dict[str, int]:
             if stripped.startswith(_TYPE_LINE_PREFIX):
                 counts[stripped[len(_TYPE_LINE_PREFIX) :].rstrip(",").rstrip('"')] += 1
     if not counts:
-        records = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(records, list):
-            for rec in records:
-                if isinstance(rec, dict):
-                    counts[str(rec.get("type"))] += 1
+        for rec in _RecordTypes.model_validate(json.loads(path.read_text(encoding="utf-8"))).root:
+            counts[rec.type] += 1
     out = {k: v for k, v in counts.items()}
     out["total"] = sum(counts.values())
     return out
 
 
-def _history_stats(d: Path) -> dict[str, int] | None:
+def _history_stats(d: Path) -> am.HistoryStats | None:
     """Record-type counts for one attack dir, computed once and cached.
 
     The history itself is only uploaded from CI on failure, so the cached
@@ -162,15 +165,8 @@ def _history_stats(d: Path) -> dict[str, int] | None:
     if history.exists():
         stats = _count_record_types(history)
         cache.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-        return stats
-    cached = _load_json(cache)
-    if cached:
-        return {k: int(v) for k, v in cached.items() if isinstance(v, (int, float))}
-    return None
-
-
-def _as_float(value: object, default: float) -> float:
-    return float(value) if isinstance(value, (int, float)) else default
+        return am.HistoryStats.model_validate(stats)
+    return am.load(am.HistoryStats, cache)
 
 
 def _min_ok_rate() -> float:
@@ -216,7 +212,7 @@ class AttackRow:
     notes: list[str] = field(default_factory=list)
 
 
-def _check_fault_waves(d: Path, meta: dict[str, object], row: AttackRow) -> None:
+def _check_fault_waves(d: Path, meta: am.MatrixMeta | None, row: AttackRow) -> None:
     """Assert the run injected the faults it planned.
 
     Wave 1 is the harness's own injector, started unconditionally at
@@ -224,44 +220,40 @@ def _check_fault_waves(d: Path, meta: dict[str, object], row: AttackRow) -> None
     and attempted. Waves 2..N come from run_elle_matrix.sh's sibling driver,
     which records every injection in fault_waves.json.
     """
-    waves = _load_json(d / "fault_waves.json")
-    if not waves:
+    waves = am.load(am.FaultWaves, d / "fault_waves.json")
+    if waves is None:
         row.errors.append("missing fault_waves.json — the fault-wave driver never ran")
         return
 
-    planned_raw = waves.get("planned")
-    injected_raw = waves.get("injected")
-    planned = planned_raw if isinstance(planned_raw, list) else []
-    injected = injected_raw if isinstance(injected_raw, list) else []
-    row.faults = f"{len(injected) + 1}/{len(planned) + 1}"
+    row.faults = f"{len(waves.injected) + 1}/{len(waves.planned) + 1}"
 
-    if waves.get("marker_seen") is not True:
+    if not waves.marker_seen:
         row.errors.append(
             "fault-wave driver never saw the workload start; extra fault waves did not run"
         )
-    elif len(injected) != len(planned):
-        row.errors.append(f"only {len(injected)} of {len(planned)} extra fault waves were injected")
+    elif len(waves.injected) != len(waves.planned):
+        row.errors.append(
+            f"only {len(waves.injected)} of {len(waves.planned)} extra fault waves were injected"
+        )
 
-    ineffective = [r for r in injected if isinstance(r, dict) and r.get("effective") is not True]
-    if ineffective:
-        offsets = ", ".join(f"t={r.get('offset_s')}s" for r in ineffective)
+    if waves.ineffective:
+        offsets = ", ".join(f"t={w.offset_s}s" for w in waves.ineffective)
         row.notes.append(
-            f"{len(ineffective)} fault wave(s) found no leader to hit ({offsets}) — "
+            f"{len(waves.ineffective)} fault wave(s) found no leader to hit ({offsets}) — "
             "that much of the schedule tested nothing"
         )
 
-    dropped = meta.get("fault_waves_dropped")
-    if isinstance(dropped, (int, float)) and dropped > 0:
+    if meta is not None and meta.fault_waves_dropped > 0:
         row.notes.append(
-            f"{int(dropped)} fault wave(s) were dropped at plan time because the workload "
-            "duration was too short for them"
+            f"{meta.fault_waves_dropped} fault wave(s) were dropped at plan time because the "
+            "workload duration was too short for them"
         )
 
 
 def _check_history_volume(
     d: Path,
-    results: dict[str, object],
-    meta: dict[str, object],
+    results: am.RunResults | None,
+    meta: am.MatrixMeta | None,
     row: AttackRow,
 ) -> None:
     """Assert the history is big enough to have been able to falsify anything."""
@@ -270,15 +262,19 @@ def _check_history_volume(
         row.errors.append("missing history.elle.json and history_stats.json")
         return
 
-    total = stats.get("total", 0)
-    ok = stats.get("ok", 0)
+    total = stats.total
+    ok = stats.ok
     row.ops = str(total)
     row.ok = str(ok)
 
     # results.json is what the harness actually ran with; matrix_meta.json is
     # what the matrix asked for, and is still there when the harness died.
-    workers = _as_float(results.get("workers"), _as_float(meta.get("workers"), 0.0))
-    duration = _as_float(results.get("duration_s"), _as_float(meta.get("duration_s"), 0.0))
+    workers = (results.workers if results is not None else 0.0) or (
+        meta.workers if meta is not None else 0.0
+    )
+    duration = (results.duration_s if results is not None else 0.0) or (
+        meta.duration_s if meta is not None else 0.0
+    )
     if workers <= 0 or duration <= 0:
         row.errors.append("no workers/duration_s recorded — cannot derive a committed-txn floor")
         return
@@ -309,42 +305,41 @@ def _row_for(attack: str, d: Path | None, expect_profile: str) -> AttackRow:
         row.anomalies = "attack did not run"
         return row
 
-    meta = _load_json(d / "matrix_meta.json")
-    results = _load_json(d / "results.json")
-    elle = _load_json(d / "elle_result.json")
+    meta = am.load(am.MatrixMeta, d / "matrix_meta.json")
+    results = am.load(am.RunResults, d / "results.json")
+    elle = am.load(am.ElleArtifact, d / "elle_result.json")
 
-    seed = meta.get("seed", results.get("seed"))
-    if isinstance(seed, int):
-        row.seed = str(seed)
-    else:
+    seed = (meta.seed if meta is not None else None) or (
+        results.seed if results is not None else None
+    )
+    if seed is None:
         row.errors.append("no seed recorded in matrix_meta.json or results.json — not replayable")
+    else:
+        row.seed = str(seed)
 
-    if not meta:
+    if meta is None:
         row.errors.append("missing matrix_meta.json — dir was not produced by run_elle_matrix.sh")
-    elif expect_profile and meta.get("profile") != expect_profile:
-        row.errors.append(f"ran with profile {meta.get('profile')!r}, expected {expect_profile!r}")
+    elif expect_profile and meta.profile != expect_profile:
+        row.errors.append(f"ran with profile {meta.profile!r}, expected {expect_profile!r}")
 
-    if not results:
+    if results is None:
         row.errors.append("missing results.json — the harness never finished")
 
     _check_fault_waves(d, meta, row)
     _check_history_volume(d, results, meta, row)
 
-    if not elle:
+    if elle is None:
         row.errors.append("missing elle_result.json — Elle never produced a verdict")
         row.anomalies = "missing elle_result.json"
         return row
 
-    verdict = _verdict_label(elle.get("valid"))
-    summary_raw = elle.get("anomaly_summary")
-    summary = summary_raw if isinstance(summary_raw, dict) else {}
-    row.anomalies = _format_anomalies({str(k): int(v) for k, v in summary.items()})
-    row.elle_ms = f"{_as_float(elle.get('elapsed_ms'), 0.0):.0f}"
+    verdict = _verdict_label(elle.valid)
+    row.anomalies = _format_anomalies(elle.anomaly_summary)
+    row.elle_ms = f"{elle.elapsed_ms:.0f}"
     # Elle's own op count is a cross-check on the history we counted, not a
     # substitute for it: it reports what the checker parsed.
-    elle_ops = elle.get("op_count")
-    if isinstance(elle_ops, int) and row.ops not in ("-", str(elle_ops)):
-        row.notes.append(f"Elle parsed {elle_ops} records, history holds {row.ops}")
+    if elle.op_count is not None and row.ops not in ("-", str(elle.op_count)):
+        row.notes.append(f"Elle parsed {elle.op_count} records, history holds {row.ops}")
     # The evidence gate outranks the verdict: a PASS on an unusable history is
     # exactly the "green means nothing was tested" failure this file exists to
     # prevent.
@@ -352,17 +347,16 @@ def _row_for(attack: str, d: Path | None, expect_profile: str) -> AttackRow:
     return row
 
 
-def _density_line(metas: list[dict[str, object]]) -> str:
+def _density_line(metas: list[am.MatrixMeta]) -> str:
     shapes = {
         (
-            str(m.get("profile")),
-            str(m.get("workers")),
-            str(m.get("keys")),
-            str(m.get("duration_s")),
-            str(m.get("fault_waves_planned")),
+            m.profile,
+            f"{m.workers:g}",
+            str(m.keys),
+            f"{m.duration_s:g}",
+            str(m.fault_waves_planned),
         )
         for m in metas
-        if m
     }
     if len(shapes) != 1:
         return f"Density: mixed across {len(shapes)} configurations — see each matrix_meta.json."
@@ -388,7 +382,11 @@ def main() -> int:
     # Expected order first (that is the matrix order), then anything else found.
     attacks = list(dict.fromkeys([*expect_attacks, *sorted(dirs)]))
     rows = [_row_for(a, dirs.get(a), expect_profile) for a in attacks]
-    metas = [_load_json(d / "matrix_meta.json") for d in dirs.values()]
+    metas = [
+        m
+        for m in (am.load(am.MatrixMeta, d / "matrix_meta.json") for d in dirs.values())
+        if m is not None
+    ]
 
     headers = ["Attack", "Seed", "Ops", "Ok txns", "Faults", "Valid", "Anomalies", "Elle ms"]
     table_rows = [

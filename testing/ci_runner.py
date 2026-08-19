@@ -33,7 +33,15 @@ from typing import Any, Final
 
 import typer
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from rich.console import Console
 from rich.table import Table
 
@@ -205,6 +213,53 @@ PRIVILEGED_EXEC_USER: Final[str] = "root"
 # Shape of a correctness contract ID as defined by the ``### <ID> — <title>``
 # headings in ``docs/CONTRACTS.md`` (W1, W2, L3, R1, V2, S1, ...).
 CONTRACT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Z]{1,3}[0-9]{1,2}")
+
+
+def captured_text(captured: Any) -> str | None:
+    """What a killed command had written, as text.
+
+    `TimeoutExpired` carries `str` or `bytes` depending on how the command was
+    run and types both as `Any`. Decoding here keeps a bytes capture in the
+    failure message instead of dropping it, which is the only place that
+    output survives at all.
+    """
+    match captured:
+        case None:
+            return None
+        case bytes():
+            return captured.decode(errors="replace")
+        case _:
+            return str(captured)
+
+
+def as_strings(value: Any) -> list[str]:
+    """A matrix field that accepts one string or a list of them, as a list.
+
+    Both spellings appear across the matrix (`body_contains`, `stdout_contains`,
+    ...). Normalised once here so no step handler has to ask which it got, and
+    so a bare string is never iterated character by character.
+    """
+    match value:
+        case None:
+            return []
+        case str():
+            return [value]
+        case _:
+            return [str(item) for item in value]
+
+
+def as_ints(value: Any) -> list[int]:
+    """A matrix field that accepts one integer or a list of them, as a list.
+
+    `expect_exit`, `expect_status` and `nodes` are all written both ways.
+    """
+    match value:
+        case None:
+            return []
+        case int():
+            return [value]
+        case _:
+            return [int(item) for item in value]
 
 
 def validate_timeout_value(raw: Any, key: str) -> int:
@@ -568,8 +623,6 @@ def parse_matrix(path: Path) -> MatrixConfig:
             ) from exc
 
         raw = yaml.safe_load(text)
-        if not isinstance(raw, dict):
-            raise RunnerError(f"Matrix {path} must contain a top-level object.") from None
 
     try:
         return MatrixConfig.model_validate(raw)
@@ -792,6 +845,26 @@ def parse_faketime_offset_seconds(text: str) -> int | None:
     return sign * int(match.group(2)) * _OFFSET_UNIT_TO_SEC[match.group(3)]
 
 
+class DockerNetworkAttachment(BaseModel):
+    """One entry of ``docker inspect .NetworkSettings.Networks``."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    ip_address: str = Field(default="", alias="IPAddress")
+
+
+class DockerNetworks(RootModel[dict[str, DockerNetworkAttachment]]):
+    """The whole Networks blob. ``null`` — a container attached to none — is an
+    empty mapping, which is what every caller means by "no addresses"."""
+
+    root: dict[str, DockerNetworkAttachment] = {}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_is_empty(cls, value: object) -> object:
+        return {} if value is None else value
+
+
 def container_subnet_addresses(json_output: str, prefix: str) -> list[str]:
     """Extract container IPs matching ``prefix`` from a Networks JSON blob.
 
@@ -805,19 +878,10 @@ def container_subnet_addresses(json_output: str, prefix: str) -> list[str]:
         matching network, or the blob is ``null`` / unparseable).
     """
     try:
-        parsed = json.loads(json_output.strip() or "null")
-    except json.JSONDecodeError:
+        attachments = DockerNetworks.model_validate_json(json_output.strip() or "null").root
+    except ValidationError:
         return []
-    if not isinstance(parsed, dict):
-        return []
-    found: list[str] = []
-    for value in parsed.values():
-        if not isinstance(value, dict):
-            continue
-        address = value.get("IPAddress")
-        if isinstance(address, str) and address.startswith(prefix):
-            found.append(address)
-    return found
+    return [a.ip_address for a in attachments.values() if a.ip_address.startswith(prefix)]
 
 
 # -- Fault-shaped shell command classification -------------------------------
@@ -1335,7 +1399,7 @@ class CIRunner:
         if expect_exit is None:
             return proc
 
-        expected = [expect_exit] if isinstance(expect_exit, int) else list(expect_exit)
+        expected = as_ints(expect_exit)
 
         if proc.returncode not in expected:
             raise RunnerError(
@@ -2047,11 +2111,7 @@ class CIRunner:
         """
         method = str(step.get("method", "GET")).upper()
         url = self._render_template(str(step["url"]))
-        expect_status = step.get("expect_status", 200)
-        if isinstance(expect_status, int):
-            expected = [expect_status]
-        else:
-            expected = [int(item) for item in expect_status]
+        expected = as_ints(step.get("expect_status", 200))
 
         # POSTs are mutations and always carry the token. GETs default to
         # unauthenticated so the public discovery contract stays tested;
@@ -2076,10 +2136,7 @@ class CIRunner:
             raise RunnerError(f"HTTP {method} {url} returned {status}, expected {expected}")
 
         if "body_contains" in step:
-            needles = step["body_contains"]
-            if isinstance(needles, str):
-                needles = [needles]
-            for needle in needles:
+            for needle in as_strings(step["body_contains"]):
                 if needle not in body:
                     raise RunnerError(f"HTTP {method} {url} body missing '{needle}'")
 
@@ -2216,8 +2273,8 @@ class CIRunner:
             message = format_timeout_failure(
                 bench_cmd,
                 timeout_sec,
-                exc.stdout if isinstance(exc.stdout, str) else None,
-                exc.stderr if isinstance(exc.stderr, str) else None,
+                captured_text(exc.stdout),
+                captured_text(exc.stderr),
             )
             self._write_text(step_log, message)
             raise RunnerError(message) from exc
@@ -2323,7 +2380,7 @@ class CIRunner:
         ]
         self._write_text(step_log, "\n".join(log_text))
 
-        expected = [expect_exit] if isinstance(expect_exit, int) else [int(e) for e in expect_exit]
+        expected = as_ints(expect_exit)
 
         if proc.returncode not in expected:
             raise RunnerError(
@@ -2886,20 +2943,12 @@ class CIRunner:
                 stdout_contains = step.get("stdout_contains")
                 stderr_contains = step.get("stderr_contains")
 
-                if stdout_contains:
-                    needles = (
-                        [stdout_contains] if isinstance(stdout_contains, str) else stdout_contains
-                    )
-                    for needle in needles:
-                        if str(needle) not in result.stdout:
-                            raise RunnerError(f"stdout missing expected token '{needle}'")
-                if stderr_contains:
-                    needles = (
-                        [stderr_contains] if isinstance(stderr_contains, str) else stderr_contains
-                    )
-                    for needle in needles:
-                        if str(needle) not in result.stderr:
-                            raise RunnerError(f"stderr missing expected token '{needle}'")
+                for needle in as_strings(stdout_contains):
+                    if needle not in result.stdout:
+                        raise RunnerError(f"stdout missing expected token '{needle}'")
+                for needle in as_strings(stderr_contains):
+                    if needle not in result.stderr:
+                        raise RunnerError(f"stderr missing expected token '{needle}'")
 
                 if "capture_stdout" in step:
                     self.context[str(step["capture_stdout"])] = result.stdout.strip()
@@ -3233,13 +3282,7 @@ class CIRunner:
                 )
 
             case StepType.WAIT_SYNC:
-                check_nodes = step.get("nodes")
-                if check_nodes is None:
-                    check_nodes = list(self.node_map.keys())
-                elif isinstance(check_nodes, int):
-                    check_nodes = [int(check_nodes)]
-                else:
-                    check_nodes = [int(n) for n in check_nodes]
+                check_nodes = as_ints(step.get("nodes")) or list(self.node_map.keys())
                 timeout_sec = int(step.get("timeout_sec", 60))
                 try:
                     leader_id = self._get_leader_id()

@@ -232,8 +232,8 @@ def txn_worker_loop(
             if outcome.committed is True:
                 r1, r2 = outcome.reads[0], outcome.reads[1]
                 ok_value: list[list[object]] = [
-                    ["r", k1, r1 if isinstance(r1, int) else None],
-                    ["r", k2, r2 if isinstance(r2, int) else None],
+                    ["r", k1, r1],
+                    ["r", k2, r2],
                     ["w", k1, new1],
                     ["w", k2, new2],
                 ]
@@ -341,8 +341,8 @@ def list_append_worker_loop(
             if outcome.committed is True:
                 l1, l2 = outcome.reads[0], outcome.reads[1]
                 ok_value: list[list[object]] = [
-                    ["r", k1, l1 if isinstance(l1, list) else None],
-                    ["r", k2, l2 if isinstance(l2, list) else None],
+                    ["r", k1, l1],
+                    ["r", k2, l2],
                     ["append", k1, tag],
                     ["append", k2, tag],
                 ]

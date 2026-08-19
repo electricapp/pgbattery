@@ -33,9 +33,11 @@ Why psycopg over `psql -c`?
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Generic, TypeVar
 
 import psycopg
+
+ReadT = TypeVar("ReadT")
 
 # Connection timeouts. We want the worker to notice a hung gateway quickly
 # during failover rather than blocking the entire 30s budget on one op.
@@ -44,21 +46,23 @@ STATEMENT_TIMEOUT_MS: Final[int] = 3_000
 
 
 @dataclass
-class TxnOutcome:
+class TxnOutcome(Generic[ReadT]):
     """Result of a multi-statement transaction attempt.
+
+    Generic in what a read yields, so each executor declares it: an rw-register
+    read is an `int | None`, a list-append read is a `list[int]`. One outcome
+    type carrying `object` made every caller ask at runtime what it was holding.
 
     Fields:
         committed: True if COMMIT succeeded; False on definite ROLLBACK
             (serialization failure, read-only error); None if the connection
             died mid-tx (treat as pending → Elle :info).
         reads:     Per-statement read values, in the order they were issued.
-                   For list-append: each entry is a list[int]. For rw-register:
-                   each entry is an int.
                    Empty on a pending/rolled-back tx.
     """
 
     committed: bool | None
-    reads: list[object]
+    reads: list[ReadT]
 
 
 class PsycopgWorkerClient:
@@ -140,7 +144,7 @@ class PsycopgWorkerClient:
         k2: int,
         new1: int,
         new2: int,
-    ) -> TxnOutcome:
+    ) -> TxnOutcome[int | None]:
         """Run a 2-key SERIALIZABLE register transaction.
 
         Reads both keys, writes new values to both, commits. Returns the
@@ -181,7 +185,7 @@ class PsycopgWorkerClient:
         k1: int,
         k2: int,
         tag: int,
-    ) -> TxnOutcome:
+    ) -> TxnOutcome[list[int]]:
         """Run a 2-key SERIALIZABLE list-append transaction.
 
         Reads both keys' lists, appends `tag` to both, commits. Returns the

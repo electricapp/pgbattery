@@ -5,8 +5,9 @@
 #     "rich>=14.0",
 #     "typer>=0.21",
 #     # topology.py reads docker-compose.yml, which is the truth source for the
-#     # cluster the matrix claims to describe.
+#     # cluster the matrix claims to describe, and parses it into models.
 #     "pyyaml>=6.0",
+#     "pydantic>=2.12",
 # ]
 # ///
 """Lint the CI test harness: matrix structure, Python syntax, SQL and contract refs.
@@ -47,6 +48,7 @@ from typing import Any, Final
 
 import typer
 import yaml
+from pydantic import BaseModel, ConfigDict
 from rich.console import Console
 from rich.table import Table
 
@@ -105,13 +107,22 @@ def check(name: str, fn: Callable[[], None]) -> None:
 # ---------------------------------------------------------------------------
 
 
+class MatrixEnvelope(BaseModel):
+    """The two keys every other check in this file reads.
+
+    Both are required: a matrix missing either would make every check over it
+    pass over an empty list, which reads as a clean lint.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    cases: list[dict[str, Any]]
+    suites: dict[str, dict[str, Any]]
+
+
 def check_matrix_json() -> None:
     """Validate ci_matrix.yaml is well-formed JSON with required keys."""
-    text = MATRIX_PATH.read_text(encoding="utf-8")
-    data = json.loads(text)
-    assert isinstance(data, dict), "top-level value must be an object"
-    assert "cases" in data, "missing 'cases' key"
-    assert "suites" in data, "missing 'suites' key"
+    MatrixEnvelope.model_validate(json.loads(MATRIX_PATH.read_text(encoding="utf-8")))
 
 
 def check_python_syntax() -> None:
@@ -380,7 +391,7 @@ def count_raw_fault_verbs(source: str) -> list[int]:
     docstrings: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
-            body = getattr(node, "body", [])
+            body = node.body
             if (
                 body
                 and isinstance(body[0], ast.Expr)
@@ -662,15 +673,13 @@ def check_transfers_can_wait_out_a_demote() -> None:
         raise AssertionError(" | ".join(problems))
 
 
-def implicit_build_targets(compose: dict[str, Any], filename: str) -> list[str]:
+def implicit_build_targets(compose: topology.ComposeDocument, filename: str) -> list[str]:
     """Services that build from the Dockerfile without naming a stage."""
     problems: list[str] = []
-    for name, service in (compose.get("services") or {}).items():
-        build = service.get("build")
-        if build is None:
+    for name, service in compose.services.items():
+        if service.build is None:
             continue
-        target = build.get("target") if isinstance(build, dict) else None
-        if not target:
+        if not service.build.target:
             problems.append(
                 f"{filename}: service {name!r} builds without an explicit `target`, so it "
                 f"gets whichever stage is last in the Dockerfile"
@@ -694,7 +703,9 @@ def check_build_targets_are_explicit() -> None:
     """
     problems: list[str] = []
     for path in sorted(PROJECT_ROOT.glob("docker-compose*.yml")):
-        compose = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        compose = topology.ComposeDocument.model_validate(
+            yaml.safe_load(path.read_text(encoding="utf-8"))
+        )
         problems.extend(implicit_build_targets(compose, path.name))
     if problems:
         raise AssertionError("; ".join(problems))

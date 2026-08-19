@@ -56,7 +56,10 @@ pub use backup::{
     BackupCreateResponse, BackupItemResponse, BackupListResponse, BackupRestoreResponse,
 };
 pub use cluster::{MemberInfo, MembershipResponse, TransferResponse};
-pub use discovery::{JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse, PeerInfo};
+pub use discovery::{
+    ClusterIdentityResponse, JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse,
+    PeerInfo,
+};
 pub use lsn::{LagResponse, ReportLsnRequest, ReportLsnResponse, TxidStatusResponse};
 
 /// Re-export `JoinRequest` from cluster module
@@ -102,6 +105,19 @@ pub struct ManagementApiState {
     /// Fixed 1s-window count of auth *failures*, to throttle brute force.
     /// Valid tokens bypass it, so a legitimate caller is never limited.
     pub auth_failures: Mutex<(std::time::Instant, u64)>,
+    /// Where this node's `PostgreSQL` lives, for the identity endpoint.
+    ///
+    /// Paths rather than the supervisor handle: reading the control file must
+    /// not queue behind a demote holding the supervisor lock, which can run
+    /// for minutes. `None` on a witness, which has no `PostgreSQL`.
+    pub pg_paths: Option<PgPaths>,
+}
+
+/// The two paths needed to read a data directory's control file.
+#[derive(Debug, Clone)]
+pub struct PgPaths {
+    pub bin_dir: std::path::PathBuf,
+    pub data_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for ManagementApiState {
@@ -327,6 +343,10 @@ pub async fn start_management_api(
         .route("/api/v1/cluster/leader", get(discovery::get_leader))
         // Node discovery (for CLI auto-discovery)
         .route("/api/v1/cluster/nodes", get(discovery::get_nodes))
+        // Which cluster this node's data belongs to, so a starting node can
+        // tell whether the cluster answering it is its own before acting on
+        // what it says.
+        .route("/api/v1/cluster/identity", get(discovery::get_cluster_identity))
         // Join info (for simplified join command)
         .route("/api/v1/cluster/join-info", get(discovery::get_join_info))
         // Replication lag (for health-based promotion)

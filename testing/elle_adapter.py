@@ -20,6 +20,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
 JAR_PATH: Path = (
     Path(__file__).resolve().parent / "third_party" / "elle" / "elle-cli-standalone.jar"
 )
@@ -75,36 +77,116 @@ class ElleError(RuntimeError):
     Distinct from 'Elle found anomalies' which is a normal result."""
 
 
-def _parse_valid(raw: dict[str, object]) -> bool | None:
-    """Elle's :valid? is true, false, or :unknown (-> "unknown" in JSON)."""
-    v = raw.get("valid?")
-    if v is True:
-        return True
-    if v is False:
-        return False
-    return None
+def _is_index(entry: object) -> bool:
+    """Whether a cycle entry is an op index rather than a whole op map."""
+    match entry:
+        case bool():
+            return False
+        case int():
+            return True
+        case _:
+            return False
 
 
-def _parse_anomalies(raw: dict[str, object]) -> list[ElleAnomaly]:
-    out: list[ElleAnomaly] = []
-    anomalies = raw.get("anomalies")
-    if not isinstance(anomalies, dict):
-        return out
-    for name, instances in anomalies.items():
-        if not isinstance(instances, list):
-            out.append(ElleAnomaly(name=str(name), cycle=[], detail={"raw": instances}))
-            continue
-        for inst in instances:
-            if not isinstance(inst, dict):
-                out.append(ElleAnomaly(name=str(name), cycle=[], detail={"raw": inst}))
-                continue
-            cycle_raw = inst.get("cycle") or inst.get("steps") or []
-            if isinstance(cycle_raw, list):
-                cycle = [c if isinstance(c, int) else hash(repr(c)) for c in cycle_raw]
-            else:
-                cycle = []
-            out.append(ElleAnomaly(name=str(name), cycle=cycle, detail=inst))
-    return out
+def _as_instance(entry: object) -> object:
+    """A payload entry, in the mapping shape `AnomalyInstance` reads.
+
+    A flag anomaly is a bare scalar rather than a map. Wrapping it keeps it in
+    the report instead of dropping it for not being the usual shape.
+    """
+    match entry:
+        case dict():
+            return entry
+        case _:
+            return {"payload": entry}
+
+
+def _as_instances(payload: object) -> list[object]:
+    """One anomaly class's payload, as a list of instances."""
+    match payload:
+        case list():
+            return [_as_instance(entry) for entry in payload]
+        case _:
+            return [_as_instance(payload)]
+
+
+class AnomalyInstance(BaseModel):
+    """One instance of one anomaly class.
+
+    `cycle` and `steps` are Elle's two spellings for the ops forming a cycle.
+    Anything else it attaches is kept, so a payload this module does not model
+    still reaches the report.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    cycle: list[int] = []
+    steps: list[int] = []
+
+    @field_validator("cycle", "steps", mode="before")
+    @classmethod
+    def _indices_only(cls, value: object) -> object:
+        """Some anomaly classes spell a step as the whole op map. Only an index
+        identifies an op to a reader, so anything else is not carried as one."""
+        match value:
+            case list():
+                return [entry for entry in value if _is_index(entry)]
+            case _:
+                return []
+
+    @property
+    def indices(self) -> list[int]:
+        return self.cycle or self.steps
+
+
+class ElleMeta(BaseModel):
+    """Elle's `_meta` block."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    op_count: int = Field(default=0, alias="op-count")
+
+
+class ElleOutput(BaseModel):
+    """Elle's JSON, parsed once at the boundary.
+
+    Every Clojure-spelled key is bound to a Python name here, so nothing
+    downstream reaches into a raw map or asks what shape it got.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    valid: bool | None = Field(default=None, alias="valid?")
+    anomalies: dict[str, list[AnomalyInstance]] = {}
+    elapsed_ms: float = Field(default=0.0, alias="elapsed-ms")
+    meta: ElleMeta = Field(default_factory=ElleMeta, alias="_meta")
+
+    @field_validator("valid", mode="before")
+    @classmethod
+    def _unknown_is_neither_verdict(cls, value: object) -> object:
+        """`:unknown` means Elle could not decide, which is not `false`."""
+        match value:
+            case bool():
+                return value
+            case _:
+                return None
+
+    @field_validator("anomalies", mode="before")
+    @classmethod
+    def _normalise_payloads(cls, value: object) -> object:
+        match value:
+            case dict():
+                return {str(name): _as_instances(payload) for name, payload in value.items()}
+            case _:
+                return {}
+
+    @property
+    def flat_anomalies(self) -> list[ElleAnomaly]:
+        return [
+            ElleAnomaly(name=name, cycle=inst.indices, detail=inst.model_dump())
+            for name, instances in self.anomalies.items()
+            for inst in instances
+        ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,24 +260,18 @@ def check_with_elle(
         raise ElleError(f"Elle produced no stdout. stderr:\n{proc.stderr}")
 
     try:
-        raw = json.loads(proc.stdout)
+        output = ElleOutput.model_validate(json.loads(proc.stdout))
     except json.JSONDecodeError as e:
         raise ElleError(f"Elle stdout was not valid JSON: {e}. stdout:\n{proc.stdout[:500]}") from e
-    if not isinstance(raw, dict):
-        raise ElleError(f"Elle JSON was not an object: {type(raw)}")
-
-    meta = raw.get("_meta") if isinstance(raw.get("_meta"), dict) else {}
-    op_count_raw = meta.get("op-count") if isinstance(meta, dict) else 0
-    op_count = int(op_count_raw) if isinstance(op_count_raw, int) else 0
-    elapsed_raw = raw.get("elapsed-ms", 0.0)
-    elapsed_ms = float(elapsed_raw) if isinstance(elapsed_raw, (int, float)) else 0.0
+    except ValidationError as e:
+        raise ElleError(f"Elle JSON was not the shape this adapter reads: {e}") from e
 
     return ElleResult(
-        valid=_parse_valid(raw),
-        anomalies=_parse_anomalies(raw),
-        elapsed_ms=elapsed_ms,
-        op_count=op_count,
-        raw=raw,
+        valid=output.valid,
+        anomalies=output.flat_anomalies,
+        elapsed_ms=output.elapsed_ms,
+        op_count=output.meta.op_count,
+        raw=output.model_dump(by_alias=True),
     )
 
 

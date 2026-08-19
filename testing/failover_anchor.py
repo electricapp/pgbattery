@@ -25,7 +25,6 @@ Two properties:
 
 from __future__ import annotations
 
-import json
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -36,6 +35,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+import api_models
 import fault_primitives as fp
 
 app = typer.Typer(add_completion=False)
@@ -108,18 +108,16 @@ def read_state(node: str, token: str) -> Sample | None:
         f"curl -s -m 3 -H 'x-pgbattery-token: {token}' http://127.0.0.1:908{index}/debug/state",
         timeout=10.0,
     )
-    if rc != 0 or not out.startswith("{"):
+    if rc != 0:
         return None
-    try:
-        parsed = json.loads(out)
-    except json.JSONDecodeError:
+    state = api_models.parse_or_none(api_models.DebugState, out)
+    if state is None:
         return None
-    age = parsed.get("failover_anchor_age_ms")
     return Sample(
         node=node,
-        leader_id=parsed.get("leader_id"),
-        is_leader=bool(parsed.get("is_leader")),
-        anchor_age_ms=int(age) if isinstance(age, int) else None,
+        leader_id=state.leader_id,
+        is_leader=state.is_leader,
+        anchor_age_ms=state.failover_anchor_age_ms,
         at=time.monotonic(),
     )
 

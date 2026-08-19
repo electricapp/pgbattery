@@ -728,6 +728,10 @@ impl App {
             // clock-lint: allow — brute-force rate-limit window, decides nothing
             // about write authority.
             auth_failures: parking_lot::Mutex::new((Instant::now(), 0)),
+            pg_paths: Some(crate::observability::management_api::PgPaths {
+                bin_dir: self.config.pg_bin_dir.clone(),
+                data_dir: self.config.pg_data_dir.clone(),
+            }),
         })
     }
 
@@ -2031,6 +2035,71 @@ impl App {
         self.config.pg_data_dir.join("PG_VERSION").exists()
     }
 
+    /// The `PostgreSQL` lineage of this node's data directory, if it has one.
+    ///
+    /// Read from the control file: this runs before `PostgreSQL` starts.
+    async fn local_cluster_lineage(&self) -> Option<u64> {
+        match crate::supervisor::read_system_identifier(
+            &self.config.pg_bin_dir,
+            &self.config.pg_data_dir,
+        )
+        .await
+        {
+            Ok(lineage) => lineage,
+            Err(e) => {
+                warn!(error = %e, "Could not read the local cluster lineage");
+                None
+            }
+        }
+    }
+
+    /// The lineage a peer reports, or `None` when it does not say.
+    ///
+    /// An older peer has no identity endpoint and a witness has no data
+    /// directory; both answer "unknown", which is not evidence of a mismatch.
+    async fn peer_cluster_lineage(&self, client: &reqwest::Client, peer_addr: &str) -> Option<u64> {
+        let url = format!("http://{peer_addr}/api/v1/cluster/identity");
+        let resp = client.get(&url).send().await.ok()?;
+        resp.json::<crate::observability::management_api::ClusterIdentityResponse>()
+            .await
+            .ok()?
+            .cluster_lineage
+    }
+
+    /// Whether `peer_addr` speaks for the cluster this node's data belongs to.
+    ///
+    /// A node that has lost its state directory re-bootstraps under the same
+    /// id and address, and answers membership questions for a cluster of one.
+    /// Believing it costs a healthy member its Raft state — it wipes on being
+    /// told it was removed, and then cannot rejoin, because the only peer it
+    /// knows is the impostor. Comparing lineages is what makes the answer
+    /// attributable: two nodes share a `PostgreSQL` system identifier exactly
+    /// when they share a data history.
+    ///
+    /// Unknown on either side is not a mismatch: a witness has no data
+    /// directory, and a node that has never been provisioned has nothing to
+    /// protect.
+    async fn peer_speaks_for_our_cluster(
+        &self,
+        client: &reqwest::Client,
+        peer_addr: &str,
+    ) -> bool {
+        let local = self.local_cluster_lineage().await;
+        let peer = self.peer_cluster_lineage(client, peer_addr).await;
+        if peer_speaks_for_lineage(local, peer) {
+            return true;
+        }
+        metrics::counter!("pgbattery_foreign_cluster_answers").increment(1);
+        error!(
+            peer = %peer_addr,
+            local_lineage = local,
+            peer_lineage = peer,
+            "Peer answers for a different PostgreSQL cluster than this node's data belongs to; \
+             its membership answers are not about us and will not be acted on"
+        );
+        false
+    }
+
     /// Check whether this `node_id` is in the cluster's committed membership.
     ///
     /// Returns `Ok(true)` if the peer reports our node as a current member
@@ -2544,6 +2613,19 @@ impl App {
                     }
                     return self.run(false).await;
                 }
+                Ok(false) if !self.peer_speaks_for_our_cluster(&client, &peer_addr).await => {
+                    // The peer answered for a cluster this node's data has
+                    // never been part of, so "you were removed" is not about
+                    // us. Keep the Raft state and resume: the real cluster is
+                    // still out there, and this node is still in it.
+                    warn!(
+                        peer = %peer_addr,
+                        node_id = self.config.node_id,
+                        "Ignoring a membership answer from a different cluster and resuming \
+                         with local Raft state"
+                    );
+                    return self.run(false).await;
+                }
                 Ok(false) => {
                     // Removed from cluster. Wipe stale Raft state and fall
                     // through to the rejoin path, which uses pg_rewind to
@@ -2660,6 +2742,25 @@ fn ensure_data_dir_ready(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a peer's answer is about the cluster this node's data belongs to.
+///
+/// Two nodes share a `PostgreSQL` system identifier exactly when they share a
+/// data history: `initdb` mints it once and `pg_basebackup` carries it. A node
+/// that lost its state directory re-bootstraps under the same id and address
+/// and mints a new one, so a differing lineage is the evidence that the peer
+/// answering is not the cluster this node belongs to.
+///
+/// Unknown on either side is not a mismatch. A witness has no data directory,
+/// an older peer serves no identity endpoint, and a node that has never been
+/// provisioned has no history to protect — treating any of those as an
+/// impostor would strand a legitimate rejoin.
+const fn peer_speaks_for_lineage(local: Option<u64>, peer: Option<u64>) -> bool {
+    match (local, peer) {
+        (Some(local), Some(peer)) => local == peer,
+        _ => true,
+    }
+}
+
 /// Remove everything inside `data_dir`, leaving the directory itself.
 ///
 /// The directory is kept because compose mounts a volume at that path; removing
@@ -2741,7 +2842,10 @@ fn are_paths_on_same_mount(_path1: &PathBuf, _path2: &PathBuf) -> Result<bool> {
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
-    use super::{clear_dir_contents, ensure_data_dir_ready, promotion_lease_holddown};
+    use super::{
+        clear_dir_contents, ensure_data_dir_ready, peer_speaks_for_lineage,
+        promotion_lease_holddown,
+    };
     use std::time::{Duration, Instant};
 
     /// A join that dies partway leaves PGDATA populated, and the emptiness
@@ -3470,6 +3574,34 @@ mod tests {
             promotion_lease_holddown(Some(started), started + LEASE, LEASE),
             None
         );
+    }
+
+    /// A node that lost its state directory re-bootstraps under the same id
+    /// and address and answers membership for a cluster of one. Acting on that
+    /// answer costs a healthy member its Raft state, and it cannot rejoin
+    /// afterwards because the impostor is the only peer it knows.
+    #[test]
+    fn test_a_different_lineage_does_not_speak_for_us() {
+        assert!(!peer_speaks_for_lineage(
+            Some(7_675_741_024_400_711_708),
+            Some(7_675_750_886_508_929_058)
+        ));
+    }
+
+    #[test]
+    fn test_the_same_lineage_speaks_for_us() {
+        let lineage = 7_675_741_024_400_711_708;
+        assert!(peer_speaks_for_lineage(Some(lineage), Some(lineage)));
+    }
+
+    /// Unknown is not evidence of a mismatch: a witness has no data directory
+    /// and an unprovisioned node has no history to protect. Refusing those
+    /// would strand every legitimate rejoin.
+    #[test]
+    fn test_an_unknown_lineage_is_not_a_mismatch() {
+        assert!(peer_speaks_for_lineage(None, Some(7_675_741_024_400_711_708)));
+        assert!(peer_speaks_for_lineage(Some(7_675_741_024_400_711_708), None));
+        assert!(peer_speaks_for_lineage(None, None));
     }
 
     /// An anchor in the future clamps to zero elapsed, deferring promotion

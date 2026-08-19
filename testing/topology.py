@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Final
 
 import yaml
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
@@ -85,6 +86,13 @@ class Node:
     counted when a test computes a quorum — counting learners as voters made
     the first 5-node run's quorum assertions vacuous."""
 
+    is_bootstrap: bool
+    """Whether this node starts with `--bootstrap`, which means "initdb a new
+    cluster if there is no data here". Wiping such a node does not exercise a
+    rejoin: it mints a fresh PostgreSQL lineage under an id the cluster still
+    lists — see H-16 in HARDENING.md — so a harness testing joins must target a
+    node that actually joins."""
+
 
 @dataclass(frozen=True)
 class Topology:
@@ -102,6 +110,16 @@ class Topology:
     def voter_services(self) -> tuple[str, ...]:
         return tuple(n.service for n in self.voters)
 
+    @property
+    def joining_services(self) -> tuple[str, ...]:
+        """Voters that reach the cluster by joining it.
+
+        The target set for anything that wipes a node and expects it back: the
+        bootstrap node answers an empty state directory with `initdb`, not with
+        a join.
+        """
+        return tuple(n.service for n in self.voters if not n.is_bootstrap)
+
     def by_service(self, service: str) -> Node:
         for node in self.nodes:
             if node.service == service:
@@ -112,88 +130,139 @@ class Topology:
         )
 
 
-def _list_field(service: str, spec: dict[str, object], key: str) -> list[object]:
-    """The list a service declares under `key`, empty if it declares none.
+class PortMapping(BaseModel):
+    """One published port.
 
-    Compose lets the key be absent. Anything present that is not a list is a
-    file this module does not understand, and reading it as empty would drop
-    the ports or volumes it declares while still yielding a plausible node.
+    Compose's short `"HOST:CONTAINER"` spelling is normalised into the long
+    form as it is read, so nothing downstream has to ask which spelling the
+    file used.
     """
-    value = spec.get(key)
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise TopologyError(f"{service}: {key} is {type(value).__name__}, expected a list")
-    return value
+
+    target: int
+    published: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_short_form(cls, value: object) -> object:
+        match value:
+            case str():
+                parts = value.split(":")
+                if len(parts) < 2:
+                    raise ValueError(f"cannot read port mapping {value!r}")
+                return {"published": parts[-2], "target": parts[-1].split("/")[0]}
+            case _:
+                return value
 
 
-def _published_ports(service: str, spec: dict[str, object]) -> dict[int, int]:
-    """Map container port to host port for one service.
+class NetworkAttachment(BaseModel):
+    """A service's attachment to one network.
 
-    Handles both compose spellings. The short form is `"HOST:CONTAINER"`; the
-    long form is a mapping with `published` and `target`. A form this does not
-    understand raises rather than silently yielding no ports, which would leave
-    every derived port lookup failing later and further from the cause.
+    `ipv4_address` is required: peer-level faults address nodes by IP, and a
+    DHCP address would move between runs.
     """
-    published: dict[int, int] = {}
-    for entry in _list_field(service, spec, "ports"):
-        if isinstance(entry, str):
-            parts = entry.split(":")
-            if len(parts) < 2:
-                raise TopologyError(f"{service}: cannot read port mapping {entry!r}")
-            host, container = parts[-2], parts[-1]
-            published[int(container.split("/")[0])] = int(host)
-        elif isinstance(entry, dict):
-            published[int(entry["target"])] = int(entry["published"])
-        else:
-            raise TopologyError(f"{service}: unrecognised port entry {entry!r}")
-    return published
+
+    ipv4_address: str
 
 
-def _config_path(service: str, spec: dict[str, object]) -> Path:
-    """The config file this service mounts as its `pgbattery.toml`."""
-    for volume in _list_field(service, spec, "volumes"):
-        if isinstance(volume, str) and CONFIG_MOUNT in volume:
-            return REPO_ROOT / volume.split(":", 1)[0]
-    raise TopologyError(f"{service}: no {CONFIG_MOUNT} mount, so it has no declared identity")
+class BuildSpec(BaseModel):
+    """A service's build block.
+
+    Compose's short form is a bare context path, which names no stage — the
+    case `lint_matrix` exists to catch, so it is normalised rather than
+    rejected.
+    """
+
+    context: str = "."
+    target: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_short_form(cls, value: object) -> object:
+        match value:
+            case str():
+                return {"context": value}
+            case _:
+                return value
 
 
-def _node_id(service: str, spec: dict[str, object]) -> int:
-    config = _config_path(service, spec)
-    if not config.exists():
-        raise TopologyError(f"{service}: mounts {config}, which does not exist")
-    parsed = tomllib.loads(config.read_text(encoding="utf-8"))
-    node_id = parsed.get("node_id")
-    if not isinstance(node_id, int):
-        raise TopologyError(f"{service}: {config.name} declares no integer node_id")
-    return node_id
+class ComposeService(BaseModel):
+    """One service, in the fields this module derives topology from."""
+
+    ports: list[PortMapping] = []
+    volumes: list[str] = []
+    networks: dict[str, NetworkAttachment] = {}
+    command: str = ""
+    build: BuildSpec | None = None
+
+    @field_validator("command", mode="before")
+    @classmethod
+    def _join_argv(cls, value: object) -> object:
+        match value:
+            case list():
+                return " ".join(str(part) for part in value)
+            case _:
+                return value
+
+    @property
+    def published(self) -> dict[int, int]:
+        """Container port to host port."""
+        return {p.target: p.published for p in self.ports}
+
+    @property
+    def is_voter(self) -> bool:
+        return self.is_bootstrap or "--voter" in self.command
+
+    @property
+    def is_bootstrap(self) -> bool:
+        return "--bootstrap" in self.command
+
+    def config_path(self, service: str) -> Path:
+        """The config file this service mounts as its `pgbattery.toml`."""
+        for volume in self.volumes:
+            if CONFIG_MOUNT in volume:
+                return REPO_ROOT / volume.split(":", 1)[0]
+        raise TopologyError(f"{service}: no {CONFIG_MOUNT} mount, so it has no declared identity")
+
+    def node_id(self, service: str) -> int:
+        config = self.config_path(service)
+        if not config.exists():
+            raise TopologyError(f"{service}: mounts {config}, which does not exist")
+        try:
+            return NodeConfig.model_validate(
+                tomllib.loads(config.read_text(encoding="utf-8"))
+            ).node_id
+        except ValidationError as exc:
+            raise TopologyError(
+                f"{service}: {config.name} declares no integer node_id: {exc}"
+            ) from exc
+
+    def static_ip(self, service: str, network: str) -> str:
+        attachment = self.networks.get(network)
+        if attachment is None:
+            raise TopologyError(
+                f"{service}: no static ipv4_address on {network}. Peer-level faults "
+                f"address nodes by IP, and a DHCP address would move between runs."
+            )
+        return attachment.ipv4_address
 
 
-def _command_text(spec: dict[str, object]) -> str:
-    command = spec.get("command")
-    if isinstance(command, str):
-        return command
-    if isinstance(command, list):
-        return " ".join(str(part) for part in command)
-    return ""
+class NodeConfig(BaseModel):
+    """The one field topology needs from a node's `pgbattery.toml`.
+
+    Strict, so a `node_id` written as a string is a config error here rather
+    than a coerced integer nothing ever questions.
+    """
+
+    model_config = {"strict": True, "extra": "ignore"}
+
+    node_id: int
 
 
-def _is_voter(spec: dict[str, object]) -> bool:
-    command = _command_text(spec)
-    return "--bootstrap" in command or "--voter" in command
+class ComposeDocument(BaseModel):
+    """The compose file itself."""
 
-
-def _static_ip(service: str, spec: dict[str, object], network: str) -> str:
-    networks = spec.get("networks")
-    if not isinstance(networks, dict):
-        raise TopologyError(f"{service}: no network assignment; expected a static address")
-    attachment = networks.get(network)
-    if not isinstance(attachment, dict) or "ipv4_address" not in attachment:
-        raise TopologyError(
-            f"{service}: no static ipv4_address on {network}. Peer-level faults "
-            f"address nodes by IP, and a DHCP address would move between runs."
-        )
-    return str(attachment["ipv4_address"])
+    services: dict[str, ComposeService] = {}
+    networks: dict[str, object] = {}
 
 
 def load(compose_file: Path | None = None) -> Topology:
@@ -202,18 +271,21 @@ def load(compose_file: Path | None = None) -> Topology:
     if not path.exists():
         raise TopologyError(f"{path} not found; nothing declares the cluster topology")
 
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    services = document.get("services") or {}
-    networks = list((document.get("networks") or {}).keys())
+    try:
+        document = ComposeDocument.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    except ValidationError as exc:
+        raise TopologyError(
+            f"{path.name} is not a compose file this harness can read: {exc}"
+        ) from exc
+
+    networks = list(document.networks)
     if len(networks) != 1:
         raise TopologyError(f"{path.name} declares {len(networks)} networks; expected exactly one")
     network = networks[0]
 
     nodes: list[Node] = []
-    for service, spec in services.items():
-        if not isinstance(spec, dict):
-            continue
-        ports = _published_ports(service, spec)
+    for service, spec in document.services.items():
+        ports = spec.published
         missing = {
             name: port
             for name, port in (
@@ -236,12 +308,13 @@ def load(compose_file: Path | None = None) -> Topology:
         nodes.append(
             Node(
                 service=service,
-                node_id=_node_id(service, spec),
-                ip=_static_ip(service, spec, network),
+                node_id=spec.node_id(service),
+                ip=spec.static_ip(service, network),
                 gateway_port=ports[PG_CONTAINER_PORT],
                 metrics_port=ports[METRICS_CONTAINER_PORT],
                 mgmt_port=ports[MGMT_CONTAINER_PORT],
-                is_voter=_is_voter(spec),
+                is_voter=spec.is_voter,
+                is_bootstrap=spec.is_bootstrap,
             )
         )
 
@@ -272,6 +345,7 @@ TOPOLOGY: Final[Topology] = load()
 """The cluster this process is driving."""
 
 NODES: Final[tuple[str, ...]] = TOPOLOGY.voter_services
+JOINING_NODES: Final[tuple[str, ...]] = TOPOLOGY.joining_services
 NODE_IPS: Final[dict[str, str]] = {n.service: n.ip for n in TOPOLOGY.nodes}
 GATEWAY_PORTS: Final[tuple[int, ...]] = tuple(n.gateway_port for n in TOPOLOGY.voters)
 MGMT_PORTS: Final[dict[str, int]] = {n.service: n.mgmt_port for n in TOPOLOGY.nodes}

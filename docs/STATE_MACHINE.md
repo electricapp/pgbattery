@@ -73,6 +73,15 @@ Every state transition is driven by a **definitive source of truth** — never b
   - `demote(addr)` — when `current_leader == Some(other)`. **Idempotent**: early-return if already in recovery, configured for `addr`, and timeline matches the leader.
   - `stop()` — on shutdown.
 - **Cache**: none. There is no `Supervisor::role` field. The `pgbattery_pg_is_primary` metric is set from the actual `pg_is_in_recovery()` result by the writer that just performed the role change.
+- **Foreign lineage → re-provision**: `demote(addr)` runs `pg_rewind` when the timelines diverge. `pg_rewind` compares control files on connect and refuses outright when the two data directories were never the same cluster ("from different systems"). That is `Error::ForeignDataDirectory`, the one rewind failure the supervisor resolves rather than reports: it discards the data directory and clones the leader's (`reprovision_from`). Safe because it is foreign — a lineage this cluster never wrote to cannot hold a write this cluster acknowledged — and necessary because no retry gives two lineages a common ancestor, so the alternative is a node that fails to fence, restarts, and repeats once a minute forever. A diverged _but related_ history never takes this path; it goes to the divergence gate, which refuses rather than discards.
+
+### 3a. Cluster lineage (identity)
+
+- **State**: which `PostgreSQL` cluster this node's data belongs to.
+- **Source of truth**: the `Database system identifier` in the data directory's control file, read with `pg_controldata` (`read_system_identifier`). `initdb` mints it once and `pg_basebackup` carries it, so two nodes share it exactly when they share a data history. `None` on a witness or an unprovisioned node.
+- **Read, never stored**: no field, no cache. A re-provision changes it, and a node that trusted a remembered value would act for a cluster it has left.
+- **Published at** `GET /api/v1/cluster/identity` (no auth, like the other discovery endpoints), served from the control file rather than from a running `PostgreSQL`, because the caller that needs it is deciding at startup whether the cluster answering it is its own — and neither end is necessarily serving yet.
+- **What it gates**: a node resuming with local Raft state asks its configured peer whether it is still in the committed membership, and _wipes its own Raft state_ when told it is not. A node that lost its state directory re-bootstraps under the same id and address and answers that question for a cluster of one, so that answer must be attributable before it is acted on. `peer_speaks_for_lineage` (pure, unit-tested) compares the two: differing lineages mean the answer is not about us, and the node resumes with its state intact. Unknown on either side is not a mismatch — refusing those would strand every legitimate rejoin.
 
 ### 4. Sync replication membership (replication manager)
 

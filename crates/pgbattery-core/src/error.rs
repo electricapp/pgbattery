@@ -111,6 +111,22 @@ pub enum Error {
         threshold_bytes: u64,
     },
 
+    /// The local data directory was never part of the cluster it is being
+    /// asked to follow: `pg_rewind` compares control files on connect and
+    /// reports the two clusters are from different systems.
+    ///
+    /// Distinct from every other rewind failure because no retry can resolve
+    /// it — there is no common ancestor to rewind to. It is also the one
+    /// failure that says the directory holds no write this cluster ever
+    /// acknowledged, which is what makes discarding it safe.
+    #[error(
+        "PostgreSQL data directory is from a different cluster than {rewind_source}; pg_rewind can never relate the two lineages: {detail}"
+    )]
+    ForeignDataDirectory {
+        rewind_source: String,
+        detail: String,
+    },
+
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
 }

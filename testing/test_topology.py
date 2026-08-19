@@ -149,6 +149,13 @@ class VoterSetComesFromTheStartCommand(unittest.TestCase):
         (joined,) = topology.load(write_compose(as_voter)).nodes
         self.assertTrue(joined.is_voter)
 
+    def test_the_bootstrap_node_is_not_a_wipe_target(self) -> None:
+        """Wiping it makes it `initdb` a new lineage under an id the cluster
+        still lists, which is B-1 rather than the rejoin a harness meant."""
+        loaded = topology.load(REPO_ROOT / "docker-compose.yml")
+        self.assertTrue(loaded.by_service("node1").is_bootstrap)
+        self.assertEqual(loaded.joining_services, ("node2", "node3"))
+
     def test_a_plain_join_is_a_learner(self) -> None:
         as_learner = MINIMAL_COMPOSE.replace(
             "exec pgbattery run --bootstrap", "exec pgbattery join --peer x --node-id 1"

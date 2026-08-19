@@ -1255,6 +1255,12 @@ class _NodeWorker(threading.Thread):
     still emits an explicit `indeterminate` probe naming the last failure, and
     the next attempt after the backoff re-probes from scratch."""
 
+    def _note_connect_failure(self, sqlstate: str | None, exc: BaseException) -> None:
+        """Record why a connect failed, and hold off the next attempt."""
+        _, self._connect_reason = classify_failure(sqlstate, str(exc))
+        self._connect_error = str(exc).strip()
+        self._connect_retry_ns = time.monotonic_ns() + self._connect_backoff_ns
+
     def _ensure_conn(self) -> psycopg.Connection[Any] | None:
         if self._conn is not None and not self._conn.closed:
             return self._conn
@@ -1271,11 +1277,13 @@ class _NodeWorker(threading.Thread):
                 connect_timeout=max(1, round(self._connect_timeout_s)),
                 autocommit=True,
             )
-        except (psycopg.Error, OSError) as exc:
-            sqlstate = exc.sqlstate if isinstance(exc, psycopg.Error) else None
-            _, self._connect_reason = classify_failure(sqlstate, str(exc))
-            self._connect_error = str(exc).strip()
-            self._connect_retry_ns = time.monotonic_ns() + self._connect_backoff_ns
+        except psycopg.Error as exc:
+            self._note_connect_failure(exc.sqlstate, exc)
+            return None
+        except OSError as exc:
+            # No sqlstate: the server never answered, so there is no server
+            # verdict to classify, only the transport failure.
+            self._note_connect_failure(None, exc)
             return None
         try:
             timeout_ms = max(1, int(self._attempt_timeout_s * 1000))
