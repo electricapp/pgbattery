@@ -878,13 +878,42 @@ No new infrastructure. Highest confidence per unit of effort.
       not happened. Every marker the probe prints is now derived from the state
       it names at the moment it prints.
 
-- [ ] **H-08 — Backward clock jumps and sub-second skew.** Current skew is
-      forward-only and coarse (+30 s / +300 s). Backward steps are the harder
-      case for lease arithmetic, and the interesting regime is within a few
-      hundred milliseconds of the lease and election boundaries.
+- [x] **H-08 — Backward clock jumps and sub-second skew.** `clock_skew_sweep.py`
+      steps the clock both ways across the boundary neighbourhood, inside a live
+      failover, with `dual_writability_prober` attached.
       **Done when** a sweep across the boundary neighbourhood runs with the
       prober attached and no dual-write window appears.
       _Blocked by_ H-02 · _Effort_ M
+
+      The magnitudes are anchored to the system's own constants —
+      `sweep_around(lease_duration)` and `sweep_around(election_timeout)`, plus
+      absolute sub-second steps — so retuning a constant retunes the sweep
+      instead of leaving it straddling nothing, and every magnitude is applied
+      in both directions. `test_clock_skew_sweep.py` pins that: it fails if the
+      plan goes forward-only, stops straddling the lease boundary, loses its
+      sub-second steps, or stops tracking the constants.
+
+      `clock_skew_at_lease_boundary` existed before this and had no caller — a
+      primitive nothing drove. Its docstring still described the guard it was
+      built against: a hold-down that compared `unix_now_ms()` to a wall-clock
+      anchor while the lease it stood in for was monotonic, which a forward
+      step of one lease duration could satisfy while the deposed leader's lease
+      was genuinely still valid. That guard is now `Instant` throughout
+      (`promotion_lease_holddown`, `failover_started_at`) with
+      `checked_duration_since(...).unwrap_or(ZERO)`, so no wall-clock step of
+      either sign can shorten it. The docstring said otherwise, which would
+      have told the next reader the primitive proves something it cannot; it
+      now records what changed and what the primitive is for — a regression
+      guard on that conversion.
+
+      The one wall-clock read left in a safety path is the LSN staleness filter
+      (`unix_now_secs`). A backward step makes every recorded LSN timestamp
+      read as future-dated, and the filter caps those at age 0 rather than
+      dropping them — dropping would shrink `max_cluster_lsn` toward the
+      bootstrap-permissive fallback and weaken the election gate, which is
+      RW-7's shape. The sweep reads `pgbattery_lsn_future_skew_total` across
+      the cluster on each step, so a backward step that never reached that path
+      is visible rather than assumed.
 
 - [ ] **H-09 — Wiped-node rejoin.** Destroy one node's volume and rejoin under
       the same node id — the canonical Raft persisted-vote violation. Plus the

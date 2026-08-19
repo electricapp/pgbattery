@@ -1213,6 +1213,7 @@ impl App {
             let state = cluster_state.read();
             let peers =
                 crate::governor::replication_manager::peer_voter_names(&state.voter_ids, node_id);
+            drop(state);
             crate::governor::replication_manager::sync_standby_list(&peers)
         };
 
@@ -1713,7 +1714,7 @@ impl App {
     /// does not begin waiting the moment the value is written — measured
     /// directly: promoted under `FIRST 1 (...)` with no standby connected, the
     /// commit returned with nothing holding it. So the GUC text is not the
-    /// evidence; a standby PostgreSQL has designated `sync` is.
+    /// evidence; a standby `PostgreSQL` has designated `sync` is.
     ///
     /// - Probe failed (`None`): not in force. Writes stay fenced rather than
     ///   recovered on a state nobody read.
@@ -1723,7 +1724,7 @@ impl App {
     /// - Otherwise: in force once at least `required` standbys report `sync`.
     ///
     /// Costs no availability. With a non-empty list and no `sync` standby a
-    /// commit blocks at the PostgreSQL level anyway once the wait engages, so
+    /// commit blocks at the `PostgreSQL` level anyway once the wait engages, so
     /// this converts an unbounded hang — or worse, an unbacked acknowledgement
     /// — into a clean read-only error.
     const fn sync_durability_in_force(observation: Option<(bool, usize)>, required: usize) -> bool {
@@ -2808,7 +2809,7 @@ mod tests {
                 in_recovery: true,
                 ..ModelPg::default()
             });
-            cluster.write().voter_ids = [1].into_iter().collect();
+            cluster.write().voter_ids = std::collections::HashSet::from([1]);
             App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
@@ -2856,9 +2857,12 @@ mod tests {
         /// synchronous acknowledgement before it will recover writes.
         fn three_voters() -> Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>
         {
-            let mut state = crate::governor::state_machine::ClusterState::default();
-            state.voter_ids = [1, 2, 3].into_iter().collect();
-            Arc::new(parking_lot::RwLock::new(state))
+            Arc::new(parking_lot::RwLock::new(
+                crate::governor::state_machine::ClusterState {
+                    voter_ids: std::collections::HashSet::from([1, 2, 3]),
+                    ..Default::default()
+                },
+            ))
         }
 
         /// A leader whose lease has expired, holding a writable primary.
@@ -3091,11 +3095,12 @@ mod tests {
             let (pg, lease) = valid_lease_over_a_fenced_primary(ModelPg::default());
             let (shutdown_tx, _shutdown_rx) = watch::channel(false);
             let mut fence_failures = 0;
-            let lone = {
-                let mut state = crate::governor::state_machine::ClusterState::default();
-                state.voter_ids = [1].into_iter().collect();
-                Arc::new(parking_lot::RwLock::new(state))
-            };
+            let lone = Arc::new(parking_lot::RwLock::new(
+                crate::governor::state_machine::ClusterState {
+                    voter_ids: std::collections::HashSet::from([1]),
+                    ..Default::default()
+                },
+            ));
 
             App::lease_enforcement_tick(&pg, &lease, &lone, 1, &mut fence_failures, &shutdown_tx)
                 .await;

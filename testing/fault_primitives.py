@@ -3284,14 +3284,30 @@ def clock_skew_at_lease_boundary(
     PROVES: whether a decision the lease guards is taken on the monotonic clock
     or on the wall clock. ``App::promote_local_postgres`` withholds promotion
     until one full lease duration has passed since the locally-observed
-    leaderless edge, but it measures that with ``unix_now_ms()``
-    (``src/app.rs:1051``, ``src/app.rs:2354``) while the lease it stands in for
-    is monotonic (``src/governor/lease.rs:106``). libfaketime is ``LD_PRELOAD``ed
-    into pgbattery, so a forward step of at least ``lease_duration`` applied to
-    the election winner *inside* that window satisfies the guard while the
-    deposed leader's lease is genuinely still valid — two writable primaries.
-    ``skew_ms`` defaults to exactly one lease duration for that reason; sweep it
-    with ``sweep_around(timings.lease_duration_ms)``.
+    leaderless edge. That hold-down now measures with ``Instant`` and
+    ``checked_duration_since(...).unwrap_or(ZERO)``
+    (``promotion_lease_holddown``, ``src/app.rs``), and ``failover_started_at``
+    is an ``Instant`` too — so a wall-clock step of either sign cannot shorten
+    it. It was not always so: the guard once compared ``unix_now_ms()`` against
+    a wall-clock anchor while the lease it stood in for was monotonic, and a
+    forward step of one lease duration applied to the election winner inside
+    that window satisfied the guard while the deposed leader's lease was still
+    genuinely valid — two writable primaries. This primitive is what keeps that
+    conversion honest, so it is a regression guard rather than a live exploit.
+
+    libfaketime is ``LD_PRELOAD``ed into pgbattery, so the step reaches every
+    wall-clock read the process makes. The path that still reads the wall clock
+    is the LSN staleness filter (``unix_now_secs`` in ``state_machine.rs``): a
+    backward step makes every recorded LSN timestamp look future-dated, and the
+    filter caps those at age 0 rather than dropping them, which keeps the
+    election gate strict instead of collapsing it to the bootstrap-permissive
+    fallback. ``pgbattery_lsn_future_skew_total`` is how that path reports it
+    was reached.
+
+    ``skew_ms`` defaults to exactly one lease duration, the magnitude that used
+    to be sufficient; sweep it — both signs — with
+    ``sweep_around(timings.lease_duration_ms)``. ``clock_skew_sweep.py`` drives
+    that sweep with the dual-writability prober attached.
 
     Timing comes from the system's own constants, not from sleeps: the window is
     ``[lease_edge, lease_edge + lease_duration]`` with ``lease_duration`` read via
