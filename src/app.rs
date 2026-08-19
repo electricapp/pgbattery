@@ -1595,7 +1595,39 @@ impl App {
         fence_failures: &mut u32,
         shutdown_tx: &watch::Sender<bool>,
     ) -> bool {
-        let pg = postgres.lock().await;
+        // Bounded, so a lifecycle operation cannot stop this loop ticking.
+        // `demote` holds the supervisor lock across stop, rewind, and recovery
+        // — measured at 8.3 s for one leadership transfer, which cost ~60 of
+        // the 250 ticks that period owed. Waiting longer than one interval buys
+        // nothing: the work this tick would do is re-derived from scratch by
+        // the next one, and skipping never fences less than blocking did.
+        //
+        // The skip is safe because every path that holds the lock this long
+        // fences first — `demote` sets read-only before stopping, `promote`
+        // arms it before `pg_ctl promote` — so a tick that cannot look is
+        // looking at a node that is already not writable.
+        let lock_wait_start = Instant::now();
+        let Ok(pg) = tokio::time::timeout(
+            crate::governor::lease::LEASE_CHECK_INTERVAL,
+            postgres.lock(),
+        )
+        .await
+        else {
+            metrics::counter!("pgbattery_lease_tick_lock_timeouts").increment(1);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a lock wait in seconds always fits in f64"
+            )]
+            metrics::histogram!("pgbattery_lease_tick_lock_wait_seconds")
+                .record(lock_wait_start.elapsed().as_secs_f64());
+            return false;
+        };
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a lock wait in seconds always fits in f64"
+        )]
+        metrics::histogram!("pgbattery_lease_tick_lock_wait_seconds")
+            .record(lock_wait_start.elapsed().as_secs_f64());
         let (in_recovery, pg_writable, sync_observation) = Self::probe_pg_state(&*pg).await;
 
         // What this cluster's voter set requires, from the same derivation the
@@ -3113,6 +3145,37 @@ mod tests {
                 Arc::new(tokio::sync::Mutex::new(model)),
                 Arc::new(parking_lot::RwLock::new(lease)),
             )
+        }
+
+        #[tokio::test]
+        async fn a_held_supervisor_lock_does_not_stall_the_tick() {
+            // RW-9. `demote` holds the supervisor lock across stop, rewind, and
+            // recovery — measured at 8.3 s for one leadership transfer, which
+            // cost ~60 of the 250 ticks that period owed. The tick must keep
+            // its period regardless of who holds the lock.
+            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            let held = pg.clone().lock_owned().await;
+            let started = std::time::Instant::now();
+            let should_stop = App::lease_enforcement_tick(
+                &pg,
+                &lease,
+                &three_voters(),
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            drop(held);
+
+            assert!(!should_stop, "a skipped tick must not stop the loop");
+            assert!(
+                elapsed < crate::governor::lease::LEASE_CHECK_INTERVAL * 3,
+                "tick blocked for {elapsed:?} on a held lock; it must give up within its period"
+            );
         }
 
         #[tokio::test]

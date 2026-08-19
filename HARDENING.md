@@ -1124,12 +1124,31 @@ No new infrastructure. Highest confidence per unit of effort.
       or becomes a documented RPO bound.
       _Closes_ RW-3 · _Effort_ M
 
-- [ ] **H-15 — Unblock the supervisor mutex in `demote()`.** It is held across
-      stop, rewind, and recovery, so the 100 ms lease tick, the health watchdog,
-      and LSN reporting all stall behind it.
+- [x] **H-15 — Unblock the supervisor mutex in `demote()`.** It was held across
+      stop, rewind, and recovery, so the 100 ms lease tick stalled behind it.
       **Done when** the stall is measured first, then removed, and a test asserts
       the lease tick keeps its period during a demote.
       _Closes_ RW-9 · _Effort_ M
+
+      Measured before touching anything, via
+      `pgbattery_lease_tick_lock_wait_seconds`. Steady state is ~9 µs a tick.
+      One leadership transfer added **8.3 s** of lock wait and left the loop
+      with 190 ticks where 25 s owed 250 — sixty ticks simply did not happen.
+
+      The tick now bounds its acquisition at one interval and skips
+      (`pgbattery_lease_tick_lock_timeouts`) rather than queueing behind a
+      lifecycle operation. Waiting longer bought nothing: the work a tick would
+      do is re-derived from scratch by the next one, and skipping never fences
+      less than blocking did — a blocked tick fences nothing either. The skip is
+      safe because every path that holds the lock this long fences first
+      (`demote` sets read-only before stopping, `promote` arms it before
+      `pg_ctl promote`), so a tick that cannot look is looking at a node that is
+      already not writable.
+
+      Same transfer on the fixed build: 2.19 s of total wait — 21 skips at the
+      100 ms bound — and **273 ticks in 25 s**, so the cadence is kept.
+      `a_held_supervisor_lock_does_not_stall_the_tick` pins it, and goes red
+      (blocking 10 s) against an unbounded acquisition.
 
 - [x] **H-45 — The lame-duck window must outlive nothing.** A leadership
       transfer stops the leader's heartbeats and sleeps a full lease so the

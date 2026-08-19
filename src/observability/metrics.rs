@@ -65,6 +65,14 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
         "pgbattery_query_duration_seconds",
         "Query execution time in seconds"
     );
+    describe_histogram!(
+        "pgbattery_lease_tick_lock_wait_seconds",
+        "How long a lease-enforcement tick waited for the supervisor lock, bounded at one tick interval"
+    );
+    describe_counter!(
+        "pgbattery_lease_tick_lock_timeouts",
+        "Lease-enforcement ticks skipped because a lifecycle operation held the supervisor lock for longer than one interval; the node is already fenced on every such path"
+    );
 
     // Failover timing histograms
     describe_histogram!(
