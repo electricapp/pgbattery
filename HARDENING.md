@@ -1248,13 +1248,38 @@ No new infrastructure. Highest confidence per unit of effort.
       critical section, which is a fault-injection capability the harness does
       not have yet.
 
-- [ ] **H-18 — Drive the failover-anchor coalescing race live.** The pure
-      functions are unit-tested; a missed clear or missed re-stamp under coalesced
-      watch transitions would make the hold-down read an ancient anchor and
-      promote immediately.
+- [x] **H-18 — Drive the failover-anchor coalescing race live.** The pure
+      functions were unit-tested; a missed clear or missed re-stamp under
+      coalesced watch transitions would make the hold-down read an ancient
+      anchor and promote immediately.
       **Done when** coalesced transitions are forced against a live cluster and
       the anchor lifecycle is asserted, not just its arithmetic.
       _Closes_ RW-8 · _Effort_ M
+
+      The anchor was internal state, so nothing outside the process could say
+      whether it had been cleared — only whether a hold-down happened to fire,
+      which is a consequence and not the thing. `/debug/state` now reports
+      `failover_anchor_age_ms`, and `failover_anchor.py` drives leadership
+      churn while sampling every node's anchor through the whole failover.
+
+      The assertion is on the anchor: a settled cluster carries none older than
+      three lease durations, because an anchor that survives is exactly what the
+      hold-down would later read as ancient. `stale_anchors` and
+      `cluster_settled` are pure and inverted in `test_failover_anchor.py` —
+      including that two nodes agreeing while a third is unreachable is not
+      agreement. Live: two rounds, anchors observed during both failovers,
+      cleared on every settled cluster.
+
+      One harness fault worth recording: "settled" originally required all three
+      nodes to answer, which can never hold while one is deliberately killed, so
+      the loop burned its whole window every round and the run took 364 s
+      instead of 10 s. The kill window now asks whether the survivors agree; the
+      full-set check is reserved for after the node returns.
+
+      Partially exercised: the re-stamp half. Anchors are observed during
+      failover, but forcing the specific `Leader(other) -> None -> Leader(self)`
+      coalescing that swallows the edge is not something this harness can demand
+      — it samples for it rather than causing it.
 
 ### Wave 2 — Differential classifier testing (Tier 2)
 

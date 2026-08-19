@@ -76,6 +76,13 @@ pub(super) struct StateResponse {
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
     pub node_count: usize,
+    /// Age of `ClusterState::failover_started_at`, or `None` when no failover
+    /// is being tracked. The promotion hold-down measures from this anchor, so
+    /// a stale one it should have cleared, or a missing one it should have
+    /// re-stamped, both read as "the lease expired long ago" and let a
+    /// promotion through immediately. Exposed so the lifecycle can be asserted
+    /// rather than inferred from whether a hold-down happened to fire.
+    pub failover_anchor_age_ms: Option<u64>,
 }
 
 /// Get current cluster state (debug snapshot).
@@ -98,7 +105,13 @@ pub(super) async fn get_state(State(state): State<Arc<ManagementApiState>>) -> J
         let learners: Vec<u64> = membership.learner_ids().collect();
         (m.current_leader, voters, learners)
     };
-    let node_count = state.cluster_state.read().nodes.len();
+    let (node_count, failover_anchor_age_ms) = {
+        let cluster = state.cluster_state.read();
+        let age = cluster
+            .failover_started_at
+            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+        (cluster.nodes.len(), age)
+    };
 
     Json(StateResponse {
         node_id: state.node_id,
@@ -107,5 +120,6 @@ pub(super) async fn get_state(State(state): State<Arc<ManagementApiState>>) -> J
         voters,
         learners,
         node_count,
+        failover_anchor_age_ms,
     })
 }
