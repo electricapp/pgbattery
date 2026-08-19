@@ -1941,6 +1941,29 @@ contained — one construction site, not the propagation into
       alone.
       _Closes_ Class C and exit criterion 3 · _Blocked by_ H-31 · _Effort_ M
 
+      **Harness half done.** Every harness that draws randomly now draws from
+      one seeded generator, records the seed in its artifact, and prints the
+      command that replays it. `linearizability_register.py` and
+      `overnight_test.py` already did; `ci_runner.py` draws nothing, so its runs
+      were always reproducible.
+
+      `correctness_lite.py` was the gap, and it was the worst kind: the seed
+      existed as a parameter on `_chaos_storm_now` that nothing passed, so the
+      storm seeded itself from `int(time.time())` and never said what it chose.
+      The paused node and the whole transfer sequence came from the global
+      generator. A B1-B4 violation could therefore be seen once and never
+      again — the storm that produced it was unrecoverable the moment the run
+      ended. The schedule and the transfer sequence are now pure functions
+      (`chaos_storm_plan`, `bank_transfer_plan`) over an explicit `Random`,
+      `results.json` carries `seed`, `attack` and a `replay` line, and the
+      replay line is printed with the verdict on any failure.
+
+      What is left needs H-31: the harness's own choices are reproducible, but
+      the cluster's timing is not, so a replay drives the same faults at the
+      same offsets against a system that may schedule them differently. Closing
+      the criterion outright means a deterministic runtime, which is what H-31
+      is for.
+
 ### Wave 6 — Connect the specs to the binary (Tier 5)
 
 The four specs are non-vacuous, but the spec-to-code mapping is _comments_, so

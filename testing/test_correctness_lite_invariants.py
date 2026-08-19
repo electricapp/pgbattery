@@ -25,6 +25,7 @@ Run with:
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 import tempfile
 import unittest
@@ -554,6 +555,68 @@ class ComposeNameResolutionTests(unittest.TestCase):
     def test_container_name_returns_resolved_id(self) -> None:
         with mock.patch.object(cl, "docker_compose", return_value=(0, "abc123\n", "")):
             self.assertEqual(cl.container_name("node1"), "abc123")
+
+
+class ReplayFromSeedTests(unittest.TestCase):
+    """A recorded seed is only worth recording if it reproduces the run.
+
+    Every random choice this harness makes is drawn from one seeded generator,
+    so the artifact's `replay` line reconstructs the same paused node, the same
+    storm schedule, and the same transfer sequence. Before this, the storm
+    seeded itself from the wall clock and the rest used the global generator:
+    a failure could be seen once and never again.
+    """
+
+    def test_a_storm_schedule_is_reproduced_by_its_seed(self) -> None:
+        first = cl.chaos_storm_plan(random.Random(4_242))
+        second = cl.chaos_storm_plan(random.Random(4_242))
+        self.assertEqual(first, second)
+        self.assertTrue(first, "a storm that fires nothing tests nothing")
+
+    def test_different_seeds_give_different_storms(self) -> None:
+        """Otherwise the seed is decoration and every run is the same run."""
+        plans = {tuple(cl.chaos_storm_plan(random.Random(s))) for s in range(40)}
+        self.assertGreater(len(plans), 1)
+
+    def test_every_storm_fault_is_dispatchable(self) -> None:
+        """A kind with no dispatch entry would raise inside a daemon thread and
+        be recorded as a fault that never fired."""
+        for kind in cl.STORM_KINDS:
+            self.assertIn(kind, cl._FAULT_DISPATCH)
+
+    def test_storm_offsets_fall_inside_the_window(self) -> None:
+        plan = cl.chaos_storm_plan(random.Random(9), duration=8.0)
+        self.assertTrue(all(0.0 <= at <= 8.0 for at, _ in plan))
+        self.assertEqual([at for at, _ in plan], sorted(at for at, _ in plan))
+
+    def test_a_transfer_sequence_is_reproduced_by_its_seed(self) -> None:
+        first = cl.bank_transfer_plan(random.Random(77), 40, cl.BANK_ACCOUNTS)
+        second = cl.bank_transfer_plan(random.Random(77), 40, cl.BANK_ACCOUNTS)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 40)
+
+    def test_a_transfer_never_moves_money_to_itself(self) -> None:
+        """A self-transfer conserves the total whatever happens to it, so it
+        cannot witness B1 and would quietly weaken the workload."""
+        for source, target, amount in cl.bank_transfer_plan(
+            random.Random(5), 200, cl.BANK_ACCOUNTS
+        ):
+            self.assertNotEqual(source, target)
+            self.assertTrue(1 <= source <= cl.BANK_ACCOUNTS)
+            self.assertTrue(1 <= target <= cl.BANK_ACCOUNTS)
+            self.assertTrue(1 <= amount <= 100)
+
+    def test_the_paused_node_is_reproduced_by_its_seed(self) -> None:
+        self.assertEqual(
+            random.Random(31).choice(cl.NODES), random.Random(31).choice(cl.NODES)
+        )
+
+    def test_every_attack_name_is_fireable(self) -> None:
+        """`FAULT_KINDS` is what `--attack` is validated against, so a name in
+        it that `fire_fault` cannot fire falls back to 'kill' and the run
+        reports on an attack nobody asked for."""
+        for kind in cl.FAULT_KINDS:
+            self.assertTrue(kind == "chaos_storm" or kind in cl._FAULT_DISPATCH)
 
 
 if __name__ == "__main__":

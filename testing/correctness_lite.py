@@ -1191,19 +1191,30 @@ def _quorum_loss_now(restore_after: float = 4.0) -> str | None:
     return leader
 
 
-def _chaos_storm_now(duration: float = 8.0, seed: int | None = None) -> str | None:
+STORM_KINDS: Final[tuple[str, ...]] = ("kill", "partition", "freeze", "transfer")
+
+
+def chaos_storm_plan(rng: random.Random, duration: float = 8.0) -> list[tuple[float, str]]:
+    """The (offset, fault) schedule a storm will fire, drawn but not executed.
+
+    Pure, so the same seed provably yields the same storm — which is what makes
+    a failed run replayable — and so the plan can be asserted without a cluster.
+    """
+    n = rng.randint(2, 4)
+    times = sorted(rng.uniform(0, duration) for _ in range(n))
+    kinds = [rng.choice(STORM_KINDS) for _ in range(n)]
+    return list(zip(times, kinds, strict=True))
+
+
+def _chaos_storm_now(rng: random.Random, duration: float = 8.0) -> str | None:
     """Fire 2-4 random faults at random times within `duration` seconds.
 
     Mixes kill, partition, freeze, transfer. Returns the leader observed
     when the storm started.
     """
-    rng = random.Random(seed if seed is not None else int(time.time()))
     leader, _ = find_leader()
-    n = rng.randint(2, 4)
-    times = sorted(rng.uniform(0, duration) for _ in range(n))
-    kinds = [rng.choice(["kill", "partition", "freeze", "transfer"]) for _ in range(n)]
     start = time.monotonic()
-    for ft, kind in zip(times, kinds, strict=True):
+    for ft, kind in chaos_storm_plan(rng, duration):
         elapsed = time.monotonic() - start
         if ft > elapsed:
             time.sleep(ft - elapsed)
@@ -1256,8 +1267,20 @@ _FAULT_DISPATCH: dict[str, Callable[[], str | None]] = {
     "transfer": _transfer_leader_now,
     "cascade": _cascade_kill_now,
     "quorum_loss": _quorum_loss_now,
-    "chaos_storm": _chaos_storm_now,
 }
+
+FAULT_KINDS: Final[tuple[str, ...]] = (*_FAULT_DISPATCH, "chaos_storm")
+
+
+def fire_fault(kind: str, rng: random.Random) -> str | None:
+    """Fire one named fault, returning the leader it aimed at.
+
+    Only the storm draws, so the run's seed reaches exactly the fault that
+    needs it and the others stay fixed sequences.
+    """
+    if kind == "chaos_storm":
+        return _chaos_storm_now(rng)
+    return _FAULT_DISPATCH[kind]()
 
 
 def _restore_killed_nodes() -> None:
@@ -1296,9 +1319,9 @@ def step_kill_leader(history: History, console: Console) -> None:
     take_snapshot(history, "kill_leader", console)
 
 
-def step_pause_random(history: History, console: Console) -> None:
+def step_pause_random(history: History, console: Console, rng: random.Random) -> None:
     """Step 3: Pause a random node for the duration of 50 inserts, then resume."""
-    node = random.choice(NODES)
+    node = rng.choice(NODES)
     console.print(f"[bold]Step 3:[/] pause {node}")
     fw = history.open_fault("pause_node", f"paused {node}")
     docker_compose("pause", node)
@@ -1375,9 +1398,25 @@ def step_final_steady(history: History, console: Console) -> None:
     do_inserts(50, history, console)
 
 
+def bank_transfer_plan(
+    rng: random.Random, count: int, accounts: int
+) -> list[tuple[int, int, int]]:
+    """The (from, to, amount) each transfer attempt will use.
+
+    Drawn up front and pure, so a run that finds a ledger violation can be
+    replayed from its seed against the same sequence of transfers.
+    """
+    plan: list[tuple[int, int, int]] = []
+    for _ in range(count):
+        source, target = rng.sample(range(1, accounts + 1), 2)
+        plan.append((source, target, rng.randint(1, 100)))
+    return plan
+
+
 def step_bank_transfer(
     history: History,
     console: Console,
+    rng: random.Random,
     attack: str = "kill",
     num_transfers: int = 40,
 ) -> None:
@@ -1425,13 +1464,14 @@ def step_bank_transfer(
         )
         return
 
-    if attack not in _FAULT_DISPATCH:
+    if attack not in FAULT_KINDS:
         console.print(f"  [red]Unknown attack '{attack}', falling back to 'kill'[/]")
         attack = "kill"
 
     # Fire the attack about 25% into the workload so we have transfers
     # before and during the fault.
     kickoff_at = max(2, num_transfers // 4)
+    plan = bank_transfer_plan(rng, num_transfers, BANK_ACCOUNTS)
     fw: FaultWindow | None = None
     tally: dict[str, int] = {"acked": 0, "rejected": 0, "indeterminate": 0}
     fired_leader: str | None = None
@@ -1441,12 +1481,11 @@ def step_bank_transfer(
             fw = history.open_fault(
                 f"bank_attack_{attack}", f"injecting {attack} mid-bank-workload"
             )
-            fired_leader = _FAULT_DISPATCH[attack]()
-        ids = random.sample(range(1, BANK_ACCOUNTS + 1), 2)
-        amount = random.randint(1, 100)
+            fired_leader = fire_fault(attack, rng)
+        source, target, amount = plan[i]
         # Transfer ids are 1-based and unique per attempt: they are the key the
         # ledger and B3/B4 count applications by.
-        record = bank_transfer(i + 1, ids[0], ids[1], amount)
+        record = bank_transfer(i + 1, source, target, amount)
         history.record_transfer(record)
         if record.reason == "unclassified":
             history.note_unclassified()
@@ -2134,6 +2173,15 @@ def run(
         "--transfers",
         help="Number of bank-transfer attempts in step 8.",
     ),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        envvar="CORRECTNESS_LITE_SEED",
+        help="Seed for every random choice this run makes: which node is paused, "
+        "the storm's fault schedule, and the transfer sequence. 0 draws a fresh "
+        "one, which is recorded in results.json and printed with the verdict so "
+        "the run can be replayed from its artifact.",
+    ),
 ) -> None:
     """Execute the fault schedule, record full history, check all invariants.
 
@@ -2150,7 +2198,14 @@ def run(
     artifact_path = Path(artifact_dir)
     artifact_path.mkdir(parents=True, exist_ok=True)
 
+    # Drawn once, recorded, and printed. A run whose seed nobody can name is a
+    # failure nobody can reproduce, which is the whole point of recording it.
+    run_seed = seed or random.randrange(1, 2**31)
+    rng = random.Random(run_seed)
+    replay = f"CORRECTNESS_LITE_SEED={run_seed} ./testing/correctness_lite.py --attack {attack}"
+
     console.rule("[bold]CORRECTNESS LITE START")
+    console.print(f"seed {run_seed} — replay this run with:\n  {replay}")
 
     if not wait_cluster_healthy(timeout=120):
         console.print("[bold red]FATAL:[/] cluster not healthy after 120s")
@@ -2180,16 +2235,16 @@ def run(
     try:
         if bank_only:
             console.print(f"[bold yellow]--bank-only:[/] running step 8 with attack={attack} only")
-            step_bank_transfer(history, console, attack=attack, num_transfers=transfers)
+            step_bank_transfer(history, console, rng, attack=attack, num_transfers=transfers)
         else:
             step_baseline(history, console)
             step_kill_leader(history, console)
-            step_pause_random(history, console)
+            step_pause_random(history, console, rng)
             step_network_partition_leader(history, console)
             step_majority_loss(history, console)
             step_full_restart(history, console)
             step_final_steady(history, console)
-            step_bank_transfer(history, console, attack=attack, num_transfers=transfers)
+            step_bank_transfer(history, console, rng, attack=attack, num_transfers=transfers)
             step_concurrent_contention(history, console)
             step_monotonic_read_session(history, console)
     finally:
@@ -2342,6 +2397,9 @@ def run(
     # ── Artifact dump ────────────────────────────────────────────────────────
     results = {
         "verdict": verdict,
+        "seed": run_seed,
+        "attack": attack,
+        "replay": replay,
         "attempted": history.total_attempted,
         "acked": len(history.acked_set),
         "errored": len(history.errored_set),
@@ -2408,8 +2466,11 @@ def run(
             "above were checked against windows that may contain no fault:\n  "
             + "\n  ".join(fault_errors)
         )
+        console.print(f"Replay this run with:\n  {replay}")
         raise typer.Exit(code=2)
 
+    if violations:
+        console.print(f"\nReplay this run with:\n  {replay}")
     raise typer.Exit(code=0 if not violations else 1)
 
 
