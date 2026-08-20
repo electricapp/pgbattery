@@ -2147,11 +2147,16 @@ class CIRunner:
             timeout_sec=CLUSTER_LIFECYCLE_TIMEOUT_SEC,
         )
 
+        # Replication health, not just topology: a leader whose sync list is
+        # not yet being honoured refuses writes, so a case's first SQL step
+        # fails on a cluster that is merely up. The between-cases barrier has
+        # always required this; a freshly started one is no different.
         self._wait_for_cluster(
             expected_nodes=self.matrix.cluster.expected_nodes,
             expected_leaders=1,
             timeout_sec=180,
             require_all_voters=True,
+            require_replication_health=True,
         )
         self._collect_snapshot(f"{label}-cluster-started")
 

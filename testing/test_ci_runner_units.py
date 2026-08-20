@@ -132,6 +132,39 @@ class DispatchRunner(StubRunner):
         self.verified.append((intent, dict(prestate)))
 
 
+class ClusterStartRunner(StubRunner):
+    """Records what `_start_cluster` asks of the cluster before a case runs."""
+
+    def __init__(self, artifact_dir: Path) -> None:
+        super().__init__(artifact_dir)
+        self.waits: list[dict[str, Any]] = []
+
+    def _wait_for_cluster(
+        self,
+        expected_nodes: int,
+        expected_leaders: int,
+        timeout_sec: int,
+        leader_not: int | None = None,
+        leader_equals: int | None = None,
+        require_all_voters: bool = False,
+        require_replication_health: bool = False,
+        min_healthy_replicas: int = 1,
+        live_nodes: int | None = None,
+        stable_for_sec: float = 0.0,
+    ) -> None:
+        self.waits.append(
+            {
+                "expected_nodes": expected_nodes,
+                "expected_leaders": expected_leaders,
+                "require_all_voters": require_all_voters,
+                "require_replication_health": require_replication_health,
+            }
+        )
+
+    def _run_shell(self, *_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args="", returncode=0, stdout="", stderr="")
+
+
 def make_runner() -> StubRunner:
     """Build a stub runner writing artifacts to a throwaway directory."""
     return StubRunner(Path(tempfile.mkdtemp(prefix="ci-runner-units-")))
@@ -1792,6 +1825,19 @@ def test_a_missing_leader_metric_is_not_a_zero() -> None:
         assert "pgbattery_raft_is_leader" in str(exc)
     else:
         raise AssertionError("a missing metric must not read as zero")
+
+
+def test_a_started_cluster_is_waited_on_for_replication_health() -> None:
+    """A leader whose sync list is not yet honoured refuses writes, so a case's
+    first SQL step fails on a cluster that is merely up. The between-cases
+    barrier has always demanded this; a freshly started one is no different."""
+    runner = ClusterStartRunner(Path(tempfile.mkdtemp(prefix="ci-runner-start-")))
+    runner._start_cluster("unit")
+
+    assert runner.waits, "the cluster was never waited on"
+    assert runner.waits[0].get("require_replication_health") is True, (
+        f"started a case against a cluster whose replication was never checked: {runner.waits[0]}"
+    )
 
 
 def test_two_leaders_still_fail_when_a_third_node_is_down() -> None:
