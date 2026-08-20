@@ -1540,6 +1540,33 @@ def test_a_write_verb_inside_a_comment_is_not_a_write() -> None:
     )
 
 
+def test_a_departed_nodes_series_is_not_counted() -> None:
+    """Prometheus never removes a series. A node that leaves keeps its
+    `node="4"` gauge at 0.0 for the life of the leader process, and counting it
+    made `observed_replicas` permanently wrong for any cluster that had ever
+    had a fourth node — which `witness-topology` creates on purpose."""
+    runner = make_runner()
+    assert not runner._series_belongs_to_cluster('{node="4"}')
+
+
+def test_a_present_nodes_series_is_counted() -> None:
+    runner = make_runner()
+    assert runner._series_belongs_to_cluster('{node="2"}')
+
+
+def test_an_unlabelled_series_is_counted() -> None:
+    """Most gauges carry no labels at all and must be unaffected."""
+    runner = make_runner()
+    assert runner._series_belongs_to_cluster(None)
+    assert runner._series_belongs_to_cluster("")
+
+
+def test_a_series_labelled_by_something_else_is_counted() -> None:
+    """Only the `node` label is filtered; nothing else is guessed at."""
+    runner = make_runner()
+    assert runner._series_belongs_to_cluster('{sync_mode="async"}')
+
+
 def _leader_count_runner(
     answers: dict[int, list[float] | Exception],
 ) -> tuple[DispatchRunner, Path]:

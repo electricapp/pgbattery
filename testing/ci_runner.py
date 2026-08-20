@@ -1948,7 +1948,7 @@ class CIRunner:
         if status != 200:
             raise RunnerError(f"Metrics endpoint {node.metrics_url} returned status {status}.")
         pattern = re.compile(
-            rf"^{re.escape(metric_name)}(?:\{{[^}}]*\}})?\s+"
+            rf"^{re.escape(metric_name)}(\{{[^}}]*\}})?\s+"
             r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$"
         )
         values: list[float] = []
@@ -1957,9 +1957,28 @@ class CIRunner:
             if not line or line.startswith("#"):
                 continue
             match = pattern.match(line)
-            if match:
-                values.append(float(match.group(1)))
+            if match and self._series_belongs_to_cluster(match.group(1)):
+                values.append(float(match.group(2)))
         return values
+
+    def _series_belongs_to_cluster(self, labels: str | None) -> bool:
+        """Whether a labelled series describes one of this cluster's own nodes.
+
+        Prometheus series are never removed once created: a node that leaves
+        keeps its `node="4"` series at 0.0 for the life of the leader process.
+        Counting those made `observed_replicas` permanently wrong for any
+        cluster that had ever had a fourth node — `witness-topology` adds one,
+        so every case after it saw three replicas on a three-node cluster and
+        the suite stopped there.
+
+        Only the `node` label is filtered, and only when it names a node the
+        matrix does not have. Series with no labels, or labelled by something
+        else, are counted as before.
+        """
+        if not labels:
+            return True
+        match = re.search(r'node="(\d+)"', labels)
+        return match is None or int(match.group(1)) in self.node_map
 
     def _poll_metric_values(
         self, node_id: int, metric_name: str, timeout_sec: int = 10
