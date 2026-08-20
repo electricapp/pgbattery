@@ -1703,7 +1703,23 @@ def step_concurrent_contention(history: History, console: Console) -> None:
 
 
 def check_contention_invariant() -> list[Violation]:
-    """C1: NO_LOST_UPDATE — db_val[key] in [acked, acked + indeterminate]."""
+    """C1: NO_LOST_UPDATE — db_val[key] in [acked, acked + indeterminate].
+
+    A step that could not set its table up is answered before the read, not
+    after: `counters` does not exist, so the read fails on every port and the
+    unreadable-counters branch below fires. That reported a setup the cluster
+    was too busy recovering to accept as a FATAL lost-update violation.
+    """
+    run = _LAST_HISTORY.contention if _LAST_HISTORY is not None else None
+    if run is None or run.skipped:
+        return [
+            Violation(
+                "C1-WARN",
+                "Contention step did not run, so C1 was not checked",
+                None,
+                SEVERITY_WARN,
+            )
+        ]
     violations: list[Violation] = []
     for port in GATEWAY_PORTS:
         rc, out, _ = run_cmd(

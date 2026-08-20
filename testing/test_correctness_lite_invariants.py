@@ -666,6 +666,44 @@ class ReplayFromSeedTests(unittest.TestCase):
     def test_the_paused_node_is_reproduced_by_its_seed(self) -> None:
         self.assertEqual(random.Random(31).choice(cl.NODES), random.Random(31).choice(cl.NODES))
 
+    def test_a_skipped_contention_step_is_not_a_c1_violation(self) -> None:
+        """The step gives up when the cluster will not accept its table, and
+        `counters` then does not exist — so the checker's read fails on every
+        port and its unreadable-counters branch fires. That reported a setup
+        the cluster was too busy recovering to accept as a lost update, and
+        failed a nightly run seventeen cases in on it."""
+        history = cl.History()
+        history.contention = cl.ContentionRun(skipped=True)
+        with mock.patch.object(cl, "_LAST_HISTORY", history):
+            findings = cl.check_contention_invariant()
+        self.assertEqual(_fatal_ids(findings), [])
+        self.assertEqual(_warn_ids(findings), ["C1-WARN"])
+
+    def test_a_skipped_contention_step_never_reaches_the_database(self) -> None:
+        """Not merely tolerated — the read is not attempted, so the verdict
+        cannot turn on whether a gateway happened to answer."""
+        history = cl.History()
+        history.contention = cl.ContentionRun(skipped=True)
+        with (
+            mock.patch.object(cl, "_LAST_HISTORY", history),
+            mock.patch.object(cl, "run_cmd") as run_cmd,
+        ):
+            cl.check_contention_invariant()
+        run_cmd.assert_not_called()
+
+    def test_a_step_that_ran_still_reports_unreadable_counters(self) -> None:
+        """The FATAL branch stays for the case it was written for: the step ran
+        and acked increments, so counters that cannot be read is a real
+        finding rather than an absent table."""
+        history = cl.History()
+        history.contention = cl.ContentionRun(acked={0: 3}, indeterminate={})
+        with (
+            mock.patch.object(cl, "_LAST_HISTORY", history),
+            mock.patch.object(cl, "run_cmd", return_value=(1, "", "connection refused")),
+        ):
+            findings = cl.check_contention_invariant()
+        self.assertEqual(_fatal_ids(findings), ["C1"])
+
     def test_every_attack_name_is_fireable(self) -> None:
         """`FAULT_KINDS` is what `--attack` is validated against, so a name in
         it that `fire_fault` cannot fire falls back to 'kill' and the run
