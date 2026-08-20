@@ -1010,14 +1010,15 @@ CROSS_REF_PRUNE: Final = frozenset(
 
 
 def file_references(node: Any) -> set[str]:
-    """Collect every path-shaped token from the strings anywhere under ``node``."""
-    if isinstance(node, str):
-        return set(FILE_REFERENCE.findall(node))
-    if isinstance(node, Mapping):
-        return set().union(*(file_references(v) for v in node.values())) if node else set()
-    if isinstance(node, list):
-        return set().union(*(file_references(v) for v in node)) if node else set()
-    return set()
+    """Collect every path-shaped token appearing anywhere under ``node``.
+
+    Serialised and scanned rather than walked by type. A case is JSON, so
+    rendering it back to JSON reaches every string it holds at any depth
+    without the traversal having to know the shape — and a value nested one
+    level deeper than the walk expected is how a reference goes unchecked.
+    """
+    text = node if type(node) is str else json.dumps(node)
+    return set(FILE_REFERENCE.findall(text))
 
 
 def unresolved_file_references(
@@ -1182,6 +1183,29 @@ def check_case_cross_references_resolve() -> None:
         )
 
 
+CLUSTER_PORTS: Final[tuple[int, ...]] = tuple(
+    sorted(
+        set(topology.GATEWAY_PORTS)
+        | set(topology.MGMT_PORTS.values())
+        | set(topology.METRICS_PORTS.values())
+    )
+)
+"""Every port this cluster publishes, from the compose file rather than a list."""
+
+CLUSTER_PORT_LITERAL_OK: Final[frozenset[str]] = frozenset(
+    {
+        "topology.py",
+        "lint_matrix.py",
+        "test_topology.py",
+    }
+)
+"""Files where a published port may legitimately appear as a literal.
+
+`topology.py` derives them and its own test pins what it derived; this file
+names them to look for them. Anywhere else, a literal is a second copy of a
+fact the compose file already states.
+"""
+
 PROSE_DOCS: Final[tuple[str, ...]] = (
     "HARDENING.md",
     "CLAUDE.md",
@@ -1206,6 +1230,77 @@ An exemption is a claim about a specific string, so it has to be written down
 next to the check rather than smuggled in as a pattern that would also hide the
 next stale path.
 """
+
+
+def restated_cluster_ports(source: str, ports: Container[int]) -> list[str]:
+    """Module-level constants that write a published port out instead of deriving it.
+
+    Every service name, address and published port comes from `topology.py`,
+    which reads the compose file named by `COMPOSE_FILE`. A harness that spells
+    one itself reaches nothing when the port moves, and an unreachable node is
+    recorded `indeterminate` — which the L1 verdict reads as "no acceptance
+    observed". It passes while blind, which this repo has been bitten by often
+    enough to gate.
+
+    Only module-level assignments, and parsed rather than matched. That is
+    where the drift happens — a harness declaring its own `PORTS` list — and
+    scanning every line instead would flag the literals a test uses as fixture
+    data, which are assertions about a value rather than a way of reaching a
+    node.
+    """
+    collector = _PortLiterals(ports)
+    for statement in ast.parse(source).body:
+        collector.visit(statement)
+    return collector.found
+
+
+class _PortLiterals(ast.NodeVisitor):
+    """Records the published ports written literally into a constant's value.
+
+    Dispatches on node type through `NodeVisitor` rather than testing for it,
+    so the traversal reads as the grammar it walks. `visit` is only ever handed
+    a top-level statement, and only assignments recurse, which is what keeps a
+    literal inside a function body out of the result.
+    """
+
+    def __init__(self, ports: Container[int]) -> None:
+        self.ports = ports
+        self.found: list[str] = []
+        self._line = 0
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self._line = node.lineno
+        self.visit(node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._line = node.lineno
+        if node.value is not None:
+            self.visit(node.value)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if node.value in self.ports:
+            self.found.append(f"line {self._line}: {node.value!r}")
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """A literal in a function body is fixture data, not a way to reach a node."""
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Same, and a class body is where a test's expected values live."""
+
+
+def check_harness_derives_cluster_ports() -> None:
+    """No harness script may restate a port `topology.py` already publishes."""
+    problems = []
+    for path in sorted(TESTING_DIR.glob("*.py")):
+        if path.name in CLUSTER_PORT_LITERAL_OK:
+            continue
+        if offenders := restated_cluster_ports(path.read_text(encoding="utf-8"), CLUSTER_PORTS):
+            problems.append(f"{path.name} -> {'; '.join(offenders)}")
+    if problems:
+        raise AssertionError(
+            "harness scripts restate published ports instead of deriving them from "
+            "topology.py — " + " | ".join(problems)
+        )
 
 
 def check_prose_file_references_resolve() -> None:
@@ -1283,6 +1378,7 @@ def lint() -> None:
     check("Workflow matrix is derived from the suite", check_workflow_matrix_is_derived)
     check("Case cross-references name real files", check_case_cross_references_resolve)
     check("preflight.sh mirrors the CI gates", check_preflight_mirrors_ci)
+    check("Harness derives cluster ports", check_harness_derives_cluster_ports)
     check("Docs name real files", check_prose_file_references_resolve)
     check("Doc reference exemptions still apply", check_prose_exemptions_are_still_needed)
 

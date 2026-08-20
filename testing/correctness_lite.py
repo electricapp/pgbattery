@@ -180,9 +180,6 @@ import fault_primitives as fp
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-GATEWAY_PORTS: Final[list[int]] = [5432, 5433, 5434]
-"""Gateway ports for node1/node2/node3 (each proxied to current leader)."""
-
 BANK_ACCOUNTS: Final[int] = 10
 """Number of accounts in the bank transfer workload."""
 
@@ -199,6 +196,15 @@ overrides per run."""
 
 MGMT_PORTS: Final[list[int]] = [fp.MGMT_PORTS[node] for node in NODES]
 """Host-published management API ports, in the same order as `NODES`."""
+
+GATEWAY_PORTS: Final[list[int]] = [fp.GATEWAY_PORT_BY_NODE[node] for node in NODES]
+"""Host-published gateway ports, in the same order as `NODES`. Each proxies to
+the current leader.
+
+Derived rather than restated, for the reason `NODES` is: a harness addressing a
+port that moved reaches nothing, and an unreachable node is recorded
+`indeterminate`, which the L1 verdict reads as "no acceptance observed". It
+would pass while blind."""
 
 PSQL_TIMEOUT: Final[int] = 5
 """Seconds before a psql write attempt is classified as indeterminate."""

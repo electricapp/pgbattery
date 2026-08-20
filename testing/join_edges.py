@@ -45,7 +45,7 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
-INTERNAL_PG_PORT: Final[int] = 5434
+INTERNAL_PG_PORT: Final[int] = fp.PG_INTERNAL_PORT
 RECOVERY_TIMEOUT_S: Final[float] = 300.0
 
 RAFT_DIR: Final[str] = f"{fp.PG_STATE_DIR}/raft"

@@ -43,7 +43,7 @@ PROBE_SQL: Final[Path] = (
     Path(__file__).resolve().parent / "sql" / "post-promotion-sync-gap-probe.sql"
 )
 
-INTERNAL_PG_PORT: Final[int] = 5434
+INTERNAL_PG_PORT: Final[int] = fp.PG_INTERNAL_PORT
 
 # The probe parks on pg_is_in_recovery() with its own 90 s deadline and then
 # bounds only the commit at 20 s, so a probe process is done well inside this.

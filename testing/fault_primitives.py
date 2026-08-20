@@ -202,6 +202,7 @@ NODE_IPS: Final[dict[str, str]] = topology.NODE_IPS
 """Static addresses on the cluster network, for peer-level faults."""
 
 MGMT_PORTS: Final[dict[str, int]] = topology.MGMT_PORTS
+GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = topology.GATEWAY_PORT_BY_NODE
 """Host-published management API ports."""
 
 METRICS_PORTS: Final[dict[str, int]] = topology.METRICS_PORTS
@@ -212,12 +213,12 @@ failover (measured: 2.5 s of ``leader_id: 3`` while node3 was down and
 unreachable). ``pgbattery_has_lease`` is per-node and cannot lie about a node
 other than itself."""
 
-MGMT_INTERNAL_PORT: Final[int] = 9091
+MGMT_INTERNAL_PORT: Final[int] = topology.MGMT_CONTAINER_PORT
 
-RAFT_PORT: Final[int] = 5433
+RAFT_PORT: Final[int] = topology.RAFT_CONTAINER_PORT
 """Raft consensus traffic between peers."""
 
-GATEWAY_PORT: Final[int] = 5432
+GATEWAY_PORT: Final[int] = topology.PG_CONTAINER_PORT
 """Client-facing gateway port."""
 """In-container management API port — the probe target for reachability."""
 
@@ -238,7 +239,7 @@ NET_DEVICE: Final[str] = "eth0"
 
 PG_DATA_DIR: Final[str] = "/var/lib/postgresql/data"
 PG_STATE_DIR: Final[str] = "/var/lib/postgresql"
-PG_INTERNAL_PORT: Final[int] = 5434
+PG_INTERNAL_PORT: Final[int] = topology.PG_INTERNAL_PORT
 
 FAKETIME_FILE: Final[str] = "/tmp/faketime"
 """Read on every clock call because the image sets ``FAKETIME_NO_CACHE=1``."""

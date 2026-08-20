@@ -49,6 +49,14 @@ PG_CONTAINER_PORT: Final[int] = 5432
 METRICS_CONTAINER_PORT: Final[int] = 9090
 MGMT_CONTAINER_PORT: Final[int] = 9091
 
+PG_INTERNAL_PORT: Final[int] = 5434
+"""Where `PostgreSQL` itself listens inside the container, behind the gateway
+on :data:`PG_CONTAINER_PORT`. A harness reaches this to ask one node about its
+own state, rather than whichever node the gateway is routing to."""
+
+RAFT_CONTAINER_PORT: Final[int] = 5433
+"""Raft consensus traffic between peers, container-side."""
+
 
 class TopologyError(RuntimeError):
     """The compose file does not describe a cluster this harness can drive."""
@@ -348,5 +356,9 @@ NODES: Final[tuple[str, ...]] = TOPOLOGY.voter_services
 JOINING_NODES: Final[tuple[str, ...]] = TOPOLOGY.joining_services
 NODE_IPS: Final[dict[str, str]] = {n.service: n.ip for n in TOPOLOGY.nodes}
 GATEWAY_PORTS: Final[tuple[int, ...]] = tuple(n.gateway_port for n in TOPOLOGY.voters)
+GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = {n.service: n.gateway_port for n in TOPOLOGY.voters}
+"""The same ports keyed by service, so a harness that has a node name does not
+have to know its position in `NODES` to reach it. Two harnesses derived this
+mapping themselves before it lived here."""
 MGMT_PORTS: Final[dict[str, int]] = {n.service: n.mgmt_port for n in TOPOLOGY.nodes}
 METRICS_PORTS: Final[dict[str, int]] = {n.service: n.metrics_port for n in TOPOLOGY.nodes}

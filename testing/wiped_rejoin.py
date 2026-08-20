@@ -32,7 +32,7 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
-INTERNAL_PG_PORT: Final[int] = 5434
+INTERNAL_PG_PORT: Final[int] = fp.PG_INTERNAL_PORT
 
 RAFT_DIR: Final[str] = f"{fp.PG_STATE_DIR}/raft"
 PGDATA_DIR: Final[str] = fp.PG_DATA_DIR

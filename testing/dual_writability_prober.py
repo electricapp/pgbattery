@@ -187,7 +187,7 @@ import topology
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 """Repo root — `docker compose` is invoked with this as cwd."""
 
-INTERNAL_PG_PORT: Final[int] = 5434
+INTERNAL_PG_PORT: Final[int] = topology.PG_INTERNAL_PORT
 """PostgreSQL port *inside* each container. Never the published gateway port."""
 
 

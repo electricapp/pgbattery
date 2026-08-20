@@ -147,9 +147,7 @@ LOG_READ_TIMEOUT_S: Final[float] = 45.0
 the Raft store's LazyFS, so the container holding the log is usually mid-restart
 when the read is issued."""
 
-GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = dict(
-    zip(topology.NODES, topology.GATEWAY_PORTS, strict=True)
-)
+GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = topology.GATEWAY_PORT_BY_NODE
 
 
 class RaftDurabilityViolation(RuntimeError):

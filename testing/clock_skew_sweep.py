@@ -37,7 +37,7 @@ console = Console()
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 ARTIFACT_DIR: Final[Path] = PROJECT_ROOT / "testing" / "artifacts" / "clock-skew-sweep"
-INTERNAL_PG_PORT: Final[int] = 5434
+INTERNAL_PG_PORT: Final[int] = fp.PG_INTERNAL_PORT
 
 # Must outlive the whole step — edge, election, skew, promotion — or the
 # interesting part goes unobserved rather than failing.
