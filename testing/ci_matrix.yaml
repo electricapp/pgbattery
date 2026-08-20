@@ -3055,8 +3055,9 @@
         },
         {
           "type": "cmd",
-          "comment": "promote node2's PostgreSQL directly, bypassing pgbattery",
-          "cmd": "docker compose exec -T node2 /usr/lib/postgresql/18/bin/pg_ctl promote -D /var/lib/postgresql/data"
+          "comment": "Promote node2's PostgreSQL directly, bypassing pgbattery. This is the setup, not the assertion: whether the rogue promotion completes is a race with the fence that exists to stop it, and pg_ctl reports 'server did not promote in time' when pgbattery wins that race — the better outcome of the two. What the case asserts is below, that the cluster converges to a single leader with the rows intact, and that holds either way.",
+          "cmd": "docker compose exec -T node2 /usr/lib/postgresql/18/bin/pg_ctl promote -D /var/lib/postgresql/data",
+          "expect_exit": null
         },
         {
           "type": "wait_cluster",
