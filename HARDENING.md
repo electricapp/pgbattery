@@ -2216,30 +2216,35 @@ nothing detects drift.
       caches — un-fsynced PGDATA is as exposed as un-fsynced redb, and an index
       page lost before its WAL is exactly this shape.
 
-      **The second face is the one to fix, and it is not the suite's.** A third
-      occurrence showed node3 restart-looping on
+      **The second face is fixed.** A third occurrence showed node3
+      restart-looping on
 
       ```
       Error: Data directory /var/lib/postgresql/data is not empty.
       ```
 
-      which is the same refusal `docs/MEMBERSHIP.md` documents for a node that
+      which was the same refusal `docs/MEMBERSHIP.md` documented for a node that
       was removed. Here nobody removed it: its first join populated PGDATA and
       then died — on the fence threshold, in the run above — before the
-      membership add committed. From then on it is stuck for good. `join`
-      clones before the node is a committed member, so a death in that window
-      leaves a data directory that blocks every retry, and the node can never
-      become a voter again without a human emptying it.
+      membership add committed. From then on it was stuck for good, since `join`
+      clones before the node is a committed member and the resulting directory
+      blocked every retry.
 
-      Wiping it automatically would be safe on the facts — a node absent from
-      membership holds nothing the cluster depends on, and §3a's lineage check
-      can confirm the data is even this cluster's — but "delete the data
-      directory on your own initiative" is a decision to take deliberately
-      rather than late in a debugging session, which is why this is written
-      down instead of done.
-      **Done when** a node that dies mid-join can retry, and the suite reports a
-      stuck node as the precondition it is rather than as a bare convergence
-      timeout.
+      A join now sorts the directory with `join_data_dir_disposition`
+      (STATE_MACHINE §3a) and discards a complete data directory when
+      `clone_supersedes_local_data` proves it shares the leader's lineage — two
+      known, equal system identifiers, never an unknown. The proof is what makes
+      it safe rather than the absence from membership: a leader of that lineage
+      holds every acked write by W1 and V1, so what the node holds beyond it was
+      never promised to anyone. An unproven lineage keeps the data and the
+      refusal, so a peer that re-bootstrapped under the same node id cannot talk
+      a node into destroying real data.
+
+      **Still open** is the first face: the corrupt catalog, and the suite
+      reporting a stuck node as a bare convergence timeout rather than as the
+      precondition failure it is.
+      **Done when** a node that cannot open its catalog after a LazyFS crash is
+      diagnosed, and the suite names what stalled it.
       _Effort_ M
 
 - [ ] **H-51 — `tests_md_ref` points at a document that does not exist.** All
@@ -2256,11 +2261,20 @@ Topology"`, and `docs/TESTS.md` has never been in the repository — not
       _Effort_ S
 
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
-      `ha-ci.yml` hardcodes five case names into the parallel matrix while the
-      suite holds seventeen, so **twelve cases are executed by no workflow at
+      `ha-ci.yml` hardcoded five case names into the parallel matrix while the
+      suite held seventeen, so **twelve cases were executed by no workflow at
       all** — written, maintained, counted in `--list`, and never run. Nothing
-      reconciles the two lists, which is the same drift `lint_matrix.py` exists
+      reconciled the two lists, which is the same drift `lint_matrix.py` exists
       to catch everywhere else.
+
+      **The drift is closed.** `ci_runner.py --suite <s> --emit-cases` prints
+      the suite's runnable case ids as JSON, an enumerate job feeds them to the
+      matrix through `fromJSON`, and sixteen cases now run where five did. A
+      case leaves that list only by carrying a `ci_excluded_reason` in the
+      matrix, which `lint_matrix.py` requires to be non-empty, and an empty
+      answer raises rather than returning — `fromJSON([])` is zero jobs and a
+      green check, the same silence `topology.py` refuses for an empty node
+      list. A second check keeps the workflow deriving rather than restating.
 
       Running the suite locally found two of the twelve broken.
       `lsn-leaderless-livelock-recovery` is fixed here: `metric_leader_count`
@@ -2271,7 +2285,9 @@ Topology"`, and `docs/TESTS.md` has never been in the repository — not
       stays fatal, because a node that is up but silent could be the second
       leader this must never miss.
 
-      `backup-restore-valid` is **not** fixed, and has never been able to pass:
+      `backup-restore-valid` is **not** fixed, and has never been able to pass.
+      It now carries a `ci_excluded_reason` saying so, which is what keeps it
+      out of the derived matrix instead of reading as coverage:
       it POSTs a full restore to node1 while node1 is the leader, and the API
       has refused exactly that since the initial commit — "Refusing full restore
       on the current leader: it overwrites the live primary's data directory."
@@ -2282,8 +2298,8 @@ Topology"`, and `docs/TESTS.md` has never been in the repository — not
       operation does. What is assertable — that a standby restore is accepted
       and does not roll the live cluster back — is a different claim from the
       one the case makes.
-      **Done when** the matrix is derived from the suite rather than restated,
-      every case in it runs, and any case deliberately excluded says why.
+      **Done when** `backup-restore-valid` asserts what a standby restore
+      actually does, and its exclusion is removed.
       _Effort_ M
 
 - [ ] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`

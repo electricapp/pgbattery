@@ -132,20 +132,40 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans || true
 
+  ha-parallel-cases:
+    name: HA Parallel (enumerate)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      cases: ${{ steps.enumerate.outputs.cases }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      # Derived from the suite, never restated here: a hardcoded list left
+      # twelve of seventeen cases executed by no workflow at all. A case is
+      # omitted only by carrying a `ci_excluded_reason` in the matrix.
+      - name: Enumerate runnable cases
+        id: enumerate
+        run: echo "cases=$(./testing/ci_runner.py --suite ha-parallel --emit-cases)" >> "$GITHUB_OUTPUT"
+
   ha-parallel:
     name: HA Parallel (${{ matrix.case }})
     runs-on: ubuntu-latest
+    needs: ha-parallel-cases
     if: github.event_name != 'schedule'
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        case:
-          - majority-loss
-          - leadership-transfer
-          - management-api
-          - observability-sanity
-          - backup-corrupt-restore
+        case: ${{ fromJSON(needs.ha-parallel-cases.outputs.cases) }}
     permissions:
       contents: read
     env:

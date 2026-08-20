@@ -916,6 +916,56 @@ def check_harness_subcommands_exist() -> None:
         )
 
 
+def check_ci_runs_every_case() -> None:
+    """Every case is run by a workflow, or says in the matrix why it is not.
+
+    `ha-ci.yml` used to restate the `ha-parallel` case list, and the copy fell
+    twelve cases behind the suite: written, maintained, counted in `--list`, and
+    executed by nothing. The workflow now derives its matrix from
+    `--emit-cases`, so the drift cannot recur; what this guards is the escape
+    hatch, since an exclusion with no reason is the same silence in a new place.
+    """
+    matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    suited = {case_id for suite in matrix["suites"].values() for case_id in suite["cases"]}
+    blank: list[str] = []
+    orphaned: list[str] = []
+    for case in matrix["cases"]:
+        reason = case.get("ci_excluded_reason")
+        if reason is not None and not reason.strip():
+            blank.append(case["id"])
+        if case["id"] not in suited and not reason:
+            orphaned.append(case["id"])
+    problems: list[str] = []
+    if blank:
+        problems.append(f"excluded with a blank reason: {', '.join(sorted(blank))}")
+    if orphaned:
+        problems.append(f"in no suite and unexplained: {', '.join(sorted(orphaned))}")
+    if problems:
+        raise AssertionError(
+            "; ".join(problems) + ". A case CI never runs reads as coverage; give it a "
+            "`ci_excluded_reason` saying why, or put it in a suite."
+        )
+
+
+def check_workflow_matrix_is_derived() -> None:
+    """`ha-ci.yml` must build its parallel matrix from the suite, not restate it.
+
+    A literal case list is exactly what went stale. This keeps the derivation in
+    place rather than checking the two lists agree today.
+    """
+    workflow = (PROJECT_ROOT / ".github/workflows/ha-ci.yml").read_text(encoding="utf-8")
+    if "--emit-cases" not in workflow:
+        raise AssertionError(
+            "ha-ci.yml no longer enumerates ha-parallel cases with --emit-cases. "
+            "A hardcoded list drifts from the suite silently."
+        )
+    if "fromJSON(needs.ha-parallel-cases.outputs.cases)" not in workflow:
+        raise AssertionError(
+            "the ha-parallel job does not consume the enumerated case list, so the "
+            "enumeration proves nothing about what runs."
+        )
+
+
 def check_fault_injection_confined() -> None:
     """Keep direct fault injection confined to the modules already tracked for it.
 
@@ -978,6 +1028,8 @@ def lint() -> None:
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
     check("Elle matrix driver names resolve", check_elle_driver_names_resolve)
     check("Harness subcommands the matrix calls exist", check_harness_subcommands_exist)
+    check("CI runs every case, or says why not", check_ci_runs_every_case)
+    check("Workflow matrix is derived from the suite", check_workflow_matrix_is_derived)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

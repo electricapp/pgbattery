@@ -468,11 +468,17 @@ class CaseConfig(BaseModel):
             cleanup step is attempted regardless of the outcome of earlier
             phases and regardless of earlier cleanup-step failures; failures are
             aggregated and reported (see :meth:`CIRunner._run_cleanup`).
+        ci_excluded_reason: Why no workflow runs this case. Empty means it runs.
+            ``--emit-cases`` omits any case carrying one, so a case is either
+            executed by CI or says in the matrix why it is not; `lint_matrix.py`
+            rejects a blank reason. Running the case by ``--case`` still works —
+            this governs the derived CI matrix, not the runner.
     """
 
     id: str
     description: str = ""
     tests_md_ref: str = ""
+    ci_excluded_reason: str = ""
     contracts: list[str] = []
     actions: list[dict[str, Any]] = []
     assertions: list[dict[str, Any]] = []
@@ -3722,6 +3728,35 @@ app = typer.Typer(
 console = Console()
 
 
+def runnable_case_ids(matrix: MatrixConfig, suite: str) -> list[str]:
+    """The case ids in `suite` that CI should run, in matrix order.
+
+    Cases carrying a `ci_excluded_reason` are left out. This is what a CI job
+    matrix is built from, so the workflow cannot list a different set of cases
+    from the suite — the drift that left twelve of seventeen `ha-parallel`
+    cases executed by nothing at all.
+
+    Raises:
+        RunnerError: If `suite` is not in the matrix, or if nothing in it is
+            runnable. `fromJSON([])` gives GitHub Actions zero matrix jobs and
+            a green check, so an empty answer must be an error rather than a
+            value — the same reason `topology.py` refuses to return no nodes.
+    """
+    suite_config = matrix.suites.get(suite)
+    if suite_config is None:
+        known = ", ".join(sorted(matrix.suites))
+        raise RunnerError(f"Unknown suite {suite!r}. Known suites: {known}")
+    excluded = {case.id for case in matrix.cases if case.ci_excluded_reason}
+    ids = [case_id for case_id in suite_config.cases if case_id not in excluded]
+    if not ids:
+        raise RunnerError(
+            f"Suite {suite!r} has no runnable cases ({len(suite_config.cases)} declared, "
+            f"all carrying a ci_excluded_reason). An empty case list would run nothing "
+            f"and report success."
+        )
+    return ids
+
+
 def _print_matrix_listing(matrix_path: Path, console: Console) -> None:
     """Print every suite in a matrix with its cases (no cluster required).
 
@@ -3793,11 +3828,29 @@ def run(
         "--list",
         help="List suites, cases, and declared contracts from the matrix, then exit.",
     ),
+    emit_cases: bool = typer.Option(
+        False,
+        "--emit-cases",
+        help="Print --suite's runnable case ids as a JSON array, then exit. "
+        "Feeds a CI job matrix so the two lists cannot drift.",
+    ),
 ) -> None:
     """Run a scenario suite against a Docker Compose pgbattery cluster."""
     project_root = Path(__file__).resolve().parent.parent
     matrix_path = (project_root / matrix).resolve()
     resolved_artifact_dir = (project_root / artifact_dir).resolve()
+
+    if emit_cases:
+        if not suite:
+            console.print("[red]Runner error:[/] --emit-cases requires --suite.")
+            raise typer.Exit(code=2)
+        try:
+            ids = runnable_case_ids(parse_matrix(matrix_path), suite)
+        except RunnerError as exc:
+            console.print(f"[red]Runner error:[/] {exc}")
+            raise typer.Exit(code=1) from exc
+        print(json.dumps(ids))
+        raise typer.Exit(code=0)
 
     if list_suites:
         try:

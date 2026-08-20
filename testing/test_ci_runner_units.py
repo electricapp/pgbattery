@@ -1540,6 +1540,53 @@ def test_a_write_verb_inside_a_comment_is_not_a_write() -> None:
     )
 
 
+def _emit_matrix(cases: list[dict[str, object]], suite_cases: list[str]) -> ci_runner.MatrixConfig:
+    return ci_runner.MatrixConfig(
+        version=1,
+        compose_file="docker-compose.yml",
+        cluster=ci_runner.ClusterConfig(expected_nodes=3, nodes=[]),
+        suites={"s": ci_runner.SuiteConfig(cases=suite_cases)},
+        cases=[ci_runner.CaseConfig(**case) for case in cases],  # type: ignore[arg-type]
+    )
+
+
+def test_an_excluded_case_is_not_emitted() -> None:
+    """The CI matrix is built from this, so a case CI cannot run must not
+    appear in it — and must say in the matrix why."""
+    matrix = _emit_matrix(
+        [{"id": "a"}, {"id": "b", "ci_excluded_reason": "asserts an unsupported operation"}],
+        ["a", "b"],
+    )
+    assert ci_runner.runnable_case_ids(matrix, "s") == ["a"]
+
+
+def test_matrix_order_is_preserved() -> None:
+    matrix = _emit_matrix([{"id": "a"}, {"id": "b"}, {"id": "c"}], ["c", "a", "b"])
+    assert ci_runner.runnable_case_ids(matrix, "s") == ["c", "a", "b"]
+
+
+def test_an_empty_case_list_is_an_error_not_a_value() -> None:
+    """`fromJSON([])` gives GitHub Actions zero jobs and a green check. A suite
+    with nothing runnable has to be loud, or it reads as coverage."""
+    matrix = _emit_matrix([{"id": "a", "ci_excluded_reason": "why"}], ["a"])
+    try:
+        ci_runner.runnable_case_ids(matrix, "s")
+    except ci_runner.RunnerError as exc:
+        assert "no runnable cases" in str(exc)
+    else:
+        raise AssertionError("an empty case list must raise")
+
+
+def test_an_unknown_suite_is_an_error() -> None:
+    matrix = _emit_matrix([{"id": "a"}], ["a"])
+    try:
+        ci_runner.runnable_case_ids(matrix, "nope")
+    except ci_runner.RunnerError as exc:
+        assert "Unknown suite" in str(exc)
+    else:
+        raise AssertionError("an unknown suite must raise")
+
+
 def test_a_departed_nodes_series_is_not_counted() -> None:
     """Prometheus never removes a series. A node that leaves keeps its
     `node="4"` gauge at 0.0 for the life of the leader process, and counting it
