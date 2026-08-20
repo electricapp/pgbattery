@@ -158,29 +158,46 @@ leader-ID-agreement check can see, and a detector sampling at 500 ms cannot
 resolve a sub-500 ms window even in principle.
 
 `dual_writability_prober.py` closes that hole for L1 specifically, and only for
-L1. It is data-plane: it races real writes at all three internal PostgreSQL
-ports on a 50 ms round period and asks the database, not the control plane, which
-node accepted. Nine matrix cases invoke it. Its own floor is that round period —
-a dual-write window shorter than 50 ms is still invisible — and it measures one
+L1. It is data-plane: it races real writes at every internal PostgreSQL port —
+three or five, by `--topology` — on a 50 ms round period and asks the database,
+not the control plane, which node accepted. Ten matrix cases invoke it, plus
+Phase 2d of the five-node suite. Its own floor is that round period — a
+dual-write window shorter than 50 ms is still invisible — and it measures one
 property, so every other contract remains control-plane-observed.
 
-Beyond that: no workload reads through a follower, issues a read-only
-transaction, or uses a predicate — so stale reads, long fork, and phantoms are
-outside the test universe. Fault timing is hand-tuned sleeps rather than values
-derived from the lease and election constants, so the boundary regime where
-openraft-0.9-without-pre-vote pathologies live is never swept deliberately.
+Follower reads, read-only transactions and predicate reads used to be absent
+entirely, which put stale reads, long fork and phantoms outside the test
+universe; H-10 brought them in. `follower_read_workload.py` reads from each
+standby carrying that standby's replay LSN, so lagging stays legal while a
+standby that has replayed past a commit and serves the older value is a
+violation, and `linreg/follower_reads.py` holds checkers for both shapes that
+their self-tests prove can reject.
+
+What remains here is timing: fault timing is hand-tuned sleeps rather than
+values derived from the lease and election constants, so the boundary regime
+where openraft-0.9-without-pre-vote pathologies live is never swept
+deliberately.
 
 ### Class C — the schedule cannot be explored
 
-There is no deterministic simulation and no way to replay a failure.
+There is no deterministic simulation, and a failure is only half replayable.
 
-The consequence is visible in where tests are _not_: `src/app.rs` holds
-`ensure_follows`, `lease_enforcement_tick`, and `promote_local_postgres` — the
-split-brain-prevention core — and is the least-tested large file in the repo,
-because reaching it requires Docker and a live PostgreSQL. The most
-safety-critical logic gets the slowest, least reproducible verification. Each
+This class used to be stated as a coverage problem — that `src/app.rs` holds
+`ensure_follows`, `lease_enforcement_tick` and `promote_local_postgres`, and was
+the least-tested large file in the repo because reaching it needed Docker and a
+live PostgreSQL. Neither half is true now. The `PgControl` trait made those
+functions injectable, `ModelPg` implements it, and `promote_local_postgres` is
+driven under `#[tokio::test]` with no database at all; by tests per thousand
+lines `app.rs` sits mid-pack among the large files rather than last.
+
+What is left is the schedule itself, and it is not a coverage problem. Each
 integration case takes minutes and explores exactly one OS-chosen interleaving,
-and a failure found in CI is not replayable.
+chosen for it rather than by it — the unit tests fix the ordering they assert,
+so nothing sweeps the orderings nobody thought to write down. Replay is half
+solved: every harness that draws randomly records its seed and prints the
+command that repeats it, so the harness's own choices come back, while the
+cluster's timing does not — the same faults land at the same offsets against a
+system free to schedule them differently.
 
 ## Risk-window register
 
@@ -354,8 +371,10 @@ fits better than `turmoil` because time control is required, not just network
 control.
 
 Payoff: thousands of failover schedules per second, seed-reproducible failures,
-and interleavings the OS will never pick — aimed directly at `app.rs`, the
-least-tested and most dangerous file in the repo (Class C).
+and interleavings the OS will never pick — aimed directly at `app.rs`, whose
+split-brain core H-29's `PgControl` seam already made reachable without Docker.
+What no seam gives is the orderings: every test there fixes the one it asserts
+(Class C).
 
 ## Tier 5 — Connect the specs to the binary
 
@@ -1900,8 +1919,9 @@ violation, and the first thing a Jepsen analysis would reach for.
 ### Wave 5 — Deterministic simulation (Tier 4)
 
 The actual next level: reproducibility and schedule coverage Docker structurally
-cannot provide. Aimed at `app.rs`, the least-tested and most dangerous file in
-the repo.
+cannot provide. Aimed at `app.rs` — not because it is untested, since H-29's
+seam fixed that, but because its tests each fix the ordering they assert and
+nothing sweeps the rest.
 
 - [x] **H-29 — `PgControl` seam added** (`src/governor/pg_control.rs`). The
       third seam, alongside `LeaseState`'s injectable `Clock` and
