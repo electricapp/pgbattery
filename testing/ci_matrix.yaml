@@ -2472,12 +2472,20 @@
     },
     {
       "id": "backup-restore-valid",
-      "ci_excluded_reason": "Asserts an operation the product does not support and never has. It POSTs a full restore to node1 while node1 is the leader, and the API has refused exactly that since the initial commit ('Refusing full restore on the current leader: it overwrites the live primary's data directory') \u2014 the case and the guard were committed together. A full restore is only accepted on a standby, and a restored standby is re-synced from the leader, so 'the cluster returns to the pre-insert snapshot' is not what the supported operation does. Rewriting it to assert what is assertable is HARDENING H-49; until then it is excluded here rather than left to look like coverage.",
       "contracts": [
-        "V2"
+        "V2",
+        "L1"
       ],
-      "description": "Creates a valid backup with 3 seed rows, inserts additional post-backup rows, restores the backup, and verifies the cluster returns to the exact pre-insert snapshot (3 rows only, no post-backup rows).",
+      "description": "A full restore is a node-local operation on a standby, and this asserts both halves of that placement rule against a real backup. The leader refuses one outright; the same node accepts it once leadership has moved away, which is what the refusal message tells an operator to do. What the restore then produces is the part worth pinning: pg_basebackup output carries no standby.signal, so the restored data directory would open as a writable primary on its own timeline, and the restore writes the signal to stop that \u2014 hence L1 alongside V2, because the failure mode is a second write authority rather than a bad byte. The restored node is therefore checked directly (not through a gateway, which would answer from the leader) for being in recovery and for having followed the leader back up to the post-backup row instead of staying pinned to the 3-row snapshot it was restored from. Backups are configured on node1 only, so node1 is both the node holding the artifact and the node that must stop leading to use it.",
       "actions": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 1,
+          "timeout_sec": 60,
+          "comment": "Pin which node leads before the backup, so 'the leader' and 'the standby' below are node identities rather than whatever the election happened to pick."
+        },
         {
           "type": "sql",
           "file": "backup-restore-valid-setup.sql",
@@ -2494,7 +2502,9 @@
           ],
           "capture_json": {
             "backup_path": "path"
-          }
+          },
+          "timeout_sec": 240,
+          "comment": "No type parameter: the API defaults to a full (pg_basebackup) backup regardless of the node's configured backup_type, which is what makes the placement rule below apply."
         },
         {
           "type": "basename",
@@ -2503,9 +2513,28 @@
         },
         {
           "type": "sql",
-          "comment": "insert post-backup rows that should vanish after restore",
           "file": "backup-restore-valid-post.sql",
           "node": 1
+        },
+        {
+          "type": "http",
+          "method": "POST",
+          "url": "http://localhost:9081/api/v1/backup/restore?filename={{backup_filename}}",
+          "expect_status": 409,
+          "body_contains": "Refusing full restore on the current leader",
+          "comment": "Half one: the leader refuses. The guard runs before the artifact is opened, so this costs nothing and leaves the cluster untouched."
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2,
+          "timeout_sec": 60
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "leader_equals": 2,
+          "timeout_sec": 90
         },
         {
           "type": "http",
@@ -2514,13 +2543,18 @@
           "expect_status": 200,
           "json_fields": [
             "success"
-          ]
+          ],
+          "timeout_sec": 300,
+          "comment": "Half two: the same request to the same node, now that it is a standby. The call is synchronous across stop, unpack and start."
         },
         {
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "leader_equals": 2,
+          "min_healthy_replicas": 2,
+          "timeout_sec": 180,
+          "comment": "A restored node that came up as a primary would show two leaders here; one that never came back would show two nodes. Requiring both replicas healthy is also what makes the row-count assertion below a measurement rather than a race: the leader counts a replica healthy once it is streaming."
         }
       ],
       "assertions": [
@@ -2528,6 +2562,13 @@
           "type": "sql",
           "file": "backup-restore-valid-assert.sql",
           "node": "leader"
+        },
+        {
+          "type": "sql",
+          "file": "backup-restore-standby-assert.sql",
+          "node": 1,
+          "direct": true,
+          "comment": "Direct: a gateway would route to node2 and this assertion would read the leader while claiming to read the restored node."
         },
         {
           "type": "cluster_topology",

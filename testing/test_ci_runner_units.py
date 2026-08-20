@@ -1585,6 +1585,19 @@ def _emit_matrix(cases: list[dict[str, object]], suite_cases: list[str]) -> ci_r
     )
 
 
+def _excluded_parallel_case(runner: Any) -> str:
+    """The id of a real `ha-parallel` case carrying an exclusion reason.
+
+    Named rather than hardcoded: which case is excluded changes as they are
+    fixed, and a test pinned to one of them goes red for the wrong reason the
+    day it is repaired.
+    """
+    reasons = {case.id for case in runner.matrix.cases if case.ci_excluded_reason}
+    excluded = [c for c in runner.matrix.suites["ha-parallel"].cases if c in reasons]
+    assert excluded, "no ha-parallel case is excluded, so these tests prove nothing"
+    return excluded[0]
+
+
 def test_a_suite_run_skips_an_excluded_case() -> None:
     """A local suite run that went red on a case no workflow executes would
     disagree with CI about the same suite. Against the real matrix, so this
@@ -1592,15 +1605,16 @@ def test_a_suite_run_skips_an_excluded_case() -> None:
     runner = make_runner()
     selected = runner._select_cases()
     assert selected == ci_runner.runnable_case_ids(runner.matrix, "ha-parallel")
-    assert "backup-restore-valid" not in selected
+    assert _excluded_parallel_case(runner) not in selected
 
 
 def test_naming_an_excluded_case_still_runs_it() -> None:
     """The exclusion governs what runs by default, not what may be run — the
     case still has to be reachable to be worked on."""
     runner = make_runner()
-    runner.case_filter = "backup-restore-valid"
-    assert runner._select_cases() == ["backup-restore-valid"]
+    excluded = _excluded_parallel_case(runner)
+    runner.case_filter = excluded
+    assert runner._select_cases() == [excluded]
 
 
 def test_an_excluded_case_is_not_emitted() -> None:

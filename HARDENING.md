@@ -2370,7 +2370,7 @@ nothing detects drift.
       dead strings, under a field invented for the test.
       _Effort_ S (mechanical) plus a judgement call per surviving reference
 
-- [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
+- [x] **H-49 — Run every `ha-parallel` case, or say which are not run.**
       `ha-ci.yml` hardcoded five case names into the parallel matrix while the
       suite held seventeen, so **twelve cases were executed by no workflow at
       all** — written, maintained, counted in `--list`, and never run. Nothing
@@ -2395,21 +2395,40 @@ nothing detects drift.
       stays fatal, because a node that is up but silent could be the second
       leader this must never miss.
 
-      `backup-restore-valid` is **not** fixed, and has never been able to pass.
-      It now carries a `ci_excluded_reason` saying so, which is what keeps it
-      out of the derived matrix instead of reading as coverage:
-      it POSTs a full restore to node1 while node1 is the leader, and the API
-      has refused exactly that since the initial commit — "Refusing full restore
-      on the current leader: it overwrites the live primary's data directory."
-      The case and the guard were committed together. Making it pass is a
-      design question rather than a repair: a full restore is only accepted on a
-      standby, and a restored standby is re-synced from the leader, so
-      "the cluster returns to the pre-insert snapshot" is not what the supported
-      operation does. What is assertable — that a standby restore is accepted
-      and does not roll the live cluster back — is a different claim from the
-      one the case makes.
-      **Done when** `backup-restore-valid` asserts what a standby restore
-      actually does, and its exclusion is removed.
+      `backup-restore-valid` had never been able to pass. It POSTed a full
+      restore to node1 while node1 was the leader, and the API has refused
+      exactly that since the initial commit — "Refusing full restore on the
+      current leader: it overwrites the live primary's data directory." The
+      case and the guard were committed together, and the case asserted the
+      cluster rolls back to the snapshot, which is not what the supported
+      operation does at all.
+
+      **It now asserts the operation the product has.** The refusal message
+      names the recovery procedure — transfer leadership away, or target a
+      standby — so the case runs it: create a full backup on node1, POST the
+      restore to node1 and require the 409, transfer leadership to node2, POST
+      the identical request again and require the 200. Backups are configured
+      on node1 alone, so the node holding the artifact and the node that must
+      stop leading to use it are the same node, which is what makes the pair of
+      requests a single controlled experiment rather than two.
+
+      What the restore produces is the part with a contract behind it.
+      `pg_basebackup` output carries no `standby.signal`, so a restored data
+      directory would open as a **writable primary on its own timeline**; the
+      restore writes the signal first, and the case declares L1 next to V2
+      because that is the failure mode. The restored node is checked against
+      its own PostgreSQL rather than through a gateway, for being in recovery
+      and for having followed the leader up to the post-backup row instead of
+      staying pinned to the snapshot — and the live cluster is checked for
+      still holding that row, since a restore that rolled the cluster back
+      would be a lost acked write.
+
+      Both branches were watched failing. Dropping `direct` routes the
+      assertion through the gateway to the leader and it reports "the restored
+      node opened its snapshot as a writable primary", which proves the
+      recovery check fires and that `direct` is load-bearing rather than
+      decorative; changing the expected count reddens the other branch. The
+      exclusion is gone and the case runs in the derived matrix, in 16s.
       _Effort_ M
 
 - [ ] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`
