@@ -1910,7 +1910,9 @@
           "live_nodes": 2,
           "leaders": 1,
           "leader_not_var": "leader_before",
-          "timeout_sec": 60
+          "require_replication_health": false,
+          "timeout_sec": 60,
+          "comment": "Failover is what this case needs here, and `leader_not_var` is what says so. The replica shape must not be asserted: services run `restart: unless-stopped`, so `kill` is followed by Docker starting node1 again on its own, and it rejoins as an Async replica while it catches up. That makes the 2-live shape (1 replica, 1 sync, 0 async) true only in the window before it returns — observed once as `observed=2 sync=1 async=1/0` against a 60s deadline. The gateway oracles below are the case's actual assertions."
         },
         {
           "type": "cmd",
