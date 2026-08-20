@@ -39,7 +39,8 @@ EXTENDS Naturals, FiniteSets, Sequences
 CONSTANTS
     Connections,        \* Set of client connections {c1, c2, ...}
     Nodes,              \* Set of database nodes {1, 2, 3}
-    MaxTxid             \* Maximum transaction ID to explore
+    MaxTxid,            \* Maximum transaction ID to explore
+    ElectionRequiresReplicatedTxns  \* Modeled defect switch; see ElectNewLeader
 
 VARIABLES
     (* Leader state *)
@@ -189,8 +190,12 @@ ElectNewLeader(n) ==
     /\ leader = None
     /\ n \in Nodes
     \* New leader must have all replicated transactions
-    \* (i.e., must be a node that was a sync replica)
-    /\ \A txid \in 1..MaxTxid : replicated[txid] => IsVisibleOn(txid, n)
+    \* (i.e., must be a node that was a sync replica). This is the LSN election
+    \* gate; `ElectionRequiresReplicatedTxns = FALSE` drops it, which is the
+    \* modeled defect the .inv- config exists to watch fail. Every other model
+    \* leaves it TRUE.
+    /\ ElectionRequiresReplicatedTxns =>
+         (\A txid \in 1..MaxTxid : replicated[txid] => IsVisibleOn(txid, n))
     /\ leader' = n
     /\ UNCHANGED <<txidCaptured, commitSent, leaderWhenSent, responseReceived, probeResult,
                    walWritten, replicated, visibleOn>>

@@ -39,9 +39,19 @@ header, the invariant TLC then has to report. A run that succeeds is the failure
 and so is one that fails for a different reason — a parse error or a violated
 `ASSUME` is not a counterexample. This is the same rule the Python harnesses live
 under: an assertion nobody has watched fail is an assertion whose passing means
-nothing. `lease_fencing` has one; the other three do not yet (H-47 in
-`HARDENING.md`), and `make check-counterexamples` says so by only checking what
-exists rather than claiming per-spec coverage.
+nothing. All four specs have one, and `make check-counterexamples` fails when a
+spec does not — a target that silently checked three of four would read as
+coverage the next time somebody added a spec.
+
+| Spec                    | Mechanism disabled                                    | Invariant that must then break |
+| ----------------------- | ----------------------------------------------------- | ------------------------------ |
+| `lease_fencing`         | hold-down anchored at the campaign it wins            | `AtMostOneWriteAuthority`      |
+| `raft_lsn`              | one vote per term                                     | `ElectionSafety`               |
+| `commit_probing`        | LSN election gate (leader holds every replicated txn) | `AckedSuccessIsDurable`        |
+| `timeline_verification` | pg_rewind's divergence gate                           | `TimelineMonotonic`            |
+
+Each switch is a `CONSTANT` defaulting to the safe value in every other model,
+so the mechanism is disabled only where a counterexample is the expected result.
 
 ## What each spec checks
 
@@ -82,7 +92,10 @@ exists rather than claiming per-spec coverage.
 **`raft_lsn.tla`** — passes (33,957 distinct states)
 
 - `ElectionSafety` (≤1 leader), `NoLSNDeadlock` / `SomeNodeCanWin` (the LSN gate
-  never wedges elections), `TypeOK`.
+  never wedges elections), `TypeOK`. `raft_lsn.inv-double-vote-per-term.cfg` is
+  the checked config in which `ElectionSafety` breaks, which matters here more
+  than elsewhere: the gate below is advisory, so this is the property safety
+  actually rests on.
 - **TLC actively DISPROVES** `LeaderHasAcceptableLSN` and `LeaderLSNNotBelowVoters`
   (defined in the spec, deliberately not in the cfg): a candidate self-votes past
   the gate — the self-vote is not LSN-checked — and reaches quorum via an
@@ -96,11 +109,16 @@ exists rather than claiming per-spec coverage.
   or false abort.
 - `AckedSuccessIsDurable` — any success the client saw (normal or synthetic) is
   still visible on the current leader after failover (RPO=0).
+  `commit_probing.inv-election-ignores-lsn.cfg` drops the requirement that a new
+  leader hold every replicated transaction, and TLC produces the lost ack.
 
 **`timeline_verification.tla`** — passes (3,208 distinct states)
 
 - `TypeOK` + `TimelineMonotonic` — timelines stay bounded and a promotion only ever
-  advances a node's timeline.
+  advances a node's timeline. No action in the base model can lower one, so
+  `timeline_verification.inv-rewind-lowers-timeline.cfg` adds the one that can —
+  a pg_rewind onto a source behind the node being rewound — and TLC catches the
+  backwards step.
 - Does **not** claim "no two primaries share a timeline" — false in the partition
   model. Single-primary safety lives in `lease_fencing.tla` (Raft); the `pg_rewind`
   data-loss gate is covered by Rust unit tests for `rewind_divergence_decision`.

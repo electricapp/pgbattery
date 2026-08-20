@@ -101,7 +101,8 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     Nodes,                  \* Set of node IDs
-    MaxTimeline            \* Maximum timeline to explore (e.g., 5)
+    MaxTimeline,            \* Maximum timeline to explore (e.g., 5)
+    RewindAdoptsSourceTimeline  \* Modeled defect; see RewindOntoPrimary
 
 VARIABLES
     (* PostgreSQL state *)
@@ -215,6 +216,29 @@ PropagateTimeline(primary, standby) ==
     /\ walReceiverTimeline' = [walReceiverTimeline EXCEPT ![standby] = timelineID[primary]]
     /\ UNCHANGED <<timelineID, inRecovery, isPrimary, promotionAttempted>>
 
+(* MODELED DEFECT — a rewind that adopts its source's timeline unguarded.
+ *
+ * `TimelineMonotonic` is otherwise unfalsifiable: no action above can lower a
+ * timeline, so TLC reports "no error" whether or not the property means
+ * anything. This action is what a `pg_rewind` looks like when the divergence
+ * gate is not consulted — a standby that promoted in a partition, and is
+ * therefore AHEAD of the primary it is being rewound onto, takes the source's
+ * lower timeline and loses the history it forked. `rewind_divergence_decision`
+ * is the code that refuses exactly this, and its Rust property tests are what
+ * hold the real gate; here it exists so the property has something to catch.
+ *
+ * Guarded off in every model but `timeline_verification.inv-rewind-lowers-
+ * timeline.cfg`, which exists to watch it fire.
+ *)
+RewindOntoPrimary(primary, standby) ==
+    /\ RewindAdoptsSourceTimeline
+    /\ isPrimary[primary]
+    /\ inRecovery[standby]
+    /\ standby /= primary
+    /\ timelineID[standby] > timelineID[primary]  \* the standby forked ahead
+    /\ timelineID' = [timelineID EXCEPT ![standby] = timelineID[primary]]
+    /\ UNCHANGED <<inRecovery, walReceiverTimeline, isPrimary, promotionAttempted>>
+
 \* ============================================================================
 \* SPECIFICATION
 \* ============================================================================
@@ -229,6 +253,7 @@ Next ==
     \/ \E n \in Nodes : VerifyTimelineSafety(n)
     \/ \E n1, n2 \in Nodes : n1 /= n2 /\ NetworkPartitionDiverge(n1, n2)
     \/ \E p, s \in Nodes : p /= s /\ PropagateTimeline(p, s)
+    \/ \E p, s \in Nodes : p /= s /\ RewindOntoPrimary(p, s)
     \/ Terminating
 
 Spec == Init /\ [][Next]_vars

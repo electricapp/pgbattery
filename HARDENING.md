@@ -2319,23 +2319,31 @@ Topology"`, and `docs/TESTS.md` has never been in the repository — not
       the mapped region (`msync`), or redb configured off mmap for the test.
       _Effort_ M
 
-- [ ] **H-47 — A counterexample model for every spec.** `make -C tla check` now
-      runs the `<spec>.inv-<name>.cfg` models and fails if one stops producing
-      the violation it names, but only `lease_fencing` has one. The other three
-      rest on the same argument every other assertion in this repo is refused:
-      an invariant nobody has watched fail is an invariant whose passing means
-      nothing, and TLC's own report of "no error" is exactly what a vacuous
-      model produces.
+- [x] **H-47 — A counterexample model for every spec.** Only `lease_fencing`
+      had one. The other three rested on the argument every other assertion in
+      this repo is refused: an invariant nobody has watched fail is an invariant
+      whose passing means nothing, and TLC's own report of "no error" is exactly
+      what a vacuous model produces.
 
-      Each needs a modeled-defect switch, because none of the three can be
-      broken by constants alone — `commit_probing`'s invariants are about the
-      probe logic, `timeline_verification` checks a monotonicity property, and
-      `raft_lsn`'s gate is already deliberately advisory. That is spec work, not
-      config work, which is why it is not folded into H-35.
-      **Done when** `make -C tla check-counterexamples` covers all four specs and
-      fails when any spec lacks one, the way `check-large` already does for the
-      nightly configs.
-      _Effort_ M
+      Each needed a modeled-defect switch, since none could be broken by
+      constants alone. `raft_lsn` gained `EnforceOneVotePerTerm` — dropping it
+      lets one follower back two candidates in a term, and `ElectionSafety`
+      breaks, which is the property the spec's own header says safety actually
+      rests on, the LSN gate being advisory. `commit_probing` gained
+      `ElectionRequiresReplicatedTxns` — dropping it elects a node that never saw
+      a replicated transaction, and `AckedSuccessIsDurable` breaks with a client
+      holding an ack for a write the cluster no longer has. `timeline_verification`
+      gained `RewindAdoptsSourceTimeline`, which adds the one action able to
+      lower a timeline: a pg_rewind onto a source behind the node being rewound,
+      which is what `rewind_divergence_decision` refuses. Before it,
+      `TimelineMonotonic` was unfalsifiable — nothing in the model could move a
+      timeline backwards.
+
+      `check-counterexamples` now refuses to run when a spec has no `.inv-`
+      config, the way `check-large` already did, and its grep accepts a violated
+      property as well as a violated invariant — `TimelineMonotonic` is temporal,
+      and the old pattern would have called a correct counterexample a failure
+      for the wrong reason.
 
 ### Wave 7 — Real Jepsen (Tier 6)
 

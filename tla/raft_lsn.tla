@@ -96,7 +96,8 @@ CONSTANTS
     Nodes,              \* Set of node IDs (e.g., {1, 2, 3})
     MaxTerm,            \* Maximum term to explore (bounds state space)
     MaxLSN,             \* Maximum LSN value to explore
-    LSNLagThreshold     \* Maximum acceptable LSN lag (e.g., 16MB = 16777216)
+    LSNLagThreshold,    \* Maximum acceptable LSN lag (e.g., 16MB = 16777216)
+    EnforceOneVotePerTerm  \* Modeled defect switch; see CanVoteFor
 
 \* ============================================================================
 \* VARIABLES
@@ -158,9 +159,17 @@ IsLSNAcceptable(candidate, voter) ==
         \/ candidateLSN + LSNLagThreshold >= voterMaxLSN
 
 \* Combined vote acceptance logic
+\*
+\* `EnforceOneVotePerTerm = FALSE` drops the second conjunct, which is the
+\* modeled defect the .inv- config exists to watch fail: a voter that may back
+\* two candidates in one term lets both reach quorum, and ElectionSafety — the
+\* property this spec is otherwise never seen to test — breaks. Every other
+\* model leaves it TRUE.
 CanVoteFor(voter, candidate) ==
     /\ currentTerm[voter] <= currentTerm[candidate]
-    /\ (votedFor[voter] = None \/ votedFor[voter] = candidate)
+    /\ (~EnforceOneVotePerTerm
+        \/ votedFor[voter] = None
+        \/ votedFor[voter] = candidate)
     /\ LogIsUpToDate(candidate, voter)
     /\ IsLSNAcceptable(candidate, voter)  \* <-- THE LSN CHECK
 

@@ -128,6 +128,14 @@ check-counterexamples: tools
 	@if [ -z "$(INV_CFGS)" ]; then \
 	  echo "no *.inv-*.cfg found — this target would check nothing"; exit 1; \
 	fi
+	@missing=""; for s in $(SPECS); do \
+	  ls $$s.inv-*.cfg >/dev/null 2>&1 || missing="$$missing $$s"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	  echo "no counterexample model for:$$missing — add <spec>.inv-<name>.cfg, or this"; \
+	  echo "target passes while those specs' invariants have never been watched fail"; \
+	  exit 1; \
+	fi
 	@mkdir -p $(STATES)
 	@fail=0; for cfg in $(INV_CFGS); do \
 	  spec=$${cfg%%.inv-*}; name=$${cfg%.cfg}; \
@@ -140,7 +148,7 @@ check-counterexamples: tools
 	  if $(TLC) -config $$cfg -workers auto -metadir $(STATES)/$$name $$spec.tla \
 	       > $(STATES)/$$name.log 2>&1; then \
 	    echo "  PASSED, which is the failure: $$want survived the injected defect"; fail=1; \
-	  elif grep -q "Invariant $$want is violated" $(STATES)/$$name.log; then \
+	  elif grep -qE "(Invariant|Action property|Temporal property|Property) $$want is violated" $(STATES)/$$name.log; then \
 	    echo "  $$want violated, as required"; \
 	  else \
 	    echo "  failed for the wrong reason (expected $$want):"; \
