@@ -31,6 +31,7 @@ from pathlib import Path
 from unittest import mock
 
 import fault_primitives as fp
+import harness_fakes as hf
 from fault_primitives import (
     DEFAULT_COMPOSE_PROJECT,
     Aim,
@@ -104,6 +105,7 @@ from fault_primitives import (
     verify_scope_unaffected,
     verify_space_restored,
 )
+from harness_fakes import ScriptedRunner, fail, ok
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -202,47 +204,9 @@ WAL_SEGMENT_BYTES = 16 * 1024**2
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class ScriptedRunner:
-    """Answers shell commands by matching substrings, recording every call.
-
-    Rules are ``(needle, CommandResult)`` pairs, checked in order; the first
-    match wins. An unmatched command returns rc 0 with empty output, which is
-    what a successful ``tc``/``kill``/``rm`` looks like.
-    """
-
-    def __init__(self, rules: Sequence[tuple[str, CommandResult]]) -> None:
-        self.rules = list(rules)
-        self.calls: list[str] = []
-
-    def __call__(self, cmd: str, timeout_s: float) -> CommandResult:
-        self.calls.append(cmd)
-        for needle, result in self.rules:
-            if needle in cmd:
-                return result
-        return CommandResult(0, "", "")
-
-    def matching(self, needle: str) -> list[str]:
-        return [call for call in self.calls if needle in call]
-
-
-def ok(stdout: str = "") -> CommandResult:
-    return CommandResult(0, stdout, "")
-
-
-def fail(stderr: str, rc: int = 1) -> CommandResult:
-    return CommandResult(rc, "", stderr)
-
-
-class RunnerFixture(unittest.TestCase):
-    """Installs a scripted runner and a capturing event sink for the test."""
-
-    def install(self, runner: ScriptedRunner) -> ScriptedRunner:
-        previous_runner = set_command_runner(runner)
-        self.addCleanup(set_command_runner, previous_runner)
-        self.events: list[dict[str, object]] = []
-        previous_sink = set_event_sink(self.events.append)
-        self.addCleanup(set_event_sink, previous_sink)
-        return runner
+# The doubles live in `harness_fakes` because the Raft torn-write tests need
+# the same ones, and a fake copied is a fake that drifts.
+RunnerFixture = hf.HarnessFixture
 
 
 # ─────────────────────────────────────────────────────────────────────────────

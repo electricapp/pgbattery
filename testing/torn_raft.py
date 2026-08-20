@@ -44,6 +44,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Final, TypedDict
 
@@ -426,7 +427,11 @@ def await_settled_cluster(timeout_s: float) -> str:
     )
 
 
-def connect(node: str) -> psycopg.Connection[Any]:
+Connector = Callable[[str], Any]
+"""Opens a session to a node's gateway. The seam a test swaps."""
+
+
+def _psycopg_connector(node: str) -> psycopg.Connection[Any]:
     return psycopg.connect(
         host="127.0.0.1",
         port=GATEWAY_PORT_BY_NODE[node],
@@ -435,6 +440,28 @@ def connect(node: str) -> psycopg.Connection[Any]:
         connect_timeout=10,
         autocommit=True,
     )
+
+
+_connector: Connector = _psycopg_connector
+
+
+def set_connector(connector: Connector) -> Connector:
+    """Swap the database connector, returning the previous one.
+
+    The counterpart of `fault_primitives.set_command_runner`, and it exists for
+    the same reason: swapping the seam lets a unit test drive a whole primitive
+    against a scripted database, where patching the functions in between would
+    assert the call graph instead of the behaviour.
+    """
+    global _connector
+    previous = _connector
+    _connector = connector
+    return previous
+
+
+def connect(node: str) -> Any:
+    """Open a session to `node` through the current connector."""
+    return _connector(node)
 
 
 def accepts_a_write(node: str) -> None:
@@ -503,12 +530,45 @@ def recreate_victim(victim: str) -> fp.CommandResult:
     A container that is not running holds no cache to lose, so the flush is
     skipped rather than waited out. That case is reached from the failure paths
     — this is called from a `finally` — and a flush that timed out there would
-    replace the failure it was called to protect against.
+    replace the failure it was called to protect against. So would the state
+    read itself: `read_container_runstate` resolves the container first and
+    raises when compose knows of none, which is precisely the state a run that
+    died mid-fault leaves behind.
     """
-    running = fp.read_container_runstate(victim)
-    if running is not None and running.status == "running":
+    if victim_is_running(victim):
         fp.flush_lazyfs_cache(victim, mount=fp.LAZYFS_DATA)
     return fp.run(f"docker compose up -d --force-recreate {victim}")
+
+
+def victim_is_running(victim: str) -> bool:
+    """Whether `victim`'s container is up, treating an unreadable state as not.
+
+    Only the affirmative matters here: it decides whether there is a cache
+    worth flushing. A container nobody can resolve has none.
+    """
+    try:
+        state = fp.read_container_runstate(victim)
+    except fp.FaultPreconditionError:
+        return False
+    return state is not None and state.status == "running"
+
+
+def establish_baseline(lead: str) -> list[int]:
+    """Write the baseline this run measures survival against, or refuse.
+
+    `lost` is `acked - surviving`, so a run whose baseline the cluster would
+    not take reports "no acked write lost" for want of anything to lose. That
+    is a green a damaged cluster can produce, which is why too few acks stops
+    the run here rather than being noticed in the verdict.
+    """
+    reset_table(lead)
+    acked = write_batch(lead, range(BASELINE_WRITES))
+    if len(acked) < MIN_BASELINE_ACKED:
+        raise fp.FaultPreconditionError(
+            f"only {len(acked)} of {BASELINE_WRITES} baseline writes were acked before "
+            f"the tear, so there was no working cluster to damage"
+        )
+    return acked
 
 
 def reset_table(node: str) -> None:
@@ -628,9 +688,21 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
     outcome.acked.extend(write_batch(lead, range(base, base + 50), under_fault=True))
     time.sleep(3)
 
-    log = fp.exec_when_deliverable(
-        victim, fp.lazyfs_log_cmd(log=fp.LAZYFS_RAFT.log), timeout_s=LOG_READ_TIMEOUT_S
+    return read_tear(
+        fp.exec_when_deliverable(
+            victim, fp.lazyfs_log_cmd(log=fp.LAZYFS_RAFT.log), timeout_s=LOG_READ_TIMEOUT_S
+        )
     )
+
+
+def read_tear(log: fp.CommandResult) -> TearReading:
+    """What one attempt's log read says about the tear.
+
+    A log the harness could not read and a log with no record in it are
+    different findings, and collapsing them turns a fault that fired into one
+    that never did. A command that failed silently still says so, because
+    "exited 1 with no output" is a reason and an empty string is not.
+    """
     if not log.ok:
         return TearReading(unreadable=log.output.strip() or f"exited {log.rc} in silence")
     records = fp.parse_lazyfs_torn_records(log.stdout, RAFT_DB)
@@ -713,13 +785,7 @@ def tear_a_page(*, target: str, occurrence: int) -> Outcome:
     """
     outcome = Outcome()
     lead = await_writable_leader(CONVERGE_TIMEOUT_S)
-    reset_table(lead)
-    outcome.acked = write_batch(lead, range(BASELINE_WRITES))
-    if len(outcome.acked) < MIN_BASELINE_ACKED:
-        raise fp.FaultPreconditionError(
-            f"only {len(outcome.acked)} of {BASELINE_WRITES} baseline writes were acked "
-            f"before the tear, so there was no working cluster to damage"
-        )
+    outcome.acked = establish_baseline(lead)
 
     victim = lead if target == "leader" else next(n for n in topology.NODES if n != lead)
     outcome.victim = victim
@@ -774,15 +840,7 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     """
     outcome = Outcome()
     lead = await_writable_leader(CONVERGE_TIMEOUT_S)
-    reset_table(lead)
-    outcome.acked = write_batch(lead, range(BASELINE_WRITES))
-    if len(outcome.acked) < MIN_BASELINE_ACKED:
-        raise fp.FaultPreconditionError(
-            f"only {len(outcome.acked)} of {BASELINE_WRITES} baseline writes were acked "
-            f"before any tear, so there was no working cluster to damage. `lost` is "
-            f"`acked - surviving`, so the run would report no acked write lost for want "
-            f"of anything to lose."
-        )
+    outcome.acked = establish_baseline(lead)
 
     # A follower keeps redb's behaviour separate from a promotion happening at
     # the same moment. The leader is the harder case: it is the node whose vote
