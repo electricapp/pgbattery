@@ -44,6 +44,33 @@ class ProseFileReferenceTest(unittest.TestCase):
             lm.check_prose_file_references_resolve()
 
 
+class HardeningCitationTest(unittest.TestCase):
+    """The register is cited as the place the reasoning lives. A citation of an
+    item that was renumbered sends a reader looking for an argument that is not
+    there, in a document long enough that nobody would notice."""
+
+    def test_the_repository_as_committed_cites_only_real_items(self) -> None:
+        lm.check_hardening_citations_resolve()
+
+    def test_a_citation_of_a_missing_item_is_caught(self) -> None:
+        self.assertEqual(
+            lm.unresolved_hardening_citations("see H-99 for the argument", {"H-01"}),
+            {"H-99"},
+        )
+
+    def test_a_citation_of_a_real_item_is_not(self) -> None:
+        self.assertEqual(lm.unresolved_hardening_citations("see H-01", {"H-01"}), set())
+
+
+class DerivedConstantTest(unittest.TestCase):
+    """Fault timings are read from the Rust source rather than restated. A
+    renamed constant otherwise surfaces minutes into a docker run, as a
+    precondition failure that reads like a broken cluster."""
+
+    def test_every_constant_the_harness_derives_is_found(self) -> None:
+        lm.check_derived_rust_constants_resolve()
+
+
 class ClusterPortTest(unittest.TestCase):
     """A harness that spells a published port itself reaches nothing when the
     port moves, and an unreachable node is recorded `indeterminate` — which the

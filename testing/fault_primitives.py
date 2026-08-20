@@ -890,11 +890,30 @@ def replication_slot_prefix(repo_root: Path | None = None) -> str:
     return parse_rust_str_const(path.read_text(encoding="utf-8"), "PREFIX")
 
 
+DURATION_UNIT_MS: Final[dict[str, float]] = {
+    "nanos": 1e-6,
+    "micros": 1e-3,
+    "millis": 1.0,
+    "secs": 1_000.0,
+    "mins": 60_000.0,
+    "hours": 3_600_000.0,
+    "days": 86_400_000.0,
+}
+"""Every `Duration::from_*` constructor, in milliseconds.
+
+All of them, not the two in use today: a constant rewritten as
+``Duration::from_mins(1)`` is the same duration, and matching only ``secs`` and
+``millis`` would have read that as an absent constant and refused the run. The
+whole set is a fact about `std`, so listing it costs nothing and closes the
+case."""
+
+
 def parse_rust_duration_const_ms(source: str, name: str) -> int:
-    """Extract ``pub const <name>: Duration = Duration::from_{secs,millis}(N);``."""
+    """Extract ``pub const <name>: Duration = Duration::from_<unit>(N);`` in ms."""
+    units = "|".join(DURATION_UNIT_MS)
     match = re.search(
         rf"const\s+{re.escape(name)}\s*:\s*Duration\s*=\s*"
-        rf"Duration::from_(secs|millis)\(\s*([0-9_]+)\s*\)",
+        rf"Duration::from_({units})\(\s*([0-9_]+)\s*\)",
         source,
     )
     if match is None:
@@ -903,8 +922,7 @@ def parse_rust_duration_const_ms(source: str, name: str) -> int:
             "timings from the Rust source; a renamed constant must be fixed here "
             "rather than silently replaced by a stale default."
         )
-    value = int(match.group(2).replace("_", ""))
-    return value * 1000 if match.group(1) == "secs" else value
+    return round(int(match.group(2).replace("_", "")) * DURATION_UNIT_MS[match.group(1)])
 
 
 def read_system_timings(repo_root: Path | None = None) -> SystemTimings:

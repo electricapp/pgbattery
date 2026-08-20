@@ -235,6 +235,25 @@ class RustConstantTests(unittest.TestCase):
         with self.assertRaises(FaultPreconditionError):
             parse_rust_duration_const_ms("nothing here", "DEFAULT_LEASE_DURATION")
 
+    def test_every_duration_constructor_is_understood(self) -> None:
+        # A constant rewritten from `from_secs(60)` to `from_mins(1)` is the
+        # same duration. Matching only secs and millis read that as an absent
+        # constant and refused the run.
+        for unit, expected in (
+            ("nanos", 0),
+            ("micros", 1),
+            ("millis", 1_000),
+            ("secs", 1_000_000),
+            ("mins", 60_000_000),
+            ("hours", 3_600_000_000),
+        ):
+            source = f"pub const T: Duration = Duration::from_{unit}(1_000);"
+            self.assertEqual(parse_rust_duration_const_ms(source, "T"), expected, unit)
+
+    def test_a_constructor_std_does_not_have_is_not_invented(self) -> None:
+        with self.assertRaises(FaultPreconditionError):
+            parse_rust_duration_const_ms("pub const T: Duration = Duration::from_years(1);", "T")
+
 
 class SystemTimingsTests(unittest.TestCase):
     """Reads the real repository, so a retuned constant surfaces here."""

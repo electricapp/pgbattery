@@ -52,6 +52,7 @@ from pydantic import BaseModel, ConfigDict
 from rich.console import Console
 from rich.table import Table
 
+import fault_primitives as fp
 import topology
 
 TESTING_DIR = Path(__file__).resolve().parent
@@ -1219,6 +1220,8 @@ disagree, so a path in them that resolves to nothing is a wrong answer given
 with confidence.
 """
 
+PROSE_DOCS_PATHS: Final[tuple[Path, ...]] = tuple(PROJECT_ROOT / doc for doc in PROSE_DOCS)
+
 PROSE_REFERENCE_EXEMPT: Final[dict[str, str]] = {
     "docs/TESTS.md": "H-51 quotes it as a document that was never in the repository",
     "BUGS.md": "the same",
@@ -1286,6 +1289,58 @@ class _PortLiterals(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Same, and a class body is where a test's expected values live."""
+
+
+HARDENING_PATH = PROJECT_ROOT / "HARDENING.md"
+
+HARDENING_ITEM = re.compile(r"^- \[[ x]\] \*\*(H-\d+)", re.MULTILINE)
+"""An item's own heading in `HARDENING.md`."""
+
+HARDENING_CITATION = re.compile(r"\b(H-\d+)\b")
+"""A reference to one from anywhere — code, matrix, docs, another item."""
+
+
+def unresolved_hardening_citations(text: str, defined: Container[str]) -> set[str]:
+    """Item IDs cited by `text` that `HARDENING.md` does not define."""
+    return {cited for cited in HARDENING_CITATION.findall(text) if cited not in defined}
+
+
+def check_hardening_citations_resolve() -> None:
+    """Every H-NN cited anywhere must be an item that exists.
+
+    The register is cited from the matrix, the harnesses and the state-machine
+    doc as the place the reasoning lives, and a citation of an item that was
+    renumbered or never written sends a reader looking for an argument that is
+    not there. The document is long enough that nobody would notice.
+    """
+    defined = set(HARDENING_ITEM.findall(HARDENING_PATH.read_text(encoding="utf-8")))
+    if not defined:
+        raise AssertionError("HARDENING.md defines no items; the heading shape must have changed")
+    problems = []
+    for path in [*sorted(TESTING_DIR.glob("*.py")), *PROSE_DOCS_PATHS, MATRIX_PATH]:
+        # This file and its test name item IDs to look for them, not to cite
+        # them — the same self-reference `check_sql_references` skips.
+        if path.name in {"lint_matrix.py", "test_lint_matrix.py"}:
+            continue
+        if unresolved := unresolved_hardening_citations(path.read_text(encoding="utf-8"), defined):
+            problems.append(f"{path.name}: {', '.join(sorted(unresolved))}")
+    if problems:
+        raise AssertionError(
+            "citations of HARDENING items that do not exist — " + " | ".join(problems)
+        )
+
+
+def check_derived_rust_constants_resolve() -> None:
+    """Every Rust constant the harness derives must still be found.
+
+    Fault timings are read out of the Rust source rather than restated, which
+    is right, but the reading is by pattern and a renamed or rewritten constant
+    only surfaces when a suite reaches for it — minutes into a docker run, as a
+    precondition failure that reads like a broken cluster. Resolving them all
+    here turns that into a lint failure in the second it takes to parse.
+    """
+    fp.read_system_timings()
+    fp.replication_slot_prefix()
 
 
 def check_harness_derives_cluster_ports() -> None:
@@ -1379,6 +1434,8 @@ def lint() -> None:
     check("Case cross-references name real files", check_case_cross_references_resolve)
     check("preflight.sh mirrors the CI gates", check_preflight_mirrors_ci)
     check("Harness derives cluster ports", check_harness_derives_cluster_ports)
+    check("Derived Rust constants resolve", check_derived_rust_constants_resolve)
+    check("HARDENING citations resolve", check_hardening_citations_resolve)
     check("Docs name real files", check_prose_file_references_resolve)
     check("Doc reference exemptions still apply", check_prose_exemptions_are_still_needed)
 
