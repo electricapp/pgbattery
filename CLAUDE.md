@@ -76,6 +76,32 @@ All on port 9091 internally (mapped to 9081/9082/9083).
 - `POST /api/v1/backup/create`, `/restore?filename=...`
 - `GET /api/v1/backup/list` — read-only but gated: it leaks filesystem paths, sizes, and the backup schedule, and drives a stat walk of every backup tree
 
+## The local loop
+
+`scripts/preflight.sh` runs every CI gate that works without a runner — fmt,
+clippy, fuzz clippy, machete, typos, prettier, the harness lint and self-tests,
+`cargo test`, `cargo doc` — in about a minute. `.githooks/pre-push` runs it and
+refuses the push on a failure (`git config core.hooksPath .githooks` once per
+clone; `SKIP_PREFLIGHT=1 git push` to bypass). Each gate names the CI job it
+stands in for and `lint_matrix.py` reconciles the two, so a lint job added to
+CI without a gate here fails the harness lint rather than a push.
+
+Images build with the `ci` cargo profile: release optimisation without the
+whole-program LTO that costs two minutes a link and buys a test nothing.
+`release.yml` still ships `release`.
+
+When only the matrix, SQL or Python changed, `docker compose build` is a
+content-hash cache hit and costs seconds — let it run. When Rust changed, the
+in-VM build is slow for a structural reason: `COPY . .` gives cargo fresh
+mtimes, so it refingerprints and rebuilds all three workspace crates for a
+one-line edit. `scripts/dev-image.sh` cross-compiles on the host instead and
+tags the result as the compose images; follow it with `--no-build` or the runner
+rebuilds in the VM and discards it:
+
+```
+scripts/dev-image.sh && ./testing/ci_runner.py --suite ha-parallel --case <id> --no-build
+```
+
 ## Verification layers
 
 Independent layers. Know which one covers a change before adding another. For current counts, ask the tools (`./testing/ci_runner.py --list`, `cargo test --workspace`) rather than trusting a number written here.

@@ -1,9 +1,12 @@
-# syntax=docker/dockerfile:1.4
+# syntax=docker/dockerfile:1.7
 FROM rust:1.97 AS builder
 WORKDIR /app
 
-# Build profile: "release" (default) or "dev" for fast iteration
-ARG BUILD_PROFILE=release
+# Cargo profile for the binary. `ci` is release optimisation without the
+# whole-program LTO that costs two minutes a link and buys tests nothing; see
+# [profile.ci] in Cargo.toml. `release` is what release.yml ships, `dev` is
+# unoptimised.
+ARG BUILD_PROFILE=ci
 
 # pg_query crate requires libclang for bindgen
 RUN apt-get update && apt-get install -y libclang-dev clang && rm -rf /var/lib/apt/lists/*
@@ -15,15 +18,16 @@ COPY . .
 # data, which `strip` cannot remove.
 ENV RUSTFLAGS="--remap-path-prefix=/app=/src --remap-path-prefix=/usr/local/cargo=/cargo"
 
+# Cargo writes a custom profile to target/<profile>/; only `dev` is spelled
+# differently. Naming the profile rather than branching on it means a new one
+# needs no change here.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    if [ "$BUILD_PROFILE" = "release" ]; then \
-        cargo build --release --locked && cp target/release/pgbattery /pgbattery; \
-    else \
-        cargo build --locked && cp target/debug/pgbattery /pgbattery; \
-    fi
+    cargo build --profile "$BUILD_PROFILE" --locked && \
+    out=$([ "$BUILD_PROFILE" = "dev" ] && echo debug || echo "$BUILD_PROFILE") && \
+    cp "target/$out/pgbattery" /pgbattery
 
-FROM postgres:18 AS runtime
+FROM postgres:18 AS runtime-base
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl && rm -rf /var/lib/apt/lists/*
@@ -45,8 +49,6 @@ RUN ln -sf /usr/lib/*/faketime/libfaketime.so.1 /usr/local/lib/libfaketime.so.1 
 RUN echo "* soft nofile 65536" >> /etc/security/limits.conf && \
     echo "* hard nofile 65536" >> /etc/security/limits.conf
 
-COPY --from=builder /pgbattery /usr/local/bin/pgbattery
-
 RUN mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && \
     chown -R postgres:postgres /var/lib/postgresql
 
@@ -64,6 +66,18 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["pgbattery", "run"]
+
+# The binary is the only thing separating these two stages, and it is the last
+# layer, so both reuse every layer above and switching between them is a copy.
+FROM runtime-base AS runtime
+COPY --from=builder /pgbattery /usr/local/bin/pgbattery
+
+# Local iteration only (`scripts/dev-image.sh`), never CI. Every `COPY . .` in
+# the builder hands cargo fresh mtimes, so the in-VM build refingerprints and
+# rebuilds all three workspace crates for a one-line edit; a host cross-build
+# keeps its own fingerprints and does the same work in a third of the time.
+FROM runtime-base AS runtime-prebuilt
+COPY .devbin/pgbattery /usr/local/bin/pgbattery
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LazyFS build — durability testing only, never in the default image.

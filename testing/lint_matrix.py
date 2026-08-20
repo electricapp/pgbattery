@@ -1048,6 +1048,81 @@ def repo_file_index() -> tuple[set[str], set[str]]:
     return rel_paths, basenames
 
 
+PREFLIGHT_PATH = PROJECT_ROOT / "scripts" / "preflight.sh"
+WORKFLOW_DIR = PROJECT_ROOT / ".github" / "workflows"
+
+MIRRORS = re.compile(r"^[ \t]*#\s*mirrors:\s*(\S+\.yml):(\S+)[ \t]*$", re.MULTILINE)
+"""`# mirrors: ci.yml:clippy` above a gate in `preflight.sh`."""
+
+PREFLIGHT_CANNOT_RUN: Final[dict[str, str]] = {
+    "ci.yml:msrv": "needs a second toolchain installed; compilation is covered by clippy",
+    "ci.yml:deny": "cargo-deny fetches advisory and license databases over the network",
+    "ci.yml:security": "same, and it is a supply-chain gate rather than a code gate",
+    "ci.yml:bench": "compiles the benchmark harness only; nothing a code edit breaks silently",
+    "ci.yml:build": "release artifact build, minutes long, and the ci profile already compiles everything",
+    "ci.yml:docker": "builds the image, which every harness run does anyway",
+    "ci.yml:actionlint": "lints the workflows themselves; not installed locally, and a workflow edit is not a code edit",
+}
+"""CI jobs `preflight.sh` deliberately does not mirror, and why.
+
+A job absent from both this map and preflight's `# mirrors:` annotations fails
+the lint. That is the point: the failure this script exists to prevent came from
+a check running in CI that nothing ran here.
+"""
+
+
+def workflow_job_names(source: str) -> set[str]:
+    """The job ids defined in a workflow, which are the keys under `jobs:`."""
+    parsed = yaml.safe_load(source)
+    jobs = parsed.get("jobs", {}) if isinstance(parsed, dict) else {}
+    return set(jobs) if isinstance(jobs, dict) else set()
+
+
+def unmirrored_ci_jobs(
+    ci_jobs: Iterable[str], mirrored: Container[str], excused: Container[str]
+) -> list[str]:
+    """CI jobs that `preflight.sh` neither runs nor says why it cannot."""
+    return sorted(job for job in ci_jobs if job not in mirrored and job not in excused)
+
+
+def check_preflight_mirrors_ci() -> None:
+    """Verify `scripts/preflight.sh` still covers every gate CI applies.
+
+    The pre-push hook is only a guarantee while it runs what CI runs. A lint job
+    added to a workflow and not here would go back to being discovered by a red
+    push, which is the failure the script was written to end.
+    """
+    preflight = PREFLIGHT_PATH.read_text(encoding="utf-8")
+    mirrored = {f"{wf}:{job}" for wf, job in MIRRORS.findall(preflight)}
+
+    problems: list[str] = []
+    for claim in sorted(mirrored):
+        workflow, job = claim.split(":", 1)
+        path = WORKFLOW_DIR / workflow
+        if not path.exists():
+            problems.append(f"preflight mirrors {claim}, but {workflow} does not exist")
+        elif job not in workflow_job_names(path.read_text(encoding="utf-8")):
+            problems.append(f"preflight mirrors {claim}, but that workflow defines no such job")
+
+    ci_jobs = {
+        f"ci.yml:{job}"
+        for job in workflow_job_names((WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8"))
+    }
+    unmirrored = unmirrored_ci_jobs(ci_jobs, mirrored, PREFLIGHT_CANNOT_RUN)
+    if unmirrored:
+        problems.append(
+            "CI jobs neither run by preflight.sh nor listed in PREFLIGHT_CANNOT_RUN "
+            f"with a reason: {unmirrored}"
+        )
+
+    stale = sorted(set(PREFLIGHT_CANNOT_RUN) - ci_jobs)
+    if stale:
+        problems.append(f"PREFLIGHT_CANNOT_RUN excuses jobs that no longer exist: {stale}")
+
+    if problems:
+        raise AssertionError(" | ".join(problems))
+
+
 def check_case_cross_references_resolve() -> None:
     """Verify every file a case names is in the repository.
 
@@ -1103,6 +1178,7 @@ def lint() -> None:
     check("CI runs every case, or says why not", check_ci_runs_every_case)
     check("Workflow matrix is derived from the suite", check_workflow_matrix_is_derived)
     check("Case cross-references name real files", check_case_cross_references_resolve)
+    check("preflight.sh mirrors the CI gates", check_preflight_mirrors_ci)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

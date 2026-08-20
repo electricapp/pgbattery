@@ -190,6 +190,16 @@ strip = true
 [profile.release.build-override]
 opt-level = 3
 
+# The profile the test images are built with. Same optimisation level as
+# `release`, without the whole-program LTO and single codegen unit that make a
+# release link take two minutes — a cost the harness pays on every iteration and
+# CI pays on every image, to no benefit for tests whose timings are in seconds.
+# `release.yml` still ships `release`.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 # Flamegraph / profiling: release optimisations + debuginfo for symbol resolution.
 # Usage: cargo flamegraph --profile profiling --bin pgbattery
 [profile.profiling]

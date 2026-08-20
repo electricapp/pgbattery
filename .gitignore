@@ -49,3 +49,6 @@ testing/elle_shim/target/
 testing/elle_shim/.cpcache/
 testing/elle_shim/pom.xml
 testing/third_party/elle/.build-stamp
+
+# Host-cross-compiled binary staged for scripts/dev-image.sh.
+.devbin/

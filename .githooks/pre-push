@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#
+# Refuse a push that CI would reject for a reason this machine could have found.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass for a push that cannot wait:
+#   SKIP_PREFLIGHT=1 git push
+
+set -uo pipefail
+
+if [ "${SKIP_PREFLIGHT:-0}" != "0" ]; then
+  echo "pre-push: SKIP_PREFLIGHT set — pushing without running the CI gates"
+  exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+if ! "$repo_root/scripts/preflight.sh"; then
+  echo
+  echo "pre-push: refusing the push — CI would fail on the gate(s) above."
+  echo "          fix them, or re-run with SKIP_PREFLIGHT=1 git push"
+  exit 1
+fi

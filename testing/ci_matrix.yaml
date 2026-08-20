@@ -2554,7 +2554,15 @@
           "leader_equals": 2,
           "min_healthy_replicas": 2,
           "timeout_sec": 180,
-          "comment": "A restored node that came up as a primary would show two leaders here; one that never came back would show two nodes. Requiring both replicas healthy is also what makes the row-count assertion below a measurement rather than a race: the leader counts a replica healthy once it is streaming."
+          "comment": "A restored node that came up as a primary would show two leaders here; one that never came back would show two nodes."
+        },
+        {
+          "type": "wait_sync",
+          "nodes": [
+            1
+          ],
+          "timeout_sec": 120,
+          "comment": "Streaming is not caught up. The step above passes while the restored node is still replaying, which made the row count below a race that happened to win on a slower image and lose on a faster one; this waits for lag_bytes == 0 on the restored node specifically."
         }
       ],
       "assertions": [

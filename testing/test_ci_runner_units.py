@@ -1534,6 +1534,28 @@ def test_prose_that_only_looks_like_a_path_is_not_a_reference() -> None:
     ) == set()
 
 
+def test_a_new_ci_lint_job_is_caught_rather_than_discovered_by_a_red_push() -> None:
+    """The drift the pre-push hook exists to prevent, in the one direction the
+    hook itself cannot notice: CI grows a gate and nothing runs it locally."""
+    assert lint_matrix.unmirrored_ci_jobs(
+        {"ci.yml:clippy", "ci.yml:newlint"}, {"ci.yml:clippy"}, {}
+    ) == ["ci.yml:newlint"]
+    assert (
+        lint_matrix.unmirrored_ci_jobs(
+            {"ci.yml:clippy", "ci.yml:newlint"},
+            {"ci.yml:clippy"},
+            {"ci.yml:newlint": "needs a runner"},
+        )
+        == []
+    )
+
+
+def test_every_preflight_gate_names_a_job_that_exists() -> None:
+    """Against the real script and the real workflows, so a renamed job is
+    caught here rather than by a gate that quietly stops meaning anything."""
+    lint_matrix.check_preflight_mirrors_ci()
+
+
 def test_a_step_that_expects_a_refusal_does_not_wait_for_writability() -> None:
     """`stale-leader-fencing` and `majority-loss` assert a write is refused.
     Waiting for a writable path there would wait out the clock on the exact
