@@ -2473,7 +2473,7 @@ nothing detects drift.
       matrix.
       _Effort_ M
 
-- [ ] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
+- [x] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
       Both `Torn write (Raft store, ...)` jobs fail intermittently on the
       precondition rather than the tear: "the cluster was not a full voter set
       within 180s", with one node absent from every view. That node's log says
@@ -2538,14 +2538,31 @@ nothing detects drift.
       uninspectable, because a diagnostic that raises replaces the failure it
       was called to explain, which is what the first version of it did.
 
-      **Still open** is the first face: why the catalog is corrupt after a
-      LazyFS crash at all. Both LazyFS instances live in one container, so
-      killing it discards both caches and an index page lost before its WAL is
-      exactly this shape — but that is a hypothesis, and the suite has never
-      reproduced it locally. The diagnosis above is what makes the next
-      occurrence worth reading.
-      **Done when** a node that cannot open its catalog after a LazyFS crash is
-      diagnosed.
+      **The first face is diagnosed: the suite was doing it.** Each node runs
+      two LazyFS instances so a fault aimed at one store cannot damage the
+      other — but both caches live in the container's memory, and the suite
+      restarts its victim with `up -d --force-recreate`, which destroys the
+      container. That discards **both** caches, so every run aimed at `raft.db`
+      was also dirty-crashing PGDATA. An index page written but not yet fsynced
+      comes back as zeros, which is exactly
+      `contains unexpected zero page at block 0`, and it only bites when the
+      recreate happens to catch that page dirty — which is why it was
+      intermittent and why it never reproduced on a quiet local run.
+
+      The separation holds for a fault, then, and not for the restart that
+      follows it. `recreate_victim` checkpoints the PGDATA mount first, so
+      exactly one store is damaged. The Raft mount is deliberately left dirty:
+      that is the fault under test. LazyFS applies a checkpoint in well under a
+      second on these mounts, and the flush waits for the `checkpoint is done`
+      line rather than the `submitted` one above it — writing to the control
+      FIFO succeeds whether or not anything acts on it, which is the mistake
+      this file already records once.
+
+      The durability settings were checked on the way and are not the cause:
+      `fsync`, `full_page_writes` and `data_checksums` are all on, and neither
+      `pg_basebackup` nor `pg_rewind` is invoked with `--no-sync`. WAL replay
+      would have repaired a lost page; the page was lost with the WAL that
+      described it.
       _Effort_ M
 
 - [x] **H-51 — `tests_md_ref` points at documents that do not exist.** All

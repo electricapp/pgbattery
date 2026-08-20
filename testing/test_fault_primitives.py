@@ -2020,6 +2020,59 @@ class TornWriteTests(RunnerFixture):
             fp.verify_torn_write_injected("node1", self.PAGE, expected_bytes=4096)
 
 
+class LazyfsCheckpointTests(unittest.TestCase):
+    """`flush_lazyfs_cache` must wait for the checkpoint to be applied.
+
+    Writing to the control FIFO succeeds whether or not anything reads it, so
+    a flush that trusted the write would report a persisted cache to a caller
+    about to destroy the container.
+    """
+
+    def flush(self, log: str, sent_rc: int = 0) -> None:
+        replies = {
+            "log": fp.CommandResult(0, log, ""),
+            "send": fp.CommandResult(sent_rc, "", ""),
+        }
+
+        def exec_in(container: str, cmd: str, **_: object) -> fp.CommandResult:
+            return replies["send"] if "fifo" in cmd else replies["log"]
+
+        with (
+            mock.patch.object(fp, "exec_in", side_effect=exec_in),
+            mock.patch("time.sleep"),
+        ):
+            fp.flush_lazyfs_cache("node2", mount=fp.LAZYFS_DATA, timeout_s=0.05)
+
+    def test_an_applied_checkpoint_is_accepted(self) -> None:
+        # The count has to rise, so the log must already carry one fewer than
+        # it will after the flush. One line before, one after is the same
+        # count; two is a rise.
+        replies = iter(
+            [
+                fp.CommandResult(0, "", ""),
+                fp.CommandResult(0, "", ""),
+                fp.CommandResult(0, f"[lazyfs.cmds]: {fp.LAZYFS_CHECKPOINT_DONE}\n", ""),
+            ]
+        )
+        with (
+            mock.patch.object(fp, "exec_in", side_effect=lambda *a, **k: next(replies)),
+            mock.patch("time.sleep"),
+        ):
+            fp.flush_lazyfs_cache("node2", mount=fp.LAZYFS_DATA, timeout_s=5.0)
+
+    def test_a_submitted_checkpoint_that_never_lands_is_refused(self) -> None:
+        with self.assertRaises(fp.FaultEffectNotObserved) as caught:
+            self.flush("[lazyfs.cmds]: cache checkpoint request submitted...\n")
+        self.assertIn("un-fsynced writes", str(caught.exception))
+
+    def test_a_fifo_that_cannot_be_written_is_refused(self) -> None:
+        with self.assertRaises(fp.FaultInjectionError):
+            self.flush("", sent_rc=1)
+
+    def test_the_command_word_is_the_one_lazyfs_parses(self) -> None:
+        self.assertEqual(fp.lazyfs_checkpoint_cmd(), "lazyfs::cache-checkpoint")
+
+
 class LazyfsConfigTests(unittest.TestCase):
     """The shipped LazyFS config, checked against what the harness assumes.
 

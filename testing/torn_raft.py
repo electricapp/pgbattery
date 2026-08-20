@@ -487,6 +487,30 @@ def await_writable_leader(timeout_s: float) -> str:
     )
 
 
+def recreate_victim(victim: str) -> fp.CommandResult:
+    """Restart `victim` onto its damaged Raft store, sparing its PostgreSQL.
+
+    Destroying the container is what restarts the node, and it discards both
+    LazyFS caches — so without this the run injects a dirty crash of PGDATA
+    alongside the torn `raft.db` it asked for, and a catalog index whose page
+    was written but never fsynced comes back as zeros. Checkpointing the PGDATA
+    mount first leaves exactly one store damaged, which is the whole reason
+    each node runs two instances.
+
+    The Raft mount is deliberately not checkpointed: its un-fsynced state is
+    the fault under test.
+
+    A container that is not running holds no cache to lose, so the flush is
+    skipped rather than waited out. That case is reached from the failure paths
+    — this is called from a `finally` — and a flush that timed out there would
+    replace the failure it was called to protect against.
+    """
+    running = fp.read_container_runstate(victim)
+    if running is not None and running.status == "running":
+        fp.flush_lazyfs_cache(victim, mount=fp.LAZYFS_DATA)
+    return fp.run(f"docker compose up -d --force-recreate {victim}")
+
+
 def reset_table(node: str) -> None:
     """Empty the probe table so this run's baseline is its own.
 
@@ -630,7 +654,7 @@ def tear_until_page(
         at = occurrence + attempt
         outcome.attempts = attempt + 1
         if attempt:
-            fp.run(f"docker compose up -d --force-recreate {victim}")
+            recreate_victim(victim)
 
         fp.arm_config_torn_write(
             victim, RAFT_DB, occurrence=at, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT
@@ -710,7 +734,7 @@ def tear_a_page(*, target: str, occurrence: int) -> Outcome:
         # disarms it: `/etc/lazyfs-raft.toml` is baked into the image, so a
         # fresh container carries no injection. It runs on the failure paths
         # too, because a fault left armed fires into whatever runs next.
-        restarted = fp.run(f"docker compose up -d --force-recreate {victim}")
+        restarted = recreate_victim(victim)
     if not restarted.ok:
         raise fp.FaultInjectionError(
             f"{victim}: could not restart onto the torn store: {restarted.output}"
@@ -784,7 +808,7 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
         # The tear crashes the Raft store's LazyFS, leaving the mount stale.
         # Recreate rather than restart so the entrypoint remounts both
         # instances through its own tested path.
-        fp.run(f"docker compose up -d --force-recreate {victim}")
+        recreate_victim(victim)
         outcome.victim_healthy, outcome.victim_refused = await_victim_settled(
             victim, CONVERGE_TIMEOUT_S
         )
@@ -938,7 +962,7 @@ def prove_oracle() -> None:
 
     mangle_raft_db(victim)
 
-    fp.run(f"docker compose up -d --force-recreate {victim}")
+    recreate_victim(victim)
     healthy, refused = await_victim_settled(victim, REFUSAL_TIMEOUT_S)
 
     if not refused:

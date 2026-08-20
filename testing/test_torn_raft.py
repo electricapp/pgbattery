@@ -405,6 +405,49 @@ class WritableLeaderTest(unittest.TestCase):
         self.assertIn("no leader", str(caught.exception))
 
 
+class VictimRecreateTest(unittest.TestCase):
+    """Destroying the container discards both LazyFS caches, not just the one
+    the run is aiming at. PGDATA is checkpointed first so exactly one store is
+    damaged; the Raft mount is left dirty because that is the fault."""
+
+    def runstate(self, status: str) -> fp.ContainerRunState:
+        return fp.ContainerRunState(status=status, started_at="t", restart_count=0)
+
+    def test_pgdata_is_checkpointed_and_the_raft_store_is_not(self) -> None:
+        with (
+            mock.patch.object(fp, "read_container_runstate", return_value=self.runstate("running")),
+            mock.patch.object(fp, "flush_lazyfs_cache") as flushed,
+            mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "", "")),
+        ):
+            tr.recreate_victim("node2")
+        flushed.assert_called_once_with("node2", mount=fp.LAZYFS_DATA)
+
+    def test_a_cache_that_will_not_flush_stops_the_run(self) -> None:
+        with (
+            mock.patch.object(fp, "read_container_runstate", return_value=self.runstate("running")),
+            mock.patch.object(
+                fp, "flush_lazyfs_cache", side_effect=fp.FaultEffectNotObserved("no checkpoint")
+            ),
+            mock.patch.object(fp, "run") as ran,
+            self.assertRaises(fp.FaultEffectNotObserved),
+        ):
+            tr.recreate_victim("node2")
+        ran.assert_not_called()
+
+    def test_a_stopped_container_is_recreated_without_waiting_on_a_flush(self) -> None:
+        # Reached from the failure paths, where a flush that timed out would
+        # replace the failure it was called to protect against.
+        for state in (self.runstate("exited"), None):
+            with (
+                mock.patch.object(fp, "read_container_runstate", return_value=state),
+                mock.patch.object(fp, "flush_lazyfs_cache") as flushed,
+                mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "", "")) as ran,
+            ):
+                tr.recreate_victim("node2")
+            flushed.assert_not_called()
+            self.assertTrue(any("--force-recreate" in str(c) for c in ran.call_args_list))
+
+
 class BaselineIsolationTest(unittest.TestCase):
     """The CI job runs the header tear and then the page tear on one cluster.
 
@@ -426,6 +469,8 @@ class BaselineIsolationTest(unittest.TestCase):
             mock.patch.object(tr, "connect", return_value=conn),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "", "")),
+            mock.patch.object(fp, "flush_lazyfs_cache"),
+            mock.patch.object(fp, "read_container_runstate", return_value=None),
             mock.patch.object(tr, "tear_until_page", side_effect=tear),
             mock.patch.object(tr, "await_victim_settled", return_value=(True, False)),
             mock.patch.object(tr, "await_leader", return_value="node1"),
@@ -516,6 +561,8 @@ class PageTearDisarmTest(unittest.TestCase):
             mock.patch.object(tr, "reset_table"),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", side_effect=record),
+            mock.patch.object(fp, "flush_lazyfs_cache"),
+            mock.patch.object(fp, "read_container_runstate", return_value=None),
             mock.patch.object(tr, "tear_until_page", side_effect=tear),
             mock.patch.object(tr, "await_victim_settled", return_value=(True, False)),
             mock.patch.object(tr, "await_leader", return_value="node1"),
@@ -541,6 +588,8 @@ class PageTearDisarmTest(unittest.TestCase):
             mock.patch.object(tr, "reset_table"),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", side_effect=record),
+            mock.patch.object(fp, "flush_lazyfs_cache"),
+            mock.patch.object(fp, "read_container_runstate", return_value=None),
             mock.patch.object(
                 tr, "tear_until_page", side_effect=fp.FaultEffectNotObserved("nothing fired")
             ),

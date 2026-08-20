@@ -3060,6 +3060,66 @@ def arm_torn_write(
     )
 
 
+LAZYFS_CHECKPOINT_DONE: Final[str] = "checkpoint is done"
+"""What LazyFS logs when a `cache-checkpoint` has actually been applied.
+
+Distinct from the "submitted" line above it, which says only that the worker
+read the command — the same distinction every fault primitive here draws
+between asking and landing."""
+
+LAZYFS_CHECKPOINT_TIMEOUT_S: Final[float] = 30.0
+"""How long to wait for one. Measured at well under a second on an idle mount;
+this covers a loaded runner with a large dirty cache."""
+
+
+def lazyfs_checkpoint_cmd() -> str:
+    """The control word that flushes a LazyFS cache to its backing store."""
+    return "lazyfs::cache-checkpoint"
+
+
+def flush_lazyfs_cache(
+    container: str,
+    *,
+    mount: LazyfsMount = LAZYFS_DATA,
+    timeout_s: float = LAZYFS_CHECKPOINT_TIMEOUT_S,
+) -> None:
+    """Persist `mount`'s un-fsynced writes, so a container kill cannot lose them.
+
+    Each node runs two LazyFS instances so a fault aimed at one store cannot
+    damage the other — but both caches live in the container, so destroying it
+    to restart a node discards both. A suite that recreates a container to
+    restart its victim is therefore injecting a second, unasked-for dirty crash
+    into whichever mount it was not aiming at, and un-fsynced PGDATA is as
+    exposed as un-fsynced redb.
+
+    Checkpointing the mount that is not under test restores the separation.
+    Waits for the applied line rather than the submitted one, because writing
+    to the FIFO succeeds whether or not anything acts on it.
+    """
+    before = _lazyfs_log_count(container, LAZYFS_CHECKPOINT_DONE, mount=mount)
+    sent = exec_in(container, lazyfs_control_cmd(lazyfs_checkpoint_cmd(), fifo=mount.fifo))
+    if not sent.ok:
+        raise FaultInjectionError(
+            f"{container}: could not write {mount.fifo}: {sent.output.strip()}"
+        )
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _lazyfs_log_count(container, LAZYFS_CHECKPOINT_DONE, mount=mount) > before:
+            _emit("lazyfs.checkpoint", "flush_lazyfs_cache", container, {"mount": mount.name})
+            return
+        time.sleep(0.5)
+    raise FaultEffectNotObserved(
+        f"{container}: LazyFS did not report '{LAZYFS_CHECKPOINT_DONE}' for the {mount.name} "
+        f"mount within {timeout_s:g}s, so its cache may still hold un-fsynced writes"
+    )
+
+
+def _lazyfs_log_count(container: str, needle: str, *, mount: LazyfsMount = LAZYFS_DATA) -> int:
+    """How many times `needle` appears in `container`'s LazyFS log for `mount`."""
+    log = exec_in(container, lazyfs_log_cmd(log=mount.log))
+    return log.stdout.count(needle) if log.ok else 0
+
+
 def config_torn_op_block(path: str, *, occurrence: int, parts: int, persist: Sequence[int]) -> str:
     """A `[[injection]]` block LazyFS reads at startup, unlike the FIFO form.
 
