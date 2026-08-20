@@ -2319,15 +2319,22 @@ nothing detects drift.
       should do; three of the cases fixed this week disagreed, and the reference
       was no help with any of them.
 
-      "Resolve it to something" is therefore not available: there is no single
-      document to resolve to, and the contents duplicate fields that do exist —
-      the contract tags in brackets restate `contracts`, and the titles restate
-      `id` and `description`. Removal is the only honest option.
-      **Done when** the field is gone from all eighty cases and from
+      "Resolve it to something" is not available: there is no single document to
+      resolve to. But a blanket delete is not right either, and that is the part
+      worth knowing before starting. Most values are pure duplication — the
+      bracketed contract tags restate `contracts`, the titles restate `id` and
+      `description` — so deleting those loses nothing. The eight `BUGS.md:`
+      entries do not: `"SIGSTOP leader + kill sync wedge (openraft 0.9
+      PreVote)"` names the root cause the case was written for, which appears
+      nowhere else in the repository now that `BUGS.md` is gone. The `Audit C3:`
+      pair is the same. Deleting those destroys the only record of why the case
+      exists.
+      **Done when** the duplicated values are gone, the ones carrying provenance
+      are folded into the case `description` first, the field is removed from
       `CaseConfig`, and `lint_matrix.py` refuses a case-level cross-reference to
-      a file that is not in the repository, since an unchecked cross-reference
-      is how this one survived eighty cases and two dead documents.
-      _Effort_ S
+      a file that is not in the repository — since an unchecked cross-reference
+      is how this survived eighty cases and two dead documents.
+      _Effort_ S (mechanical) plus a judgement call per surviving reference
 
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
       `ha-ci.yml` hardcoded five case names into the parallel matrix while the
