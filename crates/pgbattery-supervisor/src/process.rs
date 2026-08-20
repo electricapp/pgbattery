@@ -21,6 +21,17 @@ use pgbattery_core::{Error, NodeId, PgAuthMode, ReplicationSlot, Result, WalLeve
 /// session. The full marker is `__PGBATTERY_SQL_END_<seq>__`.
 const END_MARKER_PREFIX: &str = "__PGBATTERY_SQL_END_";
 
+/// Whether a dead psql session's stderr shows the server answering.
+///
+/// The distinction decides how alarming an unfenceable node is. A session that
+/// ends carrying the server's own `ERROR:` — a corrupt catalog page, say — was
+/// answered, and a server that answers may still be serving writes, so that is
+/// a fence failure worth the split-brain marker. A session that ends with
+/// nothing from the server went away, and an absent server serves nothing.
+fn server_answered(stderr_tail: &str) -> bool {
+    stderr_tail.contains("ERROR:") || stderr_tail.contains("FATAL:")
+}
+
 /// How long a read-only change waits for `pg_reload_conf()`'s SIGHUP to reach
 /// the backend that verifies it. Inside the caller's one-second lease-tick
 /// budget, with room for the psql spawn that issues the change.
@@ -151,13 +162,13 @@ impl LocalSqlClient {
             })?;
             let Some(line) = line else {
                 let detail = self.drain_stderr().await;
-                // Not-ready rather than a generic Postgres error: the session
-                // ended because the server went away, which callers deciding
-                // how alarming a failure is need to tell apart from the server
-                // answering and refusing.
-                return Err(Error::PostgresNotReady(format!(
-                    "Local psql session closed while waiting for SQL result{detail}"
-                )));
+                let text =
+                    format!("Local psql session closed while waiting for SQL result{detail}");
+                return Err(if server_answered(&detail) {
+                    Error::Postgres(text)
+                } else {
+                    Error::PostgresNotReady(text)
+                });
             };
 
             let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
@@ -4631,6 +4642,30 @@ mod tests {
             "pg_rewind failed: pg_rewind: error: source and target cluster are on the same timeline"
                 .to_string()
         )));
+    }
+
+    /// Verbatim from a node whose catalog lost an un-fsynced page to a
+    /// `LazyFS` crash. The session died, but the server answered before it did
+    /// — so this is a server that may still be serving writes, not an absent
+    /// one.
+    const CORRUPT_CATALOG_STDERR: &str = "ERROR:  index \"pg_namespace_nspname_index\" contains \
+         unexpected zero page at block 0\nHINT:  Please REINDEX it.";
+
+    #[test]
+    fn a_session_that_died_carrying_a_server_error_counts_as_answered() {
+        assert!(server_answered(CORRUPT_CATALOG_STDERR));
+        assert!(server_answered(
+            "FATAL:  the database system is in recovery mode"
+        ));
+    }
+
+    #[test]
+    fn a_session_that_died_saying_nothing_counts_as_absent() {
+        assert!(!server_answered(""));
+        assert!(!server_answered(
+            ": psql: error: connection to server on socket \
+             \"/var/run/postgresql/.s.PGSQL.5434\" failed: No such file or directory"
+        ));
     }
 
     /// `pg_rewind`'s exact wording when the target was never part of the

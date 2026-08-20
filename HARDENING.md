@@ -2187,6 +2187,39 @@ nothing detects drift.
       used to stay at four.
       _Effort_ M
 
+- [ ] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
+      Both `Torn write (Raft store, ...)` jobs fail intermittently on the
+      precondition rather than the tear: "the cluster was not a full voter set
+      within 180s", with one node absent from every view. That node's log says
+      why —
+
+      ```
+      ERROR: index "pg_namespace_nspname_index" contains unexpected zero page at block 0
+      ```
+
+      — and it shuts down on `FENCE_FAILURE_SHUTDOWN_THRESHOLD` because the
+      fence cannot probe a server whose catalog will not open. The suite is
+      right to refuse: tearing a node that is not a committed member measures
+      nothing.
+
+      Not reproducible locally — the follower target passes here first try, and
+      the same jobs passed on the commit before and after one that failed. Two
+      real defects were fixed on the way to finding this and neither is it: the
+      tear bar demanded a write the workload cannot produce (H-48), and the OCI
+      runtime's wording for a stopped container was read as a genuine failure
+      instead of an undelivered exec.
+
+      Worth knowing before chasing it: `reset_cluster` does `down -v`, so
+      damage cannot cross the oracle phase into the real run, which points at
+      the cluster's *first* convergence rather than anything the suite did.
+      Both LazyFS instances live in one container, so killing it discards both
+      caches — un-fsynced PGDATA is as exposed as un-fsynced redb, and an index
+      page lost before its WAL is exactly this shape.
+      **Done when** the suite either survives the corruption or reports it as
+      the precondition it is, naming the node and its catalog error rather than
+      a bare convergence timeout.
+      _Effort_ M
+
 - [ ] **H-51 — `tests_md_ref` points at a document that does not exist.** All
       eighty cases carry one, in the shape `"Control Plane 27. Witness Node 2+1
 Topology"`, and `docs/TESTS.md` has never been in the repository — not
