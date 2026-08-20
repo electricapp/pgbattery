@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -96,6 +97,36 @@ STORAGE_ERROR_REFUSAL: Final[str] = "generic storage error: no recovery instruct
 UNKNOWN_REFUSAL: Final[str] = "unknown"
 """The node is down and none of the store-damage markers explain why, so the
 refusal cannot be attributed to the tear."""
+
+PAGE_TEAR_OCCURRENCE: Final[int] = 1200
+"""Which write to `raft.db` the page tear aims at, counted from the restarted
+LazyFS's mount.
+
+An idle cluster writes the store at a steady 475-485 writes/min — control-plane
+appends on their own cadence, with no startup burst to clear, since the first
+minute after a mount measures the same 487. So this is about two and a half
+minutes in: long enough that the victim has rejoined and a tear lands on a node
+the cluster has admitted, short enough to leave most of the wait as margin.
+
+Pages are 85% of redb's writes, so a given occurrence is far more often a page
+than a header, and the run reports which it hit rather than assuming."""
+
+PAGE_TEAR_TIMEOUT_S: Final[float] = 420.0
+"""How long to wait for the baked fault to reach its occurrence.
+
+Two and a half times the measured time to reach :data:`PAGE_TEAR_OCCURRENCE`,
+so a runner writing at half the rate still lands the tear."""
+
+PAGE_TEAR_BATCH: Final[int] = 100
+"""Writes issued per attempt, so a run that needed several still reads back a
+distinct key range per attempt rather than re-acking one."""
+
+PAGE_TEAR_ATTEMPTS: Final[int] = 4
+"""Consecutive occurrences to try before giving up on reaching a page.
+
+Each costs a container recreate and a re-settle, so this is not free — but with
+roughly five pages per header, four consecutive headers is not a run that got
+unlucky, it is a run against a write pattern nobody measured."""
 
 BASELINE_WRITES: Final[int] = 200
 MIN_BASELINE_ACKED: Final[int] = 190
@@ -248,6 +279,48 @@ def mgmt(node: str, path: str) -> Any:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
+
+
+def mgmt_token() -> str:
+    """The management API token, from the environment or `.env`.
+
+    CI sets it as an environment variable and compose reads it from `.env`, so
+    a harness that consults only one of the two works in exactly one place.
+    """
+    from_env = os.environ.get("PGBATTERY_MANAGEMENT_API_TOKEN", "").strip()
+    if from_env:
+        return from_env
+    found = fp.run("grep -m1 PGBATTERY_MANAGEMENT_API_TOKEN .env | cut -d= -f2")
+    return found.stdout.strip() if found.ok else ""
+
+
+def make_leader(node: str, timeout_s: float) -> None:
+    """Move leadership to `node`, waiting until the cluster agrees it moved.
+
+    Baking a fault into a config costs a restart, and restarting the leader
+    hands leadership away — so a leader-targeted page tear would otherwise
+    damage a follower's store and report it as the leader case. Transfer is a
+    Raft operation that can be declined, so this waits on the result rather
+    than on the request having been accepted.
+    """
+    deadline = time.monotonic() + timeout_s
+    target = node.removeprefix("node")
+    token = mgmt_token()
+    while time.monotonic() < deadline:
+        current = leaders()
+        if current == [node]:
+            return
+        if current:
+            port = topology.MGMT_PORTS[current[0]]
+            fp.run(
+                f"curl -s -X POST --max-time 10 -H 'x-pgbattery-token: {token}' "
+                f"http://127.0.0.1:{port}/api/v1/cluster/transfer-leadership/{target}"
+            )
+        time.sleep(2)
+    raise fp.FaultPreconditionError(
+        f"leadership would not move to {node} within {timeout_s:g}s, so a leader-targeted "
+        f"tear would have damaged a follower and reported it as the leader"
+    )
 
 
 def leaders() -> list[str]:
@@ -473,6 +546,122 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
     return TearReading(record=records[-1] if records else None)
 
 
+def tear_until_page(
+    victim: str, *, occurrence: int, outcome: Outcome, target: str
+) -> tuple[int, int]:
+    """Arm at stepping occurrences until a tear lands off offset 0; `(bytes, offset)`.
+
+    redb writes one header and roughly five pages per commit, so a header hit
+    means the very next write is almost certainly a page — walking the
+    occurrence forward converges in an attempt or two rather than re-rolling
+    the same guess. Every attempt costs a recreate and a re-settle.
+
+    Raises rather than returning a header: a run that only reached offset 0 has
+    already been covered by the FIFO form and asserts nothing new.
+    """
+    for attempt in range(PAGE_TEAR_ATTEMPTS):
+        at = occurrence + attempt
+        outcome.attempts = attempt + 1
+        if attempt:
+            fp.run(f"docker compose up -d --force-recreate {victim}")
+
+        fp.arm_config_torn_write(
+            victim, RAFT_DB, occurrence=at, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT
+        )
+        # Re-settle before waiting on the fault. A tear that beat this would
+        # have hit a node the cluster had not admitted, which measures nothing.
+        lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
+        if target == "leader":
+            make_leader(victim, CONVERGE_TIMEOUT_S)
+            lead = victim
+        first = BASELINE_WRITES + attempt * PAGE_TEAR_BATCH
+        outcome.acked.extend(write_batch(lead, range(first, first + PAGE_TEAR_BATCH)))
+
+        record = fp.await_torn_record(
+            victim, RAFT_DB, mount=fp.LAZYFS_RAFT, timeout_s=PAGE_TEAR_TIMEOUT_S
+        )
+        if record is None:
+            raise fp.FaultEffectNotObserved(
+                f"no torn write to {RAFT_DB} within {PAGE_TEAR_TIMEOUT_S:g}s at occurrence "
+                f"{at}. The store may not have reached that many writes; this run "
+                f"asserts nothing about torn pages."
+            )
+        persisted, offset = record
+        outcome.observed.append(ObservedTear(bytes=persisted, offset=offset))
+        if offset != 0:
+            return persisted, offset
+
+    raise fp.FaultEffectNotObserved(
+        f"{PAGE_TEAR_ATTEMPTS} consecutive occurrences from {occurrence} all landed "
+        f"on the commit header at offset 0. redb writes about five pages per header, "
+        f"so this is not the write pattern this suite was measured against — the "
+        f"run asserts nothing about torn pages rather than claiming the header case."
+    )
+
+
+def tear_a_page(*, target: str, occurrence: int) -> Outcome:
+    """Tear a committed btree page rather than the commit header.
+
+    The FIFO form cannot: LazyFS pins it to occurrence 1, and redb opens every
+    commit with its 320-byte header, so the next write after arming is always
+    that header. Measured on a running cluster, pages are 85% of the writes to
+    `raft.db` and go through FUSE like everything else — the header-only result
+    was never about visibility.
+
+    So the fault is baked into the victim's LazyFS config, which does honour
+    `occurrence`, and the victim is restarted to load it. `occurrence` counts
+    from that mount, so it has to clear what the node writes coming back up;
+    the cluster is re-settled first and the tear is only then waited on, which
+    means a fault that fired too early shows up as a settle failure rather than
+    as a tear of something that was not yet a member.
+
+    That restart is also why a leader-targeted run moves leadership back onto
+    the victim before waiting: restarting the leader hands leadership away, and
+    tearing a node that stopped being the leader is the follower case under
+    another name.
+    """
+    outcome = Outcome()
+    lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
+    ensure_table(lead)
+    outcome.acked = write_batch(lead, range(BASELINE_WRITES))
+    if len(outcome.acked) < MIN_BASELINE_ACKED:
+        raise fp.FaultPreconditionError(
+            f"only {len(outcome.acked)} of {BASELINE_WRITES} baseline writes were acked "
+            f"before the tear, so there was no working cluster to damage"
+        )
+
+    victim = lead if target == "leader" else next(n for n in topology.NODES if n != lead)
+    outcome.victim = victim
+    outcome.target = target
+
+    try:
+        persisted, offset = tear_until_page(
+            victim, occurrence=occurrence, outcome=outcome, target=target
+        )
+    finally:
+        # One recreate both restarts the victim onto the damaged store and
+        # disarms it: `/etc/lazyfs-raft.toml` is baked into the image, so a
+        # fresh container carries no injection. It runs on the failure paths
+        # too, because a fault left armed fires into whatever runs next.
+        restarted = fp.run(f"docker compose up -d --force-recreate {victim}")
+    if not restarted.ok:
+        raise fp.FaultInjectionError(
+            f"{victim}: could not restart onto the torn store: {restarted.output}"
+        )
+
+    outcome.tears = 1
+    outcome.torn_bytes.append(persisted)
+    outcome.torn_offsets.append(offset)
+    outcome.victim_healthy, outcome.victim_refused = await_victim_settled(
+        victim, CONVERGE_TIMEOUT_S
+    )
+    outcome.refusal = refusal_shape(victim) if outcome.victim_refused else ""
+    lead = await_leader(CONVERGE_TIMEOUT_S)
+    outcome.surviving = read_back(lead)
+    outcome.leaders_after = leaders()
+    return outcome
+
+
 def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int) -> Outcome:
     """Tear `target`'s Raft store `tears` times, retrying for a big enough tear.
 
@@ -485,15 +674,12 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     and nothing here reaches a btree page. That makes this a torn-header test,
     which is a real one — the header is what redb reads to find anything else.
 
-    Why it is only the header is **not** that redb maps its data region, which
-    is what this said before and is not true of the version in use: redb 4 has
-    no mmap anywhere in its sources and writes through `pwrite` (its unix file
-    backend), so a data page is as visible to FUSE as the header is. The likely
-    cause is the arming window instead — LazyFS hardcodes a FIFO torn-op to
-    occurrence 1, so it fires on the very next write to the path, and the next
-    write after a quiet moment is the commit header. Reaching a btree page
-    therefore means arming immediately before a write known to be one, not
-    teaching LazyFS to intercept a mapping that does not exist. HARDENING H-48.
+    Why it is only the header is the arming window, not visibility: redb 4 has
+    no mmap anywhere in its sources and writes through `pwrite`, so a data page
+    reaches FUSE exactly as the header does. LazyFS pins a FIFO torn-op to
+    occurrence 1, so it fires on the very next write to the path, and every
+    redb commit opens with the header. :func:`tear_a_page` is the other
+    structure, and it pays a restart to select a later occurrence.
     """
     outcome = Outcome()
     lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
@@ -745,6 +931,23 @@ def main() -> int:
         "aim past redb's short appends at a page it has committed",
     )
     parser.add_argument(
+        "--structure",
+        choices=("header", "page"),
+        default="header",
+        help="which redb structure to tear. `header` arms over the FIFO, which "
+        "fires on the next write and so always lands on the 320-byte commit "
+        "header. `page` bakes the fault into LazyFS's config at an occurrence "
+        "past the node's own restart, which is the only way to reach a btree "
+        "page — see HARDENING H-48.",
+    )
+    parser.add_argument(
+        "--occurrence",
+        type=int,
+        default=PAGE_TEAR_OCCURRENCE,
+        help="for --structure page: which write to raft.db to tear, counted "
+        "from the restarted LazyFS's mount",
+    )
+    parser.add_argument(
         "--prove-oracle",
         action="store_true",
         help="require a mangled raft.db to be refused before believing a green run",
@@ -759,11 +962,15 @@ def main() -> int:
     if args.prove_oracle:
         prove_oracle()
 
-    outcome = run_tears(
-        tears=args.tears,
-        target=args.target,
-        min_torn_bytes=args.min_torn_bytes,
-        max_attempts=args.attempts or args.tears * 4,
+    outcome = (
+        tear_a_page(target=args.target, occurrence=args.occurrence)
+        if args.structure == "page"
+        else run_tears(
+            tears=args.tears,
+            target=args.target,
+            min_torn_bytes=args.min_torn_bytes,
+            max_attempts=args.attempts or args.tears * 4,
+        )
     )
     print(json.dumps(outcome.as_json(), indent=2))
 

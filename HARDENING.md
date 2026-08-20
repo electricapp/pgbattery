@@ -2590,7 +2590,7 @@ nothing detects drift.
       exclusion is gone and the case runs in the derived matrix, in 16s.
       _Effort_ M
 
-- [ ] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`
+- [x] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`
       arms LazyFS for the next write to `raft.db`, and every write it
       intercepts is the 320-byte header at offset 0. The suite therefore proves
       the header case — which is real, since the header is what redb reads to
@@ -2645,13 +2645,44 @@ nothing detects drift.
       page-write burst inside one commit is microseconds wide.
 
       So timing cannot reach a page, and the change was reverted rather than
-      kept for looking like progress. What is left is occurrence selection: the
-      FIFO form pins it to 1 (`lazyfs_torn_op_cmd` documents that `occurrence=`
-      parses there and is ignored), so the next thing to establish is whether
-      LazyFS honours it in a config-file `[[injection]]` block, which would let
-      a fault be baked at occurrence 2 and land on the first page of a commit.
-      **Done when** a torn write lands on a committed btree page and the node is
-      shown to tolerate it or refuse to start.
+      kept for looking like progress. What was left was occurrence selection,
+      and that is what closed it.
+
+      **Occurrence selection, in the config rather than over the FIFO.** The
+      FIFO form pins a torn-op to occurrence 1 (`lazyfs_torn_op_cmd` documents
+      that `occurrence=` parses there and is ignored). A config-file
+      `[[injection]]` block does not: `config.cpp` requires `occurrence` and
+      passes it to `faults::SplitWriteF`, and `LazyFS::split_write` increments
+      a per-fault counter on every write to the path and fires on exact
+      equality. So a fault can be aimed at an arbitrary write, at the price of
+      a container restart — LazyFS reads injections once, at mount, which also
+      means the occurrence has to clear whatever the node writes coming back up
+      and rejoining.
+
+      `--structure page` does that: it appends the block, restarts the victim,
+      waits for the cluster to re-settle, and only then waits on the tear, so a
+      fault that fired before the node was readmitted surfaces as a settle
+      failure rather than as a tear of a non-member. It reports which structure
+      it actually hit rather than assuming, and steps the occurrence forward if
+      it landed on a header — with roughly five pages per header, walking
+      forward converges in an attempt or two.
+
+      Measured on the running cluster: about 500 writes/min to `raft.db` at
+      idle, so occurrence 1200 is reached in a couple of minutes against a 420 s
+      wait. The first run took it on the first attempt: **2048 bytes persisted
+      of a 4096-byte write at offset 49152** — half a committed btree page. The
+      node came back, rejoined, and kept all 300 acked writes, so a torn data
+      page is tolerated cleanly, as a torn header is.
+
+      Two details worth keeping. The `will persist` line the harness waits for
+      is a `spdlog::warn` on the fault path, not one of the `[lazyfs.ops]`
+      lines, so it appears with `log_all_operations = false` and the suite does
+      not depend on an image built for the measurement above. And a baked
+      injection outlives the run that armed it, unlike a FIFO one, which is
+      consumed when it fires: it stays in the container's config and rearms on
+      every restart. Recreating the victim is the disarm, and it happens on the
+      failure paths too, so a run that never reached its occurrence does not
+      hand the next suite a node that tears a write nobody asked for.
       _Effort_ M
 
 - [x] **H-47 — A counterexample model for every spec.** Only `lease_fencing`

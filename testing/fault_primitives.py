@@ -159,6 +159,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -259,6 +260,7 @@ class LazyfsMount:
     root_dir: str
     fifo: str
     log: str
+    config: str
 
     def holds(self, path: str) -> bool:
         """Whether `path` is a backing-store path belonging to this instance."""
@@ -271,6 +273,7 @@ LAZYFS_DATA: Final[LazyfsMount] = LazyfsMount(
     root_dir=f"{PG_STATE_DIR}/pgdata-root",
     fifo="/tmp/lazyfs.fifo",
     log="/tmp/lazyfs.log",
+    config="/etc/lazyfs.toml",
 )
 """PGDATA. Matches ``testing/lazyfs/lazyfs.toml``, baked in at
 ``/etc/lazyfs.toml`` by the ``runtime-lazyfs`` image stage. The FIFO and log
@@ -283,6 +286,7 @@ LAZYFS_RAFT: Final[LazyfsMount] = LazyfsMount(
     root_dir=f"{PG_STATE_DIR}/raft-root",
     fifo="/tmp/lazyfs-raft.fifo",
     log="/tmp/lazyfs-raft.log",
+    config="/etc/lazyfs-raft.toml",
 )
 """The Raft store, holding redb's ``raft.db``. A separate instance from
 PGDATA's so a fault aimed at one cannot crash the filesystem holding the other,
@@ -324,6 +328,13 @@ REQUIRED_WAL_PATH_PROCESSES: Final[tuple[str, ...]] = ("walwriter", "walreceiver
 has ``walwriter`` and no ``walreceiver``, a standby in recovery has
 ``walreceiver`` and no ``walwriter``. Requiring both would make
 :func:`fsync_stall` refuse to run on every follower."""
+
+LAZYFS_CONFIG_RELOAD_TIMEOUT_S: Final[float] = 90.0
+"""How long to wait for a restarted LazyFS to reprint its config.
+
+Long enough for a node to come back with two mounts on a loaded runner, and
+short enough that a container which failed to restart is reported as such
+rather than waited on until the suite's own budget runs out."""
 
 DEFAULT_TIMEOUT_S: Final[float] = 15.0
 
@@ -3047,6 +3058,100 @@ def arm_torn_write(
         container,
         {"path": path, "parts": parts, "mount": mount.name},
     )
+
+
+def config_torn_op_block(path: str, *, occurrence: int, parts: int, persist: Sequence[int]) -> str:
+    """A `[[injection]]` block LazyFS reads at startup, unlike the FIFO form.
+
+    The FIFO pins a torn-op to occurrence 1, so it tears the first write to the
+    path after arming and nothing else. For redb that is always the 320-byte
+    commit header, because every commit opens with one — which is why the Raft
+    torn-write suite had never reached a btree page and why it is worth paying
+    a container restart to select a later write.
+    """
+    persisted = ", ".join(str(part) for part in persist)
+    return (
+        "\n[[injection]]\n"
+        'type = "torn-op"\n'
+        f'file = "{path}"\n'
+        f"occurrence = {occurrence}\n"
+        f"parts = {parts}\n"
+        f"persist = [{persisted}]\n"
+    )
+
+
+def arm_config_torn_write(
+    container: str,
+    path: str,
+    *,
+    occurrence: int,
+    parts: int = 2,
+    persist: Sequence[int] = (1,),
+    mount: LazyfsMount = LAZYFS_DATA,
+) -> None:
+    """Bake a torn-op into `container`'s LazyFS config and restart it to load it.
+
+    The restart is the cost of occurrence selection: LazyFS reads injections
+    once, at mount. `occurrence` counts writes to `path` from that moment, so it
+    has to clear whatever the node writes coming back up — the caller waits for
+    the cluster to re-settle before treating the fault as pending.
+
+    Confirms the config was re-read, not that the fault fired: that is
+    :func:`await_torn_record`'s job, and the distinction is the same one the
+    FIFO form draws between a command accepted and a command executed.
+    """
+    block = config_torn_op_block(path, occurrence=occurrence, parts=parts, persist=persist)
+    quoted = shlex.quote(block)
+    appended = exec_in(container, f"printf %s {quoted} >> {mount.config}", as_root=True)
+    if not appended.ok:
+        raise FaultInjectionError(f"{container}: could not write {mount.config}: {appended.output}")
+
+    restarted = run(f"docker compose restart {container}")
+    if not restarted.ok:
+        raise FaultInjectionError(f"{container}: could not restart to load the fault")
+
+    # LazyFS reprints its config on every mount, so its absence means the
+    # process did not come back and the fault is not armed at all.
+    deadline = time.monotonic() + LAZYFS_CONFIG_RELOAD_TIMEOUT_S
+    while time.monotonic() < deadline:
+        log = exec_in(container, lazyfs_log_cmd(log=mount.log))
+        if log.ok and "using a custom config" in log.stdout:
+            _emit(
+                "fault.armed",
+                "config_torn_write",
+                container,
+                {"path": path, "occurrence": occurrence, "mount": mount.name},
+            )
+            return
+        time.sleep(2)
+    raise FaultInjectionError(
+        f"{container}: LazyFS did not re-read {mount.config} within "
+        f"{LAZYFS_CONFIG_RELOAD_TIMEOUT_S:g}s, so the torn-op is not armed"
+    )
+
+
+def await_torn_record(
+    container: str,
+    path: str,
+    *,
+    mount: LazyfsMount = LAZYFS_DATA,
+    timeout_s: float,
+) -> tuple[int, int] | None:
+    """Wait for LazyFS to report tearing a write to `path`; `(bytes, offset)`.
+
+    None on timeout, which the caller must not read as "nothing was torn"
+    without saying so: a fault that never fired and a fault whose report could
+    not be read are different findings.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        log = exec_in(container, lazyfs_log_cmd(log=mount.log))
+        if log.ok:
+            records = parse_lazyfs_torn_records(log.stdout, path)
+            if records:
+                return records[-1]
+        time.sleep(3)
+    return None
 
 
 def verify_torn_write_injected(

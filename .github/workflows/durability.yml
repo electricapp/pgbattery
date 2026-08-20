@@ -234,19 +234,26 @@ jobs:
       # stop rather than run on it, then rebuilds the cluster. Without that a
       # green run could not be told apart from a fault that injected nothing.
       #
-      # Every write LazyFS sees on raft.db is redb's 320-byte header at offset
-      # 0 -- redb maps the data region instead of writing it through FUSE -- so
-      # a parts=2 tear persists 160 bytes and a btree page is out of reach on
-      # this path. --min-torn-bytes is set below what the header produces and
-      # above nothing, so the run still fails loudly if the fault stops landing
-      # at all. What it proves is that a torn header leaves the node tolerating
-      # cleanly or refusing to start, which is the contract; the data-page half
-      # is H-48.
+      # A FIFO torn-op fires on the next write to the path, and redb opens
+      # every commit with its 320-byte header, so this step always tears the
+      # header and a parts=2 tear persists 160 bytes of it. --min-torn-bytes is
+      # set below what the header produces and above nothing, so the run still
+      # fails loudly if the fault stops landing at all.
       - name: Prove the oracle can fail, then tear the Raft store's header
         run: |
           uv run --project testing python testing/torn_raft.py \
             --prove-oracle --target ${{ matrix.target }} --tears 1 \
             --min-torn-bytes 128 --attempts 12
+
+      # The other structure. Reaching a committed btree page needs occurrence
+      # selection, which only a config-baked injection honours, so this pays a
+      # restart to aim past the writes the victim makes rejoining. It asserts
+      # the tear landed off offset 0 and refuses to report the header case as
+      # this one. See HARDENING H-48.
+      - name: Tear a committed btree page
+        run: |
+          uv run --project testing python testing/torn_raft.py \
+            --structure page --target ${{ matrix.target }}
 
       - name: Collect diagnostics
         if: failure()

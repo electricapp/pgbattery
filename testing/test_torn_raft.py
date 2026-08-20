@@ -10,6 +10,7 @@ Run with:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -328,6 +329,116 @@ class UnobservedFaultMessageTest(unittest.TestCase):
     def test_a_readable_empty_log_says_the_fault_never_fired(self) -> None:
         message = tr.unobserved_fault_message(outcome(attempts=3), min_torn_bytes=512)
         self.assertIn("never fired", message)
+
+
+class MakeLeaderTest(unittest.TestCase):
+    """Arming a config-baked fault restarts the victim, which moves leadership
+    off it. A leader-targeted run has to put it back or it tears a follower."""
+
+    def test_leadership_already_in_place_asks_for_nothing(self) -> None:
+        with (
+            mock.patch.object(tr, "leaders", return_value=["node2"]),
+            mock.patch.object(fp, "run") as ran,
+        ):
+            tr.make_leader("node2", 5.0)
+        self.assertFalse(
+            any("transfer-leadership" in str(call) for call in ran.call_args_list),
+            "a transfer nobody needs is a leadership change nobody asked for",
+        )
+
+    def test_leadership_that_moves_is_accepted(self) -> None:
+        answers = [["node1"], ["node1"], ["node2"]]
+        with (
+            mock.patch.object(tr, "leaders", side_effect=answers),
+            mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "", "")),
+            mock.patch("time.sleep"),
+        ):
+            tr.make_leader("node2", 60.0)
+
+    def test_leadership_that_will_not_move_refuses_the_run(self) -> None:
+        with (
+            mock.patch.object(tr, "leaders", return_value=["node1"]),
+            mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "", "")),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError) as caught,
+        ):
+            tr.make_leader("node2", 0.05)
+        self.assertIn("would have damaged a follower", str(caught.exception))
+
+
+class MgmtTokenTest(unittest.TestCase):
+    """CI passes the token in the environment; compose reads it from `.env`."""
+
+    def test_the_environment_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"PGBATTERY_MANAGEMENT_API_TOKEN": "from-env"}):
+            self.assertEqual(tr.mgmt_token(), "from-env")
+
+    def test_dot_env_is_the_fallback(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"PGBATTERY_MANAGEMENT_API_TOKEN": ""}),
+            mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "from-dot-env\n", "")),
+        ):
+            self.assertEqual(tr.mgmt_token(), "from-dot-env")
+
+
+class PageTearDisarmTest(unittest.TestCase):
+    """A config-baked torn-op outlives the run that armed it.
+
+    Unlike the FIFO form, which is consumed when it fires, an `[[injection]]`
+    block stays in the container's config and rearms on every restart. Only
+    recreating the container drops it, so the page tear has to do that on the
+    paths where it fails too — otherwise it hands the next suite a node that
+    tears a write nobody asked for.
+    """
+
+    def tear_a_page_with(self, tear: object) -> list[str]:
+        """Run the page tear against a stubbed cluster; the commands it issued."""
+        issued: list[str] = []
+
+        def record(cmd: str, timeout_s: float = 0.0) -> fp.CommandResult:
+            issued.append(cmd)
+            return fp.CommandResult(rc=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
+            mock.patch.object(tr, "ensure_table"),
+            mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
+            mock.patch.object(fp, "run", side_effect=record),
+            mock.patch.object(tr, "tear_until_page", side_effect=tear),
+            mock.patch.object(tr, "await_victim_settled", return_value=(True, False)),
+            mock.patch.object(tr, "await_leader", return_value="node1"),
+            mock.patch.object(tr, "read_back", return_value=set()),
+            mock.patch.object(tr, "leaders", return_value=["node1"]),
+        ):
+            tr.tear_a_page(target="follower", occurrence=tr.PAGE_TEAR_OCCURRENCE)
+        return issued
+
+    def test_a_landed_tear_recreates_the_victim(self) -> None:
+        issued = self.tear_a_page_with(lambda *a, **k: (2048, 49152))
+        self.assertTrue(any("--force-recreate" in cmd for cmd in issued))
+
+    def test_a_fault_that_never_fired_still_recreates_the_victim(self) -> None:
+        issued: list[str] = []
+
+        def record(cmd: str, timeout_s: float = 0.0) -> fp.CommandResult:
+            issued.append(cmd)
+            return fp.CommandResult(rc=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
+            mock.patch.object(tr, "ensure_table"),
+            mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
+            mock.patch.object(fp, "run", side_effect=record),
+            mock.patch.object(
+                tr, "tear_until_page", side_effect=fp.FaultEffectNotObserved("nothing fired")
+            ),
+            self.assertRaises(fp.FaultEffectNotObserved),
+        ):
+            tr.tear_a_page(target="follower", occurrence=tr.PAGE_TEAR_OCCURRENCE)
+        self.assertTrue(
+            any("--force-recreate node" in cmd for cmd in issued),
+            "a run that failed to tear must still leave the victim disarmed",
+        )
 
 
 if __name__ == "__main__":
