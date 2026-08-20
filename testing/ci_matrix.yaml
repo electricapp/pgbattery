@@ -523,9 +523,9 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 30,
+          "timeout_sec": 60,
           "require_replication_health": false,
-          "comment": "30s = watchdog stagger window + safety. Without the watchdog this never recovers. Test goal is leader recovery, not full replica catch-up \u2014 the restarted node may still be Async at the deadline."
+          "comment": "60s covers a second pass over the watchdog schedule, which is the real worst case and not what the old 30s was derived from. First pass is 5s/13s/21s by rank; a node whose attempt lands while it is still restarting simply loses its turn, and its next slot is one full cycle (voters * stagger = 24s) later \u2014 29s for rank 0. The old budget fitted the first pass plus the rank-0 re-fire at 20s, and that 20s only existed because the flat cooldown was preempting rank 2 (see Governor::leaderless_cooldown). Without the watchdog this never recovers at all. Test goal is leader recovery, not full replica catch-up \u2014 the restarted node may still be Async at the deadline."
         }
       ],
       "assertions": [

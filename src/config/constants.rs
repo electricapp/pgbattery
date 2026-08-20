@@ -143,10 +143,10 @@ pub const LEADERLESS_RECOVERY_BASE_TIMEOUTS: u32 = 5;
 /// responses) and the cluster wedges. Wider forces serialisation.
 pub const LEADERLESS_RECOVERY_STAGGER_TIMEOUTS: u32 = 8;
 
-/// Per-node cooldown, in election timeouts, after a forced election fires.
-/// Wider than the stagger so a single watchdog node doesn't re-fire before the
-/// next-rank voter has had its turn.
-pub const LEADERLESS_RECOVERY_COOLDOWN_TIMEOUTS: u32 = 15;
+// The cooldown between one voter's forced elections is not a constant: it is
+// one full pass over the rank schedule, so it depends on how many voters there
+// are. `Governor::leaderless_cooldown` derives it, and carries the account of
+// why a constant was wrong.
 
 /// Metrics watchdog timeout in milliseconds.
 ///
@@ -467,20 +467,14 @@ mod tests {
     fn test_leaderless_recovery_windows_ordered() {
         let base = black_box(LEADERLESS_RECOVERY_BASE_TIMEOUTS);
         let stagger = black_box(LEADERLESS_RECOVERY_STAGGER_TIMEOUTS);
-        let cooldown = black_box(LEADERLESS_RECOVERY_COOLDOWN_TIMEOUTS);
 
         // Stagger must exceed openraft's worst-case election window
         // (2x election timeout) so two ranks' forced elections can't collide
-        // in the same term.
+        // in the same term. The separation between *rounds* is not a constant
+        // and is asserted where it is derived, in `raft.rs`.
         assert!(
             stagger > 2,
             "per-rank stagger must exceed 2x election timeout"
-        );
-        // Cooldown must exceed the stagger so a node doesn't re-fire before the
-        // next-rank voter has had its clear window (the cascade-wedge guard).
-        assert!(
-            cooldown > stagger,
-            "cooldown must exceed stagger so a re-fire can't preempt the next rank"
         );
         // Base gives openraft's own timers (which fire within 1-2 timeouts) a
         // chance before the watchdog forces anything.

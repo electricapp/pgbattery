@@ -2251,9 +2251,46 @@ nothing detects drift.
       be. **Holding Raft leadership and owing recovery to a peer are mutually
       exclusive**, and every route into this state is a place where the two were
       allowed to coexist: a demote-then-win race, or a rewind begun while
-      already leading. Stated that way the guard has a truth source (does
-      PGDATA carry a rewind we have not finished replaying?) rather than a
-      symptom, and does not flap, because the condition clears exactly once.
+      already leading.
+
+      The obvious reading of that — ask PostgreSQL, since it is the one
+      refusing — is **also refuted**, and by the same kind of experiment. Built
+      the state again on `postgres:18` (`initdb`, seed, `pg_basebackup -Xn`,
+      `standby.signal`, stop the primary) and connected to the stuck standby:
+
+      ```
+      standby log:  waiting for WAL to become available at 0/2000098
+      psql:         FATAL:  the database system is starting up
+      ```
+
+      That message is what an ordinary standby says for the second or two
+      between `pg_ctl start` returning and recovery reaching consistency, and
+      so is the more specific `not yet accepting connections / Consistent
+      recovery state has not been yet reached` that the entry above quotes.
+      Neither distinguishes "ready shortly" from "never, without a peer's WAL",
+      so a guard keyed on the connection error would yield leadership during
+      every normal start. **PostgreSQL does not publish the difference**: the
+      only place it appears is the `waiting for WAL` line in the server log,
+      and a guard that greps its own logs is not a truth source.
+
+      What survives is weaker than "does PGDATA carry a pending rewind?" and has
+      to be stated honestly: **this node has been the Raft leader for longer
+      than any legitimate promotion could take, and its PostgreSQL is still not
+      primary.** It cannot name the cause and does not need to — a wedged
+      recovery, a crashed postmaster and a hung start all want the same remedy,
+      which is for a peer that can serve to lead instead. It does not flap
+      provided the bound is well past the hold-down plus a cold start, and
+      provided the yield targets a peer that is actually able to take over
+      rather than merely being someone else.
+
+      The anchor to measure from is the open question left. `failover_started_at`
+      is the obvious one and is `serde(skip)`, so it is local and monotonic as
+      required — but it is `None` after a restart, which is exactly the
+      cascade's shape (node3 restarted mid-promotion), so a guard keyed on it
+      alone would not have fired on the run that produced this entry. The App
+      needs its own not-leader→leader instant, re-derived from `RaftMetrics`
+      each tick the way `ReplicationManager::leader_since` already is, and that
+      is the piece to build first.
       **Done when** a leader that cannot promote its own PostgreSQL yields
       leadership instead of holding it, or the demote-then-win race that creates
       the state is closed, and `cascade-double-failover-wedge` returns to the

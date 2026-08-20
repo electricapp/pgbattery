@@ -810,12 +810,14 @@ impl Governor {
         // we can drop the borrow before any `await` — the Ref is `!Send`.
         // `rank` is this node's 0-based position among the sorted voter ids
         // (i.e. how many voters sort before it); lowest voter id => rank 0.
-        let (has_leader, is_voter, rank) = {
+        let (has_leader, is_voter, rank, voters) = {
             let metrics = metrics_rx.borrow();
             let has_leader = metrics.current_leader.is_some();
             let mut is_voter = false;
             let mut rank: u32 = 0;
+            let mut voters: u32 = 0;
             for id in metrics.membership_config.membership().voter_ids() {
+                voters = voters.saturating_add(1);
                 if id == self.node_id {
                     is_voter = true;
                 } else if id < self.node_id {
@@ -823,7 +825,7 @@ impl Governor {
                 }
             }
             drop(metrics);
-            (has_leader, is_voter, rank)
+            (has_leader, is_voter, rank, voters)
         };
 
         if has_leader {
@@ -848,15 +850,9 @@ impl Governor {
             return;
         }
 
-        // Cooldown: don't re-fire within COOLDOWN election timeouts. Sized
-        // longer than the per-rank stagger so a single watchdog node doesn't
-        // re-fire before the next-rank voter gets its clear window — otherwise
-        // the lowest-rank node would re-fire while a higher rank was just
-        // starting, and openraft's vote state machine rejects the collision.
-        let cooldown = std::time::Duration::from_millis(
-            u64::from(crate::config::constants::LEADERLESS_RECOVERY_COOLDOWN_TIMEOUTS)
-                .saturating_mul(self.election_timeout_ms),
-        );
+        // Cooldown: one full pass over every rank, so a re-fire lands on this
+        // node's own next slot rather than inside someone else's.
+        let cooldown = Self::leaderless_cooldown(voters, self.election_timeout_ms);
         if let Some(last) = runtime.leaderless_recovery_last_fired_at
             && now.duration_since(last) < cooldown
         {
@@ -886,6 +882,24 @@ impl Governor {
         let timeouts = crate::config::constants::LEADERLESS_RECOVERY_BASE_TIMEOUTS.saturating_add(
             rank.saturating_mul(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS),
         );
+        std::time::Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
+    }
+
+    /// How long a voter waits before forcing a *second* election: one full pass
+    /// over the rank schedule, `voters * STAGGER * election_timeout`.
+    ///
+    /// The stagger only separates ranks on their first attempt. A flat cooldown
+    /// separates a node from itself, which is a different property and not the
+    /// one that matters — at three voters and the tuned 5/13/21 s schedule, a
+    /// 15-timeout cooldown put rank 0's second attempt at 20 s, one second
+    /// ahead of rank 2's first. openraft 0.9 rejects the cross-term votes and
+    /// the cluster stays leaderless through the case's whole budget, which is
+    /// the `leaderless-wedge-recovery` flake. Repeating the cycle keeps every
+    /// fire, in every round, a full stagger from every other.
+    fn leaderless_cooldown(voters: u32, election_timeout_ms: u64) -> std::time::Duration {
+        let timeouts = voters
+            .max(1)
+            .saturating_mul(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS);
         std::time::Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
     }
 
@@ -2356,6 +2370,63 @@ mod tests {
         assert_eq!(t0, std::time::Duration::from_secs(5));
         assert_eq!(t1, std::time::Duration::from_secs(13));
         assert_eq!(t2, std::time::Duration::from_secs(21));
+    }
+
+    #[test]
+    fn leaderless_fires_stay_a_stagger_apart_in_every_round() {
+        // The property the old flat cooldown did not have. Rank ordering only
+        // separates first attempts; what has to hold is that no two voters ever
+        // force an election within a stagger of each other, however many rounds
+        // the cluster stays leaderless.
+        let et = 1_000u64;
+        let stagger = std::time::Duration::from_millis(
+            u64::from(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS) * et,
+        );
+        for voters in 1..=7u32 {
+            let cooldown = Governor::leaderless_cooldown(voters, et);
+            let mut fires: Vec<(u32, std::time::Duration)> = Vec::new();
+            for rank in 0..voters {
+                for round in 0..4u32 {
+                    fires.push((
+                        rank,
+                        Governor::leaderless_threshold(rank, et) + cooldown * round,
+                    ));
+                }
+            }
+            fires.sort_by_key(|&(_, at)| at);
+            for pair in fires.windows(2) {
+                let (Some(&(first_rank, first_at)), Some(&(next_rank, next_at))) =
+                    (pair.first(), pair.get(1))
+                else {
+                    continue;
+                };
+                if first_rank == next_rank {
+                    continue;
+                }
+                // Sorted, so this never saturates; `checked_sub` only to keep
+                // the clippy lint that bans bare Duration subtraction happy.
+                let gap = next_at.saturating_sub(first_at);
+                assert!(
+                    gap >= stagger,
+                    "voters={voters}: rank {next_rank} fires at {next_at:?}, only \
+                     {gap:?} after rank {first_rank} at {first_at:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaderless_cooldown_outlasts_the_last_ranks_first_attempt() {
+        // The concrete regression: three voters, rank 0 re-firing at 20s when
+        // rank 2 had not yet had its 21s turn.
+        let et = 1_000u64;
+        let cooldown = Governor::leaderless_cooldown(3, et);
+        let rank0_second = Governor::leaderless_threshold(0, et) + cooldown;
+        let rank2_first = Governor::leaderless_threshold(2, et);
+        assert!(
+            rank0_second > rank2_first,
+            "rank 0 re-fires at {rank0_second:?}, preempting rank 2 at {rank2_first:?}"
+        );
     }
 
     #[test]
