@@ -2215,9 +2215,31 @@ nothing detects drift.
       Both LazyFS instances live in one container, so killing it discards both
       caches — un-fsynced PGDATA is as exposed as un-fsynced redb, and an index
       page lost before its WAL is exactly this shape.
-      **Done when** the suite either survives the corruption or reports it as
-      the precondition it is, naming the node and its catalog error rather than
-      a bare convergence timeout.
+
+      **The second face is the one to fix, and it is not the suite's.** A third
+      occurrence showed node3 restart-looping on
+
+      ```
+      Error: Data directory /var/lib/postgresql/data is not empty.
+      ```
+
+      which is the same refusal `docs/MEMBERSHIP.md` documents for a node that
+      was removed. Here nobody removed it: its first join populated PGDATA and
+      then died — on the fence threshold, in the run above — before the
+      membership add committed. From then on it is stuck for good. `join`
+      clones before the node is a committed member, so a death in that window
+      leaves a data directory that blocks every retry, and the node can never
+      become a voter again without a human emptying it.
+
+      Wiping it automatically would be safe on the facts — a node absent from
+      membership holds nothing the cluster depends on, and §3a's lineage check
+      can confirm the data is even this cluster's — but "delete the data
+      directory on your own initiative" is a decision to take deliberately
+      rather than late in a debugging session, which is why this is written
+      down instead of done.
+      **Done when** a node that dies mid-join can retry, and the suite reports a
+      stuck node as the precondition it is rather than as a bare convergence
+      timeout.
       _Effort_ M
 
 - [ ] **H-51 — `tests_md_ref` points at a document that does not exist.** All

@@ -3239,6 +3239,11 @@
           "type": "cmd",
           "comment": "and remove the container: a stopped-but-present one still answers `compose ps -a`.",
           "cmd": "docker compose --profile witness rm -sf witness"
+        },
+        {
+          "type": "cmd",
+          "comment": "Wait for the leader to stop counting the witness as a replica. Its streaming connection outlives the container by a moment, and the next case's wait treats three replicas on a three-node cluster as an illegal state — correctly, since only this case's fourth node made it legal.",
+          "cmd": "for i in $(seq 1 60); do n=$(docker compose exec -T node1 psql -U postgres -h localhost -p 5434 -t -A -c 'SELECT count(*) FROM pg_stat_replication' 2>/dev/null || echo 9); if [ \"$n\" -le 2 ]; then exit 0; fi; sleep 1; done; echo 'witness still streaming after 60s'; exit 1"
         }
       ]
     },
