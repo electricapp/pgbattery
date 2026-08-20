@@ -1196,13 +1196,7 @@ pub(super) async fn transfer_leadership(
         confirm_target_ready(target_mgmt_addr, state.management_api_token.as_deref()).await
     {
         warn!(target_node_id, error = %e, "Refusing leadership transfer: target not ready");
-        // A refusal is "not yet" — the target is demoting and will be able to
-        // take it shortly, so callers retry. Being unable to reach it at all is
-        // not the same answer and must not read as one.
-        let status = match e {
-            TriggerElectError::Refused(_) => StatusCode::CONFLICT,
-            TriggerElectError::Transport(_) => StatusCode::BAD_GATEWAY,
-        };
+        let status = transfer_refusal_status(&e);
         return (
             status,
             Json(TransferResponse {
@@ -1271,8 +1265,12 @@ pub(super) async fn transfer_leadership(
         // can spend timing out.
         drop(hb_guard);
         error!(error = %e, target_node_id, "Failed to trigger election on target");
+        // The refusal can arrive here too, not only before the drain: the
+        // target's supervisor can take the lock for a demote while this leader
+        // is draining, which is what a rapid cascade produces on every hop.
+        let status = transfer_refusal_status(&e);
         return (
-            StatusCode::BAD_GATEWAY,
+            status,
             Json(TransferResponse {
                 success: false,
                 message: format!("Failed to contact node {target_node_id}: {e}"),
@@ -1360,6 +1358,20 @@ enum TriggerElectError {
     /// Target accepted the request but refused to elect (e.g. 503 because
     /// its supervisor is busy demoting, or it's not the leader).
     Refused(StatusCode),
+}
+
+/// The status a failed election trigger deserves.
+///
+/// A target that answers and refuses is saying "not yet" — its supervisor took
+/// the lock for a demote and will be able to take leadership shortly — so the
+/// caller retries. One that cannot be reached is a different answer and must
+/// not read as the same one. Both trigger sites share this, because the caller
+/// cannot tell which of them refused and should not have to.
+const fn transfer_refusal_status(error: &TriggerElectError) -> StatusCode {
+    match error {
+        TriggerElectError::Refused(_) => StatusCode::CONFLICT,
+        TriggerElectError::Transport(_) => StatusCode::BAD_GATEWAY,
+    }
 }
 
 impl std::fmt::Display for TriggerElectError {
@@ -1461,6 +1473,21 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    /// A target that answers and refuses is retryable, and the caller decides
+    /// that from the status alone. Reporting it as 502 — which the trigger
+    /// inside the lame-duck window did — tells the caller not to retry a
+    /// transfer that would succeed a moment later, and a rapid cascade
+    /// produces exactly that refusal on every hop: each transfer demotes the
+    /// previous leader, and the next can reach it while the demote still holds
+    /// its supervisor lock.
+    #[test]
+    fn a_target_that_refuses_is_a_conflict_not_a_bad_gateway() {
+        assert_eq!(
+            transfer_refusal_status(&TriggerElectError::Refused(StatusCode::SERVICE_UNAVAILABLE)),
+            StatusCode::CONFLICT
+        );
+    }
 
     /// Build a membership with the given voters and `(id, raft_addr)` learners.
     /// Voter addresses follow the `10.0.0.{id}:5433` convention.
