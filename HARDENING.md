@@ -2150,6 +2150,37 @@ nothing detects drift.
       model's.
       _Effort_ M
 
+- [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
+      `ha-ci.yml` hardcodes five case names into the parallel matrix while the
+      suite holds seventeen, so **twelve cases are executed by no workflow at
+      all** — written, maintained, counted in `--list`, and never run. Nothing
+      reconciles the two lists, which is the same drift `lint_matrix.py` exists
+      to catch everywhere else.
+
+      Running the suite locally found two of the twelve broken.
+      `lsn-leaderless-livelock-recovery` is fixed here: `metric_leader_count`
+      polled every node and raised on a refused connection, so the assertion
+      could not be used by any case that kills a node — which is what it was
+      written for. A refused port now counts as not-leader (nothing is
+      listening, so nothing is leading) while a timeout or a missing metric
+      stays fatal, because a node that is up but silent could be the second
+      leader this must never miss.
+
+      `backup-restore-valid` is **not** fixed, and has never been able to pass:
+      it POSTs a full restore to node1 while node1 is the leader, and the API
+      has refused exactly that since the initial commit — "Refusing full restore
+      on the current leader: it overwrites the live primary's data directory."
+      The case and the guard were committed together. Making it pass is a
+      design question rather than a repair: a full restore is only accepted on a
+      standby, and a restored standby is re-synced from the leader, so
+      "the cluster returns to the pre-insert snapshot" is not what the supported
+      operation does. What is assertable — that a standby restore is accepted
+      and does not roll the live cluster back — is a different claim from the
+      one the case makes.
+      **Done when** the matrix is derived from the suite rather than restated,
+      every case in it runs, and any case deliberately excluded says why.
+      _Effort_ M
+
 - [ ] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`
       arms LazyFS for the next write to `raft.db`, and every write it
       intercepts is the 320-byte header at offset 0: redb maps the data region

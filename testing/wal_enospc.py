@@ -403,6 +403,13 @@ def await_writable_leader(timeout_s: float, *, via: str) -> str:
                 cur.execute("SELECT pg_is_in_recovery()")
                 row = cur.fetchone()
                 if row is not None and row[0] is False:
+                    # Out of recovery is not writable. A promoted primary stays
+                    # read-only until the lease tick recovers writes, and every
+                    # statement after this one is a write — so prove the write
+                    # path rather than the role. Rolled back, and a temp table
+                    # is session-local, so this leaves nothing behind.
+                    cur.execute("CREATE TEMP TABLE wal_enospc_writable_probe(x int)")
+                    conn.rollback()
                     found = leaders()
                     if len(found) == 1:
                         return found[0]

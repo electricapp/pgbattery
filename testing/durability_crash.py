@@ -237,6 +237,12 @@ def await_writable_leader(timeout_s: float) -> str:
                     cur.execute("SELECT pg_is_in_recovery()")
                     row = cur.fetchone()
                     if row is not None and row[0] is False:
+                        # Out of recovery is not writable: a promoted primary
+                        # stays read-only until the lease tick recovers writes.
+                        # The docstring promises a node that accepts a write, so
+                        # take one — rolled back, and session-local.
+                        cur.execute("CREATE TEMP TABLE durability_writable_probe(x int)")
+                        conn.rollback()
                         return node
             except (psycopg.Error, OSError) as exc:
                 last = f"{node}: {str(exc).strip()}"

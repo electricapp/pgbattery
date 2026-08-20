@@ -3142,9 +3142,31 @@ class CIRunner:
                 expected_count = int(step["expected"])
                 leader_metric = "pgbattery_raft_is_leader"
                 observed: dict[int, float] = {}
+                # A node whose metrics port refuses the connection has no
+                # process listening, so it is serving no Raft role either and
+                # counts as not-leader. Cases here kill nodes on purpose, and
+                # treating that as a runner error made the assertion unusable
+                # in exactly the scenarios it exists for. Anything else — a
+                # timeout, a non-200 — stays fatal: a node that is up but not
+                # answering could be a second leader, and this assertion must
+                # not pass while blind to one.
+                refused: list[int] = []
                 count = 0
                 for node_id in sorted(self.node_map):
-                    values = self._poll_metric_values(node_id=node_id, metric_name=leader_metric)
+                    try:
+                        values = self._poll_metric_values(
+                            node_id=node_id, metric_name=leader_metric
+                        )
+                    except RunnerError as exc:
+                        if "refused" not in str(exc).lower():
+                            raise
+                        refused.append(node_id)
+                        continue
+                    if not values:
+                        raise RunnerError(
+                            f"node{node_id} answered without {leader_metric}; the metric "
+                            "moved or the exporter is broken, so the leader count is unknown"
+                        )
                     observed[node_id] = values[0]
                     if values[0] > 0.5:
                         count += 1
@@ -3154,13 +3176,15 @@ class CIRunner:
                         {
                             "expected_leader_count": expected_count,
                             "observed_leader_values": observed,
+                            "refused_nodes": refused,
                         },
                         indent=2,
                     ),
                 )
                 if count != expected_count:
                     raise RunnerError(
-                        f"Expected {expected_count} leader metric=1 nodes, got {count}."
+                        f"Expected {expected_count} leader metric=1 nodes, got {count} "
+                        f"(nodes refusing their metrics port: {refused or 'none'})."
                     )
 
             case StepType.WAIT_METRIC:

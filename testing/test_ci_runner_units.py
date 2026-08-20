@@ -1457,6 +1457,84 @@ def test_pending_migration_entries_still_inject() -> None:
         )
 
 
+def _leader_count_runner(
+    answers: dict[int, list[float] | Exception],
+) -> tuple[DispatchRunner, Path]:
+    """A dispatch runner whose per-node metric reads are canned."""
+    runner = make_dispatch_runner()
+
+    def poll(*, node_id: int, metric_name: str) -> list[float]:
+        _ = metric_name
+        answer = answers[node_id]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    runner._poll_metric_values = poll  # type: ignore[assignment,method-assign]
+    return runner, Path(tempfile.mkdtemp(prefix="leader-count-")) / "step.log"
+
+
+def test_a_killed_node_does_not_break_the_leader_count() -> None:
+    """The assertion exists for cases that kill a node, so a metrics port with
+    nothing listening has to read as not-leader rather than as a runner error."""
+    runner, log = _leader_count_runner(
+        {
+            1: ci_runner.RunnerError("HTTP request failed: [Errno 61] Connection refused"),
+            2: [1.0],
+            3: [0.0],
+        }
+    )
+    runner._execute_step({"type": "metric_leader_count", "expected": 1}, "c", "assert", 0)
+    _ = log
+
+
+def test_a_node_that_is_up_but_silent_still_fails_the_leader_count() -> None:
+    """A timeout is not a refusal: the node may be running and leading, and this
+    assertion must not pass while blind to a second leader."""
+    runner, _ = _leader_count_runner(
+        {
+            1: ci_runner.RunnerError("HTTP request failed: timed out"),
+            2: [1.0],
+            3: [0.0],
+        }
+    )
+    try:
+        runner._execute_step({"type": "metric_leader_count", "expected": 1}, "c", "assert", 0)
+    except ci_runner.RunnerError as exc:
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("a timeout must not be swallowed")
+
+
+def test_a_missing_leader_metric_is_not_a_zero() -> None:
+    """An exporter that answered without the metric tells us nothing; reading
+    it as 'not leader' would let a renamed metric pass silently."""
+    runner, _ = _leader_count_runner({1: [], 2: [1.0], 3: [0.0]})
+    try:
+        runner._execute_step({"type": "metric_leader_count", "expected": 1}, "c", "assert", 0)
+    except ci_runner.RunnerError as exc:
+        assert "pgbattery_raft_is_leader" in str(exc)
+    else:
+        raise AssertionError("a missing metric must not read as zero")
+
+
+def test_two_leaders_still_fail_when_a_third_node_is_down() -> None:
+    """The refusal allowance must not become a way to pass with two leaders."""
+    runner, _ = _leader_count_runner(
+        {
+            1: ci_runner.RunnerError("Connection refused"),
+            2: [1.0],
+            3: [1.0],
+        }
+    )
+    try:
+        runner._execute_step({"type": "metric_leader_count", "expected": 1}, "c", "assert", 0)
+    except ci_runner.RunnerError as exc:
+        assert "got 2" in str(exc)
+    else:
+        raise AssertionError("two leaders must fail regardless of a down node")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
