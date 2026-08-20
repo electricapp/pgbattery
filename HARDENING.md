@@ -2241,6 +2241,19 @@ nothing detects drift.
       serviceable throughout the observed run. That is a design change to the
       leadership path (and needs a story for flapping), which is why it is
       written here rather than attempted at the end of a long session.
+
+      There is a sharper way to say it than "yield when promotion fails", and
+      `pg_rewind` is what makes it sharp. A rewound target is not a database
+      that can be opened; it is a database that must first replay from the
+      source it was rewound onto, which is why PostgreSQL requires it to start
+      under a recovery configuration. So a node with a pending rewind-recovery
+      is, by construction, dependent on a specific peer — and a leader must not
+      be. **Holding Raft leadership and owing recovery to a peer are mutually
+      exclusive**, and every route into this state is a place where the two were
+      allowed to coexist: a demote-then-win race, or a rewind begun while
+      already leading. Stated that way the guard has a truth source (does
+      PGDATA carry a rewind we have not finished replaying?) rather than a
+      symptom, and does not flap, because the condition clears exactly once.
       **Done when** a leader that cannot promote its own PostgreSQL yields
       leadership instead of holding it, or the demote-then-win race that creates
       the state is closed, and `cascade-double-failover-wedge` returns to the
