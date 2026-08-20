@@ -1529,9 +1529,39 @@ def test_a_reference_resolves_by_basename_or_by_path() -> None:
 
 def test_prose_that_only_looks_like_a_path_is_not_a_reference() -> None:
     """Version numbers and config keys must not be read as files to resolve."""
-    assert lint_matrix.file_references(
-        {"c": "openraft 0.9 sets postgresql.conf and postmaster.pid under /tmp/faketime"}
-    ) == set()
+    assert (
+        lint_matrix.file_references(
+            {"c": "openraft 0.9 sets postgresql.conf and postmaster.pid under /tmp/faketime"}
+        )
+        == set()
+    )
+
+
+def test_a_step_of_a_mirrored_job_that_preflight_skips_is_caught() -> None:
+    """Job granularity was not enough. `ruff format --check` shared a job with
+    two commands preflight already ran, so the job read as covered while four of
+    its six steps ran nowhere locally — and one of them failed the push."""
+    job = (
+        "jobs:\n"
+        "  lint:\n"
+        "    steps:\n"
+        "      - run: uv run --project testing ruff format --check testing/\n"
+        "      - run: uv run --python 3.14 --script testing/lint_matrix.py\n"
+    )
+    commands = lint_matrix.job_run_commands(job, "lint")
+    assert len(commands) == 2
+    covered = "gate a uv run --python 3.14 --script testing/lint_matrix.py\n"
+    assert lint_matrix.unrun_job_steps(commands, covered) == [
+        "uv run --project testing ruff format --check testing/"
+    ]
+    assert lint_matrix.unrun_job_steps(commands, covered + "\n".join(commands)) == []
+
+
+def test_a_multi_line_run_block_is_not_matched_as_a_command() -> None:
+    """A script is not a command; matching one as text would fail on whitespace
+    and push authors toward pasting shell into preflight to satisfy a lint."""
+    job = "jobs:\n  lint:\n    steps:\n      - run: |\n          set -e\n          echo hi\n"
+    assert lint_matrix.job_run_commands(job, "lint") == []
 
 
 def test_a_new_ci_lint_job_is_caught_rather_than_discovered_by_a_red_push() -> None:
@@ -1607,7 +1637,7 @@ def _emit_matrix(cases: list[dict[str, object]], suite_cases: list[str]) -> ci_r
     )
 
 
-def _excluded_parallel_case(runner: Any) -> str:
+def _excluded_parallel_case(runner: ci_runner.CIRunner) -> str:
     """The id of a real `ha-parallel` case carrying an exclusion reason.
 
     Named rather than hardcoded: which case is excluded changes as they are

@@ -1029,9 +1029,7 @@ def unresolved_file_references(
     ``src/cluster/network.rs``, and demanding the full path would push authors
     toward writing no reference at all.
     """
-    return sorted(
-        {ref for ref in refs if ref not in rel_paths and Path(ref).name not in basenames}
-    )
+    return sorted({ref for ref in refs if ref not in rel_paths and Path(ref).name not in basenames})
 
 
 def repo_file_index() -> tuple[set[str], set[str]]:
@@ -1059,9 +1057,9 @@ PREFLIGHT_CANNOT_RUN: Final[dict[str, str]] = {
     "ci.yml:deny": "cargo-deny fetches advisory and license databases over the network",
     "ci.yml:security": "same, and it is a supply-chain gate rather than a code gate",
     "ci.yml:bench": "compiles the benchmark harness only; nothing a code edit breaks silently",
-    "ci.yml:build": "release artifact build, minutes long, and the ci profile already compiles everything",
+    "ci.yml:build": "release artifact build; the ci profile already compiles everything",
     "ci.yml:docker": "builds the image, which every harness run does anyway",
-    "ci.yml:actionlint": "lints the workflows themselves; not installed locally, and a workflow edit is not a code edit",
+    "ci.yml:actionlint": "lints the workflows themselves, and is not installed locally",
 }
 """CI jobs `preflight.sh` deliberately does not mirror, and why.
 
@@ -1076,6 +1074,35 @@ def workflow_job_names(source: str) -> set[str]:
     parsed = yaml.safe_load(source)
     jobs = parsed.get("jobs", {}) if isinstance(parsed, dict) else {}
     return set(jobs) if isinstance(jobs, dict) else set()
+
+
+def job_run_commands(source: str, job: str) -> list[str]:
+    """The single-line `run:` commands of one job, in order.
+
+    Single-line only. A multi-line block is a script rather than a command and
+    cannot be matched as text; those stay covered by the `# mirrors:`
+    annotation, which is weaker and is called out where one is used.
+    """
+    parsed = yaml.safe_load(source)
+    steps = parsed.get("jobs", {}).get(job, {}).get("steps", []) or []
+    return [
+        step["run"].strip()
+        for step in steps
+        if isinstance(step, dict)
+        and isinstance(step.get("run"), str)
+        and "\n" not in step["run"].strip()
+    ]
+
+
+def unrun_job_steps(commands: Iterable[str], preflight: str) -> list[str]:
+    """Commands a mirrored job runs that do not appear in `preflight.sh`.
+
+    Verbatim, because a paraphrase is a different gate. `ruff format --check`
+    lived in the same job as two commands preflight already ran, so mirroring at
+    job granularity called that job covered while four of its six steps ran
+    nowhere locally — and one of them failed the push that proved it.
+    """
+    return [command for command in commands if command not in preflight]
 
 
 def unmirrored_ci_jobs(
@@ -1101,8 +1128,14 @@ def check_preflight_mirrors_ci() -> None:
         path = WORKFLOW_DIR / workflow
         if not path.exists():
             problems.append(f"preflight mirrors {claim}, but {workflow} does not exist")
-        elif job not in workflow_job_names(path.read_text(encoding="utf-8")):
+            continue
+        source = path.read_text(encoding="utf-8")
+        if job not in workflow_job_names(source):
             problems.append(f"preflight mirrors {claim}, but that workflow defines no such job")
+            continue
+        missing = unrun_job_steps(job_run_commands(source, job), preflight)
+        if missing:
+            problems.append(f"{claim} runs commands preflight.sh does not: {missing}")
 
     ci_jobs = {
         f"ci.yml:{job}"

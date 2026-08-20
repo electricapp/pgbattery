@@ -54,23 +54,38 @@ echo "preflight: the CI gates that run without a runner"
 # harness lint rather than waiting to fail a push — the same drift that left
 # twelve ha-parallel cases run by nothing.
 #
+# The commands are CI's own, character for character, because the lint matches
+# them that way. Anything reworded here to read better stops being the gate CI
+# applies, which is the whole failure this file exists to prevent.
+#
 # mirrors: ci.yml:fmt
 gate "cargo fmt" cargo fmt --all -- --check
 # mirrors: ci.yml:clippy
 gate "clippy" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 # mirrors: ci.yml:fuzz-clippy
-gate "clippy (fuzz)" env -C fuzz cargo clippy --all-targets --locked -- -D warnings
+gate "clippy (fuzz)" bash -c 'cd fuzz && cargo clippy --all-targets --locked -- -D warnings'
 # mirrors: ci.yml:unused-deps
 gate "cargo machete" cargo machete
 # mirrors: ci.yml:typos
 gate "typos" typos
 # mirrors: prettier.yml:prettier
 gate "prettier (markdown)" npx --yes prettier@3.8.4 --check "**/*.md"
+
 # mirrors: ha-ci.yml:lint-test-harness
-gate "harness lint" ./testing/lint_matrix.py
+gate "ruff format" uv run --project testing ruff format --check testing/
+# mirrors: ha-ci.yml:lint-test-harness
+gate "ruff lint" uv run --project testing ruff check testing/
+# mirrors: ha-ci.yml:lint-test-harness
+gate "mypy strict" uv run --project testing mypy testing/ --strict
+# mirrors: ha-ci.yml:lint-test-harness
+gate "harness lint" uv run --python 3.14 --script testing/lint_matrix.py
+# mirrors: ha-ci.yml:lint-test-harness
+gate "clock injection lint" uv run --python 3.14 --script testing/lint_clock_injection.py
 
 # The harness self-tests gate CI as one job; a single failure there is a
-# checker that can no longer fail, so they are not optional here either.
+# checker that can no longer fail, so they are not optional here either. CI runs
+# them from a multi-line block, which the lint exempts from matching, so this
+# one is kept honest by the annotation rather than by the command text.
 harness_self_tests() {
   local f
   for f in testing/test_*.py; do
@@ -85,7 +100,7 @@ gate "harness self-tests" harness_self_tests
 
 if [ "$QUICK" -eq 0 ]; then
   # mirrors: ci.yml:test
-  gate "cargo test" cargo test --workspace --locked
+  gate "cargo test" cargo test --workspace --verbose --locked
   # mirrors: ci.yml:doc
   gate "cargo doc" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 fi
