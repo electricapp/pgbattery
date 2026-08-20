@@ -2862,10 +2862,22 @@ These close the exit criteria and cannot be done early.
       sweep is not.
       _Closes_ exit criterion 4 · _Effort_ S
 
-- [ ] **H-40 — Re-verify the whole document.** Re-read the escape classes and the
+- [x] **H-40 — Re-verify the whole document.** Re-read the escape classes and the
       register against the implemented state and delete what is no longer true.
-      **Done when** the prose describes the system as it then is, with no gap left
-      unclaimed.
+
+      The pass is done: the escape classes, the risk-window table and the exit
+      criteria now describe the system as it is, and several entries carry
+      refutations of what they used to assert rather than the assertion.
+
+      A pass is worth one day, though, so the recurring half is a gate.
+      `lint_matrix.py` resolves every path this document, `CLAUDE.md`,
+      `docs/STATE_MACHINE.md` and `docs/CONTRACTS.md` name against the
+      repository, by full path or by basename. Three references name nothing on
+      purpose — two are H-51 quoting documents that were never committed, one
+      is a path inside the redb crate — and each is exempted by name with its
+      reason, with a second check that fails when an exemption stops describing
+      anything. `test_lint_matrix.py` drives both to red, so a green lint means
+      they looked.
       _Effort_ S
 
 ## Review pass — one fact, one place

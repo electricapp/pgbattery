@@ -1182,6 +1182,73 @@ def check_case_cross_references_resolve() -> None:
         )
 
 
+PROSE_DOCS: Final[tuple[str, ...]] = (
+    "HARDENING.md",
+    "CLAUDE.md",
+    "docs/STATE_MACHINE.md",
+    "docs/CONTRACTS.md",
+)
+"""Documents that describe the system rather than instruct a tool.
+
+These are the ones a reader consults when the code and their expectation
+disagree, so a path in them that resolves to nothing is a wrong answer given
+with confidence.
+"""
+
+PROSE_REFERENCE_EXEMPT: Final[dict[str, str]] = {
+    "docs/TESTS.md": "H-51 quotes it as a document that was never in the repository",
+    "BUGS.md": "the same",
+    "file_backend/optimized.rs": "a path inside the redb crate, not this repository",
+}
+"""References that name no file here on purpose, and why.
+
+An exemption is a claim about a specific string, so it has to be written down
+next to the check rather than smuggled in as a pattern that would also hide the
+next stale path.
+"""
+
+
+def check_prose_file_references_resolve() -> None:
+    """Verify every file the prose docs name is in the repository.
+
+    Documentation only ever appended to accumulates paths for files that have
+    since moved or gone, and a re-read finds them once. This finds them on every
+    push, which is the difference between an audit and a property.
+    """
+    rel_paths, basenames = repo_file_index()
+    problems = []
+    for doc in PROSE_DOCS:
+        text = (PROJECT_ROOT / doc).read_text(encoding="utf-8")
+        refs = file_references(text) - set(PROSE_REFERENCE_EXEMPT)
+        if unresolved := unresolved_file_references(refs, rel_paths, basenames):
+            problems.append(f"{doc}: {', '.join(unresolved)}")
+    if problems:
+        raise AssertionError(
+            "documentation names files that are not in the repository — " + " | ".join(problems)
+        )
+
+
+def check_prose_exemptions_are_still_needed() -> None:
+    """Verify no exemption names a file that now exists, or that nothing cites.
+
+    An exemption that has outlived its reason is a hole in the check above,
+    kept open by a line nobody reads.
+    """
+    rel_paths, basenames = repo_file_index()
+    cited: set[str] = set()
+    for doc in PROSE_DOCS:
+        cited |= file_references((PROJECT_ROOT / doc).read_text(encoding="utf-8"))
+    stale = sorted(
+        ref
+        for ref in PROSE_REFERENCE_EXEMPT
+        if ref not in cited or ref in rel_paths or Path(ref).name in basenames
+    )
+    if stale:
+        raise AssertionError(
+            "PROSE_REFERENCE_EXEMPT entries that no longer describe anything — " + ", ".join(stale)
+        )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1216,6 +1283,8 @@ def lint() -> None:
     check("Workflow matrix is derived from the suite", check_workflow_matrix_is_derived)
     check("Case cross-references name real files", check_case_cross_references_resolve)
     check("preflight.sh mirrors the CI gates", check_preflight_mirrors_ci)
+    check("Docs name real files", check_prose_file_references_resolve)
+    check("Doc reference exemptions still apply", check_prose_exemptions_are_still_needed)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")
