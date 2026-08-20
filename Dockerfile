@@ -4,8 +4,12 @@ WORKDIR /app
 
 # Cargo profile for the binary. `ci` is release optimisation without the
 # whole-program LTO that costs two minutes a link and buys tests nothing; see
-# [profile.ci] in Cargo.toml. `release` is what release.yml ships, `dev` is
-# unoptimised.
+# [profile.ci] in Cargo.toml.
+#
+# Safe as a default only because nothing published comes from this file:
+# `release.yml` runs `cargo build --release` against the target triple directly,
+# and ci.yml's Docker job is `push: false`. Anything that starts publishing an
+# image built here must pass `--build-arg BUILD_PROFILE=release`.
 ARG BUILD_PROFILE=ci
 
 # pg_query crate requires libclang for bindgen
