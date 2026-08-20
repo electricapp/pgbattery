@@ -1427,7 +1427,7 @@ No new infrastructure. Highest confidence per unit of effort.
 
 The durable fix for a bug class that has already produced one real defect.
 
-- [ ] **H-19 — Build the differential classifier oracle.** Generate SQL, execute
+- [x] **H-19 — Build the differential classifier oracle.** Generate SQL, execute
       it against a real PostgreSQL session, snapshot ground truth from
       `pg_prepared_statements`, `pg_cursors`,
       `pg_locks WHERE locktype = 'advisory'`, `pg_listening_channels()`,
@@ -1453,6 +1453,44 @@ The durable fix for a bug class that has already produced one real defect.
       **Done when** the oracle asserts _if session state changed, the classifier
       said non-migratable_, and it reproduces the known advisory-lock defect when
       the fix is reverted.
+
+      **Built, and the property it asserts is not the one written above.**
+      Demanding non-migratable reports `LISTEN` as a defect, and `LISTEN` is not
+      one: `apply_session_changes` records the channel and replays it onto the
+      migrated backend, so that state survives by being reconstructed rather
+      than by refusing to move. Only `LISTEN "*"` severs, because the channel
+      set cannot then be enumerated. The assertion is therefore that the gateway
+      must **either sever or replay** — `Unnoticed` is the defect, and it is the
+      exact case where a client silently loses state.
+
+      Getting that wrong once was instructive in the other direction too. The
+      first verdict function asked `analyze_query` alone and called `SET`
+      unnoticed, because `SetSessionVar` reaches `not_migratable` through
+      `apply_session_changes` rather than by being a `NonMigratable` variant.
+      An oracle has to model what the gateway concludes, not what one of its
+      functions returns — the prefilters gate the analyzer, which is the H-20
+      shape exactly.
+
+      It lives beside the classifier rather than widening its API, reads six
+      catalogs narrowed to `pg_backend_pid()` and `pg_my_temp_schema()` so a
+      concurrent session cannot move the reading, and takes both fingerprints
+      from one psql invocation because the state is backend-local. Fourteen
+      samples, ten of which leave state and four of which deliberately do not —
+      `SET LOCAL` in a committed transaction leaves nothing, and a corpus where
+      everything is flagged would pass against a classifier that flagged
+      everything. A floor of five state-changing samples fails a run whose
+      fingerprint stopped measuring.
+
+      Reverting the `pg_advisory_lock` token reproduces the defect and names the
+      catalog that moved: `"SELECT pg_advisory_lock(4242)" changed session state
+      (0/0/0/0/0/0 -> 0/0/1/0/0/0) and the gateway neither severs nor replays
+      it`. That is ground truth from PostgreSQL, not the classifier restating
+      itself.
+
+      CI runs it against a `postgres:18` service container — the property is
+      about PostgreSQL's semantics, so it needs a database and not a cluster —
+      and `PGBATTERY_ORACLE_REQUIRED` makes a missing or misspelled psql command
+      fail that job instead of skipping the test, which would report as a pass.
       _Effort_ L
 
 - [x] **H-20 — Add a `LoadStmt` arm.** Done. `LOAD 'lib'` links a shared library

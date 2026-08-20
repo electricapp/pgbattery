@@ -1060,6 +1060,10 @@ PREFLIGHT_CANNOT_RUN: Final[dict[str, str]] = {
     "ci.yml:build": "release artifact build; the ci profile already compiles everything",
     "ci.yml:docker": "builds the image, which every harness run does anyway",
     "ci.yml:actionlint": "lints the workflows themselves, and is not installed locally",
+    "ci.yml:session-state-oracle": (
+        "needs a live PostgreSQL, which CI gets from a service container and a "
+        "developer machine may not have; run it by hand with PGBATTERY_ORACLE_PSQL"
+    ),
 }
 """CI jobs `preflight.sh` deliberately does not mirror, and why.
 

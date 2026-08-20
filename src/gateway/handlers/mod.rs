@@ -4686,3 +4686,267 @@ mod tests {
         assert!(!state.is_migratable());
     }
 }
+
+/// H-19: the differential classifier oracle.
+///
+/// The classifier is a deny-list over a language with roughly two hundred
+/// statement types, so its correctness cannot be argued from its own arms. It
+/// needs a reference, and the only true reference for "did this statement leave
+/// session state behind" is a `PostgreSQL` session and its catalogs. This runs
+/// candidate SQL in a real session, snapshots the six catalogs that expose
+/// backend-local state either side of it, and asserts the one direction that
+/// matters: **if session state changed, the gateway must have marked the
+/// connection non-migratable.** The converse is not asserted — over-marking
+/// severs a connection that could have moved, which is the safe direction and
+/// the whole point of a deny-list.
+///
+/// Skipped unless `PGBATTERY_ORACLE_PSQL` names a command that runs `psql`
+/// against a scratch database, because `cargo test` in CI has neither:
+///
+/// ```text
+/// PGBATTERY_ORACLE_PSQL='docker compose exec -T node1 psql -U postgres -h 127.0.0.1 -p 5434' \
+///     cargo test --lib session_state_oracle -- --nocapture
+/// ```
+#[cfg(test)]
+mod session_state_oracle {
+    use super::{ConnectionHandler, SessionChange};
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    const ORACLE_ENV: &str = "PGBATTERY_ORACLE_PSQL";
+
+    /// Set wherever the oracle is meant to run, so that a missing or misspelled
+    /// `PGBATTERY_ORACLE_PSQL` fails the job instead of skipping it. A test
+    /// that silently declines to run reports exactly like one that ran and
+    /// found nothing, which is the whole failure mode this file exists to
+    /// close.
+    const ORACLE_REQUIRED_ENV: &str = "PGBATTERY_ORACLE_REQUIRED";
+
+    /// The six catalogs, each narrowed to this backend.
+    ///
+    /// Narrowing is what makes the reading a fact about the session rather than
+    /// about the instance: `pg_locks` and `pg_class` are cluster-wide, so an
+    /// unscoped count would move when anything else on the node took an
+    /// advisory lock or made a temp table, and the oracle would report a
+    /// violation belonging to another session.
+    const FINGERPRINT: &str = "(SELECT count(*)::text FROM pg_prepared_statements) || '/' || \
+        (SELECT count(*)::text FROM pg_cursors) || '/' || \
+        (SELECT count(*)::text FROM pg_locks \
+            WHERE locktype = 'advisory' AND pid = pg_backend_pid()) || '/' || \
+        (SELECT count(*)::text FROM pg_listening_channels()) || '/' || \
+        (SELECT count(*)::text FROM pg_class \
+            WHERE relpersistence = 't' AND relnamespace = pg_my_temp_schema()) || '/' || \
+        (SELECT count(*)::text FROM pg_settings WHERE source = 'session')";
+
+    /// One candidate. `cleanup` runs after the second snapshot, so a sample may
+    /// leave a permanent object behind without poisoning the next one.
+    struct Sample {
+        sql: &'static str,
+        setup: Option<&'static str>,
+        cleanup: Option<&'static str>,
+    }
+
+    const fn s(sql: &'static str) -> Sample {
+        Sample {
+            sql,
+            setup: None,
+            cleanup: None,
+        }
+    }
+
+    const fn s_around(sql: &'static str, setup: &'static str, cleanup: &'static str) -> Sample {
+        Sample {
+            sql,
+            setup: Some(setup),
+            cleanup: Some(cleanup),
+        }
+    }
+
+    /// Deliberately mixed. The statements that leave nothing behind are not
+    /// padding: they are what stops this passing because every sample happens
+    /// to be flagged, which a classifier that marked everything would achieve
+    /// too.
+    fn samples() -> Vec<Sample> {
+        vec![
+            s("SELECT 1"),
+            s("SELECT pg_advisory_lock(4242)"),
+            s("SELECT pg_try_advisory_lock(4243)"),
+            s("SELECT pg_advisory_lock_shared(4244)"),
+            s("SELECT set_config('search_path', 'public', false)"),
+            s("CREATE TEMP TABLE oracle_tmp (id int)"),
+            s("CREATE TEMP TABLE oracle_tmp_as AS SELECT 1 AS id"),
+            s("PREPARE oracle_ps AS SELECT 1"),
+            s("LISTEN oracle_channel"),
+            s("SET search_path = pg_catalog, public"),
+            s("BEGIN; DECLARE oracle_cur CURSOR WITH HOLD FOR SELECT 1; COMMIT"),
+            s_around(
+                "CREATE TABLE oracle_perm (id int)",
+                "DROP TABLE IF EXISTS oracle_perm",
+                "DROP TABLE IF EXISTS oracle_perm",
+            ),
+            s_around(
+                "INSERT INTO oracle_perm2 VALUES (1)",
+                "CREATE TABLE IF NOT EXISTS oracle_perm2 (id int)",
+                "DROP TABLE IF EXISTS oracle_perm2",
+            ),
+            s("BEGIN; SET LOCAL search_path = public; COMMIT"),
+        ]
+    }
+
+    /// What the gateway does about a statement's session state.
+    ///
+    /// Severing is not the only correct answer, and an oracle that demanded it
+    /// would report `LISTEN` as a defect: the gateway tracks channels and
+    /// replays them on the new backend, so that state survives migration by
+    /// being reconstructed rather than by refusing to migrate. Only `Unnoticed`
+    /// is a defect — state left behind that nothing recorded and nothing
+    /// severed for, which is the case where a client silently loses it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        /// The connection is marked non-migratable and failover severs it.
+        Severs,
+        /// The change is tracked and replayed onto the migrated backend.
+        Replays,
+        /// The gateway saw nothing.
+        Unnoticed,
+    }
+
+    /// What the gateway concludes, prefilters and analyzer together.
+    ///
+    /// The analyzer alone is not the verdict, and asking it alone would make
+    /// this oracle disagree with the running gateway: `analyze_query` runs only
+    /// when a prefilter recognises the statement, and function-call state
+    /// (`set_config`, the advisory-lock family) never reaches it because that
+    /// flag is authoritative on its own. H-20 is the precedent — an arm sat
+    /// unreachable in production while its own test passed, because the test
+    /// called the analyzer directly and could not see a missing gate keyword.
+    fn gateway_verdict(query: &str) -> Verdict {
+        let flags = ConnectionHandler::query_keyword_flags(query);
+        if flags.function_state {
+            return Verdict::Severs;
+        }
+        if !(ConnectionHandler::might_contain_session_state_command(query)
+            || flags.subscription
+            || flags.temp_object)
+        {
+            return Verdict::Unnoticed;
+        }
+        let changes = ConnectionHandler::analyze_query(query).session_changes;
+        if changes.is_empty() {
+            return Verdict::Unnoticed;
+        }
+        // `SetSessionVar` and `LISTEN "*"` reach `not_migratable` through
+        // `apply_session_changes` rather than by being `NonMigratable`, so a
+        // predicate that only matched that variant would call both unnoticed.
+        let severs = changes.iter().any(|c| match c {
+            SessionChange::NonMigratable(_) | SessionChange::SetSessionVar => true,
+            SessionChange::Listen(channel) => channel == "*",
+            _ => false,
+        });
+        if severs {
+            Verdict::Severs
+        } else {
+            Verdict::Replays
+        }
+    }
+
+    /// Run `script` through the configured psql and return its stdout.
+    fn psql(prefix: &str, script: &str) -> Result<String, String> {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{prefix} -tA -q -v ON_ERROR_STOP=1"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not spawn psql: {e}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "psql stdin unavailable".to_string())?
+            .write_all(script.as_bytes())
+            .map_err(|e| format!("could not write to psql: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("psql did not complete: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The two fingerprints either side of `sample`, from one session.
+    ///
+    /// One session is the whole point: the state under test is backend-local,
+    /// so a before and an after read on different connections would compare two
+    /// unrelated backends and never see a change at all.
+    fn fingerprints(prefix: &str, sample: &Sample) -> Result<(String, String), String> {
+        let script = format!(
+            "{};\nSELECT 'FP:' || {FINGERPRINT};\n{};\nSELECT 'FP:' || {FINGERPRINT};\n{};\n",
+            sample.setup.unwrap_or("SELECT 1"),
+            sample.sql,
+            sample.cleanup.unwrap_or("SELECT 1"),
+        );
+        let out = psql(prefix, &script)?;
+        let marks: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("FP:"))
+            .collect();
+        match marks.as_slice() {
+            [before, after] => Ok(((*before).to_owned(), (*after).to_owned())),
+            other => Err(format!(
+                "expected two fingerprints, got {}: {out}",
+                other.len()
+            )),
+        }
+    }
+
+    #[test]
+    fn session_state_implies_the_gateway_severs() {
+        let Ok(prefix) = std::env::var(ORACLE_ENV) else {
+            assert!(
+                std::env::var(ORACLE_REQUIRED_ENV).is_err(),
+                "{ORACLE_REQUIRED_ENV} is set but {ORACLE_ENV} is not, so the oracle \
+                 would have skipped in the one place built to run it"
+            );
+            eprintln!("{ORACLE_ENV} unset — skipping the differential oracle");
+            return;
+        };
+
+        let mut changed = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+        for sample in samples() {
+            // A sample that cannot run is a broken sample, not a pass: the
+            // corpus is ours, so every entry has to be valid SQL here.
+            let (before, after) = match fingerprints(&prefix, &sample) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    violations.push(format!("sample {:?} did not run: {e}", sample.sql));
+                    continue;
+                }
+            };
+            let left_state = before != after;
+            if left_state {
+                changed += 1;
+            }
+            let verdict = gateway_verdict(sample.sql);
+            if left_state && verdict == Verdict::Unnoticed {
+                violations.push(format!(
+                    "{:?} changed session state ({before} -> {after}) and the gateway \
+                     neither severs nor replays it",
+                    sample.sql
+                ));
+            }
+            eprintln!("{:<64} state={left_state:<5} {verdict:?}", sample.sql);
+        }
+
+        // Without this the oracle passes on a corpus that touched nothing,
+        // which is what a broken fingerprint or a psql that quietly did nothing
+        // produces — and it would read as the classifier being correct.
+        assert!(
+            changed >= 5,
+            "only {changed} samples changed session state; the fingerprint is not measuring"
+        );
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+}
