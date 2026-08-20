@@ -2350,11 +2350,26 @@ nothing detects drift.
       refusal, so a peer that re-bootstrapped under the same node id cannot talk
       a node into destroying real data.
 
-      **Still open** is the first face: the corrupt catalog, and the suite
-      reporting a stuck node as a bare convergence timeout rather than as the
-      precondition failure it is.
+      **The suite now names what stalled it.** The precondition said which node
+      was missing from the voter views and never why, so a node shut down on the
+      fence threshold over a catalog it cannot open read exactly like a slow
+      start — which is what made three occurrences look like three different
+      flakes. On timeout it now reports, per node that is not a full voter, the
+      container's status and restart count and the last line of its log matching
+      a known stall signature; both shapes seen in CI are among them, and a node
+      matching none is reported as such rather than silently. The diagnosis is
+      best-effort by construction — a node it cannot inspect is named as
+      uninspectable, because a diagnostic that raises replaces the failure it
+      was called to explain, which is what the first version of it did.
+
+      **Still open** is the first face: why the catalog is corrupt after a
+      LazyFS crash at all. Both LazyFS instances live in one container, so
+      killing it discards both caches and an index page lost before its WAL is
+      exactly this shape — but that is a hypothesis, and the suite has never
+      reproduced it locally. The diagnosis above is what makes the next
+      occurrence worth reading.
       **Done when** a node that cannot open its catalog after a LazyFS crash is
-      diagnosed, and the suite names what stalled it.
+      diagnosed.
       _Effort_ M
 
 - [x] **H-51 — `tests_md_ref` points at documents that do not exist.** All

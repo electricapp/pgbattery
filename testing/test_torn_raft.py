@@ -102,6 +102,52 @@ class SettledClusterTest(unittest.TestCase):
         ):
             tr.await_settled_cluster(0.05)
 
+    def test_the_precondition_names_what_stalled_the_missing_node(self) -> None:
+        """A bare convergence timeout reads as a slow cluster. The two CI
+        occurrences were a node shut down over a catalog it could not open, and
+        one that met a populated data directory — both said so in their logs."""
+        full = membership(*topology.NODES)
+        silent = topology.NODES[-1]
+        corrupt = (
+            'ERROR: index "pg_namespace_nspname_index" contains unexpected zero page at block 0'
+        )
+
+        def reply(node: str, path: str) -> object:
+            if node == silent:
+                return None
+            return mgmt_replies("node1", full)(node, path)  # type: ignore[operator]
+
+        with (
+            mock.patch.object(tr, "mgmt", side_effect=reply),
+            mock.patch.object(
+                fp,
+                "read_container_runstate",
+                return_value=fp.ContainerRunState(
+                    status="restarting", started_at="t", restart_count=7
+                ),
+            ),
+            mock.patch.object(
+                fp, "run", return_value=fp.CommandResult(0, f"noise\n{corrupt}\nmore noise", "")
+            ),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError) as raised,
+        ):
+            tr.await_settled_cluster(0.05)
+        message = str(raised.exception)
+        self.assertIn(silent, message)
+        self.assertIn("unexpected zero page", message)
+        self.assertIn("restarts=7", message)
+
+    def test_a_stall_with_no_known_signature_says_so(self) -> None:
+        """Silence would read as "nothing wrong with that node"."""
+        self.assertIsNone(tr.stall_reason("just some ordinary startup chatter"))
+
+    def test_the_most_recent_stall_line_wins(self) -> None:
+        """A restart-looping node repeats its complaint; the last one is the
+        state it is in now."""
+        log = "FATAL: first thing that went wrong\nFATAL: what it is doing now"
+        self.assertEqual(tr.stall_reason(log), "FATAL: what it is doing now")
+
 
 class ProveOracleTest(unittest.TestCase):
     """The inversion must not damage a node the cluster has not admitted."""
