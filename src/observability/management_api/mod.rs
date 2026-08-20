@@ -264,7 +264,15 @@ const MGMT_API_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 /// implement their own internal budgets, and the timeout layer applies to the
 /// request lifecycle as observed by axum, not to in-flight work after a
 /// streaming response has begun.
-const MGMT_API_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub(crate) const MGMT_API_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// The wedge watchdog calls transfer-leadership on this node's own API. A
+/// caller that gives up first turns the endpoint's refusal into a timeout, and
+/// the watchdog would then retry against an answer it never read.
+const _: () = assert!(
+    crate::config::constants::LEADERSHIP_YIELD_CLIENT_TIMEOUT_SECS > MGMT_API_REQUEST_TIMEOUT_SECS,
+    "the leadership-yield client must outlast the management API's request timeout"
+);
 
 /// Start the management API server.
 ///

@@ -275,8 +275,7 @@ class BaselineAckedTest(unittest.TestCase):
 
     def run_tears_with_baseline(self, acked: list[int]) -> None:
         with (
-            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
-            mock.patch.object(tr, "ensure_table"),
+            mock.patch.object(tr, "await_writable_leader", return_value="node1"),
             mock.patch.object(tr, "write_batch", return_value=acked),
         ):
             tr.run_tears(tears=1, target="follower", min_torn_bytes=512, max_attempts=1)
@@ -329,6 +328,80 @@ class UnobservedFaultMessageTest(unittest.TestCase):
     def test_a_readable_empty_log_says_the_fault_never_fired(self) -> None:
         message = tr.unobserved_fault_message(outcome(attempts=3), min_torn_bytes=512)
         self.assertIn("never fired", message)
+
+
+class WritableLeaderTest(unittest.TestCase):
+    """A settled voter set is not a serving data plane.
+
+    A node that has just rejoined leaves the leader fenced until the sync
+    durability it promises is being delivered again. Waiting only for
+    membership let a run start its baseline into that window, have all 200
+    writes refused, and report "no working cluster to damage" — accurate, but
+    naming the symptom two steps after the cause.
+    """
+
+    def test_a_leader_that_takes_a_write_is_returned_at_once(self) -> None:
+        with (
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
+            mock.patch.object(tr, "leaders", return_value=["node1"]),
+            mock.patch.object(tr, "accepts_a_write") as probed,
+        ):
+            self.assertEqual(tr.await_writable_leader(30.0), "node1")
+        probed.assert_called_once_with("node1")
+
+    def test_a_fenced_leader_is_waited_out_rather_than_used(self) -> None:
+        refusals = [
+            psycopg.errors.ReadOnlySqlTransaction("cannot execute INSERT in a read-only txn"),
+            None,
+        ]
+        with (
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
+            mock.patch.object(tr, "leaders", return_value=["node1"]),
+            mock.patch.object(tr, "accepts_a_write", side_effect=refusals),
+            mock.patch("time.sleep"),
+        ):
+            self.assertEqual(tr.await_writable_leader(30.0), "node1")
+
+    def test_a_leader_that_never_takes_a_write_refuses_the_run(self) -> None:
+        refusal = psycopg.errors.ReadOnlySqlTransaction("read-only transaction")
+        with (
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
+            mock.patch.object(tr, "leaders", return_value=["node1"]),
+            mock.patch.object(tr, "accepts_a_write", side_effect=refusal),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError) as caught,
+        ):
+            tr.await_writable_leader(0.05)
+        self.assertIn("read-only transaction", str(caught.exception))
+
+    def test_the_probe_issues_a_write_and_keeps_none_of_it(self) -> None:
+        # Two traps this gate fell into. CREATE TABLE IF NOT EXISTS against an
+        # existing table is not a write, so it succeeds on a fenced primary and
+        # the gate passes into a cluster that refuses every row a moment later.
+        # And `connect` is autocommit, so a probe that inserts keeps the row
+        # and the second call fails on the primary key it wrote itself.
+        cur = mock.MagicMock()
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+        with mock.patch.object(tr, "connect", return_value=conn):
+            tr.accepts_a_write("node1")
+            tr.accepts_a_write("node1")
+        issued = " ".join(str(call) for call in cur.execute.call_args_list)
+        self.assertIn("DELETE", issued, f"the probe never attempted a write: {issued}")
+        self.assertNotIn(
+            "INSERT", issued, f"an autocommit probe that inserts cannot repeat: {issued}"
+        )
+
+    def test_a_cluster_with_no_leader_says_so(self) -> None:
+        with (
+            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
+            mock.patch.object(tr, "leaders", return_value=[]),
+            mock.patch("time.sleep"),
+            self.assertRaises(fp.FaultPreconditionError) as caught,
+        ):
+            tr.await_writable_leader(0.05)
+        self.assertIn("no leader", str(caught.exception))
 
 
 class MakeLeaderTest(unittest.TestCase):
@@ -400,8 +473,7 @@ class PageTearDisarmTest(unittest.TestCase):
             return fp.CommandResult(rc=0, stdout="", stderr="")
 
         with (
-            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
-            mock.patch.object(tr, "ensure_table"),
+            mock.patch.object(tr, "await_writable_leader", return_value="node1"),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", side_effect=record),
             mock.patch.object(tr, "tear_until_page", side_effect=tear),
@@ -425,8 +497,7 @@ class PageTearDisarmTest(unittest.TestCase):
             return fp.CommandResult(rc=0, stdout="", stderr="")
 
         with (
-            mock.patch.object(tr, "await_settled_cluster", return_value="node1"),
-            mock.patch.object(tr, "ensure_table"),
+            mock.patch.object(tr, "await_writable_leader", return_value="node1"),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", side_effect=record),
             mock.patch.object(

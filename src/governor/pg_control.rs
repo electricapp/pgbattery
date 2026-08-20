@@ -224,6 +224,9 @@ pub enum ModelOp {
     VerifyPromotionSafe,
     Demote,
     SetReadonly,
+    /// The probe itself refusing, which is what a standby that has not reached
+    /// a consistent recovery state does to every connection (H-53).
+    IsInRecovery,
 }
 
 #[cfg(test)]
@@ -272,6 +275,11 @@ impl ModelPg {
 impl PgControl for ModelPg {
     async fn is_in_recovery(&self) -> Result<bool> {
         self.note("is_in_recovery");
+        if self.fails == Some(ModelOp::IsInRecovery) {
+            return Err(pgbattery_core::Error::Postgres(
+                "model: the database system is not yet accepting connections".to_string(),
+            ));
+        }
         Ok(self.in_recovery)
     }
 

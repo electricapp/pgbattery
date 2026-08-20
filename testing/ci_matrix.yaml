@@ -672,7 +672,7 @@
     },
     {
       "id": "cascade-double-failover-wedge",
-      "ci_excluded_reason": "The case is right and the product is not: it fails intermittently on a real liveness defect, so enabling it in CI would report a known product bug as CI flake. A leader whose PostgreSQL is a standby that has not reached a consistent recovery state can never be promoted, because promote() begins with SELECT pg_is_in_recovery() and such a server refuses connections \u2014 so every tick fails identically while the node holds the lease and is published as leader. Observed with node3 leading, its PG waiting on WAL from node1, and node1 returning only to stop its own PG and rewind onto node3. HARDENING H-53 carries the evidence. Run it by name; it passes when the timing does not line up.",
+      "ci_excluded_reason": "The case is right and the product is not: it fails intermittently on a real liveness defect, so enabling it in CI would report a known product bug as CI flake. A leader whose PostgreSQL is a standby that has not reached a consistent recovery state can never be promoted, because promote() begins with SELECT pg_is_in_recovery() and such a server refuses connections. HARDENING H-53 carries the analysis and what remains open. Run it by name; it passes when the timing does not line up.",
       "contracts": [
         "W1",
         "W2",
@@ -761,6 +761,11 @@
           "timeout_sec": 90,
           "require_replication_health": false,
           "comment": "After 3-kill cascade under load, test goal is leader+topology recovery (matches the assertion below). A trailing follower still catching up via basebackup is expected and shouldn't fail the case."
+        },
+        {
+          "type": "wait_sync",
+          "timeout_sec": 180,
+          "comment": "A leader is not a serving cluster: wait_cluster above passes on a leader whose PostgreSQL is dead, because a wedged leader is still a leader. The lag endpoint is served from the leader's own pg_stat_replication and cannot answer while that PostgreSQL refuses connections, so it gates on a serving data plane rather than on topology. The budget covers the promotion watchdog's bound plus a transfer and a promotion."
         }
       ],
       "assertions": [

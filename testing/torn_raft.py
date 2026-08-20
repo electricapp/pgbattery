@@ -128,6 +128,10 @@ Each costs a container recreate and a re-settle, so this is not free — but wit
 roughly five pages per header, four consecutive headers is not a run that got
 unlucky, it is a run against a write pattern nobody measured."""
 
+WRITABILITY_PROBE_KEY: Final[int] = -1
+"""Key the writability probe deletes. Negative so no run ever writes it, which
+is what makes the delete both a real write and a no-op."""
+
 BASELINE_WRITES: Final[int] = 200
 MIN_BASELINE_ACKED: Final[int] = 190
 """How much of the baseline batch must be acked before the first tear.
@@ -433,6 +437,56 @@ def connect(node: str) -> psycopg.Connection[Any]:
     )
 
 
+def accepts_a_write(node: str) -> None:
+    """Raise unless `node` will actually take a write right now.
+
+    A `DELETE` of a key no run uses. `CREATE TABLE IF NOT EXISTS` against a
+    table that already exists is not a write and succeeds on a fenced primary,
+    which is how a gate built on it passed and handed the caller a leader that
+    refused all 200 baseline rows a moment later. `PostgreSQL` refuses a
+    read-only transaction by command type before it runs, so a `DELETE` that
+    matches nothing is as good a probe as one that matches — and unlike the
+    `INSERT` this first used, it is idempotent, which matters because
+    `connect` is autocommit and there is no rollback to undo it with.
+    """
+    with connect(node) as conn, conn.cursor() as cur:
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (k int PRIMARY KEY)")
+        cur.execute(f"DELETE FROM {TABLE} WHERE k = {WRITABILITY_PROBE_KEY}")
+
+
+def await_writable_leader(timeout_s: float) -> str:
+    """A settled cluster whose leader actually accepts a write.
+
+    A settled voter set is not a serving data plane. A node that has just
+    rejoined leaves the leader fenced until the sync durability its list
+    promises is being delivered again, and every write in that window is
+    refused — so a run that waited only for membership got its whole baseline
+    refused and reported "no working cluster to damage", which was true but two
+    steps later than the fact that explains it.
+
+    Leadership is re-read each round rather than held from the settle: the
+    window this waits out is one in which it can still move.
+    """
+    deadline = time.monotonic() + timeout_s
+    await_settled_cluster(timeout_s)
+    refusal = "no write was attempted"
+    while time.monotonic() < deadline:
+        current = leaders()
+        if len(current) == 1:
+            try:
+                accepts_a_write(current[0])
+                return current[0]
+            except (psycopg.Error, OSError) as e:
+                refusal = str(e).strip()
+        else:
+            refusal = f"the cluster named {current or 'no leader'}"
+        time.sleep(2)
+    raise fp.FaultPreconditionError(
+        f"no leader accepted a write within {timeout_s:g}s ({refusal}), so there was no "
+        f"working cluster to damage"
+    )
+
+
 def ensure_table(node: str) -> None:
     with connect(node) as conn, conn.cursor() as cur:
         cur.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (k int PRIMARY KEY)")
@@ -570,7 +624,7 @@ def tear_until_page(
         )
         # Re-settle before waiting on the fault. A tear that beat this would
         # have hit a node the cluster had not admitted, which measures nothing.
-        lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
+        lead = await_writable_leader(CONVERGE_TIMEOUT_S)
         if target == "leader":
             make_leader(victim, CONVERGE_TIMEOUT_S)
             lead = victim
@@ -621,8 +675,7 @@ def tear_a_page(*, target: str, occurrence: int) -> Outcome:
     another name.
     """
     outcome = Outcome()
-    lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
-    ensure_table(lead)
+    lead = await_writable_leader(CONVERGE_TIMEOUT_S)
     outcome.acked = write_batch(lead, range(BASELINE_WRITES))
     if len(outcome.acked) < MIN_BASELINE_ACKED:
         raise fp.FaultPreconditionError(
@@ -682,8 +735,7 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     structure, and it pays a restart to select a later occurrence.
     """
     outcome = Outcome()
-    lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
-    ensure_table(lead)
+    lead = await_writable_leader(CONVERGE_TIMEOUT_S)
     outcome.acked = write_batch(lead, range(BASELINE_WRITES))
     if len(outcome.acked) < MIN_BASELINE_ACKED:
         raise fp.FaultPreconditionError(

@@ -2390,14 +2390,83 @@ nothing detects drift.
       provided the yield targets a peer that is actually able to take over
       rather than merely being someone else.
 
-      The anchor to measure from is the open question left. `failover_started_at`
-      is the obvious one and is `serde(skip)`, so it is local and monotonic as
-      required — but it is `None` after a restart, which is exactly the
-      cascade's shape (node3 restarted mid-promotion), so a guard keyed on it
-      alone would not have fired on the run that produced this entry. The App
-      needs its own not-leader→leader instant, re-derived from `RaftMetrics`
-      each tick the way `ReplicationManager::leader_since` already is, and that
-      is the piece to build first.
+      **Built, and the anchor is the part that decided its shape.**
+      `failover_started_at` is the obvious one and is `serde(skip)`, so it is
+      local and monotonic as required — but it is `None` after a restart, which
+      is exactly the cascade's shape (node3 restarted mid-promotion), so a
+      guard keyed on it alone would not have fired on the run that produced
+      this entry. `PromotionWatchdog` keeps its own not-leader to leader
+      instant, re-derived from `RaftMetrics` on every pass the way
+      `ReplicationManager::leader_since` already is: set on the edge, cleared
+      the moment leadership goes, never written once and trusted. A node that
+      restarts and wins an election has a fresh edge, which is the case the
+      other anchor misses.
+
+      The rule is `wedge_verdict` and holds no clock of its own, so it reads as
+      the sentence it implements: not leader, or `PostgreSQL` known primary, or
+      inside the bound, or inside the cooldown after a previous attempt — hold;
+      otherwise yield. An unreadable probe is deliberately not folded into "not
+      primary", because it is the only thing a wedged standby emits.
+
+      The yield goes through this node's own `transfer-leadership` endpoint
+      rather than driving the Raft handle. That endpoint is where the lease
+      drain, the target's Raft catch-up and PG LSN gates, the readiness call
+      and `transfer_lock` already live, and a second implementation of the
+      handoff would be a second thing to keep correct. The target is the
+      acceptable peer holding the most WAL, `acceptable` being
+      `is_lsn_acceptable_for_promotion`, which fails closed on a peer with no
+      fresh report. No acceptable peer means no yield: moving an outage is not
+      recovering from it, and that case is logged and counted rather than held
+      silently.
+
+      Two things the build changed beyond the watchdog itself.
+      `promote_local_postgres` now fails closed on a role it could not read
+      instead of running `pg_controldata` and an LSN probe against a
+      `PostgreSQL` that is answering nothing and letting `Supervisor::promote`
+      refuse on its own account — the refusal is now stated where every other
+      gate in that function states it. And a `const` assertion pins the yield's
+      client timeout above the management API's own request timeout, so a
+      refusal arrives as a refusal rather than as a timeout the watchdog would
+      retry against an answer it never read.
+
+      `cascade-double-failover-wedge` gained a `wait_sync` after its topology
+      check, which is worth having whatever happens to the rest of this entry.
+      A leader is not a serving cluster, and that is the gap the case fell
+      into: `wait_cluster` passes on the wedge, because a wedged leader is a
+      leader, and only the SQL assertions afterwards noticed. The lag endpoint
+      is served from the leader's own `pg_stat_replication`, so it cannot
+      answer while that `PostgreSQL` refuses connections — which is what makes
+      it the right gate rather than another topology check.
+
+      **Why this stays open: the bound may be unreachable, and that is a new
+      question the build raised.** `handle_supervisor_health_tick` probes
+      `SELECT 1` every second with a 2 s budget and signals process shutdown
+      after five consecutive failures, so a node whose `PostgreSQL` refuses
+      connections asks to be restarted in **ten to twelve seconds** — far
+      inside a 60 s bound. If that is what happens, the watchdog never
+      accumulates the leadership it needs and this entry's original scenario is
+      handled by restart-and-re-elect rather than by yielding, which also means
+      the entry's own premise — that the lease loop "retries identically
+      forever while the node holds the lease" — needs re-checking against that
+      shutdown path. An attempt to measure it by `SIGSTOP`-ing a leader's
+      postmaster did not land the signal (`pkill` returned 137 and the
+      postmaster was still `S`), so this is a question, not a finding.
+
+      The watchdog is kept either way, because the sub-case it certainly does
+      catch is real and persistent: a leader whose `PostgreSQL` is a **healthy
+      standby** that cannot be promoted — refused by the LSN catch-up gate, by
+      `verify_promotion_safe`, or looping on the lease hold-down. There
+      `SELECT 1` succeeds, the health tick is satisfied, the node keeps
+      leadership indefinitely, and `promote_local_postgres` returns
+      `Some(false)` on every pass forever. That is the same symptom with a
+      different cause and no other bound on it.
+
+      **Done when** the connection-refusing state is measured end to end —
+      whether the node holds leadership at all, and for how long — and the
+      bound is set from that measurement rather than from an estimate of what a
+      legitimate promotion costs. If it turns out the node dies at twelve
+      seconds, the remedy belongs on the election side (a node that cannot open
+      its database should not be winning on LSN), not in this watchdog.
       **Done when** a leader that cannot promote its own PostgreSQL yields
       leadership instead of holding it, or the demote-then-win race that creates
       the state is closed, and `cascade-double-failover-wedge` returns to the

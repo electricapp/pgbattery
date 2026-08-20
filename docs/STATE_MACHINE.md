@@ -122,6 +122,20 @@ Every state transition is driven by a **definitive source of truth** — never b
 - **Transition trigger**: `leader_rx.changed()` (event) + 2-second reconcile (safety fallback). Both paths call `App::ensure_follows` (`src/app.rs`).
 - **Snapshot coherence**: the promote-vs-demote decision _and_ the follow-target address derive from one `RaftMetrics::current_leader` read plus the `nodes` membership map; `leader_rx` is a wakeup signal only, never the address source (the watch is populated after the metrics update, so mixing the two snapshots let a just-deposed leader demote toward its own stale address). `demote(addr)` refuses `addr == self`.
 - **Cache**: none. `ensure_follows` calls `promote()` or `demote(addr)` unconditionally; both are idempotent in the supervisor.
+- **What each pass reports**: `ensure_follows` returns a `LeadershipObservation` — whether we are Raft leader, and whether PG is primary as `Some(true)` / `Some(false)` / `None`. `None` is a probe that could not complete, kept distinct from `Some(false)` because it is the only signal a `PostgreSQL` refusing connections emits (see 7a). `promote_local_postgres` fails closed on it, the same rule its LSN gate follows.
+
+### 7a. App orchestration — the leadership / data-plane divergence watchdog
+
+- **Purpose**: Raft leadership and a serving PostgreSQL are separate facts. A node holding the first without the second serves nothing, and its only remedy that does not touch data is to stop being the leader.
+- **States**: `not leading | leading (measuring) | leading (yielded, in cooldown)`. Held in `PromotionWatchdog` (`src/governor/promotion_watchdog.rs`), owned by the supervisor loop.
+- **Source of truth**: `leader_since`, re-derived from `RaftMetrics` on every pass — set on the not-leader → leader edge, cleared the moment leadership goes away, exactly as `ReplicationManager::leader_since` is. Not `failover_started_at`, which is `None` after a restart and so misses a node that restarts and wins an election.
+- **Clock**: the lease clock (`SharedLeaseState::now`), so an injected skew the lease honours is honoured here.
+- **Transition trigger**: the same two paths as section 7, fed the observation that pass already made. The watchdog adds no probe of its own.
+- **The rule**: yield when this node has been Raft leader for longer than `LEADER_WITHOUT_PRIMARY_YIELD_MS` and PG is still not primary. It does not name the cause: nothing the node can read locally distinguishes a wedged standby from a healthy primary, and a wedged recovery, a crashed postmaster and a hung start all want the same remedy.
+- **The action**: `POST /api/v1/cluster/transfer-leadership/{target}` against this node's own management API — section 9's protocol, not a second copy of it. A `const` assertion pins the client timeout above the API's request timeout so a refusal arrives as a refusal.
+- **The target**: the acceptable peer holding the most WAL, `acceptable` being `ClusterState::is_lsn_acceptable_for_promotion` (fail-closed on a peer with no fresh report). No acceptable peer means no yield.
+- **Flapping**: a successful yield clears `leader_since`, so nothing further fires from this node. A refused one is retried no sooner than `LEADER_YIELD_COOLDOWN_MS`.
+- **Cache**: none. Both instants are local and monotonic, and `leader_since` is re-derived from the truth source every pass rather than remembered across one.
 
 ### 8. App orchestration — lease enforcement / fencing
 

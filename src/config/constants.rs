@@ -264,6 +264,40 @@ pub const LEADERSHIP_TRANSFER_LEASE_SAFETY_MS: u64 = 100;
 /// WAL before it can safely start serving writes.
 pub const LEADERSHIP_TRANSFER_CATCHUP_TOLERANCE: u64 = 5;
 
+/// How long this node may be Raft leader without its `PostgreSQL` being primary
+/// before it hands leadership to a peer that can serve.
+///
+/// A leader whose standby never reaches a consistent recovery state cannot be
+/// promoted by any means — the probe fails, `pg_ctl promote` refuses, and
+/// nothing readable on the node distinguishes it from a healthy primary — so
+/// yielding is the only recovery that does not touch data. See
+/// [`crate::governor::promotion_watchdog`] and `HARDENING.md` H-53.
+///
+/// Well past any legitimate promotion, which is a `pg_controldata` read, an LSN
+/// probe and a `pg_ctl promote`, and past a cold start with `pg_rewind`'s
+/// [`PG_REWIND_MAX_RETRIES`] x [`PG_REWIND_RETRY_DELAY_MS`] of retries. Short
+/// enough that a wedge is a minute of lost writes rather than an outage nobody
+/// bounded.
+pub const LEADER_WITHOUT_PRIMARY_YIELD_MS: u64 = 60_000;
+
+/// Client timeout for the yield's call to this node's own transfer-leadership
+/// endpoint.
+///
+/// Must exceed the management API's own per-request timeout, or the yield gives
+/// up before the endpoint answers and reports a timeout where there was a
+/// decision. The handoff spends a full lease drain plus a readiness call inside
+/// that window, so it is seconds rather than milliseconds by construction. A
+/// test in `observability::management_api` pins the relationship.
+pub const LEADERSHIP_YIELD_CLIENT_TIMEOUT_SECS: u64 = 35;
+
+/// Minimum spacing between yields driven by
+/// [`LEADER_WITHOUT_PRIMARY_YIELD_MS`].
+///
+/// A yield costs the cluster a lease drain, and a peer that could not take over
+/// a moment ago usually still cannot. Without the spacing a cluster where
+/// nobody can serve would spend its time in handoffs rather than recovering.
+pub const LEADER_YIELD_COOLDOWN_MS: u64 = 15_000;
+
 /// Max supervisor-lock wait in `/internal/elect-readiness`.
 ///
 /// Affordable because it runs before the leader stops heartbeating;

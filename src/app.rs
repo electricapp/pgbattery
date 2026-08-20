@@ -134,6 +134,19 @@ struct SupervisorLoopInputs {
     lease: crate::governor::SharedLeaseState,
 }
 
+/// What the promotion watchdog needs to act on a verdict, borrowed from the
+/// supervisor loop that owns it.
+struct WatchdogContext<'a> {
+    node_id: NodeId,
+    mgmt_port: u16,
+    client: &'a reqwest::Client,
+    raft: &'a Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+    cluster_state: &'a Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+    /// The same clock the lease and the promotion hold-down read, so a test
+    /// that moves time moves the wedge bound with it.
+    lease: &'a crate::governor::SharedLeaseState,
+}
+
 struct DataNodeSpawnInputs {
     governor: Governor,
     raft: Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
@@ -826,6 +839,9 @@ impl App {
         } = input;
         let node_id = self.config.node_id;
         let self_pg_addr = self.config.get_advertise_pg_addr();
+        // The bind address can be a wildcard, so the yield's self-call is aimed
+        // at loopback on the same port rather than at whatever we bound.
+        let mgmt_port = self.config.get_mgmt_addr().port();
         let mgmt_token = self
             .config
             .management_api_token
@@ -862,23 +878,40 @@ impl App {
             // to a peer 401'd and replication tracking went dark. Refuse to
             // start the supervisor loop instead; a malformed token is an
             // operator misconfiguration that wants attention now, not later.
-            let lsn_http_client = match Self::build_management_http_client(
+            let Some(lsn_http_client) = Self::loop_http_client(
                 Duration::from_secs(2),
                 mgmt_token.as_deref(),
-            ) {
-                Ok(client) => client,
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        "Failed to build management HTTP client for LSN reporting — \
-                         signaling shutdown so the operator notices the misconfiguration"
-                    );
-                    let _ = shutdown_tx.send(true);
-                    return;
-                }
+                &shutdown_tx,
+                "LSN reporting",
+            ) else {
+                return;
             };
             let mut consecutive_pg_probe_failures: u32 = 0;
             let mut lsn_cadence = LsnReportCadence::default();
+            // Watches for Raft leadership and a serving PostgreSQL diverging.
+            // Fed from both reconcile paths, because the observation it needs
+            // is the probe `ensure_follows` already makes.
+            let mut promotion_watchdog =
+                crate::governor::promotion_watchdog::PromotionWatchdog::default();
+            // Its own client, not the LSN one: a yield spends a full lease
+            // drain inside the endpoint, and the 2 s budget that suits an LSN
+            // report would abort the handoff partway through.
+            let Some(yield_http_client) = Self::loop_http_client(
+                Duration::from_secs(constants::LEADERSHIP_YIELD_CLIENT_TIMEOUT_SECS),
+                mgmt_token.as_deref(),
+                &shutdown_tx,
+                "leadership yield",
+            ) else {
+                return;
+            };
+            let watchdog_ctx = WatchdogContext {
+                node_id,
+                mgmt_port,
+                client: &yield_http_client,
+                raft: &raft_client,
+                cluster_state: &cluster_state,
+                lease: &lease,
+            };
 
             loop {
                 tokio::select! {
@@ -890,10 +923,12 @@ impl App {
                         ).await;
                     }
                     _ = leader_rx.changed() => {
-                        Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
+                        let observed = Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
+                        Self::apply_promotion_watchdog(&mut promotion_watchdog, observed, &watchdog_ctx).await;
                     }
                     _ = reconcile_interval.tick() => {
-                        Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
+                        let observed = Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
+                        Self::apply_promotion_watchdog(&mut promotion_watchdog, observed, &watchdog_ctx).await;
                     }
                     _ = lsn_interval.tick() => {
                         Self::report_lsn(
@@ -1040,7 +1075,9 @@ impl App {
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
         lease: &crate::governor::SharedLeaseState,
-    ) {
+    ) -> crate::governor::promotion_watchdog::LeadershipObservation {
+        use crate::governor::promotion_watchdog::LeadershipObservation;
+
         let leader_id = {
             let metrics = raft.metrics();
             let m = metrics.borrow();
@@ -1050,11 +1087,15 @@ impl App {
         };
         let Some(leader_id) = leader_id else {
             warn!("No leader - cluster in unsafe state");
-            return;
+            return LeadershipObservation::not_leading();
         };
         if leader_id == node_id {
-            Self::promote_local_postgres(postgres, cluster_state, lease, node_id).await;
-            return;
+            let pg_primary =
+                Self::promote_local_postgres(postgres, cluster_state, lease, node_id).await;
+            return LeadershipObservation {
+                is_raft_leader: true,
+                pg_primary,
+            };
         }
 
         // node_id → pg_addr is membership data (Raft-replicated, static per
@@ -1068,7 +1109,7 @@ impl App {
                 leader_id,
                 "Leader not in cluster membership yet - deferring follow"
             );
-            return;
+            return LeadershipObservation::not_leading();
         };
         // A demote targeting our own PG address would stop local PG and
         // pg_rewind it against itself, leaving it stopped. The leader id is
@@ -1079,65 +1120,188 @@ impl App {
                 %addr,
                 leader_id, "Leader address equals own PG address - refusing self-demote"
             );
-            return;
+            return LeadershipObservation::not_leading();
         }
 
         Self::demote_to_leader(postgres, addr, "follow leader").await;
+        LeadershipObservation::not_leading()
     }
 
-    async fn promote_local_postgres<P: crate::governor::pg_control::PgControl>(
-        postgres: &Arc<tokio::sync::Mutex<P>>,
-        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
-        lease: &crate::governor::SharedLeaseState,
-        node_id: NodeId,
-    ) {
-        let mut pg = postgres.lock().await;
-        // Fast-path idempotency: if PG is already primary we have nothing to
-        // do. Skips the expensive verify_promotion_safe (which shells out to
-        // pg_controldata) on every leader_rx tick. `ensure_follows` is called
-        // from both the event and reconcile paths, so this function runs
-        // often when steady-state is "we are leader".
-        if matches!(pg.is_in_recovery().await, Ok(false)) {
-            return;
-        }
-        info!("This node is now the leader");
-        match pg.verify_promotion_safe().await {
-            Ok(timeline_info) => {
-                info!(
-                    timeline_id = timeline_info.timeline_id,
-                    "Timeline check passed"
-                );
-            }
-            Err(e) => {
-                error!(error = %e, "Promotion safety check failed - potential split-brain");
-                error!("Manual intervention required. Check pg_controldata on all nodes.");
-                return;
-            }
-        }
-
-        // LSN catch-up guard: must fail *closed* (refuse to promote) when we
-        // can't determine local LSN or parse it. We *always* probe local LSN,
-        // not only when `max_cluster_lsn > 0`: a `max_cluster_lsn == 0` could
-        // mean a genuinely-fresh cluster (safe) or that the leader's LSN
-        // tracking has been broken since startup (unsafe). Reading our own
-        // LSN distinguishes the two: if ours is also 0, the cluster really is
-        // fresh and the comparison is a no-op anyway.
-        //
-        // The probe is the *reportable* LSN (receive position on a standby) —
-        // the same definition every node feeds into `max_cluster_lsn` via
-        // `report_lsn` — so both sides of the comparison measure the same
-        // thing. The replay position lags receive under write load by far
-        // more than the sync-mode tolerance, which would refuse promotion of
-        // a standby that actually holds all the acked WAL.
-        let local_lsn_str = match pg.get_reportable_lsn().await {
-            Ok(s) => s,
+    /// A management-API client for the supervisor loop, or `None` after asking
+    /// the process to shut down.
+    ///
+    /// A malformed token used to fall back to a tokenless client, and every
+    /// call the loop made then 401'd silently. Refusing to start the loop makes
+    /// an operator misconfiguration something that wants attention now.
+    fn loop_http_client(
+        timeout: Duration,
+        token: Option<&str>,
+        shutdown_tx: &watch::Sender<bool>,
+        purpose: &str,
+    ) -> Option<reqwest::Client> {
+        match Self::build_management_http_client(timeout, token) {
+            Ok(client) => Some(client),
             Err(e) => {
                 error!(
                     error = %e,
-                    "Could not read local LSN — refusing promotion (fail-closed)"
+                    purpose,
+                    "Failed to build a management HTTP client — signaling shutdown so the \
+                     operator notices the misconfiguration"
                 );
+                let _ = shutdown_tx.send(true);
+                None
+            }
+        }
+    }
+
+    /// One `pg_is_in_recovery()` probe as the promotion watchdog reads it:
+    /// `Some(true)` primary, `Some(false)` standby, `None` unprobeable.
+    ///
+    /// The third case is the one that matters. A `PostgreSQL` that has not
+    /// reached a consistent recovery state refuses connections, so a wedge
+    /// cannot be probed at all, and collapsing that into "not primary" would
+    /// lose the only signal there is.
+    async fn observe_pg_primary<P: crate::governor::pg_control::PgControl>(pg: &P) -> Option<bool> {
+        match pg.is_in_recovery().await {
+            Ok(false) => Some(true),
+            Ok(true) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// Fold one reconcile pass into the watchdog and act on its verdict.
+    async fn apply_promotion_watchdog(
+        watchdog: &mut crate::governor::promotion_watchdog::PromotionWatchdog,
+        observed: crate::governor::promotion_watchdog::LeadershipObservation,
+        ctx: &WatchdogContext<'_>,
+    ) {
+        use crate::governor::promotion_watchdog::WedgeVerdict;
+
+        let now = ctx.lease.read().now();
+        if watchdog.observe(observed, now) != WedgeVerdict::Yield {
+            return;
+        }
+        let leader_for = watchdog.leader_for(now).unwrap_or_default();
+        Self::yield_wedged_leadership(
+            ctx.node_id,
+            ctx.mgmt_port,
+            ctx.client,
+            ctx.raft,
+            ctx.cluster_state,
+            leader_for,
+        )
+        .await;
+    }
+
+    /// Hand leadership to a peer that can serve, because this node cannot.
+    ///
+    /// Goes through this node's own management API rather than driving the
+    /// Raft handle directly. That endpoint is where the handoff protocol lives
+    /// — the lease drain, the target's Raft catch-up and PG LSN gates, the
+    /// readiness call, the `transfer_lock` that keeps an operator's transfer
+    /// and this one from running at once — and a second implementation of it
+    /// would be a second thing to keep correct. A refusal is the endpoint
+    /// deciding the target cannot take over, which is an answer, so it is
+    /// logged and left to the next attempt after the cooldown.
+    async fn yield_wedged_leadership(
+        node_id: NodeId,
+        mgmt_port: u16,
+        client: &reqwest::Client,
+        raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        leader_for: Duration,
+    ) {
+        use crate::governor::promotion_watchdog::{YieldCandidate, choose_yield_target};
+
+        let voters: Vec<NodeId> = {
+            let metrics = raft.metrics();
+            let m = metrics.borrow();
+            let v = m.membership_config.membership().voter_ids().collect();
+            drop(m);
+            v
+        };
+        let candidates: Vec<YieldCandidate> = {
+            let state = cluster_state.read();
+            voters
+                .into_iter()
+                .filter(|&id| id != node_id)
+                .map(|id| YieldCandidate {
+                    node_id: id,
+                    lsn: state.node_lsns.get(&id).map_or(0, |&(lsn, _)| lsn),
+                    acceptable: state.is_lsn_acceptable_for_promotion(id).0,
+                })
+                .collect()
+        };
+        let Some(target) = choose_yield_target(&candidates) else {
+            warn!(
+                node_id,
+                leader_for_ms = leader_for.as_millis(),
+                "Leading without a primary, and no peer is caught up enough to take over — \
+                 holding leadership because yielding would only move the outage"
+            );
+            metrics::counter!("pgbattery_leadership_yield_no_target").increment(1);
+            return;
+        };
+        error!(
+            node_id,
+            target,
+            leader_for_ms = leader_for.as_millis(),
+            "Raft leader for longer than any promotion should take with PostgreSQL still not \
+             primary — yielding leadership"
+        );
+        metrics::counter!("pgbattery_leadership_yields_attempted").increment(1);
+        let url =
+            format!("http://127.0.0.1:{mgmt_port}/api/v1/cluster/transfer-leadership/{target}");
+        match client.post(&url).send().await {
+            Ok(response) if response.status().is_success() => {
+                info!(target, "Leadership yield accepted");
+                metrics::counter!("pgbattery_leadership_yields_accepted").increment(1);
+            }
+            Ok(response) => {
+                warn!(
+                    target,
+                    status = %response.status(),
+                    "Leadership yield refused — retrying after the cooldown"
+                );
+            }
+            Err(e) => {
+                warn!(target, error = %e, "Leadership yield could not be requested");
+            }
+        }
+    }
+
+    /// Whether this node holds enough WAL to be promoted. Fails closed.
+    ///
+    /// Local LSN is *always* probed, not only when `max_cluster_lsn > 0`: a
+    /// zero max could mean a genuinely fresh cluster (safe) or LSN tracking
+    /// broken since startup (unsafe), and reading our own distinguishes the
+    /// two — if ours is also zero the cluster really is fresh and the
+    /// comparison is a no-op.
+    ///
+    /// The probe is the *reportable* LSN (receive position on a standby), the
+    /// same definition every node feeds into `max_cluster_lsn` via
+    /// `report_lsn`, so both sides measure the same thing. Replay position
+    /// lags receive under write load by far more than the sync-mode tolerance,
+    /// which would refuse a standby that actually holds all the acked WAL.
+    ///
+    /// The maximum is re-derived through `fresh_max_lsn()` rather than read
+    /// from the stored field, which only refreshes on a Raft apply and so sits
+    /// frozen at a pre-outage value through a long leaderless window. That
+    /// keeps this gate consistent with the election gate, which already
+    /// re-derives, and bootstrap-permissive once every peer's report has aged
+    /// out. `sync_active` is tri-state and
+    /// `lsn_catchup_threshold_bytes` applies the loose-vs-tight rule in one
+    /// place.
+    async fn lsn_catchup_permits_promotion<P: crate::governor::pg_control::PgControl>(
+        pg: &P,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+    ) -> bool {
+        let local_lsn_str = match pg.get_reportable_lsn().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "Could not read local LSN — refusing promotion (fail-closed)");
                 metrics::counter!("pgbattery_promotion_lsn_probe_failures").increment(1);
-                return;
+                return false;
             }
         };
         let Some(local_lsn) = parse_lsn(&local_lsn_str) else {
@@ -1146,20 +1310,9 @@ impl App {
                 "Could not parse local LSN — refusing promotion (fail-closed)"
             );
             metrics::counter!("pgbattery_promotion_lsn_parse_failures").increment(1);
-            return;
+            return false;
         };
-        // Read max LSN and sync mode from a single cluster_state snapshot
-        // so the threshold matches the data it's being compared against.
-        // Re-derive the max via `fresh_max_lsn()` (staleness-filtered, on the
-        // fly) rather than reading the stored `max_cluster_lsn` field: the
-        // stored field only refreshes on a Raft apply, so a leaderless window
-        // past the staleness threshold leaves it frozen at a pre-outage value.
-        // Re-deriving keeps this gate consistent with the election gate (which
-        // already re-derives) and falls back to bootstrap-permissive once every
-        // peer's report has aged out.
-        // `sync_active` is tri-state: `Some(false)` = known async (loose
-        // threshold), `Some(true)`/`None` = sync-or-unknown (tight, fail-safe).
-        // `lsn_catchup_threshold_bytes` applies that rule in one place.
+        // One snapshot, so the threshold matches the data it is compared against.
         let (max_cluster_lsn, sync_active, catchup_threshold) = {
             let state = cluster_state.read();
             (
@@ -1181,7 +1334,60 @@ impl App {
                 "sync_mode" => if sync_active == Some(false) { "async" } else { "sync" }
             )
             .increment(1);
-            return;
+            return false;
+        }
+        true
+    }
+
+    /// Returns whether `PostgreSQL` is primary once this pass is done, or `None`
+    /// if that could not be probed. The promotion watchdog reads it; see
+    /// [`crate::governor::promotion_watchdog`].
+    async fn promote_local_postgres<P: crate::governor::pg_control::PgControl>(
+        postgres: &Arc<tokio::sync::Mutex<P>>,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        lease: &crate::governor::SharedLeaseState,
+        node_id: NodeId,
+    ) -> Option<bool> {
+        let mut pg = postgres.lock().await;
+        // One probe, reported to the caller whatever it said — see
+        // `observe_pg_primary` for why `None` is load-bearing (H-53).
+        let observed = Self::observe_pg_primary(&*pg).await;
+        // Fast-path idempotency: if PG is already primary we have nothing to
+        // do. Skips the expensive verify_promotion_safe (which shells out to
+        // pg_controldata) on every leader_rx tick. `ensure_follows` is called
+        // from both the event and reconcile paths, so this function runs
+        // often when steady-state is "we are leader".
+        if observed == Some(true) {
+            return observed;
+        }
+        // Fail closed on a role we could not read, the same way the LSN gate
+        // below does. `Supervisor::promote` probes again and would refuse
+        // anyway, but delegating the refusal means running `pg_controldata`
+        // and an LSN probe against a PostgreSQL that is answering nothing —
+        // and it leaves "we do not know our own role" as an implicit reason to
+        // promote rather than an explicit reason not to.
+        if observed.is_none() {
+            error!("Could not read local recovery state — refusing promotion (fail-closed)");
+            metrics::counter!("pgbattery_promotion_role_probe_failures").increment(1);
+            return observed;
+        }
+        info!("This node is now the leader");
+        match pg.verify_promotion_safe().await {
+            Ok(timeline_info) => {
+                info!(
+                    timeline_id = timeline_info.timeline_id,
+                    "Timeline check passed"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "Promotion safety check failed - potential split-brain");
+                error!("Manual intervention required. Check pg_controldata on all nodes.");
+                return observed;
+            }
+        }
+
+        if !Self::lsn_catchup_permits_promotion(&*pg, cluster_state).await {
+            return observed;
         }
 
         let failover_started_at = cluster_state.read().failover_started_at;
@@ -1205,7 +1411,7 @@ impl App {
                 "Holding promotion until the deposed leader's lease has expired"
             );
             metrics::counter!("pgbattery_promotion_lease_holddowns").increment(1);
-            return;
+            return observed;
         }
 
         // The sync list the new primary must run under, from the voter set
@@ -1230,9 +1436,11 @@ impl App {
                     tracing::info!(total_secs, "Failover total duration recorded");
                     cluster_state.write().failover_started_at = None;
                 }
+                Some(true)
             }
             Err(e) => {
                 error!(error = %e, "Failed to promote");
+                observed
             }
         }
     }
@@ -3243,6 +3451,88 @@ mod tests {
             assert!(
                 !calls.iter().any(|c| c.starts_with("promote(")),
                 "promoted despite a failed safety check: {calls:?}"
+            );
+        }
+
+        // ── what the promotion watchdog is told (H-53) ──────────────────────
+
+        #[tokio::test]
+        async fn a_primary_reports_itself_as_serving() {
+            let (pg, cluster, lease) = fixtures(ModelPg::default());
+            assert_eq!(
+                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                Some(true)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_promotion_that_succeeds_reports_a_primary() {
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                ..ModelPg::default()
+            });
+            assert_eq!(
+                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                Some(true)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_promotion_that_fails_reports_a_standby() {
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                fails: Some(ModelOp::Promote),
+                ..ModelPg::default()
+            });
+            assert_eq!(
+                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                Some(false)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unprobeable_postgres_is_reported_as_unknown_not_as_a_standby() {
+            // The whole of H-53. A standby that has not reached a consistent
+            // recovery state refuses connections, so the probe cannot answer —
+            // and if that collapsed into `Some(false)` the watchdog would see
+            // an ordinary un-promoted standby, which is the state it must not
+            // act on.
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                fails: Some(ModelOp::IsInRecovery),
+                ..ModelPg::default()
+            });
+            assert_eq!(
+                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_wedged_leader_yields_once_the_bound_passes() {
+            use crate::governor::promotion_watchdog::{
+                LeadershipObservation, PromotionWatchdog, WedgeVerdict,
+            };
+
+            let (pg, cluster, lease) = fixtures(ModelPg {
+                in_recovery: true,
+                fails: Some(ModelOp::IsInRecovery),
+                ..ModelPg::default()
+            });
+            let mut watchdog = PromotionWatchdog::default();
+            let observation = LeadershipObservation {
+                is_raft_leader: true,
+                pg_primary: App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+            };
+            let start = std::time::Instant::now();
+            let bound = std::time::Duration::from_millis(
+                crate::config::constants::LEADER_WITHOUT_PRIMARY_YIELD_MS,
+            );
+            assert_eq!(watchdog.observe(observation, start), WedgeVerdict::Hold);
+            assert_eq!(
+                watchdog.observe(observation, start + bound),
+                WedgeVerdict::Yield,
+                "a leader that cannot even probe its PostgreSQL held on past the bound"
             );
         }
     }
