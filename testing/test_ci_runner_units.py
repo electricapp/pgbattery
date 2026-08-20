@@ -1550,6 +1550,24 @@ def _emit_matrix(cases: list[dict[str, object]], suite_cases: list[str]) -> ci_r
     )
 
 
+def test_a_suite_run_skips_an_excluded_case() -> None:
+    """A local suite run that went red on a case no workflow executes would
+    disagree with CI about the same suite. Against the real matrix, so this
+    tracks what is actually excluded rather than a fixture."""
+    runner = make_runner()
+    selected = runner._select_cases()
+    assert selected == ci_runner.runnable_case_ids(runner.matrix, "ha-parallel")
+    assert "backup-restore-valid" not in selected
+
+
+def test_naming_an_excluded_case_still_runs_it() -> None:
+    """The exclusion governs what runs by default, not what may be run — the
+    case still has to be reachable to be worked on."""
+    runner = make_runner()
+    runner.case_filter = "backup-restore-valid"
+    assert runner._select_cases() == ["backup-restore-valid"]
+
+
 def test_an_excluded_case_is_not_emitted() -> None:
     """The CI matrix is built from this, so a case CI cannot run must not
     appear in it — and must say in the matrix why."""

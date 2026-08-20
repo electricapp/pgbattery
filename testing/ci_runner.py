@@ -1313,15 +1313,29 @@ class CIRunner:
     def _select_cases(self) -> list[str]:
         """Return the list of case IDs to run, respecting ``case_filter``.
 
+        A whole-suite run skips cases carrying a ``ci_excluded_reason`` and says
+        so, matching what CI runs — a local run that went red on a case no
+        workflow executes would disagree with CI about the same suite. Naming
+        one with ``--case`` still runs it: the exclusion governs what runs by
+        default, not what may be run.
+
         Raises:
             RunnerError: If ``case_filter`` is set but not found in the suite.
         """
         case_ids = list(self.suite_config.cases)
-        if self.case_filter is None:
-            return case_ids
-        if self.case_filter not in case_ids:
-            raise RunnerError(f"Case '{self.case_filter}' is not in suite '{self.suite_name}'.")
-        return [self.case_filter]
+        if self.case_filter is not None:
+            if self.case_filter not in case_ids:
+                raise RunnerError(f"Case '{self.case_filter}' is not in suite '{self.suite_name}'.")
+            return [self.case_filter]
+        selected: list[str] = []
+        for case_id in case_ids:
+            case = next((c for c in self.matrix.cases if c.id == case_id), None)
+            reason = case.ci_excluded_reason if case is not None else ""
+            if reason:
+                self.log(f"[skip] {case_id}: {reason}")
+                continue
+            selected.append(case_id)
+        return selected
 
     # -- Output helpers ------------------------------------------------------
 
