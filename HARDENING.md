@@ -2217,16 +2217,34 @@ nothing detects drift.
       The obvious repair — read the recovery state from `pg_controldata`'s
       "Database cluster state" when the SQL probe fails, which
       `parse_controldata_fields` already parses for `read_system_identifier` —
-      is **not known to be sufficient**, and was deliberately not landed on that
-      basis: `pg_ctl promote -w` may itself require consistency, in which case
-      the failure moves one line down and nothing changes. The promotion path is
-      the most safety-critical code in the repository and does not get a
-      speculative change.
-      **Done when** it is established whether PostgreSQL can promote a standby
-      that has not reached consistency, and either the control-file fallback
-      lands with that evidence, or — if it cannot — the leader stops being left
-      to follow a peer after its own rewind, so this state is unreachable.
-      Either way `cascade-double-failover-wedge` returns to the matrix.
+      is **refuted, and would have been worse than the defect.** Built the state
+      directly (clone with `pg_basebackup -Xn`, no `restore_command`, primary
+      then stopped) on `postgres:18`:
+
+      ```
+      pg_ctl promote      →  cannot promote server; server is not in standby mode
+      pg_controldata      →  Database cluster state:  in production
+      server log          →  waiting for WAL to become available at 0/2000098
+      ```
+
+      Both halves of the repair fail. `pg_ctl promote` refuses outright, so
+      getting past the SQL probe only moves the failure one line down. And the
+      control file reads **`in production`** for this server, so the fallback
+      would have concluded "not in recovery", returned `Ok(())` from `promote`
+      as a no-op, and left the cluster believing it had a working primary that
+      cannot answer a single query — turning a stall into a silent lie. Nothing
+      the node can read locally distinguishes this state from a healthy primary.
+
+      That leaves making the state unreachable, or leaving it. A node stuck here
+      cannot be promoted by any means, so the only recovery that does not touch
+      data is for it to **stop being the Raft leader** — node2 was alive and
+      serviceable throughout the observed run. That is a design change to the
+      leadership path (and needs a story for flapping), which is why it is
+      written here rather than attempted at the end of a long session.
+      **Done when** a leader that cannot promote its own PostgreSQL yields
+      leadership instead of holding it, or the demote-then-win race that creates
+      the state is closed, and `cascade-double-failover-wedge` returns to the
+      matrix.
       _Effort_ M
 
 - [ ] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
