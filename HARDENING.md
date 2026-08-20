@@ -2187,6 +2187,48 @@ nothing detects drift.
       used to stay at four.
       _Effort_ M
 
+- [ ] **H-53 — a leader whose standby never reached consistency can never be
+      promoted.** `Supervisor::promote` opens with
+      `is_in_recovery()`, which is `SELECT pg_is_in_recovery()` over SQL, and
+      treats a probe failure as fatal — deliberately, so a promotion cannot
+      double-promote a primary or silently no-op. But a standby that has not yet
+      reached a consistent recovery state **refuses connections**:
+
+      ```
+      FATAL: the database system is not yet accepting connections
+      DETAIL: Consistent recovery state has not been yet reached.
+      ```
+
+      So the probe cannot succeed, promotion returns `Error::Promotion`, and the
+      lease loop retries it identically forever while the node holds the lease
+      and `/api/v1/cluster/leader` publishes it. Raft is healthy throughout —
+      the node heartbeats as leader — and only the data plane is dead, which is
+      why `wait_cluster` passes and every liveness check reads green.
+
+      Caught by `cascade-double-failover-wedge`, which is excluded from the
+      derived CI matrix for exactly this reason and not because the case is
+      wrong. Observed shape: node3 promoted, its process restarted mid-promotion,
+      it ran `pg_rewind` and came back as a standby following node1; node1 was
+      down; node1 then returned and immediately stopped its own PostgreSQL to
+      rewind onto node3. Each was waiting on the other's WAL. The case passes
+      when node1 happens to return early enough, which is what makes it read as
+      flake rather than as the defect it is.
+
+      The obvious repair — read the recovery state from `pg_controldata`'s
+      "Database cluster state" when the SQL probe fails, which
+      `parse_controldata_fields` already parses for `read_system_identifier` —
+      is **not known to be sufficient**, and was deliberately not landed on that
+      basis: `pg_ctl promote -w` may itself require consistency, in which case
+      the failure moves one line down and nothing changes. The promotion path is
+      the most safety-critical code in the repository and does not get a
+      speculative change.
+      **Done when** it is established whether PostgreSQL can promote a standby
+      that has not reached consistency, and either the control-file fallback
+      lands with that evidence, or — if it cannot — the leader stops being left
+      to follow a peer after its own rewind, so this state is unreachable.
+      Either way `cascade-double-failover-wedge` returns to the matrix.
+      _Effort_ M
+
 - [ ] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
       Both `Torn write (Raft store, ...)` jobs fail intermittently on the
       precondition rather than the tear: "the cluster was not a full voter set
@@ -2247,17 +2289,26 @@ nothing detects drift.
       diagnosed, and the suite names what stalled it.
       _Effort_ M
 
-- [ ] **H-51 — `tests_md_ref` points at a document that does not exist.** All
-      eighty cases carry one, in the shape `"Control Plane 27. Witness Node 2+1
-Topology"`, and `docs/TESTS.md` has never been in the repository — not
-      deleted, never added. The field reads as the case's specification, which
-      is exactly what somebody reaches for when a case and the product disagree
-      about what it should do; three of the cases fixed this week disagreed, and
-      the reference was no help with any of them.
-      **Done when** the field either resolves to something, or is removed and
-      the descriptions carry the intent on their own — and `lint_matrix.py`
-      checks whichever is chosen, since an unchecked cross-reference is how this
-      one survived eighty cases.
+- [ ] **H-51 — `tests_md_ref` points at documents that do not exist.** All
+      eighty cases carry one, and it names **two** different documents, neither
+      of which has ever been in the repository — not deleted, never added.
+      Seventy-two are `docs/TESTS.md` section numbers, in the shape
+      `"Control Plane 27. Witness Node 2+1 Topology"`; the other eight are
+      `"BUGS.md: hung postmaster wedges leader silently"` and similar. A handful
+      more (`"Audit C3: ..."`, `"Performance 1. ..."`) name no document at all.
+      The field reads as the case's specification, which is exactly what
+      somebody reaches for when a case and the product disagree about what it
+      should do; three of the cases fixed this week disagreed, and the reference
+      was no help with any of them.
+
+      "Resolve it to something" is therefore not available: there is no single
+      document to resolve to, and the contents duplicate fields that do exist —
+      the contract tags in brackets restate `contracts`, and the titles restate
+      `id` and `description`. Removal is the only honest option.
+      **Done when** the field is gone from all eighty cases and from
+      `CaseConfig`, and `lint_matrix.py` refuses a case-level cross-reference to
+      a file that is not in the repository, since an unchecked cross-reference
+      is how this one survived eighty cases and two dead documents.
       _Effort_ S
 
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
