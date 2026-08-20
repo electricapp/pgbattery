@@ -431,11 +431,29 @@ The roadmap is done when:
 
 1. Every FATAL contract has an oracle that measures the contract rather than a
    proxy for it, and a paired inversion test proving that oracle can fail.
-2. Durability claims survive a dirty crash, not just a clean one.
-3. Any failure found in CI can be replayed from a seed.
+   **Met, and mechanically.** `lint_matrix.py` fails when a FATAL row in the
+   Contract-to-Test Index leaves its Inversion column empty, so this one cannot
+   drift back out without going red (H-38).
+2. Durability claims survive a dirty crash, not just a clean one. **Met.**
+   `durability_crash.py` (W1 and R2 against un-fsynced writes on LazyFS),
+   `torn_write.py`, `torn_raft.py` and `wal_enospc.py` all run against
+   `docker-compose.lazyfs.yml`, and each refuses a green until its inversion has
+   gone red.
+3. Any failure found in CI can be replayed from a seed. **Half met.** Every
+   harness that draws randomly now draws from one seeded generator and records
+   the seed; what is not reproducible is the cluster's own timing, so a replay
+   drives the same faults against a system that may schedule them differently.
+   Closing it outright needs a deterministic runtime — H-31, and H-32 behind it.
 4. Every risk window above is either covered by a test, closed by design, or
-   listed in Accepted risks with a rationale.
-5. The specs are checked against traces from the running binary.
+   listed in Accepted risks with a rationale. **Met.** Every window names a
+   tracking task and all of them are checked; RW-5 is the one with no task,
+   because it is an Accepted risk with its rationale there.
+5. The specs are checked against traces from the running binary. **Not met.**
+   The spec-to-code mapping is still comments, so nothing detects drift — H-34,
+   which H-33 unblocked by making the transitions observable.
+
+So the distance to zero is criteria 3 and 5, and both are infrastructure rather
+than a missing assertion: a deterministic runtime, and a trace-checking harness.
 
 ## Execution plan
 

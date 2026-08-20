@@ -140,13 +140,13 @@ class SettledClusterTest(unittest.TestCase):
 
     def test_a_stall_with_no_known_signature_says_so(self) -> None:
         """Silence would read as "nothing wrong with that node"."""
-        self.assertIsNone(tr.stall_reason("just some ordinary startup chatter"))
+        self.assertIsNone(fp.stall_reason("just some ordinary startup chatter"))
 
     def test_the_most_recent_stall_line_wins(self) -> None:
         """A restart-looping node repeats its complaint; the last one is the
         state it is in now."""
         log = "FATAL: first thing that went wrong\nFATAL: what it is doing now"
-        self.assertEqual(tr.stall_reason(log), "FATAL: what it is doing now")
+        self.assertEqual(fp.stall_reason(log), "FATAL: what it is doing now")
 
 
 class ProveOracleTest(unittest.TestCase):

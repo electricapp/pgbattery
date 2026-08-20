@@ -50,6 +50,34 @@ def probe_report(
     )
 
 
+class WritableLeaderTimeoutTests(unittest.TestCase):
+    """A CI run timed out here and left only the last connection error, which
+    says the gateway would not take a write and nothing about which node could
+    not serve one. The rerun passed on identical code, so the artifact was the
+    only evidence there was ever going to be."""
+
+    def test_the_timeout_names_the_state_of_every_node(self) -> None:
+        corrupt = "FATAL:  the database system is in recovery mode"
+        with (
+            mock.patch.object(we, "connect_gateway", side_effect=OSError("connection refused")),
+            mock.patch.object(
+                fp,
+                "read_container_runstate",
+                return_value=fp.ContainerRunState(
+                    status="restarting", started_at="t", restart_count=4
+                ),
+            ),
+            mock.patch.object(fp, "run", return_value=fp.CommandResult(0, corrupt, "")),
+            mock.patch("time.sleep"),
+            self.assertRaises(TimeoutError) as raised,
+        ):
+            we.await_writable_leader(0.01, via="node1")
+        message = str(raised.exception)
+        self.assertIn("connection refused", message)
+        self.assertIn("restarts=4", message)
+        self.assertIn("in recovery mode", message)
+
+
 class SingleWritabilityTests(unittest.TestCase):
     def test_a_violation_fails_the_run(self) -> None:
         outcome = we.Outcome(probe=probe_report(violations=(object(),)))  # type: ignore[arg-type]

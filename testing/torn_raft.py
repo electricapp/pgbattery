@@ -97,24 +97,6 @@ UNKNOWN_REFUSAL: Final[str] = "unknown"
 """The node is down and none of the store-damage markers explain why, so the
 refusal cannot be attributed to the tear."""
 
-STALL_SIGNATURES: Final[tuple[str, ...]] = (
-    "contains unexpected zero page",
-    "is not empty",
-    "Raft DB corrupted",
-    "Failed to create database",
-    "PANIC:",
-    "FATAL:",
-    "Shutting down after",
-    "database system is shut down",
-)
-"""Lines that explain why a node is not a serving member of the cluster.
-
-The precondition this suite fails on — "the cluster was not a full voter set" —
-says which node is missing and never why, so a node shut down by the fence
-threshold on a catalog it cannot open reads exactly like a slow start. Both of
-the shapes seen in CI are here: the corrupt index (`unexpected zero page`) and
-the join that met a populated data directory (`is not empty`)."""
-
 BASELINE_WRITES: Final[int] = 200
 MIN_BASELINE_ACKED: Final[int] = 190
 """How much of the baseline batch must be acked before the first tear.
@@ -358,7 +340,7 @@ def await_settled_cluster(timeout_s: float) -> str:
     # shut down on the fence threshold over a catalog it could not open, and a
     # join that met a populated data directory. Both say so in their own logs.
     stalled = [node for node in sorted(expected) if views.get(node) != expected]
-    diagnosis = "; ".join(node_stall_report(node) for node in stalled) or "every node answered"
+    diagnosis = fp.cluster_stall_report(stalled) if stalled else "every node answered"
     raise fp.FaultPreconditionError(
         f"the cluster was not a full voter set within {timeout_s:g}s ({detail}); "
         f"tearing a node that is not a committed member measures nothing, because "
@@ -434,41 +416,6 @@ def refused_to_start(service: str) -> bool:
     """
     status = fp.run(f"docker compose ps -a --format '{{{{.Status}}}}' {service}")
     return status.ok and "Restarting" in status.stdout
-
-
-def stall_reason(log_text: str) -> str | None:
-    """The last line in `log_text` that explains why a node is not serving.
-
-    Last rather than first: a node that restart-loops repeats its complaint, and
-    the most recent one is the state it is in now. Returns None when nothing
-    matches, which is itself worth reporting — it means the node is missing for
-    a reason this suite has not seen before.
-    """
-    for line in reversed(log_text.splitlines()):
-        if any(signature in line for signature in STALL_SIGNATURES):
-            return line.strip()
-    return None
-
-
-def node_stall_report(service: str) -> str:
-    """One line on why `service` is not a serving member, for the precondition.
-
-    Diagnostic only, and best-effort: a node that cannot be inspected is
-    reported as such rather than raising, because this runs on the path that is
-    already failing and must not replace one error with another.
-    """
-    try:
-        state = fp.read_container_runstate(service)
-        where = (
-            f"status={state.status} restarts={state.restart_count}"
-            if state is not None
-            else "container state unreadable"
-        )
-        logs = fp.run(f"docker compose logs --no-color --tail 2000 {service}")
-        reason = stall_reason(logs.output) if logs.ok else None
-    except Exception as exc:
-        return f"{service}: could not be inspected ({exc})"
-    return f"{service}: {where}; {reason or 'no known stall signature in its log'}"
 
 
 def refusal_shape(service: str) -> str:

@@ -416,7 +416,14 @@ def await_writable_leader(timeout_s: float, *, via: str) -> str:
         except (psycopg.Error, OSError) as exc:
             last = str(exc).strip()
         time.sleep(2.0)
-    raise TimeoutError(f"no writable leader within {timeout_s:g}s; last error: {last}")
+    # The last connection error says the gateway would not take a write and
+    # nothing about which node could not serve one. A CI run that timed out here
+    # left only that line, and no way to tell a node still restarting after the
+    # disk filled from one that had stopped for good.
+    raise TimeoutError(
+        f"no writable leader within {timeout_s:g}s; last error: {last}. "
+        f"Cluster: {fp.cluster_stall_report(list(topology.NODES))}"
+    )
 
 
 def ensure_table(via: str) -> None:

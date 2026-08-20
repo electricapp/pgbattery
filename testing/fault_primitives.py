@@ -647,6 +647,65 @@ def read_container_networks(service: str) -> dict[str, str]:
     return parse_container_networks(result.stdout)
 
 
+STALL_SIGNATURES: Final[tuple[str, ...]] = (
+    "contains unexpected zero page",
+    "is not empty",
+    "Raft DB corrupted",
+    "Failed to create database",
+    "PANIC:",
+    "FATAL:",
+    "Shutting down after",
+    "database system is shut down",
+)
+"""Log lines that explain why a node is not a serving member of the cluster.
+
+A harness that gives up waiting reports what it was waiting for and almost never
+why it never arrived, so a node shut down by the fence threshold over a catalog
+it cannot open reads exactly like a slow start. Both shapes seen in CI are here:
+the corrupt index (`unexpected zero page`) and the join that met a populated
+data directory (`is not empty`)."""
+
+
+def stall_reason(log_text: str) -> str | None:
+    """The last line in `log_text` that explains why a node is not serving.
+
+    Last rather than first: a node that restart-loops repeats its complaint, and
+    the most recent one is the state it is in now. None when nothing matches,
+    which is itself worth reporting — the node is stalled for a reason no
+    harness has seen before.
+    """
+    for line in reversed(log_text.splitlines()):
+        if any(signature in line for signature in STALL_SIGNATURES):
+            return line.strip()
+    return None
+
+
+def node_stall_report(service: str) -> str:
+    """One line on why `service` is not serving, for a harness that gave up.
+
+    Diagnostic only, and best-effort: a node that cannot be inspected is
+    reported as such rather than raising, because this runs on a path that is
+    already failing and must not replace one error with another.
+    """
+    try:
+        state = read_container_runstate(service)
+        where = (
+            f"status={state.status} restarts={state.restart_count}"
+            if state is not None
+            else "container state unreadable"
+        )
+        logs = run(f"docker compose logs --no-color --tail 2000 {service}")
+        reason = stall_reason(logs.output) if logs.ok else None
+    except Exception as exc:
+        return f"{service}: could not be inspected ({exc})"
+    return f"{service}: {where}; {reason or 'no known stall signature in its log'}"
+
+
+def cluster_stall_report(services: Sequence[str]) -> str:
+    """`node_stall_report` for each of `services`, joined for one message."""
+    return "; ".join(node_stall_report(service) for service in services) or "no nodes to inspect"
+
+
 def verify_detached(networks: dict[str, str], *, target: str, network: str) -> None:
     """Assert `network` is gone. A disconnect that no-ops leaves an empty fault
     window, and an empty window reads as "no violations during the partition"."""
