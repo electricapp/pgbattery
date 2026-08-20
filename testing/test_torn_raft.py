@@ -276,6 +276,7 @@ class BaselineAckedTest(unittest.TestCase):
     def run_tears_with_baseline(self, acked: list[int]) -> None:
         with (
             mock.patch.object(tr, "await_writable_leader", return_value="node1"),
+            mock.patch.object(tr, "reset_table"),
             mock.patch.object(tr, "write_batch", return_value=acked),
         ):
             tr.run_tears(tears=1, target="follower", min_torn_bytes=512, max_attempts=1)
@@ -404,6 +405,44 @@ class WritableLeaderTest(unittest.TestCase):
         self.assertIn("no leader", str(caught.exception))
 
 
+class BaselineIsolationTest(unittest.TestCase):
+    """The CI job runs the header tear and then the page tear on one cluster.
+
+    Both write the same key range, so without a reset every insert in the
+    second run is a duplicate-key violation. `write_batch` counts those as
+    unacked, correctly — which is how a healthy cluster came to be reported as
+    "no working cluster to damage".
+    """
+
+    def tearing_issues(self, tear: object) -> list[str]:
+        issued: list[str] = []
+        cur = mock.MagicMock()
+        cur.execute.side_effect = lambda sql, *a: issued.append(sql)
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cur
+        with (
+            mock.patch.object(tr, "await_writable_leader", return_value="node1"),
+            mock.patch.object(tr, "connect", return_value=conn),
+            mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
+            mock.patch.object(fp, "run", return_value=fp.CommandResult(0, "", "")),
+            mock.patch.object(tr, "tear_until_page", side_effect=tear),
+            mock.patch.object(tr, "await_victim_settled", return_value=(True, False)),
+            mock.patch.object(tr, "await_leader", return_value="node1"),
+            mock.patch.object(tr, "read_back", return_value=set()),
+            mock.patch.object(tr, "leaders", return_value=["node1"]),
+        ):
+            tr.tear_a_page(target="follower", occurrence=tr.PAGE_TEAR_OCCURRENCE)
+        return issued
+
+    def test_the_baseline_starts_from_an_empty_table(self) -> None:
+        issued = self.tearing_issues(lambda *a, **k: (2048, 49152))
+        self.assertTrue(
+            any("TRUNCATE" in sql for sql in issued),
+            f"a second run inherits the first run's keys: {issued}",
+        )
+
+
 class MakeLeaderTest(unittest.TestCase):
     """Arming a config-baked fault restarts the victim, which moves leadership
     off it. A leader-targeted run has to put it back or it tears a follower."""
@@ -474,6 +513,7 @@ class PageTearDisarmTest(unittest.TestCase):
 
         with (
             mock.patch.object(tr, "await_writable_leader", return_value="node1"),
+            mock.patch.object(tr, "reset_table"),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", side_effect=record),
             mock.patch.object(tr, "tear_until_page", side_effect=tear),
@@ -498,6 +538,7 @@ class PageTearDisarmTest(unittest.TestCase):
 
         with (
             mock.patch.object(tr, "await_writable_leader", return_value="node1"),
+            mock.patch.object(tr, "reset_table"),
             mock.patch.object(tr, "write_batch", return_value=list(range(tr.BASELINE_WRITES))),
             mock.patch.object(fp, "run", side_effect=record),
             mock.patch.object(

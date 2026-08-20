@@ -487,6 +487,19 @@ def await_writable_leader(timeout_s: float) -> str:
     )
 
 
+def reset_table(node: str) -> None:
+    """Empty the probe table so this run's baseline is its own.
+
+    Two runs against one cluster — the CI job runs the header tear and then the
+    page tear — otherwise write the same key range twice, and every insert in
+    the second run is a duplicate-key violation. `write_batch` counts those as
+    unacked, correctly, so the run reported no working cluster to damage when
+    the cluster was healthy and the keys were simply already there.
+    """
+    with connect(node) as conn, conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {TABLE}")
+
+
 def ensure_table(node: str) -> None:
     with connect(node) as conn, conn.cursor() as cur:
         cur.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (k int PRIMARY KEY)")
@@ -676,6 +689,7 @@ def tear_a_page(*, target: str, occurrence: int) -> Outcome:
     """
     outcome = Outcome()
     lead = await_writable_leader(CONVERGE_TIMEOUT_S)
+    reset_table(lead)
     outcome.acked = write_batch(lead, range(BASELINE_WRITES))
     if len(outcome.acked) < MIN_BASELINE_ACKED:
         raise fp.FaultPreconditionError(
@@ -736,6 +750,7 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     """
     outcome = Outcome()
     lead = await_writable_leader(CONVERGE_TIMEOUT_S)
+    reset_table(lead)
     outcome.acked = write_batch(lead, range(BASELINE_WRITES))
     if len(outcome.acked) < MIN_BASELINE_ACKED:
         raise fp.FaultPreconditionError(
