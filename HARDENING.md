@@ -1387,6 +1387,23 @@ The durable fix for a bug class that has already produced one real defect.
       `pg_locks WHERE locktype = 'advisory'`, `pg_listening_channels()`,
       `pg_class WHERE relpersistence = 't'`, and
       `pg_settings WHERE source = 'session'`.
+      **Where it has to live, since that is the part that decides the shape.**
+      The oracle must call `analyze_query`, which is private, and the obvious
+      move — widen it, and `QueryAnalysis` and `SessionChange` with it — is
+      already argued against in `gateway_query_analysis.rs`: the properties a
+      public entry would buy the fuzzer (determinism, no panic) are covered
+      through the public prefilters, so widening trades permanent API surface
+      for nothing. That reasoning holds here too and is not this task's to
+      overturn.
+
+      So the oracle goes _inside_ the crate, next to `marks_non_migratable` in
+      `gateway/handlers/mod.rs`'s test module, which already reaches the private
+      function. What it additionally needs is a live PostgreSQL, and the root
+      crate has no client dependency and `tests/` holds no integration harness —
+      so the connection is the real cost, not the classification. Gate it on an
+      env var naming a DSN and skip when unset, so `cargo test` in CI (which has
+      no database) stays green and the suites that do have one run it
+      explicitly.
       **Done when** the oracle asserts _if session state changed, the classifier
       said non-migratable_, and it reproduces the known advisory-lock defect when
       the fix is reverted.
