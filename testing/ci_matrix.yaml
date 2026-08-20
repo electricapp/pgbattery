@@ -672,7 +672,6 @@
     },
     {
       "id": "cascade-double-failover-wedge",
-      "ci_excluded_reason": "The case is right and the product is not: it fails intermittently on a real liveness defect, so enabling it in CI would report a known product bug as CI flake. A leader whose PostgreSQL is a standby that has not reached a consistent recovery state can never be promoted, because promote() begins with SELECT pg_is_in_recovery() and such a server refuses connections. HARDENING H-53 carries the analysis and what remains open. Run it by name; it passes when the timing does not line up.",
       "contracts": [
         "W1",
         "W2",

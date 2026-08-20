@@ -1671,26 +1671,29 @@ def _emit_matrix(cases: list[dict[str, object]], suite_cases: list[str]) -> ci_r
 
 
 def _excluded_parallel_case(runner: ci_runner.CIRunner) -> str:
-    """The id of a real `ha-parallel` case carrying an exclusion reason.
+    """Mark a real `ha-parallel` case excluded on `runner`, and return its id.
 
-    Named rather than hardcoded: which case is excluded changes as they are
-    fixed, and a test pinned to one of them goes red for the wrong reason the
-    day it is repaired.
+    Synthesised rather than found. An exclusion is meant to be temporary, so a
+    test that needs one to exist goes red on the day the last one is repaired —
+    which is what happened when `cascade-double-failover-wedge` was fixed. The
+    selection path under test is still the real one over the real matrix.
     """
-    reasons = {case.id for case in runner.matrix.cases if case.ci_excluded_reason}
-    excluded = [c for c in runner.matrix.suites["ha-parallel"].cases if c in reasons]
-    assert excluded, "no ha-parallel case is excluded, so these tests prove nothing"
-    return excluded[0]
+    case_id = runner.matrix.suites["ha-parallel"].cases[0]
+    for case in runner.matrix.cases:
+        if case.id == case_id:
+            case.ci_excluded_reason = "synthetic, so the exclusion path has something to skip"
+            return case_id
+    raise AssertionError(f"suite ha-parallel names {case_id}, which the matrix does not define")
 
 
 def test_a_suite_run_skips_an_excluded_case() -> None:
     """A local suite run that went red on a case no workflow executes would
-    disagree with CI about the same suite. Against the real matrix, so this
-    tracks what is actually excluded rather than a fixture."""
+    disagree with CI about the same suite."""
     runner = make_runner()
+    excluded = _excluded_parallel_case(runner)
     selected = runner._select_cases()
     assert selected == ci_runner.runnable_case_ids(runner.matrix, "ha-parallel")
-    assert _excluded_parallel_case(runner) not in selected
+    assert excluded not in selected
 
 
 def test_naming_an_excluded_case_still_runs_it() -> None:

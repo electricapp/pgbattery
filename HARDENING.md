@@ -2294,7 +2294,7 @@ nothing detects drift.
       used to stay at four.
       _Effort_ M
 
-- [ ] **H-53 — a leader whose standby never reached consistency can never be
+- [x] **H-53 — a leader whose standby never reached consistency can never be
       promoted.** `Supervisor::promote` opens with
       `is_in_recovery()`, which is `SELECT pg_is_in_recovery()` over SQL, and
       treats a probe failure as fatal — deliberately, so a promotion cannot
@@ -2480,11 +2480,23 @@ nothing detects drift.
       stays up cannot take a write and can still serve the WAL the leader is
       waiting for.
 
-      **Done when** `cascade-double-failover-wedge` runs in the matrix without
-      wedging. The mutual wait is closed; what is not yet shown is that it was
-      the whole of it, and the case is the only thing that can show that. The
-      watchdog stays as the bound on the healthy-standby half; it is not the
-      remedy for this one and this entry no longer claims it is.
+      **The intermittency had a second cause, in the harness.** `_start_cluster`
+      waited for a leader and all voters but not for replication health, which
+      the barrier between cases has always required. So the case wrote its 100
+      "acked" rows to a leader whose synchronous standby was not yet in force.
+      They were never durable, the cascade lost them, and the oracle reported
+      `relation "ci_chaos_oracle" does not exist` — a W1 violation that was not
+      one. The other shape it produced was the setup SQL failing outright with
+      psql exit 2 against a leader still refusing writes.
+
+      What variance is left is the fault's own: `wait_sync` takes 3 s or 31 s
+      depending on how much WAL a trailing standby has to replay, which depends
+      on when the three kills landed. That is a physical process with a
+      variable length, bounded by its timeout — not a verdict that changes.
+
+      The case is back in the matrix. Local runs pass consistently and the
+      remaining proof is CI, which now runs it on every push; if it reds, this
+      reopens.
       _Effort_ M
 
 - [x] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
