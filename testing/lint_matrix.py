@@ -998,6 +998,78 @@ def check_fault_injection_confined() -> None:
         raise AssertionError(" | ".join(problems))
 
 
+FILE_REFERENCE = re.compile(
+    r"(?<![\w./-])((?:[\w.-]+/)*[\w.-]+\.(?:md|py|rs|sql|tla|toml|ya?ml|sh))(?![\w/])"
+)
+"""A token in case text that reads as a path to a file in this repository."""
+
+CROSS_REF_PRUNE: Final = frozenset(
+    {".git", ".venv", "__pycache__", "target", "node_modules", "backups", "states", "store"}
+)
+"""Directories that hold build output or run artifacts, not referenceable sources."""
+
+
+def file_references(node: Any) -> set[str]:
+    """Collect every path-shaped token from the strings anywhere under ``node``."""
+    if isinstance(node, str):
+        return set(FILE_REFERENCE.findall(node))
+    if isinstance(node, Mapping):
+        return set().union(*(file_references(v) for v in node.values())) if node else set()
+    if isinstance(node, list):
+        return set().union(*(file_references(v) for v in node)) if node else set()
+    return set()
+
+
+def unresolved_file_references(
+    refs: Iterable[str], rel_paths: Container[str], basenames: Container[str]
+) -> list[str]:
+    """Return the references that name no file, by full path or by basename.
+
+    Basenames count because case text says ``network.rs`` where the file is
+    ``src/cluster/network.rs``, and demanding the full path would push authors
+    toward writing no reference at all.
+    """
+    return sorted(
+        {ref for ref in refs if ref not in rel_paths and Path(ref).name not in basenames}
+    )
+
+
+def repo_file_index() -> tuple[set[str], set[str]]:
+    """Every referenceable file in the repository, by relative path and by name."""
+    rel_paths: set[str] = set()
+    basenames: set[str] = set()
+    for dirpath, dirnames, filenames in PROJECT_ROOT.walk():
+        dirnames[:] = [
+            d for d in dirnames if d not in CROSS_REF_PRUNE and (d == ".github" or d[0] != ".")
+        ]
+        for name in filenames:
+            rel_paths.add(str((dirpath / name).relative_to(PROJECT_ROOT)))
+            basenames.add(name)
+    return rel_paths, basenames
+
+
+def check_case_cross_references_resolve() -> None:
+    """Verify every file a case names is in the repository.
+
+    Eighty cases carried a ``tests_md_ref`` naming ``docs/TESTS.md`` or
+    ``BUGS.md``, neither of which was ever committed, and it held for eighty
+    cases because nothing checked it. A case's own text is what somebody reads
+    when the case and the product disagree about what should happen, so a
+    reference that resolves to nothing is worse than no reference at all.
+    """
+    rel_paths, basenames = repo_file_index()
+    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    problems = [
+        f"{case['id']}: {', '.join(unresolved)}"
+        for case in data["cases"]
+        if (unresolved := unresolved_file_references(file_references(case), rel_paths, basenames))
+    ]
+    if problems:
+        raise AssertionError(
+            "case text names files that are not in the repository — " + " | ".join(problems)
+        )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1030,6 +1102,7 @@ def lint() -> None:
     check("Harness subcommands the matrix calls exist", check_harness_subcommands_exist)
     check("CI runs every case, or says why not", check_ci_runs_every_case)
     check("Workflow matrix is derived from the suite", check_workflow_matrix_is_derived)
+    check("Case cross-references name real files", check_case_cross_references_resolve)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

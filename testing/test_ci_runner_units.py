@@ -1499,6 +1499,41 @@ def test_an_explicitly_named_command_counts() -> None:
     assert lint_matrix.module_defines_subcommand(source, "restamp")
 
 
+def test_the_dead_tests_md_ref_values_are_caught_against_the_real_repository() -> None:
+    """The exact strings eighty cases carried must now fail the lint.
+
+    `docs/TESTS.md` and `BUGS.md` were never in the repository, and the field
+    that named them survived eighty cases because nothing resolved it.
+    """
+    rel_paths, basenames = lint_matrix.repo_file_index()
+    dead = {
+        "BUGS.md: hung postmaster wedges leader silently",
+        "Control Plane 27. Witness Node 2+1 Topology, docs/TESTS.md",
+    }
+    assert lint_matrix.unresolved_file_references(
+        lint_matrix.file_references({"id": "x", "tests_md_ref": sorted(dead)}),
+        rel_paths,
+        basenames,
+    ) == ["BUGS.md", "docs/TESTS.md"]
+
+
+def test_a_reference_resolves_by_basename_or_by_path() -> None:
+    """Case text says `network.rs`; the file is `src/cluster/network.rs`."""
+    rel_paths, basenames = lint_matrix.repo_file_index()
+    refs = lint_matrix.file_references(
+        {"comment": "the LSN gate in network.rs, per docs/CONTRACTS.md and docker-compose.yml"}
+    )
+    assert refs == {"network.rs", "docs/CONTRACTS.md", "docker-compose.yml"}
+    assert lint_matrix.unresolved_file_references(refs, rel_paths, basenames) == []
+
+
+def test_prose_that_only_looks_like_a_path_is_not_a_reference() -> None:
+    """Version numbers and config keys must not be read as files to resolve."""
+    assert lint_matrix.file_references(
+        {"c": "openraft 0.9 sets postgresql.conf and postmaster.pid under /tmp/faketime"}
+    ) == set()
+
+
 def test_a_step_that_expects_a_refusal_does_not_wait_for_writability() -> None:
     """`stale-leader-fencing` and `majority-loss` assert a write is refused.
     Waiting for a writable path there would wait out the clock on the exact

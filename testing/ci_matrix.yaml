@@ -141,7 +141,6 @@
   "cases": [
     {
       "id": "leader-crash",
-      "tests_md_ref": "1. Leader Crash (SIGKILL) [V1]",
       "contracts": [
         "W1",
         "V1"
@@ -209,7 +208,6 @@
     },
     {
       "id": "sync-replica-failure",
-      "tests_md_ref": "2. Sync Replica Failure [R2, V1]",
       "contracts": [
         "V1"
       ],
@@ -251,7 +249,6 @@
     },
     {
       "id": "leader-network-partition",
-      "tests_md_ref": "3. Leader Network Partition [V1]",
       "contracts": [
         "W1",
         "V1"
@@ -308,7 +305,6 @@
     },
     {
       "id": "cluster-restart",
-      "tests_md_ref": "5. Cluster-Wide Restart [V1]",
       "contracts": [
         "W1",
         "V1"
@@ -353,7 +349,6 @@
     },
     {
       "id": "rapid-leadership-transfer-cascade",
-      "tests_md_ref": "Chaos: rapid back-to-back leadership transfers",
       "contracts": [
         "V1"
       ],
@@ -439,7 +434,6 @@
     },
     {
       "id": "postgres-kill-auto-restart",
-      "tests_md_ref": "Chaos: internal-failure shutdown produces non-zero exit + Docker restart",
       "contracts": [
         "V1"
       ],
@@ -481,7 +475,6 @@
     },
     {
       "id": "leaderless-wedge-recovery",
-      "tests_md_ref": "BUGS.md: SIGSTOP leader + kill sync wedge (openraft 0.9 PreVote)",
       "contracts": [
         "W1",
         "V1"
@@ -552,7 +545,6 @@
     },
     {
       "id": "restart-budget-sustained-pg-death",
-      "tests_md_ref": "BUGS.md: Docker restart budget exhaustion under sustained PG death",
       "contracts": [
         "V1"
       ],
@@ -593,7 +585,6 @@
     },
     {
       "id": "mgmt-api-no-stale-leader-after-pg-death",
-      "tests_md_ref": "BUGS.md: management API serves stale leader after PG death (zombie leader, root cause #5)",
       "contracts": [
         "L1",
         "V1"
@@ -637,7 +628,6 @@
     },
     {
       "id": "hung-postmaster-failover",
-      "tests_md_ref": "BUGS.md: hung postmaster wedges leader silently",
       "contracts": [
         "V1"
       ],
@@ -682,8 +672,7 @@
     },
     {
       "id": "cascade-double-failover-wedge",
-      "ci_excluded_reason": "The case is right and the product is not: it fails intermittently on a real liveness defect, so enabling it in CI would report a known product bug as CI flake. A leader whose PostgreSQL is a standby that has not reached a consistent recovery state can never be promoted, because promote() begins with SELECT pg_is_in_recovery() and such a server refuses connections — so every tick fails identically while the node holds the lease and is published as leader. Observed with node3 leading, its PG waiting on WAL from node1, and node1 returning only to stop its own PG and rewind onto node3. HARDENING H-53 carries the evidence. Run it by name; it passes when the timing does not line up.",
-      "tests_md_ref": "BUGS.md: cluster wedges when chaos arrives faster than node recovery",
+      "ci_excluded_reason": "The case is right and the product is not: it fails intermittently on a real liveness defect, so enabling it in CI would report a known product bug as CI flake. A leader whose PostgreSQL is a standby that has not reached a consistent recovery state can never be promoted, because promote() begins with SELECT pg_is_in_recovery() and such a server refuses connections \u2014 so every tick fails identically while the node holds the lease and is published as leader. Observed with node3 leading, its PG waiting on WAL from node1, and node1 returning only to stop its own PG and rewind onto node3. HARDENING H-53 carries the evidence. Run it by name; it passes when the timing does not line up.",
       "contracts": [
         "W1",
         "W2",
@@ -803,7 +792,6 @@
     },
     {
       "id": "pgbattery-sigkill-recovery",
-      "tests_md_ref": "BUGS.md: abruptly-killed pgbattery leaves PG zombie",
       "contracts": [
         "W1",
         "V1"
@@ -849,11 +837,10 @@
     },
     {
       "id": "faketime-shift-active",
-      "tests_md_ref": "BUGS.md: libfaketime not actually installed in container",
       "contracts": [
         "L1"
       ],
-      "description": "Precondition oracle for every clock-skew case, and therefore a coverage guard on L1 rather than a direct L1 measurement: it pins down WHAT the FAKETIME LD_PRELOAD machinery injects, in both directions. (1) Writing +30s to /tmp/faketime must move CLOCK_REALTIME by 25\u201335s \u2014 if it does not, every skew case is a silent no-op and their L1 coverage has evaporated. (2) The same write must leave CLOCK_MONOTONIC within a few seconds of real elapsed time, because the split between the two clocks is the entire mechanism promotion-holddown-clock-step depends on: a wall-clock-only step is what separates a hold-down measured on SystemTime from a lease measured on Instant. FAKETIME_DONT_FAKE_MONOTONIC is not set in docker-compose.yml, so monotonic invariance is a property of the installed libfaketime rather than of our configuration \u2014 this assertion is what notices if a rebuild changes it. Both clocks are sampled from one in-container perl process so they share a single faketime view.",
+      "description": "Precondition oracle for every clock-skew case, and therefore a coverage guard on L1 rather than a direct L1 measurement: it pins down WHAT the FAKETIME LD_PRELOAD machinery injects, in both directions. (1) Writing +30s to /tmp/faketime must move CLOCK_REALTIME by 25\u201335s \u2014 if it does not, every skew case is a silent no-op and their L1 coverage has evaporated. (2) The same write must leave CLOCK_MONOTONIC within a few seconds of real elapsed time, because the split between the two clocks is the entire mechanism promotion-holddown-clock-step depends on: a wall-clock-only step is what separates a hold-down measured on SystemTime from a lease measured on Instant. Monotonic invariance is configuration, not a property of the library: libfaketime fakes CLOCK_MONOTONIC by default on amd64 and does not on arm64, so every compose file sets FAKETIME_DONT_FAKE_MONOTONIC=1 and this assertion is what notices if that setting is lost. Both clocks are sampled from one in-container perl process so they share a single faketime view. The case exists because libfaketime was once not installed in the image at all, which made every clock-skew case a silent no-op.",
       "actions": [],
       "assertions": [
         {
@@ -864,7 +851,6 @@
     },
     {
       "id": "majority-loss",
-      "tests_md_ref": "4. Majority Loss [L2]",
       "contracts": [
         "L2"
       ],
@@ -911,7 +897,6 @@
     },
     {
       "id": "leadership-transfer",
-      "tests_md_ref": "7. Manual Promotion (modeled as leadership transfer) [V1]",
       "contracts": [
         "W1",
         "V1"
@@ -960,7 +945,6 @@
     },
     {
       "id": "management-api",
-      "tests_md_ref": "10. Management API",
       "contracts": [
         "V1"
       ],
@@ -999,7 +983,6 @@
     },
     {
       "id": "observability-sanity",
-      "tests_md_ref": "11. Observability Sanity",
       "contracts": [
         "L1"
       ],
@@ -1034,7 +1017,6 @@
     },
     {
       "id": "backup-corrupt-restore",
-      "tests_md_ref": "14a. Corrupt Backup",
       "contracts": [
         "V2"
       ],
@@ -1104,7 +1086,6 @@
     },
     {
       "id": "acked-write-durability",
-      "tests_md_ref": "Control Plane 1. Acked Write Durability Invariant [W1, R2]",
       "contracts": [
         "W1",
         "R2"
@@ -1162,7 +1143,6 @@
     },
     {
       "id": "stale-leader-fencing",
-      "tests_md_ref": "Control Plane 2. Stale Leader Fencing Under Asymmetric Partition [L1]",
       "contracts": [
         "L1",
         "L2"
@@ -1220,7 +1200,6 @@
     },
     {
       "id": "failover-commit-boundary",
-      "tests_md_ref": "Control Plane 3. Failover During In-Flight Transaction Matrix [W1, S1]",
       "contracts": [
         "W1",
         "S1"
@@ -1276,7 +1255,6 @@
     },
     {
       "id": "repeated-failover-load",
-      "tests_md_ref": "Control Plane 4. Repeated Failover Under Sustained Write Load [W1, V1]",
       "contracts": [
         "W1",
         "V1"
@@ -1386,7 +1364,6 @@
     },
     {
       "id": "diverged-node-rejoin",
-      "tests_md_ref": "Control Plane 5. Diverged Node Rejoin Correctness [V2]",
       "contracts": [
         "V2"
       ],
@@ -1435,7 +1412,6 @@
     },
     {
       "id": "restart-permutations",
-      "tests_md_ref": "Control Plane 6. Cluster Restart Liveness Permutations [V1]",
       "contracts": [
         "W1",
         "V1"
@@ -1524,7 +1500,6 @@
     },
     {
       "id": "leadership-churn-livelock",
-      "tests_md_ref": "Control Plane 7. Leadership Churn Livelock Test [V1]",
       "contracts": [
         "V1"
       ],
@@ -1611,7 +1586,6 @@
     },
     {
       "id": "backup-consistency-under-load",
-      "tests_md_ref": "Control Plane 8. Backup Consistency Under Concurrent Writes [W1]",
       "contracts": [
         "W1"
       ],
@@ -1672,7 +1646,6 @@
     },
     {
       "id": "prepared-transaction-semantics",
-      "tests_md_ref": "Control Plane 9. Prepared Transaction Semantics (2PC) [S1]",
       "contracts": [
         "S1"
       ],
@@ -1726,7 +1699,6 @@
     },
     {
       "id": "session-semantics-contract",
-      "tests_md_ref": "Control Plane 10. Session Semantics Contract (Locks/Temp Objects) [S2]",
       "contracts": [
         "S1",
         "S2"
@@ -1771,7 +1743,6 @@
     },
     {
       "id": "leader-network-partition-real",
-      "tests_md_ref": "Control Plane 11. Real Network Partition (docker network disconnect) [V1]",
       "contracts": [
         "L1",
         "V1"
@@ -1846,7 +1817,6 @@
     },
     {
       "id": "concurrent-writes-failover",
-      "tests_md_ref": "Control Plane 12. Concurrent Writes During Failover [W2]",
       "contracts": [
         "W2"
       ],
@@ -1895,7 +1865,6 @@
     },
     {
       "id": "gateway-connection-survival",
-      "tests_md_ref": "Control Plane 13. Gateway Connection Migration [S2]",
       "contracts": [
         "S2"
       ],
@@ -1980,7 +1949,6 @@
     },
     {
       "id": "replication-slot-no-leak",
-      "tests_md_ref": "Control Plane 14. Replication Slot Leak After Repeated Failovers [R1]",
       "contracts": [
         "R1"
       ],
@@ -2044,7 +2012,6 @@
     },
     {
       "id": "clock-skew-resilience",
-      "tests_md_ref": "Control Plane 15. NTP Clock Skew Resilience [V1]",
       "contracts": [
         "L1",
         "W1"
@@ -2129,7 +2096,6 @@
     },
     {
       "id": "asymmetric-leader-partition",
-      "tests_md_ref": "Control Plane 13. Asymmetric Partition (leader inbound blocked) [L1]",
       "contracts": [
         "L1",
         "W1",
@@ -2228,7 +2194,6 @@
     },
     {
       "id": "leader-clock-skew",
-      "tests_md_ref": "Control Plane 16. Leader Clock Skew [V1]",
       "contracts": [
         "L1",
         "W1"
@@ -2309,7 +2274,6 @@
     },
     {
       "id": "async-degraded-durability",
-      "tests_md_ref": "Control Plane 17. Write Durability Under Async Degradation [L2]",
       "contracts": [
         "L2",
         "W1"
@@ -2409,7 +2373,6 @@
     },
     {
       "id": "membership-remove-rejoin",
-      "tests_md_ref": "Control Plane 18. Membership Remove and Rejoin [V2]",
       "contracts": [
         "W1",
         "V2"
@@ -2458,7 +2421,7 @@
         },
         {
           "type": "cmd",
-          "comment": "node3's command is 'pgbattery join --peer ... --voter'. It learns it is no longer a member, wipes its Raft state, and reaches the join path with a complete data directory. That directory is discarded and re-cloned only because the leader proves the same PostgreSQL lineage (STATE_MACHINE §3a) — an operator wiping it by hand is no longer the documented procedure.",
+          "comment": "node3's command is 'pgbattery join --peer ... --voter'. It learns it is no longer a member, wipes its Raft state, and reaches the join path with a complete data directory. That directory is discarded and re-cloned only because the leader proves the same PostgreSQL lineage (STATE_MACHINE \u00a73a) \u2014 an operator wiping it by hand is no longer the documented procedure.",
           "cmd": "docker compose start node3"
         },
         {
@@ -2509,8 +2472,7 @@
     },
     {
       "id": "backup-restore-valid",
-      "tests_md_ref": "14b. Valid Backup Restore",
-      "ci_excluded_reason": "Asserts an operation the product does not support and never has. It POSTs a full restore to node1 while node1 is the leader, and the API has refused exactly that since the initial commit ('Refusing full restore on the current leader: it overwrites the live primary's data directory') — the case and the guard were committed together. A full restore is only accepted on a standby, and a restored standby is re-synced from the leader, so 'the cluster returns to the pre-insert snapshot' is not what the supported operation does. Rewriting it to assert what is assertable is HARDENING H-49; until then it is excluded here rather than left to look like coverage.",
+      "ci_excluded_reason": "Asserts an operation the product does not support and never has. It POSTs a full restore to node1 while node1 is the leader, and the API has refused exactly that since the initial commit ('Refusing full restore on the current leader: it overwrites the live primary's data directory') \u2014 the case and the guard were committed together. A full restore is only accepted on a standby, and a restored standby is re-synced from the leader, so 'the cluster returns to the pre-insert snapshot' is not what the supported operation does. Rewriting it to assert what is assertable is HARDENING H-49; until then it is excluded here rather than left to look like coverage.",
       "contracts": [
         "V2"
       ],
@@ -2576,7 +2538,6 @@
     },
     {
       "id": "concurrent-backup-failover",
-      "tests_md_ref": "Control Plane 19. Concurrent Backup and Leader Failover [W1]",
       "contracts": [
         "V1"
       ],
@@ -2621,7 +2582,6 @@
     },
     {
       "id": "network-latency-stability",
-      "tests_md_ref": "Control Plane 20. Network Latency Stability [V1]",
       "contracts": [
         "V1"
       ],
@@ -2707,7 +2667,6 @@
     },
     {
       "id": "follower-one-peer-partition",
-      "tests_md_ref": "Control Plane 21. Follower Inter-Peer Partition [V1]",
       "contracts": [
         "V1"
       ],
@@ -2800,7 +2759,6 @@
     },
     {
       "id": "rolling-upgrade",
-      "tests_md_ref": "Control Plane 22. Rolling Upgrade [V1]",
       "contracts": [
         "W1",
         "V1"
@@ -2906,7 +2864,6 @@
     },
     {
       "id": "wal-hole-resync",
-      "tests_md_ref": "Control Plane 23. WAL-Hole Full Resync [V2]",
       "contracts": [
         "V2"
       ],
@@ -2985,7 +2942,6 @@
     },
     {
       "id": "ddl-failover",
-      "tests_md_ref": "Control Plane 24. DDL Atomicity During Failover [W3]",
       "contracts": [
         "W3"
       ],
@@ -3033,7 +2989,6 @@
     },
     {
       "id": "rogue-pg-promote",
-      "tests_md_ref": "Control Plane 25. Rogue pg_ctl Promote Split-Brain Detection [W2, L1]",
       "contracts": [
         "L1",
         "W2"
@@ -3057,7 +3012,7 @@
         },
         {
           "type": "cmd",
-          "comment": "Promote node2's PostgreSQL directly, bypassing pgbattery. This is the setup, not the assertion: whether the rogue promotion completes is a race with the fence that exists to stop it, and pg_ctl reports 'server did not promote in time' when pgbattery wins that race — the better outcome of the two. What the case asserts is below, that the cluster converges to a single leader with the rows intact, and that holds either way.",
+          "comment": "Promote node2's PostgreSQL directly, bypassing pgbattery. This is the setup, not the assertion: whether the rogue promotion completes is a race with the fence that exists to stop it, and pg_ctl reports 'server did not promote in time' when pgbattery wins that race \u2014 the better outcome of the two. What the case asserts is below, that the cluster converges to a single leader with the rows intact, and that holds either way.",
           "cmd": "docker compose exec -T node2 /usr/lib/postgresql/18/bin/pg_ctl promote -D /var/lib/postgresql/data",
           "expect_exit": null
         },
@@ -3095,7 +3050,6 @@
     },
     {
       "id": "correctness-lite-invariants",
-      "tests_md_ref": "Control Plane 26. Correctness Lite \u2014 Durability + Split-Brain (I1\u2013I7 + L2\u2013L3 + B1\u2013B2) [W1, W2, L1, L2]",
       "contracts": [
         "W1",
         "W2",
@@ -3115,7 +3069,6 @@
     },
     {
       "id": "linearizability-register",
-      "tests_md_ref": "Control Plane 26b. Linearizability \u2014 single-register CAS history (WGL)",
       "contracts": [
         "W1",
         "W2",
@@ -3134,7 +3087,6 @@
     },
     {
       "id": "witness-topology",
-      "tests_md_ref": "Control Plane 27. Witness Node 2+1 Topology",
       "contracts": [
         "W1",
         "V1"
@@ -3209,7 +3161,7 @@
       "assertions": [
         {
           "type": "cluster_topology",
-          "comment": "The witness is still attached here — cleanup removes it afterwards — so the 2+1 topology is four registered nodes and three voters.",
+          "comment": "The witness is still attached here \u2014 cleanup removes it afterwards \u2014 so the 2+1 topology is four registered nodes and three voters.",
           "nodes": 4,
           "leaders": 1
         },
@@ -3234,7 +3186,7 @@
         },
         {
           "type": "cmd",
-          "comment": "Empty its state, or the next run inherits it. `witness_state` is a NAMED volume, so neither `down -v` (the witness is not in the default profile) nor `rm -v` (anonymous volumes only) touches it — a second run then starts a witness whose data directory is far ahead of a freshly bootstrapped leader, pg_rewind refuses the divergence, and it never joins. Wiped through a throwaway container on the same volume, which derives the project from compose rather than naming it.",
+          "comment": "Empty its state, or the next run inherits it. `witness_state` is a NAMED volume, so neither `down -v` (the witness is not in the default profile) nor `rm -v` (anonymous volumes only) touches it \u2014 a second run then starts a witness whose data directory is far ahead of a freshly bootstrapped leader, pg_rewind refuses the divergence, and it never joins. Wiped through a throwaway container on the same volume, which derives the project from compose rather than naming it.",
           "cmd": "docker compose --profile witness run --rm --no-deps --entrypoint sh witness -c 'rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* /var/lib/postgresql/raft/* /var/lib/postgresql/raft/.[!.]* 2>/dev/null; ls -A /var/lib/postgresql/data; ls -A /var/lib/postgresql/raft'"
         },
         {
@@ -3244,14 +3196,13 @@
         },
         {
           "type": "cmd",
-          "comment": "Wait until no node counts the witness as a replica. Its streaming connection outlives the container by a moment, and the next case's wait treats three replicas on a three-node cluster as an illegal state — correctly, since only this case's fourth node made it legal. Asked of every node rather than of node1: leadership can have moved by here, and a standby reports zero replicas, so checking one node reads clean while the actual leader still has three.",
+          "comment": "Wait until no node counts the witness as a replica. Its streaming connection outlives the container by a moment, and the next case's wait treats three replicas on a three-node cluster as an illegal state \u2014 correctly, since only this case's fourth node made it legal. Asked of every node rather than of node1: leadership can have moved by here, and a standby reports zero replicas, so checking one node reads clean while the actual leader still has three.",
           "cmd": "for i in $(seq 1 60); do ok=1; for n in node1 node2 node3; do c=$(docker compose exec -T $n psql -U postgres -h localhost -p 5434 -t -A -c 'SELECT count(*) FROM pg_stat_replication' 2>/dev/null || echo 0); if [ \"$c\" -gt 2 ]; then ok=0; fi; done; if [ \"$ok\" = \"1\" ]; then exit 0; fi; sleep 1; done; echo 'a node still reports more than two replicas'; exit 1"
         }
       ]
     },
     {
       "id": "assert-sanity-acked",
-      "tests_md_ref": "Assert Sanity 1. acked-write-durability assertion fires on bad data [W1]",
       "contracts": [
         "W1"
       ],
@@ -3297,7 +3248,6 @@
     },
     {
       "id": "assert-sanity-concurrent",
-      "tests_md_ref": "Assert Sanity 2. concurrent-writes assertion fires on partial batch [W2]",
       "contracts": [
         "W2"
       ],
@@ -3337,7 +3287,6 @@
     },
     {
       "id": "assert-sanity-diverged",
-      "tests_md_ref": "Assert Sanity 3. diverged-node-rejoin assertion fires on wrong row count [V2]",
       "contracts": [
         "V2"
       ],
@@ -3377,7 +3326,6 @@
     },
     {
       "id": "storage-fault-recovery",
-      "tests_md_ref": "Control Plane V2. Storage Fault Recovery (pg_control corruption) [V2]",
       "contracts": [
         "V2"
       ],
@@ -3445,7 +3393,6 @@
     },
     {
       "id": "perf-baseline",
-      "tests_md_ref": "Performance 1. pgbench TPS Regression Gate",
       "contracts": [
         "V1"
       ],
@@ -3483,7 +3430,6 @@
     },
     {
       "id": "partition-plus-crash",
-      "tests_md_ref": "Control Plane 18. Compound: Asymmetric Partition + Leader Crash [L1, V1]",
       "contracts": [
         "L1",
         "W1",
@@ -3589,7 +3535,6 @@
     },
     {
       "id": "skew-plus-restart",
-      "tests_md_ref": "Control Plane 19. Compound: Clock Skew + Node Restart [V1]",
       "contracts": [
         "L1",
         "W1",
@@ -3679,7 +3624,6 @@
     },
     {
       "id": "double-failover-partition",
-      "tests_md_ref": "Control Plane 19. Double Failover with Network Partition [V1]",
       "contracts": [
         "W1",
         "V2"
@@ -3799,7 +3743,6 @@
     },
     {
       "id": "sync-standby-livelock",
-      "tests_md_ref": "Control Plane 20. Sync Standby Livelock Prevention [V1]",
       "contracts": [
         "R2",
         "V1"
@@ -3892,7 +3835,6 @@
     },
     {
       "id": "lsn-leaderless-livelock-recovery",
-      "tests_md_ref": "Audit C3/Liveness: LSN fail-closed leaderless livelock",
       "contracts": [
         "V1"
       ],
@@ -3948,7 +3890,6 @@
     },
     {
       "id": "vote-rejection-progresses",
-      "tests_md_ref": "Audit C3: Vote rejection returns proper VoteResponse, not transport error",
       "contracts": [
         "L3",
         "V1"
@@ -4012,7 +3953,6 @@
     },
     {
       "id": "rewind-refused-on-data-loss-risk",
-      "tests_md_ref": "Rewind data-loss gate \u2014 supervisor refuses pg_rewind when local WAL is more than one block ahead of the source",
       "contracts": [
         "W1",
         "V1"
@@ -4063,7 +4003,6 @@
     },
     {
       "id": "stale-sync-metric-after-kill",
-      "tests_md_ref": "BUGS.md: pgbattery_replica_is_sync stale-Sync after replica disconnect",
       "contracts": [
         "R2",
         "V1"
@@ -4114,7 +4053,6 @@
     },
     {
       "id": "lsn-over-report-rejected",
-      "tests_md_ref": "Management API: report-lsn over-report guard rejects impossible follower LSNs",
       "contracts": [
         "L3"
       ],
@@ -4138,7 +4076,6 @@
     },
     {
       "id": "promotion-holddown-clock-step",
-      "tests_md_ref": "Control Plane 28. Promotion Lease Hold-Down vs Forward Wall-Clock Step [L1, W1]",
       "contracts": [
         "L1",
         "W1"
@@ -4237,7 +4174,6 @@
     },
     {
       "id": "dual-writability-baseline",
-      "tests_md_ref": "Control Plane 29. Dual-Writability Prober Non-Vacuity Baseline [L1]",
       "contracts": [
         "L1"
       ],
@@ -4265,7 +4201,6 @@
     },
     {
       "id": "dual-writability-leader-kill",
-      "tests_md_ref": "Control Plane 30. Dual Writability Across Leader Kill [L1, W1]",
       "contracts": [
         "L1",
         "W1"
@@ -4344,7 +4279,6 @@
     },
     {
       "id": "dual-writability-network-partition",
-      "tests_md_ref": "Control Plane 31. Dual Writability Across Real Network Partition [L1, W1]",
       "contracts": [
         "L1",
         "W1"
@@ -4432,7 +4366,6 @@
     },
     {
       "id": "dual-writability-quorum-loss",
-      "tests_md_ref": "Control Plane 32. Dual Writability Across Quorum Loss and Restore [L1, W1]",
       "contracts": [
         "L1",
         "W1"
@@ -4503,7 +4436,6 @@
     },
     {
       "id": "network-loss-stability",
-      "tests_md_ref": "Control Plane 33. Packet Loss on a Follower [W1, V1]",
       "contracts": [
         "W1",
         "V1"
@@ -4591,7 +4523,6 @@
     },
     {
       "id": "disk-full-wal-pressure",
-      "tests_md_ref": "Control Plane 34. Reachable ENOSPC on a Follower [W1, V1, V2]",
       "contracts": [
         "W1",
         "V1",
@@ -4686,7 +4617,6 @@
     },
     {
       "id": "assert-sanity-chaos-oracle",
-      "tests_md_ref": "Assert Sanity 4. chaos-oracle survived assertion fires on a short pre batch [W1]",
       "contracts": [
         "W1"
       ],
@@ -4726,7 +4656,6 @@
     },
     {
       "id": "assert-sanity-chaos-oracle-post",
-      "tests_md_ref": "Assert Sanity 5. chaos-oracle survived-and-writable assertion fires with no post batch [W1]",
       "contracts": [
         "W1"
       ],
@@ -4766,7 +4695,6 @@
     },
     {
       "id": "assert-sanity-chaos-oracle-full",
-      "tests_md_ref": "Assert Sanity 6. chaos-oracle full assertion fires with no mid batch [W1]",
       "contracts": [
         "W1"
       ],
@@ -4806,7 +4734,6 @@
     },
     {
       "id": "assert-sanity-cascade-atomicity",
-      "tests_md_ref": "Assert Sanity 7. cascade write-atomicity assertion fires on a partial batch [W2]",
       "contracts": [
         "W2"
       ],
@@ -4846,7 +4773,6 @@
     },
     {
       "id": "assert-sanity-gateway-migration",
-      "tests_md_ref": "Assert Sanity 8. gateway migration assertion fires when no session survived [S2]",
       "contracts": [
         "S2"
       ],
@@ -4886,7 +4812,6 @@
     },
     {
       "id": "assert-sanity-ddl",
-      "tests_md_ref": "Assert Sanity 9. ddl-failover assertion fires on a half-created table [W3]",
       "contracts": [
         "W3"
       ],
@@ -4926,7 +4851,6 @@
     },
     {
       "id": "assert-sanity-commit-boundary",
-      "tests_md_ref": "Assert Sanity 10. failover-commit-boundary assertion fires on a duplicated autocommit row [S1]",
       "contracts": [
         "S1"
       ],
@@ -4966,7 +4890,6 @@
     },
     {
       "id": "assert-sanity-acked-dup",
-      "tests_md_ref": "Assert Sanity 11. acked-write-durability duplicate branch fires [W1, R2]",
       "contracts": [
         "W1",
         "R2"
@@ -5007,7 +4930,6 @@
     },
     {
       "id": "assert-sanity-slot-leak",
-      "tests_md_ref": "Assert Sanity 12. replication-slot-no-leak assertion fires on an inactive slot [R1]",
       "contracts": [
         "R1"
       ],
@@ -5052,7 +4974,6 @@
     },
     {
       "id": "replication-severed-raft-healthy",
-      "tests_md_ref": "Control Plane 20. Replication severed, Raft intact [W1, R2]",
       "contracts": [
         "W1",
         "R2"
@@ -5149,7 +5070,6 @@
     },
     {
       "id": "raft-severed-replication-healthy",
-      "tests_md_ref": "Control Plane 21. Raft severed, replication intact [L1, W1]",
       "contracts": [
         "L1",
         "W1"

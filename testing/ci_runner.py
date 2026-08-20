@@ -455,8 +455,9 @@ class CaseConfig(BaseModel):
 
     Attributes:
         id: Unique identifier referenced by suites.
-        description: Human-readable summary.
-        tests_md_ref: Cross-reference to the ``TESTS.md`` section.
+        description: Human-readable summary, and the case's own specification —
+            what it asserts and why that is the right thing to assert. There is
+            no other document to defer to.
         contracts: Correctness contract IDs from ``docs/CONTRACTS.md`` that this
             case exercises (e.g. ``["W1", "R2"]``).  Optional for the runner so
             a case without it still parses and executes; ``lint_matrix.py``
@@ -477,7 +478,6 @@ class CaseConfig(BaseModel):
 
     id: str
     description: str = ""
-    tests_md_ref: str = ""
     ci_excluded_reason: str = ""
     contracts: list[str] = []
     actions: list[dict[str, Any]] = []

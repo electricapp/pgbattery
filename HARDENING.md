@@ -2320,7 +2320,7 @@ nothing detects drift.
       diagnosed, and the suite names what stalled it.
       _Effort_ M
 
-- [ ] **H-51 — `tests_md_ref` points at documents that do not exist.** All
+- [x] **H-51 — `tests_md_ref` points at documents that do not exist.** All
       eighty cases carry one, and it names **two** different documents, neither
       of which has ever been in the repository — not deleted, never added.
       Seventy-two are `docs/TESTS.md` section numbers, in the shape
@@ -2342,11 +2342,32 @@ nothing detects drift.
       nowhere else in the repository now that `BUGS.md` is gone. The `Audit C3:`
       pair is the same. Deleting those destroys the only record of why the case
       exists.
-      **Done when** the duplicated values are gone, the ones carrying provenance
-      are folded into the case `description` first, the field is removed from
-      `CaseConfig`, and `lint_matrix.py` refuses a case-level cross-reference to
-      a file that is not in the repository — since an unchecked cross-reference
-      is how this survived eighty cases and two dead documents.
+      **Done, and the judgement call went the other way on nine of the ten.**
+      Reading each of the eight `BUGS.md:` values against its own case showed
+      the root cause was already in the `description`, in more detail than the
+      reference gave: `leaderless-wedge-recovery` says "openraft 0.9 has no
+      PreVote, so persisted-but-undelivered T+1 votes wedge the term",
+      `hung-postmaster-failover` says liveness by process-existence would report
+      a SIGSTOPped postmaster healthy, `vote-rejection-progresses` names the
+      `Err(Protocol)` return the LSN gate used to make. What the references
+      carried that the descriptions did not was their _pointers_ — "root cause
+      #5", "Audit C3" — and a pointer into a document that does not exist
+      recovers nothing.
+
+      One value was genuinely the only record: `faketime-shift-active` exists
+      because libfaketime was once not installed in the image at all, which is
+      now the last sentence of its description. Checking that case also caught
+      the field earning its keep in the wrong direction — the description
+      asserted `FAKETIME_DONT_FAKE_MONOTONIC is not set in docker-compose.yml`,
+      true when written and made false by H-49's fix two commits earlier, so
+      the case explained its own assertion backwards.
+
+      The field is gone from all eighty cases and from `CaseConfig`. The lint
+      that replaces it resolves any path-shaped token in a case — by full path
+      or by basename, since case text reasonably says `network.rs` — and is
+      keyed on the shape rather than on the field name, so reintroducing the
+      habit under a new key fails the same way. Verified red against the exact
+      dead strings, under a field invented for the test.
       _Effort_ S (mechanical) plus a judgement call per surviving reference
 
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
