@@ -83,6 +83,11 @@ Stopping them does not weaken the *green* run, which never touches them: it
 widens the un-fsynced window for the red one so the fault has something to
 destroy."""
 
+FREEZE_REACQUIRE_TIMEOUT_S: Final[float] = 60.0
+"""How long the freeze waits for a node that lost its PostgreSQL between the
+readiness check and the freeze itself — long enough for a demote's stop, rewind
+and restart, short enough that a node with none says so."""
+
 
 class DurabilityViolation(Exception):
     """An acknowledged write did not survive the crash. Contract W1 or R2."""
@@ -268,6 +273,15 @@ def freeze_wal_flush(nodes: list[str]) -> None:
         # pkill SIGSTOPs its own caller and the exec hangs until it times out.
         running = fp.read_processes(node)
         pids = [p.pid for p in running if any(name in p.args for name in WAL_FLUSH_PROCESSES)]
+        if not pids:
+            # `await_postgres_running` cleared every node moments ago, so an
+            # empty read here is a node that lost its PostgreSQL in between —
+            # a demote stops it to rewind, and comes back. Wait it out once
+            # rather than failing the run on the gap between the check and the
+            # use; a node that genuinely has none still raises below.
+            await_postgres_running([node], FREEZE_REACQUIRE_TIMEOUT_S)
+            running = fp.read_processes(node)
+            pids = [p.pid for p in running if any(name in p.args for name in WAL_FLUSH_PROCESSES)]
         if not pids:
             raise fp.FaultPreconditionError(
                 f"{node}: none of {WAL_FLUSH_PROCESSES} are running, so there is "

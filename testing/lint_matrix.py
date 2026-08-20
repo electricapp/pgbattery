@@ -864,6 +864,58 @@ def check_elle_driver_names_resolve() -> None:
         )
 
 
+def harness_subcommands_used(matrix_text: str) -> dict[str, str]:
+    """`{script: subcommand}` for every `testing/<script>.py <word>` in the matrix.
+
+    Only a bare word counts: an option (`--artifact-dir`) is an argument, not a
+    subcommand.
+    """
+    found: dict[str, str] = {}
+    for match in re.finditer(r"testing/([a-z_]+)\.py\s+([a-z][a-z-]*)\b", matrix_text):
+        found[match.group(1)] = match.group(2)
+    return found
+
+
+def module_defines_subcommand(source: str, name: str) -> bool:
+    """Whether `source` registers `name` as a Typer command.
+
+    Matches the decorator and the function it names — a single-command app
+    (`@app.command()` on one function, invoked with no verb) registers nothing
+    a caller may pass as a word.
+    """
+    if not re.search(r"@app\.command\(", source):
+        return False
+    commands = re.findall(r"@app\.command\([^)]*\)\s*\ndef\s+([a-z_]+)", source)
+    named = re.findall(r"@app\.command\(\s*[\"']([a-z-]+)[\"']", source)
+    return name in named or (len(commands) > 1 and name in commands)
+
+
+def check_harness_subcommands_exist() -> None:
+    """A matrix step must not call a harness with a verb the harness rejects.
+
+    `correctness-lite-invariants` called `correctness_lite.py run` against a
+    single-command Typer app, which answers "Got unexpected extra argument
+    (run)" and exits 2. The case had been failing on that alone, and could not
+    say so, because it sits at position seventeen of a nightly suite that had
+    not reached position eleven in months.
+    """
+    wrong: list[str] = []
+    for script, verb in harness_subcommands_used(MATRIX_PATH.read_text(encoding="utf-8")).items():
+        path = TESTING_DIR / f"{script}.py"
+        if not path.exists():
+            wrong.append(f"{script}.py does not exist")
+            continue
+        if not module_defines_subcommand(path.read_text(encoding="utf-8"), verb):
+            wrong.append(f"{script}.py has no {verb!r} command")
+    if wrong:
+        raise AssertionError(
+            "matrix steps call harnesses with arguments they reject: "
+            + "; ".join(wrong)
+            + ". The step exits 2 before doing anything, and the case reports that as its own "
+            "failure."
+        )
+
+
 def check_fault_injection_confined() -> None:
     """Keep direct fault injection confined to the modules already tracked for it.
 
@@ -925,6 +977,7 @@ def lint() -> None:
     check("Transfers can wait out a demote", check_transfers_can_wait_out_a_demote)
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
     check("Elle matrix driver names resolve", check_elle_driver_names_resolve)
+    check("Harness subcommands the matrix calls exist", check_harness_subcommands_exist)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

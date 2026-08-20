@@ -1457,6 +1457,89 @@ def test_pending_migration_entries_still_inject() -> None:
         )
 
 
+def test_a_bare_word_after_a_harness_path_reads_as_a_subcommand() -> None:
+    """`correctness_lite.py run` and `linearizability_register.py run` both
+    called verbs that do not exist, and both exited 2 before doing anything."""
+    used = lint_matrix.harness_subcommands_used(
+        "uv run --project testing python testing/correctness_lite.py run --artifact-dir x"
+    )
+    assert used == {"correctness_lite": "run"}
+
+
+def test_an_option_is_not_a_subcommand() -> None:
+    """The single-command form is the correct one, and must not be flagged."""
+    assert (
+        lint_matrix.harness_subcommands_used(
+            "uv run --project testing python testing/correctness_lite.py --artifact-dir x"
+        )
+        == {}
+    )
+
+
+def test_a_single_command_app_defines_no_subcommand() -> None:
+    """One `@app.command()` means the app is invoked with no verb at all."""
+    source = "@app.command()\ndef main() -> None:\n    pass\n"
+    assert not lint_matrix.module_defines_subcommand(source, "run")
+    assert not lint_matrix.module_defines_subcommand(source, "main")
+
+
+def test_a_multi_command_app_defines_its_verbs() -> None:
+    """A harness that really does take verbs must not be flagged for them."""
+    source = (
+        "@app.command()\ndef run() -> None:\n    pass\n"
+        "@app.command()\ndef check() -> None:\n    pass\n"
+    )
+    assert lint_matrix.module_defines_subcommand(source, "run")
+    assert not lint_matrix.module_defines_subcommand(source, "missing")
+
+
+def test_an_explicitly_named_command_counts() -> None:
+    """`@app.command("restamp")` names a verb the function does not."""
+    source = '@app.command("restamp")\ndef whatever() -> None:\n    pass\n'
+    assert lint_matrix.module_defines_subcommand(source, "restamp")
+
+
+def test_a_step_that_expects_a_refusal_does_not_wait_for_writability() -> None:
+    """`stale-leader-fencing` and `majority-loss` assert a write is refused.
+    Waiting for a writable path there would wait out the clock on the exact
+    state under test."""
+    assert not ci_runner.sql_step_needs_a_writable_path(
+        {"expect_exit": [1, 2]}, "INSERT INTO t VALUES (1);"
+    )
+
+
+def test_a_direct_step_does_not_wait_for_writability() -> None:
+    """`direct` addresses one node's own PostgreSQL, which is legitimately a
+    read-only standby."""
+    assert not ci_runner.sql_step_needs_a_writable_path(
+        {"direct": True}, "INSERT INTO t VALUES (1);"
+    )
+
+
+def test_a_read_only_step_does_not_wait_for_writability() -> None:
+    """An assertion that only reads must not be held up by a cluster that is
+    deliberately fenced."""
+    assert not ci_runner.sql_step_needs_a_writable_path({}, "SELECT count(*) FROM t;")
+
+
+def test_a_write_through_the_gateway_waits_however_the_node_was_named() -> None:
+    """The read-only flake hit steps naming an explicit node, not just
+    `node: leader` — the gateway routes both to the same primary."""
+    assert ci_runner.sql_step_needs_a_writable_path(
+        {"node": 3}, "INSERT INTO ci_failover_load(seq) VALUES (1);"
+    )
+    assert ci_runner.sql_step_needs_a_writable_path(
+        {"node": "leader"}, "DO $$ BEGIN INSERT INTO t VALUES (1); END $$;"
+    )
+
+
+def test_a_write_verb_inside_a_comment_is_not_a_write() -> None:
+    """Matched at the start of a line, so prose about INSERT does not count."""
+    assert not ci_runner.sql_step_needs_a_writable_path(
+        {}, "-- this file used to INSERT rows\nSELECT 1;\n"
+    )
+
+
 def _leader_count_runner(
     answers: dict[int, list[float] | Exception],
 ) -> tuple[DispatchRunner, Path]:

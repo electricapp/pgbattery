@@ -53,6 +53,30 @@ Removal steps:
 
 Never remove so many voters that the cluster loses majority (N/2+1).
 
+## Bringing a Removed Node Back
+
+A removed node does not rejoin by restarting. `join` clones from the leader and
+refuses a data directory that already holds a cluster:
+
+```
+Error: Data directory /var/lib/postgresql/data is not empty.
+```
+
+That refusal is deliberate — the node's data is from a membership it is no
+longer in, and nothing has reconciled it against the cluster's history — so the
+operator clears the state and lets the node join as a new one:
+
+```bash
+# with the node stopped
+rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/raft/*
+pgbattery join --peer <any-member> --voter
+```
+
+The cost is a full basebackup rather than catch-up from the WAL the node
+already holds. Reattaching that WAL would need the node's data proven to be
+this cluster's (see `docs/STATE_MACHINE.md` §3a) and no further ahead than the
+leader; until that exists, the clone is the supported path.
+
 ## API Reference
 
 | Endpoint                                 | Purpose                                    |

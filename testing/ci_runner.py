@@ -196,6 +196,20 @@ CLUSTER_LIFECYCLE_TIMEOUT_SEC: Final[int] = 1800
 DIAGNOSTIC_TIMEOUT_SEC: Final[int] = 120
 # Fault-effect probes are single short `docker inspect` / `docker exec` calls.
 FAULT_PROBE_TIMEOUT_SEC: Final[int] = 60
+# How long a writing SQL step waits for its path to take writes. Long enough to
+# cover a promotion plus the lease tick's write recovery, short enough that a
+# node which is never going to accept writes says so rather than eating the
+# case's own timeout.
+SQL_WRITABLE_TIMEOUT_SEC: Final[int] = 60
+
+# Statement-leading verbs that need a path accepting writes. Matched at the
+# start of a line so a verb inside a string or a comment does not count; the
+# cost of a false positive is one wait that returns immediately, and of a false
+# negative the flake this exists to remove.
+_SQL_WRITE_VERB: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(insert|update|delete|truncate|create|drop|alter|grant|revoke|do)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 # Per-stream character budget for the partial output reported on a timeout.
 TIMEOUT_OUTPUT_CHARS: Final[int] = 4000
 # How long to wait for the pipes of a killed command to drain.
@@ -213,6 +227,25 @@ PRIVILEGED_EXEC_USER: Final[str] = "root"
 # Shape of a correctness contract ID as defined by the ``### <ID> — <title>``
 # headings in ``docs/CONTRACTS.md`` (W1, W2, L3, R1, V2, S1, ...).
 CONTRACT_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Z]{1,3}[0-9]{1,2}")
+
+
+def sql_step_needs_a_writable_path(step: dict[str, Any], sql_content: str) -> bool:
+    """Whether this SQL step should wait for a path that accepts writes.
+
+    Three things have to hold. It has to go through a gateway — a `direct` step
+    addresses one node's own PostgreSQL, which is legitimately a read-only
+    standby. It has to expect success — `stale-leader-fencing` and
+    `majority-loss` assert a write is *refused*, and waiting for writability
+    there would wait out the clock on the state under test. And it has to
+    actually write, so an assertion that only reads is not held up by a cluster
+    that is deliberately fenced.
+    """
+    if step.get("direct"):
+        return False
+    expect = step.get("expect_exit", 0)
+    if expect != 0:
+        return False
+    return bool(_SQL_WRITE_VERB.search(sql_content))
 
 
 def captured_text(captured: Any) -> str | None:
@@ -2311,6 +2344,37 @@ class CIRunner:
         if measured_tps < min_tps:
             raise RunnerError(f"pgbench TPS {measured_tps:.0f} below minimum {min_tps:.0f}")
 
+    def _await_node_accepts_writes(self, node: ClusterNodeConfig, step_log: Path) -> None:
+        """Block until `node` runs a write, or raise saying it never did.
+
+        The probe is a rolled-back temp table: refused in a read-only
+        transaction the same way the case's own INSERT would be, and
+        session-local, so a passing probe leaves nothing behind.
+        """
+        deadline = time.time() + SQL_WRITABLE_TIMEOUT_SEC
+        last = "no attempt made"
+        probe = (
+            f"{container_exec_prefix(node.name)} "
+            "psql -U postgres -h localhost -p 5432 -d postgres -v ON_ERROR_STOP=1 "
+            '-c "CREATE TEMP TABLE ci_runner_writable_probe(x int)"'
+        )
+        while time.time() < deadline:
+            proc = self._run_shell(
+                probe,
+                step_log.with_suffix(".writable-probe.log"),
+                expect_exit=None,
+                timeout_sec=15,
+                render=False,
+            )
+            if proc.returncode == 0:
+                return
+            last = (proc.stderr or proc.stdout).strip()
+            time.sleep(1.0)
+        raise RunnerError(
+            f"{node.name} never accepted a write within {SQL_WRITABLE_TIMEOUT_SEC}s of being "
+            f"resolved as the leader; last psql error: {last}"
+        )
+
     def _execute_sql_step(self, step: dict[str, Any], step_log: Path) -> None:
         """Execute a ``sql`` step: pipe a ``.sql`` file through psql via stdin.
 
@@ -2346,6 +2410,14 @@ class CIRunner:
         node = self.node_map.get(node_id)
         if not node:
             raise RunnerError(f"Unknown node {node_id} for sql step.")
+
+        # Winning the election is not the same as taking writes: a freshly
+        # promoted primary stays read-only until the lease tick recovers
+        # writes. Waiting turns "cannot execute INSERT in a read-only
+        # transaction" — which reads like the case's own subject failing —
+        # back into what it is, a step that started too early.
+        if sql_step_needs_a_writable_path(step, sql_content):
+            self._await_node_accepts_writes(node, step_log)
 
         port = 5434 if step.get("direct") else 5432
         on_error_stop = "1" if step.get("on_error_stop", True) else "0"

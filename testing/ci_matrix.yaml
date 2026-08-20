@@ -1983,7 +1983,7 @@
       "contracts": [
         "R1"
       ],
-      "description": "Forces two successive pgbattery kills and verifies no inactive physical replication slots remain on any node's primary. Stale slots block WAL cleanup and cause unbounded disk growth.",
+      "description": "Forces two successive pgbattery kills and verifies no inactive physical replication slots remain on any node's primary. Stale slots block WAL cleanup and cause unbounded disk growth. The kills are what this case needs, and the runner verifies each one landed by the container's incarnation changing; leadership moving is NOT required, because `restart: unless-stopped` can bring the process back before a follower's election timer fires, and demanding it made the case fail on exactly the fast restart it should tolerate.",
       "actions": [
         {
           "type": "record_leader",
@@ -1997,7 +1997,6 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "leader_not_var": "leader_before",
           "timeout_sec": 120
         },
         {
@@ -2453,7 +2452,12 @@
         },
         {
           "type": "cmd",
-          "comment": "node3 command is 'pgbattery join --peer ... --voter'; it will re-add itself",
+          "comment": "A removed node cannot rejoin on top of its old state: `join` clones from the leader and refuses a non-empty data directory ('Data directory /var/lib/postgresql/data is not empty'), which is the safe direction and the documented procedure in docs/MEMBERSHIP.md. Wiped through a throwaway container on the same volume because the node is stopped, so there is nothing to exec into.",
+          "cmd": "docker compose run --rm --no-deps --entrypoint sh node3 -c 'rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* /var/lib/postgresql/raft/* /var/lib/postgresql/raft/.[!.]* 2>/dev/null; ls -A /var/lib/postgresql/data; ls -A /var/lib/postgresql/raft'"
+        },
+        {
+          "type": "cmd",
+          "comment": "node3 command is 'pgbattery join --peer ... --voter'; with an empty directory it clones from the leader and re-adds itself",
           "cmd": "docker compose start node3"
         },
         {
@@ -3100,7 +3104,7 @@
         {
           "type": "cmd",
           "comment": "correctness_lite assumes a running cluster; waits up to 120s for a healthy leader",
-          "cmd": "uv run --project testing python testing/correctness_lite.py run --artifact-dir testing/artifacts/correctness-matrix",
+          "cmd": "uv run --project testing python testing/correctness_lite.py --artifact-dir testing/artifacts/correctness-matrix",
           "expect_exit": 0
         }
       ],
@@ -3119,7 +3123,7 @@
         {
           "type": "cmd",
           "comment": "linearizability_register assumes a running cluster; needs a leader for the initial CREATE TABLE",
-          "cmd": "uv run --project testing python testing/linearizability_register.py run --artifact-dir testing/artifacts/linearizability-matrix",
+          "cmd": "uv run --project testing python testing/linearizability_register.py --artifact-dir testing/artifacts/linearizability-matrix",
           "expect_exit": 0
         }
       ],
@@ -3214,6 +3218,11 @@
           "type": "cmd",
           "comment": "stop witness so it does not affect subsequent test cases",
           "cmd": "docker compose --profile witness stop witness"
+        },
+        {
+          "type": "cmd",
+          "comment": "and remove it: a stopped-but-present container still answers `compose ps -a`, and the next case's cluster wait counts registered nodes.",
+          "cmd": "docker compose --profile witness rm -sf witness"
         }
       ]
     },

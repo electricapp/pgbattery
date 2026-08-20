@@ -2150,6 +2150,26 @@ nothing detects drift.
       model's.
       _Effort_ M
 
+- [ ] **H-50 — `witness-topology` does not describe the cluster it builds.**
+      Case nineteen of the control-plane nightly, and the first one the suite
+      reaches that is still red. It calls node4 a "witness learner", waits for
+      `nodes: 3` after starting it, and asserts a 3-node topology at the end —
+      while the witness is still up, since cleanup stops it afterwards.
+
+      The counts observed do not agree with each other, which is why this is
+      left open rather than patched to whichever number a run happened to
+      produce. In the nightly it timed out on `nodes=4, voters=3`; run alone
+      against a freshly rebuilt cluster it timed out on `nodes=3, voters=4`.
+      Starting the witness by hand and watching membership for thirty seconds,
+      node4 never appeared at all. `--voter` defaults to false and the compose
+      command does not pass it, so a voter count of four says either the join
+      raced into one or something promoted it — and a 2+1 topology whose
+      witness can become a voter is a different quorum than the case claims to
+      test.
+      **Done when** the case waits for and asserts the topology it actually
+      builds, and node4's role is deterministic rather than raced.
+      _Effort_ M
+
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
       `ha-ci.yml` hardcodes five case names into the parallel matrix while the
       suite holds seventeen, so **twelve cases are executed by no workflow at
