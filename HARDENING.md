@@ -2470,19 +2470,38 @@ nothing detects drift.
 
 - [ ] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`
       arms LazyFS for the next write to `raft.db`, and every write it
-      intercepts is the 320-byte header at offset 0: redb maps the data region
-      rather than writing it through the FUSE path, so a btree page cannot be
-      torn this way at all. The suite therefore proves the header case — which
-      is real, since the header is what redb reads to find everything else, and
-      a torn one is tolerated cleanly today — and nothing about a page the store
-      has committed.
+      intercepts is the 320-byte header at offset 0. The suite therefore proves
+      the header case — which is real, since the header is what redb reads to
+      find everything else, and a torn one is tolerated cleanly today — and
+      nothing about a page the store has committed.
 
       This was hidden behind a threshold. `--min-torn-bytes 512` asked for a
       tear the workload cannot produce, so the job failed intermittently saying
       "redb's write pattern changed" when the pattern had never been different.
+
+      **The explanation this entry gave for it is wrong, and so are both
+      remedies it prescribed.** "redb maps the data region rather than writing
+      it through the FUSE path" is not true of the version in use: redb 4.2 has
+      no `mmap` anywhere in its sources — mapping went away in 2.0 — and its
+      unix file backend writes with `pwrite` (`file_backend/optimized.rs`). A
+      btree page is exactly as visible to FUSE as the header. So there is no
+      mapped region for LazyFS to intercept via `msync`, and redb is already
+      "configured off mmap"; both halves of the old **Done when** describe work
+      that cannot be done because the condition it assumes does not hold.
+
+      What is left is the arming window. LazyFS hardcodes a torn-op arriving
+      over the FIFO to occurrence 1 — `occurrence=` parses and is then ignored,
+      which `lazyfs_torn_op_cmd` already documents — so the tear fires on the
+      very next write to the path, and after a quiet moment that is the commit
+      header. Reaching a btree page means arming immediately before a write
+      known to be one: drive a value large enough to force a data page and arm
+      in the gap, or drop the fault through LazyFS's config file if that form
+      honours `occurrence`. Neither is confirmed yet, and the cheap first step
+      is to record the offset and size of every write LazyFS sees on `raft.db`
+      across a workload — the harness already keeps the offsets it tears, so it
+      is a matter of keeping the ones it does not.
       **Done when** a torn write lands on a committed btree page and the node is
-      shown to tolerate it or refuse to start — which needs LazyFS to intercept
-      the mapped region (`msync`), or redb configured off mmap for the test.
+      shown to tolerate it or refuse to start.
       _Effort_ M
 
 - [x] **H-47 — A counterexample model for every spec.** Only `lease_fencing`

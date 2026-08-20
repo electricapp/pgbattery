@@ -475,9 +475,18 @@ def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int
     writes anything larger in this workload" is itself an answer — and it is
     the one this store gives. Every write LazyFS intercepts on `raft.db` is the
     320-byte header at offset 0, so a `parts=2` tear persists 160 bytes of it
-    and nothing here can reach a btree page: redb maps the data region rather
-    than writing it through the FUSE path. That makes this a torn-header test,
+    and nothing here reaches a btree page. That makes this a torn-header test,
     which is a real one — the header is what redb reads to find anything else.
+
+    Why it is only the header is **not** that redb maps its data region, which
+    is what this said before and is not true of the version in use: redb 4 has
+    no mmap anywhere in its sources and writes through `pwrite` (its unix file
+    backend), so a data page is as visible to FUSE as the header is. The likely
+    cause is the arming window instead — LazyFS hardcodes a FIFO torn-op to
+    occurrence 1, so it fires on the very next write to the path, and the next
+    write after a quiet moment is the commit header. Reaching a btree page
+    therefore means arming immediately before a write known to be one, not
+    teaching LazyFS to intercept a mapping that does not exist. HARDENING H-48.
     """
     outcome = Outcome()
     lead = await_settled_cluster(CONVERGE_TIMEOUT_S)
