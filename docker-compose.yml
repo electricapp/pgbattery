@@ -43,6 +43,11 @@ services:
       - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
       - FAKETIME_NO_CACHE=1
       - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+      # The lease is measured on CLOCK_MONOTONIC, so faking it too would move
+      # the thing every clock-skew case exists to prove is unmoved. libfaketime
+      # fakes it by default on amd64; arm64 does not, which is why this was
+      # invisible until `faketime-shift-active` first ran in CI.
+      - FAKETIME_DONT_FAKE_MONOTONIC=1
     networks:
       raft_net:
         ipv4_address: 172.28.0.11
@@ -76,6 +81,11 @@ services:
       - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
       - FAKETIME_NO_CACHE=1
       - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+      # The lease is measured on CLOCK_MONOTONIC, so faking it too would move
+      # the thing every clock-skew case exists to prove is unmoved. libfaketime
+      # fakes it by default on amd64; arm64 does not, which is why this was
+      # invisible until `faketime-shift-active` first ran in CI.
+      - FAKETIME_DONT_FAKE_MONOTONIC=1
     networks:
       raft_net:
         ipv4_address: 172.28.0.12
@@ -109,6 +119,11 @@ services:
       - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
       - FAKETIME_NO_CACHE=1
       - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+      # The lease is measured on CLOCK_MONOTONIC, so faking it too would move
+      # the thing every clock-skew case exists to prove is unmoved. libfaketime
+      # fakes it by default on amd64; arm64 does not, which is why this was
+      # invisible until `faketime-shift-active` first ran in CI.
+      - FAKETIME_DONT_FAKE_MONOTONIC=1
     networks:
       raft_net:
         ipv4_address: 172.28.0.13
@@ -138,6 +153,11 @@ services:
       - LD_PRELOAD=/usr/local/lib/libfaketime.so.1
       - FAKETIME_NO_CACHE=1
       - FAKETIME_TIMESTAMP_FILE=/tmp/faketime
+      # The lease is measured on CLOCK_MONOTONIC, so faking it too would move
+      # the thing every clock-skew case exists to prove is unmoved. libfaketime
+      # fakes it by default on amd64; arm64 does not, which is why this was
+      # invisible until `faketime-shift-active` first ran in CI.
+      - FAKETIME_DONT_FAKE_MONOTONIC=1
     networks:
       raft_net:
         ipv4_address: 172.28.0.14

@@ -2247,7 +2247,10 @@ impl App {
             local_lineage,
             leader_lineage,
         ) {
-            JoinDataDir::Usable => {}
+            // Nothing to clear either way: an empty directory is ready as it
+            // is, and a refusal is `ensure_data_dir_ready`'s to report below —
+            // keeping the data is the whole point of that outcome.
+            JoinDataDir::Usable | JoinDataDir::Refuse => {}
             JoinDataDir::ClearInterruptedClone => {
                 warn!(
                     data_dir = %data_dir.display(),
@@ -2265,7 +2268,6 @@ impl App {
                 );
                 clear_dir_contents(data_dir)?;
             }
-            JoinDataDir::Refuse => {}
         }
         ensure_data_dir_ready(data_dir)
     }
