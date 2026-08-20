@@ -2610,7 +2610,9 @@ These close the exit criteria and cannot be done early.
       which was the part deliberately left last — RW-5 was already stale when
       the register was written, the prober having made it reachable without the
       column noticing. Each row was checked against the capability it claims:
-      RW-1 against `five_node_suite.py` (still a raising skeleton), RW-2 against
+      RW-1 against `five_node_suite.py` (a raising skeleton when that pass was
+      made; H-06 and H-44 have since given it Phase 2, whose `phase_rw1_asymmetric`
+      runs the prober across an asymmetric partition), RW-2 against
       the absence of any protocol-state-triggered wait in the primitive layer or
       runner, RW-4 against the SIGSTOP primitives, RW-5 against the prober's
       three-port coverage, RW-6 against the matrix (**no case drives a follower

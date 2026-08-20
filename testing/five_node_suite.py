@@ -574,8 +574,8 @@ def phase_rw1_asymmetric(leader: int) -> None:
 
 @app.command()
 def run_suite() -> None:
-    """Run Phase 1. Exits non-zero on any failed assertion."""
-    console.rule("[bold]5-NODE SUITE — Phase 1")
+    """Run Phases 1 and 2. Exits non-zero on any failed assertion."""
+    console.rule("[bold]5-NODE SUITE — Phases 1 and 2")
     results: list[tuple[str, str]] = []
     try:
         leader = phase_bootstrap()
@@ -624,7 +624,7 @@ def run_suite() -> None:
 
 
 def _report(results: list[tuple[str, str]]) -> None:
-    table = Table(title="5-Node Suite — Phase 1")
+    table = Table(title="5-Node Suite — Phases 1 and 2")
     table.add_column("Case", style="bold")
     table.add_column("Result")
     for name, verdict in results:
