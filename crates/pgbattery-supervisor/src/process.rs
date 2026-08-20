@@ -429,6 +429,27 @@ pub(crate) enum TimelineCheck {
     Unknown,
 }
 
+/// What a former primary should do about a demote request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormerPrimaryAction {
+    /// Stop and rewind onto the new leader.
+    Rewind,
+    /// Stay up and retry on the next reconcile tick.
+    Defer,
+}
+
+/// Whether a former primary may stop its `PostgreSQL` to rewind onto the leader.
+///
+/// Defers on an unreachable leader, as the standby path already does: stopping
+/// a node that holds WAL the leader is waiting for leaves both stuck (H-53).
+/// The caller has already fenced this node, so what stays up cannot write.
+const fn former_primary_action(timeline: TimelineCheck) -> FormerPrimaryAction {
+    match timeline {
+        TimelineCheck::Match | TimelineCheck::Mismatch => FormerPrimaryAction::Rewind,
+        TimelineCheck::Unknown => FormerPrimaryAction::Defer,
+    }
+}
+
 /// What the demote path should do once we have probed local + leader state.
 ///
 /// Computed by [`Supervisor::decide_standby_action`] — extracting the four
@@ -2317,6 +2338,19 @@ host all all ::/0 {auth_method}
             new_leader = %new_leader_addr,
             "Demoting to replica (may require pg_rewind for timeline sync)"
         );
+
+        // Reach the leader before stopping for it — see `former_primary_action`.
+        if former_primary_action(self.check_timeline_state(new_leader_addr).await)
+            == FormerPrimaryAction::Defer
+        {
+            metrics::counter!("pgbattery_demote_deferred_unreachable_leader").increment(1);
+            tracing::warn!(
+                new_leader = %new_leader_addr,
+                "New leader's timeline could not be probed - deferring demote rather than \
+                 stopping PostgreSQL to rewind onto a node that may not be able to serve"
+            );
+            return Ok(());
+        }
 
         // For demoting a former primary:
         // 1. Capture the divergence gate's local-LSN input while PG is
@@ -5034,6 +5068,26 @@ mod tests {
         // An unreadable sync marker or count is a failed probe, not a default.
         assert!(parse_role_readonly("false,off,maybe,0").is_err());
         assert!(parse_role_readonly("false,off,set,many").is_err());
+    }
+
+    #[test]
+    fn a_former_primary_defers_rather_than_stopping_for_an_unreachable_leader() {
+        // It holds WAL the leader may be waiting for; stopping strands both.
+        assert_eq!(
+            former_primary_action(TimelineCheck::Unknown),
+            FormerPrimaryAction::Defer
+        );
+    }
+
+    #[test]
+    fn a_reachable_leader_still_gets_the_rewind() {
+        for timeline in [TimelineCheck::Match, TimelineCheck::Mismatch] {
+            assert_eq!(
+                former_primary_action(timeline),
+                FormerPrimaryAction::Rewind,
+                "{timeline:?}"
+            );
+        }
     }
 
     /// Property tests over the pure `pg_rewind` data-loss gate.

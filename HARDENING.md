@@ -2467,20 +2467,24 @@ nothing detects drift.
       leadership indefinitely, and `promote_local_postgres` returns
       `Some(false)` on every pass.
 
-      **So the cascade is a livelock, not a stuck leader.** If every node that
-      wins the election has a `PostgreSQL` that cannot open, each wins, fails
-      its probes, restarts, and hands on — for as long as no peer can be
-      promoted. That fits what the case shows, minutes of no progress with the
-      cluster alive, and it is not something a yield can fix, because
-      leadership is already moving. The remedy belongs on the election side: a
-      node that cannot open its database should not be winning on LSN.
+      **So the cascade is a livelock, not a stuck leader**, and one half of it
+      is now closed. The observed run has node1 returning and "immediately
+      stopping its own PostgreSQL to rewind onto node3" while node3 waits for
+      WAL only node1 holds. `demote` is where that happens, and it had two
+      paths: the standby one defers on `TimelineCheck::Unknown` — the enum's
+      own doc says stopping for a leader nobody could reach spins on a dead one
+      — while the former-primary path called `stop()` unconditionally.
 
-      **Done when** a node whose `PostgreSQL` cannot open is kept from winning
-      an election it will then fail out of, so the cascade converges on
-      whichever peer can actually serve instead of rotating through all three,
-      and `cascade-double-failover-wedge` returns to the matrix. The watchdog
-      stays as the bound on the healthy-standby half; it is not the remedy for
-      this one and this entry no longer claims it is.
+      Both defer now. Deferring is free here because `demote_to_leader` fences
+      the node read-only and severs its sessions before calling in, so what
+      stays up cannot take a write and can still serve the WAL the leader is
+      waiting for.
+
+      **Done when** `cascade-double-failover-wedge` runs in the matrix without
+      wedging. The mutual wait is closed; what is not yet shown is that it was
+      the whole of it, and the case is the only thing that can show that. The
+      watchdog stays as the bound on the healthy-standby half; it is not the
+      remedy for this one and this entry no longer claims it is.
       _Effort_ M
 
 - [x] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
