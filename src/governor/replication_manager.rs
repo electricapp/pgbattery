@@ -112,29 +112,63 @@ pub(crate) fn peer_voter_names(voter_ids: &HashSet<NodeId>, self_id: NodeId) -> 
     names
 }
 
-fn plan_sync_replication(
-    all_voter_names: &[String],
+/// Number of voter peers (voters excluding this node) — the input
+/// [`required_sync_standbys`] takes. Allocation-free counterpart of
+/// [`peer_voter_names`]; the 100 ms lease tick reads it.
+pub(crate) fn peer_voter_count(voter_ids: &HashSet<NodeId>, self_id: NodeId) -> usize {
+    voter_ids.iter().filter(|id| **id != self_id).count()
+}
+
+/// Rebuild the memoized peer-name list and its `synchronous_standby_names`
+/// text when the voter set changed; returns whether it rebuilt. Not an
+/// apply-decision cache: both are pure derivations of `voters`, and
+/// `cached_voters` is compared against the live set on every tick before
+/// either is used, so a stale value cannot survive a use.
+fn refresh_peer_names(
+    names: &mut Vec<String>,
+    sync_list: &mut String,
+    cached_voters: &mut HashSet<NodeId>,
+    voters: &HashSet<NodeId>,
+    self_id: NodeId,
+) -> bool {
+    if *cached_voters == *voters {
+        return false;
+    }
+    *names = peer_voter_names(voters, self_id);
+    *sync_list = sync_standby_list(names);
+    cached_voters.clone_from(voters);
+    true
+}
+
+/// The tick's `synchronous_standby_names` decision. String-free: the caller
+/// resolves `FullList` against the memoized [`sync_standby_list`] text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncPlan {
+    /// Install the full voter list — which [`sync_standby_list`] itself
+    /// leaves empty when no ack is required (one or two voters).
+    FullList,
+    /// Deliberate async fallback: empty list, RPO>0.
+    AsyncFallback,
+}
+
+const fn plan_sync_replication(
+    peer_count: usize,
     healthy_voter_count: usize,
     has_quorum: bool,
     in_leader_grace: bool,
-) -> (String, bool) {
-    // Require enough synchronous acks that the write set (leader + k sync
-    // standbys) intersects every Raft majority, so no elected leader can
-    // lack an acknowledged write. `FIRST 1` is only correct up to 4 voters;
-    // at >=5 it acks a write on leader + 1 standby = 2 of >=5 nodes, and a
-    // failover to the other majority silently loses it. See
-    // `required_sync_standbys`.
-    let sync_list = sync_standby_list(all_voter_names);
-
+) -> (SyncPlan, bool) {
+    // The full list requires enough synchronous acks that the write set
+    // (leader + k sync standbys) intersects every Raft majority — see
+    // `required_sync_standbys` and `sync_standby_list`.
     if healthy_voter_count == 0 && has_quorum && !in_leader_grace {
         // Quorum intact but no replica streaming: fall back to async
         // (empty). A stale list naming disconnected replicas blocks ALL
         // client writes — including any the operator needs — so with the
         // cluster otherwise healthy we trade durability (brief RPO>0) for
         // availability until a replica reconnects. A single-node cluster
-        // (empty voter list) is not degraded — there is no standby whose
+        // (no voter peers) is not degraded — there is no standby whose
         // ack we are giving up.
-        return (String::new(), !all_voter_names.is_empty());
+        return (SyncPlan::AsyncFallback, peer_count > 0);
     }
 
     // in_leader_grace: a freshly-promoted leader sees an empty
@@ -153,7 +187,7 @@ fn plan_sync_replication(
     // read-only, so there is no client write left to deadlock. Keep the
     // sync list rather than silently dropping to RPO>0 — fail-stop, not
     // fail-open. With ≥1 healthy replica, sync replication as normal.
-    (sync_list, false)
+    (SyncPlan::FullList, false)
 }
 
 /// Whether the tick's `pg_stat_replication` sample shows at least one
@@ -222,6 +256,48 @@ fn plan_slot_reconciliation(
     (create_slots_for, drop_slots_for)
 }
 
+/// Interned per-replica gauge handles, so per-tick recording skips
+/// rebuilding and re-hashing four labeled keys per replica. Not a state
+/// cache in the `docs/STATE_MACHINE.md` sense: the recorder registry these
+/// point into is itself the truth.
+struct ReplicaGauges {
+    lag_bytes: metrics::Gauge,
+    lag_seconds: metrics::Gauge,
+    health: metrics::Gauge,
+    is_sync: metrics::Gauge,
+}
+
+impl std::fmt::Debug for ReplicaGauges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicaGauges").finish_non_exhaustive()
+    }
+}
+
+impl ReplicaGauges {
+    fn for_node(node_id: NodeId) -> Self {
+        let node_label = node_id.to_string();
+        Self {
+            lag_bytes: metrics::gauge!("pgbattery_replica_lag_bytes", "node" => node_label.clone()),
+            lag_seconds: metrics::gauge!(
+                "pgbattery_replica_lag_seconds",
+                "node" => node_label.clone()
+            ),
+            health: metrics::gauge!("pgbattery_replica_health", "node" => node_label.clone()),
+            is_sync: metrics::gauge!("pgbattery_replica_is_sync", "node" => node_label),
+        }
+    }
+
+    /// Reset to the "gone" values (0 = unhealthy / async / no lag data).
+    /// The metrics registry never forgets a labeled series, so a departed
+    /// node's gauges must be zeroed, not abandoned at their last values.
+    fn zero(&self) {
+        self.lag_bytes.set(0.0);
+        self.lag_seconds.set(0.0);
+        self.health.set(0.0);
+        self.is_sync.set(0.0);
+    }
+}
+
 pub struct ReplicationManager<P: crate::governor::pg_control::PgControl> {
     node_id: NodeId,
     postgres: Arc<tokio::sync::Mutex<P>>,
@@ -233,6 +309,25 @@ pub struct ReplicationManager<P: crate::governor::pg_control::PgControl> {
     /// must use the same source `get_leader`/`get_nodes` use.
     raft: Arc<openraft::Raft<TypeConfig>>,
     replica_status: Arc<RwLock<HashMap<NodeId, ReplicaStatus>>>,
+    /// See [`ReplicaGauges`]: interned metric handles, populated on first
+    /// sight of a replica, dropped (after zeroing) when it leaves the
+    /// cluster.
+    replica_gauges: HashMap<NodeId, ReplicaGauges>,
+    /// Memoized [`peer_voter_names`] output, rebuilt by
+    /// [`refresh_peer_names`] when `peer_names_voters` stops matching the
+    /// live voter set.
+    peer_names: Vec<String>,
+    /// Memoized [`sync_standby_list`] text for `peer_names`, rebuilt on the
+    /// same edge.
+    peer_sync_list: String,
+    /// The voter set `peer_names` was derived from, re-verified against the
+    /// live set every tick before either is used.
+    peer_names_voters: HashSet<NodeId>,
+    /// Scratch: cluster-member ids, refilled from the live membership every
+    /// tick (capacity reuse only, never carried values).
+    known_nodes: HashSet<NodeId>,
+    /// Scratch: node ids seen in this tick's `pg_stat_replication` sample.
+    seen_nodes: HashSet<NodeId>,
     shutdown_rx: watch::Receiver<bool>,
     /// Last sync-mode value this manager committed to the Raft log, used
     /// to avoid re-committing `SetSyncMode` when the live GUC matches the
@@ -300,6 +395,12 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
             cluster_state,
             raft,
             replica_status: Arc::new(RwLock::new(HashMap::new())),
+            replica_gauges: HashMap::new(),
+            peer_names: Vec::new(),
+            peer_sync_list: String::new(),
+            peer_names_voters: HashSet::new(),
+            known_nodes: HashSet::new(),
+            seen_nodes: HashSet::new(),
             shutdown_rx,
             max_lag_bytes: MAX_REPLICATION_LAG_BYTES,
             max_lag_seconds: MAX_REPLICATION_LAG_SECONDS,
@@ -384,29 +485,24 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
     /// Check replica health and update `synchronous_standby_names` if needed.
     async fn check_and_update_sync_standbys(&mut self) -> Result<()> {
         self.ensure_replication_slots_if_due().await;
-        let (all_voter_names, healthy_voter_count, repl_stats) =
-            self.refresh_replica_health_and_metrics().await?;
+        let (healthy_voter_count, repl_stats) = self.refresh_replica_health_and_metrics().await?;
         let has_quorum = self.has_raft_quorum();
         let now = self.lease.read().now();
         let in_leader_grace = self
             .leader_since
             .is_some_and(|since| now.duration_since(since) < self.disconnect_timeout);
-        let (new_sync_names, async_fallback) = plan_sync_replication(
-            &all_voter_names,
+        let (plan, async_fallback) = plan_sync_replication(
+            self.peer_names.len(),
             healthy_voter_count,
             has_quorum,
             in_leader_grace,
         );
         self.record_rpo_state(async_fallback);
 
-        self.apply_sync_standby_names(
-            &new_sync_names,
-            &all_voter_names,
-            healthy_voter_count,
-            &repl_stats,
-        )
-        .await?;
-        self.emit_sync_mode_metrics(!new_sync_names.is_empty());
+        self.apply_sync_standby_names(plan, healthy_voter_count, &repl_stats)
+            .await?;
+        let sync_active = plan == SyncPlan::FullList && !self.peer_sync_list.is_empty();
+        self.emit_sync_mode_metrics(sync_active);
         Ok(())
     }
 
@@ -455,75 +551,110 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         }
     }
 
-    /// Returns the voter name list, the healthy streaming voter count, and the
-    /// tick's `pg_stat_replication` sample (reused by the sync-state
-    /// verification so the tick issues the query exactly once).
+    /// Returns the healthy streaming voter count and the tick's
+    /// `pg_stat_replication` sample (reused by the sync-state verification
+    /// so the tick issues the query exactly once). Also refreshes the
+    /// memoized peer-name list against the live voter set.
     async fn refresh_replica_health_and_metrics(
-        &self,
-    ) -> Result<(Vec<String>, usize, Vec<ReplicationStat>)> {
+        &mut self,
+    ) -> Result<(usize, Vec<ReplicationStat>)> {
         let repl_stats = self.postgres.lock().await.get_replication_stats().await?;
         let now = self.lease.read().now();
-        let known_node_ids: HashSet<NodeId> = {
+        {
             let cluster = self.cluster_state.read();
-            cluster.nodes.keys().copied().collect()
-        };
+            refresh_peer_names(
+                &mut self.peer_names,
+                &mut self.peer_sync_list,
+                &mut self.peer_names_voters,
+                &cluster.voter_ids,
+                self.node_id,
+            );
+            self.known_nodes.clear();
+            self.known_nodes.extend(cluster.nodes.keys().copied());
+        }
+        let known_nodes = &self.known_nodes;
+        let gauges = &mut self.replica_gauges;
         let mut status_map = self.replica_status.write();
         // Prune entries for nodes that left the cluster. Without this,
         // `has_sync_quorum` and `emit_replica_metrics` would keep counting
         // a departed voter's last-observed `sync_state=Sync` forever,
         // manufacturing quorum from a node that no longer exists.
         status_map.retain(|id, _| {
-            if known_node_ids.contains(id) {
+            if known_nodes.contains(id) {
                 return true;
             }
-            // The metrics registry never forgets a labeled series: without an
-            // explicit reset, a removed node's gauges keep reporting their
-            // last values to Prometheus indefinitely (a departed replica
-            // shown healthy/in-sync forever). Zero them as the entry leaves.
-            Self::zero_replica_metrics(*id);
+            gauges
+                .remove(id)
+                .unwrap_or_else(|| ReplicaGauges::for_node(*id))
+                .zero();
             false
         });
-        let seen_nodes = self.upsert_replica_statuses(&mut status_map, &repl_stats, now);
-        self.mark_unseen_replicas_unhealthy(&mut status_map, &seen_nodes, now);
-        Self::emit_replica_metrics(&status_map);
-        let (healthy_names, healthy_voter_count) = self.collect_healthy_voter_names(&status_map);
+        Self::upsert_replica_statuses(
+            &mut status_map,
+            &repl_stats,
+            now,
+            self.max_lag_bytes,
+            self.max_lag_seconds,
+            &mut self.seen_nodes,
+        );
+        Self::mark_unseen_replicas_unhealthy(
+            &mut status_map,
+            &self.seen_nodes,
+            now,
+            self.disconnect_timeout,
+        );
+        Self::emit_replica_metrics(gauges, &status_map);
+        let healthy_voter_count = self.healthy_voter_count(&status_map);
         drop(status_map);
-        Ok((healthy_names, healthy_voter_count, repl_stats))
+        Ok((healthy_voter_count, repl_stats))
     }
 
     fn upsert_replica_statuses(
-        &self,
         status_map: &mut HashMap<NodeId, ReplicaStatus>,
         repl_stats: &[ReplicationStat],
         now: Instant,
-    ) -> HashSet<NodeId> {
-        let mut seen_nodes = HashSet::new();
+        max_lag_bytes: u64,
+        max_lag_seconds: f64,
+        seen_nodes: &mut HashSet<NodeId>,
+    ) {
+        seen_nodes.clear();
         for stat in repl_stats {
             let Some(node_id) = Self::parse_replica_node_id(&stat.application_name) else {
                 continue;
             };
             seen_nodes.insert(node_id);
-            let health =
-                if stat.lag_bytes > self.max_lag_bytes || stat.lag_seconds > self.max_lag_seconds {
-                    ReplicaHealth::Lagging
-                } else {
-                    ReplicaHealth::Healthy
-                };
-            status_map.insert(
-                node_id,
-                ReplicaStatus {
-                    node_id,
-                    application_name: stat.application_name.clone(),
-                    state: stat.state,
-                    health,
-                    lag_bytes: stat.lag_bytes,
-                    lag_seconds: stat.lag_seconds,
-                    last_seen: now,
-                    sync_state: stat.sync_state,
-                },
-            );
+            let health = if stat.lag_bytes > max_lag_bytes || stat.lag_seconds > max_lag_seconds {
+                ReplicaHealth::Lagging
+            } else {
+                ReplicaHealth::Healthy
+            };
+            match status_map.entry(node_id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let status = entry.get_mut();
+                    if status.application_name != stat.application_name {
+                        status.application_name.clone_from(&stat.application_name);
+                    }
+                    status.state = stat.state;
+                    status.health = health;
+                    status.lag_bytes = stat.lag_bytes;
+                    status.lag_seconds = stat.lag_seconds;
+                    status.last_seen = now;
+                    status.sync_state = stat.sync_state;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(ReplicaStatus {
+                        node_id,
+                        application_name: stat.application_name.clone(),
+                        state: stat.state,
+                        health,
+                        lag_bytes: stat.lag_bytes,
+                        lag_seconds: stat.lag_seconds,
+                        last_seen: now,
+                        sync_state: stat.sync_state,
+                    });
+                }
+            }
         }
-        seen_nodes
     }
 
     fn parse_replica_node_id(application_name: &str) -> Option<NodeId> {
@@ -533,10 +664,10 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
     }
 
     fn mark_unseen_replicas_unhealthy(
-        &self,
         status_map: &mut HashMap<NodeId, ReplicaStatus>,
         seen_nodes: &HashSet<NodeId>,
         now: Instant,
+        disconnect_timeout: Duration,
     ) {
         for (id, status) in status_map.iter_mut() {
             if seen_nodes.contains(id) {
@@ -554,7 +685,7 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
             // decisions don't flap on brief connection blips. Strict `<`: a
             // replica unseen for exactly `disconnect_timeout` is already over
             // the budget and should be marked unhealthy.
-            if now.duration_since(status.last_seen) < self.disconnect_timeout {
+            if now.duration_since(status.last_seen) < disconnect_timeout {
                 continue;
             }
             status.health = ReplicaHealth::Unhealthy;
@@ -568,45 +699,36 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         }
     }
 
-    /// Reset a departed node's labeled gauges to their "gone" values
-    /// (0 = unhealthy / async / no lag data). See the prune in
-    /// `refresh_replica_health_and_metrics`.
-    fn zero_replica_metrics(node_id: NodeId) {
-        let node_label = node_id.to_string();
-        metrics::gauge!("pgbattery_replica_lag_bytes", "node" => node_label.clone()).set(0.0);
-        metrics::gauge!("pgbattery_replica_lag_seconds", "node" => node_label.clone()).set(0.0);
-        metrics::gauge!("pgbattery_replica_health", "node" => node_label.clone()).set(0.0);
-        metrics::gauge!("pgbattery_replica_is_sync", "node" => node_label).set(0.0);
-    }
-
-    fn emit_replica_metrics(status_map: &HashMap<NodeId, ReplicaStatus>) {
+    fn emit_replica_metrics(
+        gauges: &mut HashMap<NodeId, ReplicaGauges>,
+        status_map: &HashMap<NodeId, ReplicaStatus>,
+    ) {
         let mut healthy_count = 0usize;
         let mut sync_count = 0usize;
         for status in status_map.values() {
-            let node_label = status.node_id.to_string();
+            let g = gauges
+                .entry(status.node_id)
+                .or_insert_with(|| ReplicaGauges::for_node(status.node_id));
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "lag bytes metric; exact precision not needed"
             )]
-            metrics::gauge!("pgbattery_replica_lag_bytes", "node" => node_label.clone())
-                .set(status.lag_bytes as f64);
-            metrics::gauge!("pgbattery_replica_lag_seconds", "node" => node_label.clone())
-                .set(status.lag_seconds);
+            g.lag_bytes.set(status.lag_bytes as f64);
+            g.lag_seconds.set(status.lag_seconds);
 
             let health_value = match status.health {
                 ReplicaHealth::Healthy => 1.0,
                 ReplicaHealth::Lagging => 0.5,
                 ReplicaHealth::Unhealthy => 0.0,
             };
-            metrics::gauge!("pgbattery_replica_health", "node" => node_label.clone())
-                .set(health_value);
+            g.health.set(health_value);
 
             let sync_value = match status.sync_state {
                 SyncState::Sync => 2.0,
                 SyncState::Potential => 1.0,
                 SyncState::Async => 0.0,
             };
-            metrics::gauge!("pgbattery_replica_is_sync", "node" => node_label).set(sync_value);
+            g.is_sync.set(sync_value);
 
             if status.health == ReplicaHealth::Healthy {
                 healthy_count += 1;
@@ -625,49 +747,41 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         }
     }
 
-    /// Build the sync standby list and count how many are healthy.
+    /// Healthy streaming voters — drives the sync-vs-async decision: when
+    /// zero replicas are streaming, we may choose to disable sync entirely
+    /// rather than block.
     ///
-    /// The NAME LIST includes ALL voter replicas (excluding self), regardless
-    /// of current health or streaming state. `PostgreSQL`'s `FIRST 1 (a, b, c)`
-    /// waits for acknowledgement from the first CONNECTED replica in the list
-    /// and silently ignores disconnected ones. So listing a temporarily-offline
-    /// replica costs nothing, while OMITTING a healthy replica removes a safety
-    /// net. If the list is narrowed to only currently-streaming replicas and
-    /// the last one drops, writes block — and the `ALTER SYSTEM` to fix the
-    /// list is itself a write, causing an unrecoverable deadlock.
+    /// Distinct from `peer_names`, which lists ALL voter replicas (excluding
+    /// self) regardless of health or streaming state: `PostgreSQL`'s
+    /// `FIRST 1 (a, b, c)` waits for acknowledgement from the first CONNECTED
+    /// replica and silently ignores disconnected ones, so listing a
+    /// temporarily-offline replica costs nothing while OMITTING a healthy one
+    /// removes a safety net. A list narrowed to currently-streaming replicas
+    /// deadlocks when the last one drops — the `ALTER SYSTEM` to fix it is
+    /// itself a write.
     ///
-    /// The HEALTHY COUNT drives the sync-vs-async decision: when zero replicas
-    /// are streaming, we may choose to disable sync entirely rather than block.
-    fn collect_healthy_voter_names(
-        &self,
-        status_map: &HashMap<NodeId, ReplicaStatus>,
-    ) -> (Vec<String>, usize) {
-        let cluster = self.cluster_state.read();
-
-        // All voter replicas (excluding self) → sync standby name list.
-        // Construct deterministic application_name from node_id so we don't
-        // depend on the replica currently being in pg_stat_replication.
-        let all_voter_names = peer_voter_names(&cluster.voter_ids, self.node_id);
-
-        // Healthy streaming voters → drives the sync/async decision.
-        let healthy_voter_count = status_map
+    /// Filters on `peer_names_voters`, the same voter-set snapshot this tick
+    /// verified in [`refresh_peer_names`], so count and name list can never
+    /// describe different memberships.
+    fn healthy_voter_count(&self, status_map: &HashMap<NodeId, ReplicaStatus>) -> usize {
+        status_map
             .values()
             .filter(|s| s.health == ReplicaHealth::Healthy)
-            .filter(|s| cluster.voter_ids.contains(&s.node_id))
+            .filter(|s| self.peer_names_voters.contains(&s.node_id))
             .filter(|s| s.state == ReplicationState::Streaming)
-            .count();
-
-        drop(cluster);
-        (all_voter_names, healthy_voter_count)
+            .count()
     }
 
     async fn apply_sync_standby_names(
         &mut self,
-        new_sync_names: &str,
-        healthy_replica_names: &[String],
+        plan: SyncPlan,
         healthy_voter_count: usize,
         repl_stats: &[ReplicationStat],
     ) -> Result<()> {
+        let new_sync_names: &str = match plan {
+            SyncPlan::FullList => &self.peer_sync_list,
+            SyncPlan::AsyncFallback => "",
+        };
         // No cache: `Supervisor::set_sync_standby_names` is itself idempotent
         // (reads the live GUC and short-circuits if it already matches), so
         // calling it every tick costs at most one extra `SHOW` and rules out
@@ -723,12 +837,12 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         // either way). The gauge lets a stuck transition surface without
         // gating any state change.
         if now_active {
-            let verified = sync_state_confirmed(repl_stats, healthy_replica_names);
+            let verified = sync_state_confirmed(repl_stats, &self.peer_names);
             if verified {
                 metrics::counter!("pgbattery_sync_state_verifications").increment(1);
             } else {
                 tracing::debug!(
-                    expected = ?healthy_replica_names,
+                    expected = ?self.peer_names,
                     "Sync state not yet confirmed in pg_stat_replication; will recheck next tick"
                 );
             }
@@ -768,16 +882,18 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
     /// from a removed voter cannot manufacture quorum.
     #[must_use]
     pub fn has_sync_quorum(&self) -> bool {
-        let voter_ids: HashSet<NodeId> = {
-            let cluster = self.cluster_state.read();
-            cluster.voter_ids.clone()
-        };
+        // Lock order: replica_status before cluster_state, matching
+        // `refresh_replica_health_and_metrics` (via
+        // `collect_healthy_voter_names`); the reverse order could cycle
+        // against it through a queued cluster_state writer.
         let status = self.replica_status.read();
+        let cluster = self.cluster_state.read();
         let healthy_sync = status
             .values()
-            .filter(|s| voter_ids.contains(&s.node_id))
+            .filter(|s| cluster.voter_ids.contains(&s.node_id))
             .filter(|s| s.health == ReplicaHealth::Healthy && s.sync_state.is_sync())
             .count();
+        drop(cluster);
         drop(status);
 
         // Standard topology requires at least 1 sync standby
@@ -1159,7 +1275,7 @@ mod tests {
             "pgbattery_node_2".to_string(),
             "pgbattery_node_3".to_string(),
         ];
-        let (plan, fallback) = plan_sync_replication(&voters, 1, true, false);
+        let (plan, fallback) = planned_sync_names(&voters, 1, true, false);
         assert_eq!(plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)");
         assert!(!fallback);
     }
@@ -1198,7 +1314,7 @@ mod tests {
             "pgbattery_node_4".to_string(),
             "pgbattery_node_5".to_string(),
         ];
-        let (plan, _fallback) = plan_sync_replication(&voters, 4, true, false);
+        let (plan, _fallback) = planned_sync_names(&voters, 4, true, false);
         assert_eq!(
             plan,
             "FIRST 2 (pgbattery_node_2, pgbattery_node_3, pgbattery_node_4, pgbattery_node_5)"
@@ -1218,7 +1334,7 @@ mod tests {
         ];
 
         // No healthy replica, quorum intact → async fallback (empty).
-        let (with_quorum, fallback) = plan_sync_replication(&voters, 0, true, false);
+        let (with_quorum, fallback) = planned_sync_names(&voters, 0, true, false);
         assert!(
             with_quorum.is_empty(),
             "quorum-intact + no replicas must fall back to async, got {with_quorum:?}"
@@ -1226,7 +1342,7 @@ mod tests {
         assert!(fallback, "the empty list IS the degraded RPO>0 state");
 
         // No healthy replica, quorum LOST → keep the sync list (fail-stop).
-        let (no_quorum, fallback) = plan_sync_replication(&voters, 0, false, false);
+        let (no_quorum, fallback) = planned_sync_names(&voters, 0, false, false);
         assert_eq!(
             no_quorum, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)",
             "quorum-lost must keep sync enabled, not silently drop to RPO>0"
@@ -1247,7 +1363,7 @@ mod tests {
         ];
 
         // In grace: keep the sync list, not degraded.
-        let (plan, fallback) = plan_sync_replication(&voters, 0, true, true);
+        let (plan, fallback) = planned_sync_names(&voters, 0, true, true);
         assert_eq!(
             plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)",
             "grace window must keep sync replication configured"
@@ -1256,12 +1372,12 @@ mod tests {
 
         // Grace elapsed with replicas still absent: the genuine
         // all-replicas-dead case must still fall back to async.
-        let (plan, fallback) = plan_sync_replication(&voters, 0, true, false);
+        let (plan, fallback) = planned_sync_names(&voters, 0, true, false);
         assert!(plan.is_empty());
         assert!(fallback);
 
         // A healthy replica during grace behaves as normal sync.
-        let (plan, fallback) = plan_sync_replication(&voters, 1, true, true);
+        let (plan, fallback) = planned_sync_names(&voters, 1, true, true);
         assert_eq!(plan, "FIRST 1 (pgbattery_node_2, pgbattery_node_3)");
         assert!(!fallback);
     }
@@ -1271,20 +1387,32 @@ mod tests {
     #[test]
     fn test_single_node_has_empty_sync_list() {
         for in_grace in [false, true] {
-            let (plan, fallback) = plan_sync_replication(&[], 0, true, in_grace);
+            let (plan, fallback) = planned_sync_names(&[], 0, true, in_grace);
             assert!(plan.is_empty());
             assert!(!fallback, "no standby exists whose ack we are giving up");
         }
+    }
+
+    /// Mirror the manager's resolution of a [`SyncPlan`] against the
+    /// memoized list, so tests assert the end-to-end GUC string.
+    fn planned_sync_names(
+        voters: &[String],
+        healthy: usize,
+        quorum: bool,
+        grace: bool,
+    ) -> (String, bool) {
+        let (plan, degraded) = plan_sync_replication(voters.len(), healthy, quorum, grace);
+        let names = match plan {
+            SyncPlan::FullList => sync_standby_list(voters),
+            SyncPlan::AsyncFallback => String::new(),
+        };
+        (names, degraded)
     }
 
     fn stat(application_name: &str, sync_state: SyncState) -> ReplicationStat {
         ReplicationStat {
             application_name: application_name.to_string(),
             state: ReplicationState::Streaming,
-            sent_lsn: "0/0".to_string(),
-            write_lsn: "0/0".to_string(),
-            flush_lsn: "0/0".to_string(),
-            replay_lsn: "0/0".to_string(),
             lag_bytes: 0,
             lag_seconds: 0.0,
             sync_state,
@@ -1359,7 +1487,7 @@ mod tests {
                 // A leader inside its grace window keeps the sync list rather
                 // than falling back to async, which is the state a node is in
                 // immediately after promotion.
-                let (steady, _) = plan_sync_replication(&names, 0, true, true);
+                let (steady, _) = planned_sync_names(&names, 0, true, true);
                 prop_assert_eq!(
                     promotion,
                     steady,
@@ -1417,7 +1545,7 @@ mod tests {
                 in_leader_grace: bool,
             ) {
                 let names = voter_names(others);
-                let (plan, degraded) = plan_sync_replication(
+                let (plan, degraded) = planned_sync_names(
                     &names,
                     healthy,
                     has_quorum,
@@ -1449,6 +1577,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn peer_voter_count_matches_names_and_is_allocation_free() {
+        let voters: HashSet<NodeId> = (1..=7).collect();
+        let (count, stats) = crate::alloc_meter::measure(|| peer_voter_count(&voters, 3));
+        assert_eq!(
+            stats.count, 0,
+            "the 100 ms lease tick reads this; it must not allocate: {stats:?}"
+        );
+        // The count and the name list must never drift apart — one feeds
+        // `required_sync_standbys`, the other the GUC text.
+        assert_eq!(count, peer_voter_names(&voters, 3).len());
+        // A self id outside the voter set removes nothing.
+        assert_eq!(peer_voter_count(&voters, 99), 7);
+        assert_eq!(peer_voter_count(&HashSet::new(), 1), 0);
+    }
+
+    #[test]
+    fn refresh_peer_names_rebuilds_only_on_voter_change() {
+        let mut names = Vec::new();
+        let mut sync_list = String::new();
+        let mut cached = HashSet::new();
+        let voters: HashSet<NodeId> = [1, 2, 3].into_iter().collect();
+
+        assert!(refresh_peer_names(
+            &mut names,
+            &mut sync_list,
+            &mut cached,
+            &voters,
+            1
+        ));
+        assert_eq!(names, peer_voter_names(&voters, 1));
+        assert_eq!(sync_list, sync_standby_list(&names));
+
+        // Unchanged voter set: no rebuild, and the verify-compare is free.
+        let (rebuilt, stats) = crate::alloc_meter::measure(|| {
+            refresh_peer_names(&mut names, &mut sync_list, &mut cached, &voters, 1)
+        });
+        assert!(!rebuilt);
+        assert_eq!(
+            stats.count, 0,
+            "steady-state tick must not rebuild the name list: {stats:?}"
+        );
+
+        let grown: HashSet<NodeId> = [1, 2, 3, 4].into_iter().collect();
+        assert!(refresh_peer_names(
+            &mut names,
+            &mut sync_list,
+            &mut cached,
+            &grown,
+            1
+        ));
+        assert_eq!(names, peer_voter_names(&grown, 1));
+        assert_eq!(
+            sync_list,
+            sync_standby_list(&names),
+            "the memoized GUC text must track the memoized names"
+        );
     }
 
     #[test]

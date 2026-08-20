@@ -1,4 +1,9 @@
 # syntax=docker/dockerfile:1.7
+
+# PostgreSQL major for the runtime image. Supported window: 13 (floor set by
+# the managed GUCs) through this default; CI can matrix it via --build-arg.
+ARG PG_MAJOR=18
+
 FROM rust:1.97 AS builder
 WORKDIR /app
 
@@ -31,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     out=$([ "$BUILD_PROFILE" = "dev" ] && echo debug || echo "$BUILD_PROFILE") && \
     cp "target/$out/pgbattery" /pgbattery
 
-FROM postgres:18 AS runtime-base
+FROM postgres:${PG_MAJOR} AS runtime-base
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl && rm -rf /var/lib/apt/lists/*

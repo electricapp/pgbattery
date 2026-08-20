@@ -266,9 +266,11 @@ impl RedbLogStorage {
         Ok(db)
     }
 
-    /// Path of the backing `raft.db`, for error messages that must name it.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    /// Shared handle to the backing `raft.db` path, for error messages that
+    /// must name it — a refcount, not a `PathBuf` copy, since `storage_io`
+    /// takes one per operation.
+    pub(crate) fn path_handle(&self) -> Arc<Path> {
+        Arc::clone(&self.path)
     }
 
     /// Build the fatal, operator-actionable error for a corrupted Raft DB.
@@ -349,10 +351,13 @@ impl RedbLogStorage {
                 .open_table(LOGS_TABLE)
                 .map_err(|e| Error::Storage(format!("Failed to open table: {e}")))?;
 
+            // One scratch buffer across the batch instead of a Vec per entry.
+            let mut scratch = Vec::new();
             for entry in entries {
-                let bytes = postcard::to_allocvec(entry)?;
+                scratch.clear();
+                scratch = postcard::to_extend(entry, scratch)?;
                 table
-                    .insert(entry.index, bytes.as_slice())
+                    .insert(entry.index, scratch.as_slice())
                     .map_err(|e| Error::Storage(format!("Failed to insert: {e}")))?;
             }
         }
@@ -535,7 +540,11 @@ impl RedbLogStorage {
             .open_table(LOGS_TABLE)
             .map_err(|e| Error::Storage(format!("Failed to open table: {e}")))?;
 
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(
+            usize::try_from(end.saturating_sub(start))
+                .unwrap_or(0)
+                .min(4_096),
+        );
 
         for result in table
             .range(start..end)
@@ -569,9 +578,7 @@ impl RedbLogStorage {
 
         match last_result {
             Some((_, value)) => {
-                let bytes = value.value().to_vec();
-                drop(value);
-                let entry: LogEntry = decode(&bytes, "log entry")?;
+                let entry: LogEntry = decode(value.value(), "log entry")?;
                 Ok(Some(entry))
             }
             None => Ok(None),

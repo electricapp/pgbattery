@@ -119,8 +119,9 @@ pub struct SessionReplay {
 /// transaction actually succeeded.
 #[derive(Debug, Default, Clone)]
 pub struct CommitProbeState {
-    /// Transaction ID from `txid_current()` - captured before COMMIT
-    pub txid: Option<i64>,
+    /// Transaction ID from `pg_current_xact_id()` (xid8, epoch-qualified,
+    /// textually unsigned digits) - captured before COMMIT
+    pub txid: Option<u64>,
     /// Whether we're waiting for a COMMIT response from backend
     pub pending_commit: bool,
     /// True while the probe's own response frames (`RowDescription`, `DataRow`,

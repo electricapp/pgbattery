@@ -247,6 +247,38 @@ const fn default_compress() -> bool {
     true
 }
 
+/// Where a `server_version_num` falls relative to a supported window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgVersionSupport {
+    /// Older than the supported floor; the managed configuration writes
+    /// GUCs that do not exist there, so the postmaster refuses to boot.
+    BelowMinimum,
+    /// Inside the window.
+    Supported,
+    /// Newer than the embedded SQL parser's `PostgreSQL` major: the gateway
+    /// analyzer fails closed on syntax it cannot parse, so sessions using
+    /// newer grammar sever on failover instead of migrating.
+    AheadOfParser,
+}
+
+/// Classify a `server_version_num` (e.g. `170004`) against the supported
+/// floor and the embedded SQL parser's `PostgreSQL` major.
+#[must_use]
+pub const fn classify_pg_version(
+    server_version_num: u32,
+    min_major: u32,
+    parser_major: u32,
+) -> PgVersionSupport {
+    let major = server_version_num / 10_000;
+    if major < min_major {
+        PgVersionSupport::BelowMinimum
+    } else if major > parser_major {
+        PgVersionSupport::AheadOfParser
+    } else {
+        PgVersionSupport::Supported
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -254,6 +286,16 @@ const fn default_compress() -> bool {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_pg_version_window() {
+        use PgVersionSupport::{AheadOfParser, BelowMinimum, Supported};
+        assert_eq!(classify_pg_version(120_011, 13, 17), BelowMinimum);
+        assert_eq!(classify_pg_version(130_000, 13, 17), Supported);
+        assert_eq!(classify_pg_version(170_004, 13, 17), Supported);
+        assert_eq!(classify_pg_version(180_000, 13, 17), AheadOfParser);
+        assert_eq!(classify_pg_version(190_001, 13, 17), AheadOfParser);
+    }
 
     /// The secret must never be serialized in cleartext: a transparent derive
     /// would round-trip the inner string, leaking it through any struct that

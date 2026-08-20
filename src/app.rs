@@ -887,6 +887,9 @@ impl App {
                 return;
             };
             let mut consecutive_pg_probe_failures: u32 = 0;
+            // One-shot version report once PG first answers; see
+            // `report_server_version`.
+            let mut server_version_reported = false;
             let mut lsn_cadence = LsnReportCadence::default();
             // Watches for Raft leadership and a serving PostgreSQL diverging.
             // Fed from both reconcile paths, because the observation it needs
@@ -921,6 +924,10 @@ impl App {
                             &shutdown_tx,
                             &mut consecutive_pg_probe_failures,
                         ).await;
+                        if !server_version_reported && consecutive_pg_probe_failures == 0 {
+                            server_version_reported =
+                                Self::report_server_version(&postgres).await;
+                        }
                     }
                     _ = leader_rx.changed() => {
                         let observed = Self::ensure_follows(node_id, self_pg_addr, &postgres, &cluster_state, &raft_client, &lease).await;
@@ -949,6 +956,58 @@ impl App {
                 }
             }
         })
+    }
+
+    /// One-shot report of the server's version against the supported window
+    /// (`PostgreSQL` `MIN_SUPPORTED_PG_MAJOR` and newer), run after the first
+    /// successful health probe so `PostgreSQL` is known reachable. Publishes
+    /// `pgbattery_pg_server_version_num` (which `doctor` checks) and warns
+    /// when the server's major is ahead of the embedded SQL parser's —
+    /// there, statements in newer grammar sever on failover instead of
+    /// migrating. Returns whether the report succeeded.
+    async fn report_server_version(postgres: &Arc<tokio::sync::Mutex<Supervisor>>) -> bool {
+        let version = { postgres.lock().await.server_version_num().await };
+        let version_num = match version {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "server_version_num probe failed; will retry");
+                return false;
+            }
+        };
+        metrics::gauge!("pgbattery_pg_server_version_num").set(f64::from(version_num));
+        let major = version_num / 10_000;
+        match pgbattery_core::classify_pg_version(
+            version_num,
+            pgbattery_core::constants::MIN_SUPPORTED_PG_MAJOR,
+            constants::EMBEDDED_PARSER_PG_MAJOR,
+        ) {
+            pgbattery_core::PgVersionSupport::Supported => {
+                info!(
+                    server_version_num = version_num,
+                    major, "PostgreSQL version supported"
+                );
+            }
+            pgbattery_core::PgVersionSupport::BelowMinimum => {
+                error!(
+                    server_version_num = version_num,
+                    major,
+                    min_major = pgbattery_core::constants::MIN_SUPPORTED_PG_MAJOR,
+                    "PostgreSQL major below the supported floor; managed settings \
+                     (wal_keep_size, max_slot_wal_keep_size) require it"
+                );
+            }
+            pgbattery_core::PgVersionSupport::AheadOfParser => {
+                warn!(
+                    server_version_num = version_num,
+                    major,
+                    parser_major = constants::EMBEDDED_PARSER_PG_MAJOR,
+                    "PostgreSQL major is ahead of the embedded SQL parser; statements in \
+                     newer grammar sever on failover instead of migrating — bump pg_query \
+                     when a release for this major ships"
+                );
+            }
+        }
+        true
     }
 
     /// Supervisor liveness tick (every 1 s).
@@ -1851,8 +1910,8 @@ impl App {
         let required_sync = {
             let state = cluster_state.read();
             let peers =
-                crate::governor::replication_manager::peer_voter_names(&state.voter_ids, node_id);
-            crate::governor::replication_manager::required_sync_standbys(peers.len())
+                crate::governor::replication_manager::peer_voter_count(&state.voter_ids, node_id);
+            crate::governor::replication_manager::required_sync_standbys(peers)
         };
         let sync_in_force = Self::sync_durability_in_force(sync_observation, required_sync);
 

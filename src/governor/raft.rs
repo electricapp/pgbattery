@@ -282,7 +282,7 @@ impl Governor {
 
                 Ok(()) = metrics_rx.changed() => {
                     runtime.last_metrics_update = self.lease.read().now();
-                    let metrics = metrics_rx.borrow().clone();
+                    let metrics = MetricsView::from_metrics(&metrics_rx.borrow());
                     self.process_metrics_update(&metrics, &mut runtime);
                 }
 
@@ -297,11 +297,7 @@ impl Governor {
         Ok(())
     }
 
-    fn process_metrics_update(
-        &self,
-        metrics: &openraft::RaftMetrics<NodeId, BasicNode>,
-        runtime: &mut GovernorRunState,
-    ) {
+    fn process_metrics_update(&self, metrics: &MetricsView, runtime: &mut GovernorRunState) {
         let leader_id = metrics.current_leader;
         let leader_addr =
             leader_id.and_then(|id| self.state.read().nodes.get(&id).map(|n| n.pg_addr));
@@ -410,7 +406,7 @@ impl Governor {
         self.sync_voter_ids(metrics);
     }
 
-    fn has_quorum(metrics: &openraft::RaftMetrics<NodeId, BasicNode>, is_leader: bool) -> bool {
+    fn has_quorum(metrics: &MetricsView, is_leader: bool) -> bool {
         let voter_count = metrics.membership_config.membership().voter_ids().count();
         Self::has_quorum_decision(
             is_leader,
@@ -458,10 +454,7 @@ impl Governor {
     /// from actual quorum contact. A single-voter cluster is its own quorum, so
     /// the ack is "now" (age zero). For non-leaders the lease is never renewed,
     /// so the value is unused (returns zero).
-    fn quorum_ack_age(
-        metrics: &openraft::RaftMetrics<NodeId, BasicNode>,
-        is_leader: bool,
-    ) -> std::time::Duration {
+    fn quorum_ack_age(metrics: &MetricsView, is_leader: bool) -> std::time::Duration {
         if !is_leader {
             return std::time::Duration::ZERO;
         }
@@ -674,7 +667,7 @@ impl Governor {
 
     fn emit_raft_metrics(
         &self,
-        metrics: &openraft::RaftMetrics<NodeId, BasicNode>,
+        metrics: &MetricsView,
         leader_id: Option<NodeId>,
         has_quorum: bool,
     ) {
@@ -715,17 +708,17 @@ impl Governor {
         metrics::gauge!("pgbattery_cluster_nodes").set(node_count as f64);
     }
 
-    fn sync_voter_ids(&self, metrics: &openraft::RaftMetrics<NodeId, BasicNode>) {
-        let voter_ids: std::collections::HashSet<NodeId> =
-            metrics.membership_config.membership().voter_ids().collect();
-        if voter_ids.is_empty() {
+    fn sync_voter_ids(&self, metrics: &MetricsView) {
+        let membership = metrics.membership_config.membership();
+        // A metrics tick with no voters carries nothing to sync.
+        if membership.voter_ids().next().is_none() {
             return;
         }
         // Read-check first: avoids write lock contention on the common case (no change)
-        if self.state.read().voter_ids == voter_ids {
+        if voter_set_matches(&self.state.read().voter_ids, membership.voter_ids()) {
             return;
         }
-        self.state.write().voter_ids = voter_ids;
+        self.state.write().voter_ids = membership.voter_ids().collect();
     }
 
     fn run_metrics_watchdog(
@@ -1183,12 +1176,7 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        // Collect entries first to count them
-        let entries_vec: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
-
-        tracing::trace!(raw_count = entries_vec.len(), "append() called by OpenRaft");
-
-        let log_entries: Vec<LogEntry> = entries_vec
+        let log_entries: Vec<LogEntry> = entries
             .into_iter()
             .map(|e| {
                 tracing::trace!(
@@ -1202,7 +1190,7 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
                 );
                 openraft_to_log_entry(e)
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         if log_entries.is_empty() {
             tracing::trace!("append() called with no entries (flush notification only)");
@@ -1982,12 +1970,57 @@ fn make_log_id(term: u64, node_id: NodeId, index: u64) -> LogId<NodeId> {
 /// this is where a corrupt store shows up once the node is past startup. The
 /// closures passed in are thin wrappers over storage methods, so a panic
 /// raised inside one is redb's.
+/// The subset of `RaftMetrics` the governor reads per update, copied out
+/// under the watch borrow so the sender is never blocked. `RaftMetrics`
+/// additionally carries the leader's per-node replication map, which
+/// nothing here reads.
+struct MetricsView {
+    current_leader: Option<NodeId>,
+    current_term: u64,
+    millis_since_quorum_ack: Option<u64>,
+    last_log_index: Option<u64>,
+    last_applied: Option<LogId<NodeId>>,
+    membership_config: Arc<StoredMembership<NodeId, BasicNode>>,
+}
+
+impl MetricsView {
+    fn from_metrics(m: &openraft::RaftMetrics<NodeId, BasicNode>) -> Self {
+        Self {
+            current_leader: m.current_leader,
+            current_term: m.current_term,
+            millis_since_quorum_ack: m.millis_since_quorum_ack,
+            last_log_index: m.last_log_index,
+            last_applied: m.last_applied,
+            membership_config: Arc::clone(&m.membership_config),
+        }
+    }
+}
+
+/// True when `ids` yields exactly the members of `current`.
+///
+/// Precondition: `ids` yields distinct elements (openraft's membership voter
+/// set cannot repeat a node id). Runs on every Raft metrics update, so the
+/// unchanged steady state must not allocate.
+fn voter_set_matches(
+    current: &std::collections::HashSet<NodeId>,
+    ids: impl Iterator<Item = NodeId>,
+) -> bool {
+    let mut count = 0_usize;
+    for id in ids {
+        if !current.contains(&id) {
+            return false;
+        }
+        count += 1;
+    }
+    count == current.len()
+}
+
 async fn storage_io<T, F>(storage: &RedbLogStorage, op: F) -> Result<T>
 where
     F: FnOnce(&RedbLogStorage) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let path = storage.path().to_path_buf();
+    let path = storage.path_handle();
     let storage = storage.clone();
     match tokio::task::spawn_blocking(move || op(&storage)).await {
         Ok(result) => result,
@@ -2238,6 +2271,24 @@ fn openraft_to_log_entry(entry: Entry<TypeConfig>) -> LogEntry {
 mod tests {
     use super::*;
     use crate::governor::state_machine::ClusterCommand;
+
+    #[test]
+    fn voter_set_matches_is_allocation_free_and_correct() {
+        let current: std::collections::HashSet<NodeId> = (1..=5).collect();
+        let (matched, stats) = crate::alloc_meter::measure(|| voter_set_matches(&current, 1..=5));
+        assert!(matched);
+        assert_eq!(
+            stats.count, 0,
+            "steady-state voter compare must not allocate: {stats:?}"
+        );
+        assert!(!voter_set_matches(&current, 1..=4), "subset must differ");
+        assert!(!voter_set_matches(&current, 1..=6), "superset must differ");
+        assert!(
+            !voter_set_matches(&current, [1, 2, 3, 4, 6].into_iter()),
+            "same size, different member must differ"
+        );
+        assert!(!voter_set_matches(&current, std::iter::empty()));
+    }
 
     #[test]
     fn test_fence_state_unfenced() {

@@ -131,20 +131,42 @@ struct LocalSqlClient {
     next_seq: u64,
 }
 
+/// Build the psql input for one query: the SQL (`;`-terminated) plus the
+/// `\echo` of its end marker. Runs on every SQL probe — several per second,
+/// forever — so the budget is the one `String` returned.
+fn build_command(sql: &str, seq: u64) -> String {
+    use std::fmt::Write as _;
+    let sql = sql.trim_end();
+    // `;` + `\n` + `\echo ` + marker + up to 20 sequence digits + `__\n`.
+    let mut command = String::with_capacity(sql.len() + END_MARKER_PREFIX.len() + 32);
+    command.push_str(sql);
+    if !command.ends_with(';') {
+        command.push(';');
+    }
+    command.push('\n');
+    command.push_str("\\echo ");
+    command.push_str(END_MARKER_PREFIX);
+    let _ = write!(command, "{seq}");
+    command.push_str("__\n");
+    command
+}
+
+/// Split the first line — through `pos`, the index of its `\n` — off
+/// `line_buf`, lossily decoded, newline included. Runs on every stdout line
+/// of every SQL probe, so the budget is the one returned `String` for valid
+/// UTF-8 input.
+fn take_line(line_buf: &mut Vec<u8>, pos: usize) -> String {
+    let line = String::from_utf8_lossy(line_buf.get(..=pos).unwrap_or_default()).into_owned();
+    line_buf.drain(..=pos);
+    line
+}
+
 impl LocalSqlClient {
     async fn run_query(&mut self, sql: &str) -> Result<String> {
         let seq = self.next_seq;
         self.next_seq += 1;
 
-        let mut command = sql.trim_end().to_string();
-        if !command.ends_with(';') {
-            command.push(';');
-        }
-        command.push('\n');
-        command.push_str("\\echo ");
-        command.push_str(END_MARKER_PREFIX);
-        command.push_str(&seq.to_string());
-        command.push_str("__\n");
+        let command = build_command(sql, seq);
 
         self.stdin
             .write_all(command.as_bytes())
@@ -155,7 +177,9 @@ impl LocalSqlClient {
             .await
             .map_err(|e| Error::Postgres(format!("Failed flushing SQL to psql: {e}")))?;
 
-        let mut lines = Vec::new();
+        // The flag (not `result.is_empty()`) keeps an empty first line intact.
+        let mut result = String::new();
+        let mut has_lines = false;
         loop {
             let line = self.next_line().await.map_err(|e| {
                 Error::Postgres(format!("Failed reading SQL result from psql: {e}"))
@@ -173,9 +197,18 @@ impl LocalSqlClient {
 
             let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
             match classify_marker_line(trimmed, seq) {
-                MarkerLine::Data => lines.push(trimmed.to_string()),
+                MarkerLine::Data => {
+                    if has_lines {
+                        result.push('\n');
+                    }
+                    has_lines = true;
+                    result.push_str(trimmed);
+                }
                 MarkerLine::Current => break,
-                MarkerLine::Stale => lines.clear(),
+                MarkerLine::Stale => {
+                    result.clear();
+                    has_lines = false;
+                }
                 MarkerLine::Corrupt => {
                     return Err(Error::Postgres(format!(
                         "Local psql session out of sync: saw {trimmed} while awaiting sequence {seq}"
@@ -184,7 +217,7 @@ impl LocalSqlClient {
             }
         }
 
-        Ok(lines.join("\n"))
+        Ok(result)
     }
 
     /// Read one newline-terminated stdout line, or `None` on EOF.
@@ -199,8 +232,7 @@ impl LocalSqlClient {
     async fn next_line(&mut self) -> std::io::Result<Option<String>> {
         loop {
             if let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
-                return Ok(Some(String::from_utf8_lossy(&line_bytes).into_owned()));
+                return Ok(Some(take_line(&mut self.line_buf, pos)));
             }
             let chunk = self.stdout.fill_buf().await?;
             if chunk.is_empty() {
@@ -254,14 +286,42 @@ impl LocalSqlClient {
     }
 }
 
-/// Canonicalise a `synchronous_standby_names` value for equality comparison
-/// across what we set and what Postgres reports.
+/// Whether two `synchronous_standby_names` values are semantically equal.
 ///
-/// Postgres normalises whitespace and casing in `SHOW` output (for example
-/// `FIRST 1 (a, b)` may come back with different spacing), so a literal
-/// string compare would fire spurious timeouts. Collapse all internal
-/// whitespace, trim outer whitespace, and lowercase ASCII so identical
-/// semantic values compare equal.
+/// Postgres normalises whitespace, quoting, and casing in `SHOW` output
+/// (for example `FIRST 1 (a, b)` may come back with different spacing), so
+/// a literal string compare would fire spurious timeouts. Token-wise,
+/// case-insensitive comparison after stripping outer whitespace and quotes —
+/// equivalent to comparing [`normalise_sync_standby_names`] outputs (pinned
+/// by test) without building either canonical string; this runs on every
+/// reconcile tick's idempotency check.
+fn sync_names_equivalent(a: &str, b: &str) -> bool {
+    fn strip(s: &str) -> &str {
+        s.trim().trim_matches('"').trim_matches('\'')
+    }
+    let mut a_tokens = strip(a).split_whitespace();
+    let mut b_tokens = strip(b).split_whitespace();
+    loop {
+        match (a_tokens.next(), b_tokens.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                if !x
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .eq(y.chars().flat_map(char::to_lowercase))
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Canonicalise a `synchronous_standby_names` value: the test oracle for
+/// [`sync_names_equivalent`]. Collapses internal whitespace, trims outer
+/// whitespace/quotes, and lowercases.
+#[cfg(test)]
 fn normalise_sync_standby_names(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
     let mut out = String::with_capacity(trimmed.len());
@@ -1697,13 +1757,17 @@ host all all ::/0 {auth_method}
         leader_addr: SocketAddr,
         cfg: &SupervisorConfig,
     ) -> String {
+        fn starts_with_ci(s: &str, prefix: &str) -> bool {
+            s.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        }
         let preserved_lines: Vec<&str> = existing
             .lines()
             .filter(|line| {
-                let trimmed = line.trim().to_lowercase();
-                !trimmed.starts_with("primary_conninfo")
-                    && !trimmed.starts_with("primary_slot_name")
-                    && !trimmed.starts_with("synchronous_standby_names")
+                let trimmed = line.trim();
+                !starts_with_ci(trimmed, "primary_conninfo")
+                    && !starts_with_ci(trimmed, "primary_slot_name")
+                    && !starts_with_ci(trimmed, "synchronous_standby_names")
             })
             .collect();
 
@@ -3139,8 +3203,21 @@ host all all ::/0 {auth_method}
                 "SELECT setting FROM pg_settings WHERE name = 'default_transaction_read_only';",
             )
             .await?;
-        let is_readonly = result.trim().to_lowercase() == "on";
+        let is_readonly = result.trim().eq_ignore_ascii_case("on");
         Ok(is_readonly)
+    }
+
+    /// The server's `server_version_num` (e.g. `170004`). Output shape is
+    /// stable across every version this project can meet.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails or the value does not parse.
+    pub async fn server_version_num(&self) -> Result<u32> {
+        let result = self.execute_sql("SHOW server_version_num;").await?;
+        result
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| Error::Postgres(format!("Unexpected server_version_num: {result:?}")))
     }
 
     /// Execute a SQL command with a 30-second timeout.
@@ -3482,10 +3559,6 @@ host all all ::/0 {auth_method}
             SELECT
                 application_name,
                 state,
-                coalesce(sent_lsn::text, '0/0') as sent_lsn,
-                coalesce(write_lsn::text, '0/0') as write_lsn,
-                coalesce(flush_lsn::text, '0/0') as flush_lsn,
-                coalesce(replay_lsn::text, '0/0') as replay_lsn,
                 -- Use pg_current_wal_lsn() not sent_lsn: during reconnect, sent_lsn < replay_lsn gives negative lag
                 greatest(coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn), 0), 0) as lag_bytes,
                 coalesce(extract(epoch from replay_lag), 0) as lag_seconds,
@@ -3512,26 +3585,6 @@ host all all ::/0 {auth_method}
             let state_str = fields.next().ok_or_else(|| {
                 Error::Postgres(format!(
                     "Invalid pg_stat_replication row (missing state): {trimmed}"
-                ))
-            })?;
-            let sent_lsn = fields.next().ok_or_else(|| {
-                Error::Postgres(format!(
-                    "Invalid pg_stat_replication row (missing sent_lsn): {trimmed}"
-                ))
-            })?;
-            let write_lsn = fields.next().ok_or_else(|| {
-                Error::Postgres(format!(
-                    "Invalid pg_stat_replication row (missing write_lsn): {trimmed}"
-                ))
-            })?;
-            let flush_lsn = fields.next().ok_or_else(|| {
-                Error::Postgres(format!(
-                    "Invalid pg_stat_replication row (missing flush_lsn): {trimmed}"
-                ))
-            })?;
-            let replay_lsn = fields.next().ok_or_else(|| {
-                Error::Postgres(format!(
-                    "Invalid pg_stat_replication row (missing replay_lsn): {trimmed}"
                 ))
             })?;
             let lag_bytes_str = fields.next().ok_or_else(|| {
@@ -3571,10 +3624,6 @@ host all all ::/0 {auth_method}
             stats.push(ReplicationStat {
                 application_name: application_name.to_string(),
                 state: ReplicationState::from_str(state_str),
-                sent_lsn: sent_lsn.to_string(),
-                write_lsn: write_lsn.to_string(),
-                flush_lsn: flush_lsn.to_string(),
-                replay_lsn: replay_lsn.to_string(),
                 lag_bytes,
                 lag_seconds,
                 sync_state: SyncState::from_str(sync_state_str),
@@ -3633,9 +3682,8 @@ host all all ::/0 {auth_method}
 
         // Idempotency check: live GUC is the truth source. If it already
         // matches what we want, skip the round-trip entirely.
-        let want = normalise_sync_standby_names(names);
         if let Ok(current) = self.get_sync_standby_names().await
-            && normalise_sync_standby_names(&current) == want
+            && sync_names_equivalent(&current, names)
         {
             tracing::trace!(names = %names, "synchronous_standby_names already current");
             return Ok(());
@@ -3719,14 +3767,11 @@ host all all ::/0 {auth_method}
             Duration::from_millis(pgbattery_core::constants::SYNC_CHECK_INTERVAL_MS);
         let deadline = tokio::time::Instant::now() + max_wait;
 
-        // Postgres normalises whitespace/quoting in SHOW output. Compare on a
-        // conservative canonical form so benign reformatting doesn't trigger a
-        // false timeout.
-        let want = normalise_sync_standby_names(expected);
-
         loop {
             let observed = self.get_sync_standby_names().await?;
-            if normalise_sync_standby_names(&observed) == want {
+            // Postgres normalises whitespace/quoting in SHOW output; a
+            // literal compare would fire spurious timeouts.
+            if sync_names_equivalent(&observed, expected) {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -3905,8 +3950,15 @@ fn postmaster_pid_is_stale(
 /// [`Supervisor::probe_role_and_readonly`]: `true,on,set,1` style.
 fn parse_role_readonly(raw: &str) -> Result<PgWriteState> {
     let trimmed = raw.trim();
-    let fields: Vec<&str> = trimmed.split(',').collect();
-    let [recovery, readonly, sync_list, sync_count] = fields.as_slice() else {
+    // The trailing `None` enforces exactly four fields.
+    let mut fields = trimmed.split(',');
+    let (Some(recovery), Some(readonly), Some(sync_list), Some(sync_count), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
         return Err(Error::Postgres(format!(
             "Unexpected role/readonly probe result: {trimmed:?}"
         )));
@@ -4009,15 +4061,7 @@ pub struct ReplicationStat {
     pub application_name: String,
     /// Replication state
     pub state: ReplicationState,
-    /// LSN sent to this standby
-    pub sent_lsn: String,
-    /// LSN written to disk on standby
-    pub write_lsn: String,
-    /// LSN flushed to disk on standby
-    pub flush_lsn: String,
-    /// LSN replayed (applied) on standby
-    pub replay_lsn: String,
-    /// Replication lag in bytes (`sent_lsn` - `replay_lsn`)
+    /// Replication lag in bytes (current WAL position - `replay_lsn`)
     pub lag_bytes: u64,
     /// Replication lag in seconds (from `replay_lag`)
     pub lag_seconds: f64,
@@ -4808,6 +4852,104 @@ mod tests {
             19,
             7
         ));
+    }
+
+    // ── allocation budgets (see pgbattery_core::alloc_meter) ─────────────
+    //
+    // These paths run several times per second forever (SQL probes on the
+    // 100 ms lease tick and 1 s health/replication ticks), so each states
+    // its allocation budget as a number.
+
+    #[test]
+    fn parse_role_readonly_is_allocation_free() {
+        let (parsed, stats) =
+            pgbattery_core::alloc_meter::measure(|| parse_role_readonly("false,on,set,1"));
+        assert_eq!(
+            parsed.unwrap(),
+            PgWriteState {
+                in_recovery: false,
+                read_only: true,
+                sync_list_empty: false,
+                sync_standbys: 1,
+            }
+        );
+        assert_eq!(
+            stats.count, 0,
+            "happy-path probe parse must not allocate: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn take_line_budget_is_one_string() {
+        let mut buf = b"result line\nrest".to_vec();
+        let (line, stats) = pgbattery_core::alloc_meter::measure(|| take_line(&mut buf, 11));
+        assert_eq!(line, "result line\n");
+        assert_eq!(buf, b"rest");
+        assert!(
+            stats.count <= 1,
+            "line extraction budget is the returned String: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn take_line_survives_invalid_utf8() {
+        let mut buf = b"bad\xFFline\nrest".to_vec();
+        let line = take_line(&mut buf, 8);
+        assert_eq!(line, "bad\u{FFFD}line\n");
+        assert_eq!(buf, b"rest");
+    }
+
+    #[test]
+    fn build_command_budget_is_one_string() {
+        let (cmd, stats) = pgbattery_core::alloc_meter::measure(|| build_command("SELECT 1", 42));
+        assert_eq!(cmd, "SELECT 1;\n\\echo __PGBATTERY_SQL_END_42__\n");
+        assert!(
+            stats.count <= 1,
+            "command build budget is the returned String: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn sync_names_equivalent_matches_canonical_oracle() {
+        let cases = [
+            "",
+            "FIRST 1 (pgbattery_node_2, pgbattery_node_3)",
+            "  first  1  ( pgbattery_node_2,  pgbattery_node_3 ) ",
+            "\"FIRST 1 (a, b)\"",
+            "'first 1 (A, B)'",
+            "ANY 2 (a, b, c)",
+            "FIRST 1 (a,b)",
+            "FIRST 2 (a, b)",
+        ];
+        for a in cases {
+            for b in cases {
+                assert_eq!(
+                    sync_names_equivalent(a, b),
+                    normalise_sync_standby_names(a) == normalise_sync_standby_names(b),
+                    "comparator diverged from the canonical oracle for {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_names_equivalent_is_allocation_free() {
+        let a = "FIRST 1 (pgbattery_node_2, pgbattery_node_3)";
+        let b = " first 1  (pgbattery_node_2, pgbattery_node_3)";
+        let (equal, stats) = pgbattery_core::alloc_meter::measure(|| sync_names_equivalent(a, b));
+        assert!(equal);
+        assert_eq!(
+            stats.count, 0,
+            "per-tick idempotency compare must not allocate: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn build_command_keeps_existing_semicolon() {
+        assert_eq!(
+            build_command("SELECT 1;  ", 7),
+            "SELECT 1;\n\\echo __PGBATTERY_SQL_END_7__\n"
+        );
     }
 
     // ── parse_role_readonly ───────────────────────────────────────────────

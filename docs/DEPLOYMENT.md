@@ -3,7 +3,11 @@
 ## Prerequisites
 
 - Three or more nodes (odd count keeps elections simple).
-- PostgreSQL 16 binaries installed locally.
+- PostgreSQL 13 or newer binaries installed locally. The bundled image ships
+  PostgreSQL 18 (`ARG PG_MAJOR` in the Dockerfile); the gateway's embedded
+  SQL parser tracks PostgreSQL 17 (`pg_query` in `Cargo.toml`) — on a newer
+  server, statements in newer grammar sever on failover instead of
+  migrating, and the startup log and `pgbattery doctor` flag the gap.
 - Ports open between nodes: `5432` (clients), `5433` (Raft), `5434`
   (internal PG), `9090` (metrics), `9091` (management).
 - Set a shared management API token on every node:

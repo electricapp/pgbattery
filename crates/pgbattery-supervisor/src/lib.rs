@@ -10,6 +10,13 @@
 pub mod backup;
 mod process;
 
+/// Allocation-budget tests need the counting allocator installed in this
+/// crate's own test binary; see `pgbattery_core::alloc_meter`.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: pgbattery_core::alloc_meter::CountingAllocator =
+    pgbattery_core::alloc_meter::CountingAllocator;
+
 pub use backup::BackupManager;
 pub use process::{
     PgWriteState, ReplicationStat, ReplicationState, Supervisor, SupervisorConfig, SyncState,

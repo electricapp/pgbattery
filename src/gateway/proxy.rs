@@ -62,7 +62,9 @@ pub struct GatewayConfig {
 
 /// The Gateway - `PostgreSQL`-aware TCP proxy.
 pub struct Gateway {
-    config: GatewayConfig,
+    /// Shared with every connection handler; a per-connection clone of the
+    /// config struct itself would copy its `PathBuf`s.
+    config: Arc<GatewayConfig>,
     tls_config: Arc<TlsConfig>,
     registry: Arc<ConnectionRegistry>,
     /// Caps concurrent client connections at `config.max_connections`.
@@ -115,7 +117,7 @@ impl Gateway {
         let conn_limit = Arc::new(Semaphore::new(config.max_connections));
 
         Ok(Self {
-            config,
+            config: Arc::new(config),
             tls_config,
             registry,
             conn_limit,

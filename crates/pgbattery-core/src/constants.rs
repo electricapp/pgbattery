@@ -17,6 +17,15 @@ pub const SYNC_WAIT_TIMEOUT_MS: u64 = 5_000;
 /// Sync check interval in milliseconds.
 pub const SYNC_CHECK_INTERVAL_MS: u64 = 100;
 
+/// Oldest `PostgreSQL` major this project supports.
+///
+/// Set by the managed configuration: `wal_keep_size` and
+/// `max_slot_wal_keep_size` (both PG 13+) go into every node's
+/// `postgresql.conf`, and an unknown GUC there stops the postmaster at
+/// boot. The commit probe's `pg_current_xact_id`/`pg_xact_status` pair is
+/// PG 13+ as well.
+pub const MIN_SUPPORTED_PG_MAJOR: u32 = 13;
+
 /// Hard wall-clock budget for `pg_ctl stop -m fast -w`.
 ///
 /// `pg_ctl stop -m fast -w` sends SIGINT and waits for the postmaster to

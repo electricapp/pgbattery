@@ -85,29 +85,74 @@ fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
     Ok(len - FRAME_OVERHEAD_AFTER_LEN)
 }
 
-/// Append one framed message to `buf`: length prefix, type byte,
-/// correlation ID, body.
-fn append_frame(buf: &mut BytesMut, rpc_type: RpcType, corr_id: u64, body: &[u8]) -> Result<()> {
-    append_frame_bytes(buf, rpc_type as u8, corr_id, body)
-}
-
-/// The wire format itself, written once.
+/// Write a frame header (length placeholder, type byte, correlation ID);
+/// returns the length field's offset for [`finish_frame`].
 ///
-/// `append_frame` takes a typed [`RpcType`]; the fuzz seam takes whatever type
-/// byte the fuzzer produced, including values no variant maps to. Both go
-/// through here so the round-trip property the fuzzer checks is a property of
-/// the *shipping* encoder — a second copy of these four writes would keep
-/// agreeing with the decoder after the real one had changed.
-fn append_frame_bytes(buf: &mut BytesMut, type_byte: u8, corr_id: u64, body: &[u8]) -> Result<()> {
-    let total_len = FRAME_OVERHEAD_AFTER_LEN + body.len();
-    let total_len_u32 = u32::try_from(total_len)
-        .map_err(|_| Error::Protocol("RPC frame length exceeds u32".to_string()))?;
-    buf.reserve(4 + total_len);
-    buf.put_u32(total_len_u32);
+/// Together with `finish_frame` this is the wire format itself, written
+/// once: the byte-body path (`append_frame_bytes`, which the fuzz seam also
+/// exercises) and the serializing path (`append_frame_serialize`) both go
+/// through here, so the round-trip property the fuzzer checks stays a
+/// property of the *shipping* encoder.
+fn start_frame(buf: &mut BytesMut, type_byte: u8, corr_id: u64) -> usize {
+    let len_pos = buf.len();
+    buf.put_u32(0);
     buf.put_u8(type_byte);
     buf.put_u64(corr_id);
-    buf.put_slice(body);
+    len_pos
+}
+
+/// Backfill the length prefix written by [`start_frame`]. On error the
+/// frame is truncated away, leaving earlier staged bytes intact.
+fn finish_frame(buf: &mut BytesMut, len_pos: usize) -> Result<()> {
+    let total_len = buf.len().saturating_sub(len_pos + 4);
+    let Ok(total_len_u32) = u32::try_from(total_len) else {
+        buf.truncate(len_pos);
+        return Err(Error::Protocol("RPC frame length exceeds u32".to_string()));
+    };
+    let Some(len_slot) = buf.get_mut(len_pos..len_pos + 4) else {
+        buf.truncate(len_pos);
+        return Err(Error::Protocol("RPC frame header missing".to_string()));
+    };
+    len_slot.copy_from_slice(&total_len_u32.to_be_bytes());
     Ok(())
+}
+
+fn append_frame_bytes(buf: &mut BytesMut, type_byte: u8, corr_id: u64, body: &[u8]) -> Result<()> {
+    let len_pos = start_frame(buf, type_byte, corr_id);
+    buf.put_slice(body);
+    finish_frame(buf, len_pos)
+}
+
+/// Append one framed message, serializing `msg` directly into `buf` after
+/// the header — no intermediate `Vec` per RPC. An encode error may lose
+/// bytes staged before this frame; every caller treats it as
+/// connection-fatal, so nothing is resumed from the buffer afterwards.
+fn append_frame_serialize<T>(
+    buf: &mut BytesMut,
+    rpc_type: RpcType,
+    corr_id: u64,
+    msg: &T,
+) -> Result<()>
+where
+    T: Serialize + ?Sized,
+{
+    let len_pos = start_frame(buf, rpc_type as u8, corr_id);
+    let staged = std::mem::take(buf);
+    *buf = postcard::to_extend(msg, staged)?;
+    finish_frame(buf, len_pos)
+}
+
+/// Capacity retained by a staging buffer once it is empty. A 4 MB
+/// `InstallSnapshot` must not pin its high-water allocation for the
+/// connection's remaining life.
+const FRAME_BUF_RETAIN: usize = 64 * 1024;
+
+/// Release an oversized staging buffer's capacity once drained; a buffer
+/// still holding bytes (a torn frame) is left untouched.
+fn shrink_frame_buf(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() > FRAME_BUF_RETAIN {
+        *buf = BytesMut::with_capacity(4096);
+    }
 }
 
 /// One parsed inbound frame.
@@ -117,7 +162,7 @@ struct Frame {
     body: BytesMut,
 }
 
-/// Fuzz/test seam over [`take_frame`] and [`append_frame`].
+/// Fuzz/test seam over [`take_frame`] and [`append_frame_bytes`].
 ///
 /// The frame codec only otherwise reachable through a live socket plus an
 /// `openraft` dependency. `Ok(None)` must leave `buf` byte-identical (the
@@ -368,68 +413,69 @@ async fn handle_connection_generic<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Per-connection staging, retained across requests: inbound frames are
+    // split off `read_buf` by the same `take_frame` the client side decodes
+    // with, and responses serialize into `response_buf`.
+    let mut read_buf = BytesMut::with_capacity(4096);
+    let mut response_buf = BytesMut::with_capacity(4096);
     loop {
-        // Wait for the next request's length prefix (4 bytes). A clean close
-        // or an idle expiry ends the connection without error.
-        let mut len_buf = [0u8; 4];
-        match tokio::time::timeout(SERVER_IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::trace!(%peer_addr, "Peer closed RPC connection");
-                return Ok(());
-            }
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                tracing::debug!(%peer_addr, "Idle RPC connection reaped");
-                return Ok(());
-            }
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let body_len = validate_rpc_frame_len(len, "request")?;
+        response_buf.clear();
+        shrink_frame_buf(&mut read_buf);
+        shrink_frame_buf(&mut response_buf);
 
-        // Read message type (1 byte) + correlation ID (8 bytes). The ID is
-        // echoed verbatim in the response so the client can match it against
-        // the request — including skipping responses to requests it has
-        // since abandoned.
-        let mut type_buf = [0u8; 1];
-        tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut type_buf))
-            .await
-            .map_err(|_| Error::ConnectionTimeout(peer_addr))??;
-        let rpc_type = RpcType::try_from(type_buf[0])?;
-        let mut corr_buf = [0u8; 8];
-        tokio::time::timeout(RPC_IO_TIMEOUT, stream.read_exact(&mut corr_buf))
-            .await
-            .map_err(|_| Error::ConnectionTimeout(peer_addr))??;
-        let corr_id = u64::from_be_bytes(corr_buf);
-
-        // Read message body. `read_buf` appends into the reserved (but
-        // uninitialized) capacity, so the buffer is written exactly once by
-        // the socket read — no zero-fill pass over `body_len` bytes first,
-        // which matters at InstallSnapshot chunk sizes (up to 4 MB). Each
-        // read is `take`-bounded to the remaining frame bytes:
-        // `with_capacity` may round the allocation up, and an unbounded
-        // `read_buf` fills to capacity — swallowing the start of the next
-        // frame and desyncing the connection.
-        let mut body = BytesMut::with_capacity(body_len);
-        tokio::time::timeout(RPC_IO_TIMEOUT, async {
-            while body.len() < body_len {
-                let remaining = (body_len - body.len()) as u64;
-                let n = (&mut stream).take(remaining).read_buf(&mut body).await?;
-                if n == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        let frame = loop {
+            if let Some(frame) = take_frame(&mut read_buf, "request")? {
+                break frame;
+            }
+            // Waiting between requests is idle time; once any bytes of a
+            // frame are staged, each read gets the per-op budget instead so
+            // a half-open peer cannot pin this task.
+            let idle = read_buf.is_empty();
+            let read_timeout = if idle {
+                SERVER_IDLE_TIMEOUT
+            } else {
+                RPC_IO_TIMEOUT
+            };
+            // Once the length prefix is in, reserve the whole frame — one
+            // growth step even at InstallSnapshot sizes. `read_buf` appends
+            // into uninitialized capacity, so nothing is zero-filled.
+            if let Some(len_bytes) = read_buf.get(..4) {
+                let len = u32::from_be_bytes(<[u8; 4]>::try_from(len_bytes).unwrap_or_default());
+                read_buf.reserve((4 + len as usize).saturating_sub(read_buf.len()));
+            } else {
+                read_buf.reserve(4096);
+            }
+            match tokio::time::timeout(read_timeout, stream.read_buf(&mut read_buf)).await {
+                Ok(Ok(0)) => {
+                    if read_buf.is_empty() {
+                        tracing::trace!(%peer_addr, "Peer closed RPC connection");
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
                 }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) if idle => {
+                    tracing::debug!(%peer_addr, "Idle RPC connection reaped");
+                    return Ok(());
+                }
+                Err(_) => return Err(Error::ConnectionTimeout(peer_addr)),
             }
-            Ok(())
-        })
-        .await
-        .map_err(|_| Error::ConnectionTimeout(peer_addr))??;
+        };
+        let rpc_type = RpcType::try_from(frame.type_byte)?;
 
-        let (resp_type, resp_body) =
-            process_request(rpc_type, &body, peer_addr, &raft, &cluster_state).await?;
-
-        // Send response, echoing the request's correlation ID.
-        let mut response_buf = BytesMut::new();
-        append_frame(&mut response_buf, resp_type, corr_id, &resp_body)?;
+        // The response echoes the request's correlation ID so the client can
+        // match it — including skipping responses to abandoned requests.
+        process_request(
+            rpc_type,
+            &frame.body,
+            frame.corr_id,
+            peer_addr,
+            &raft,
+            &cluster_state,
+            &mut response_buf,
+        )
+        .await?;
 
         tokio::time::timeout(RPC_IO_TIMEOUT, stream.write_all(&response_buf))
             .await
@@ -440,15 +486,18 @@ where
     }
 }
 
-/// Dispatch a single decoded RPC request to the local Raft instance.
+/// Dispatch a single decoded RPC request to the local Raft instance,
+/// framing the response (echoing `corr_id`) into `response_buf`.
 async fn process_request(
     rpc_type: RpcType,
     body: &[u8],
+    corr_id: u64,
     peer_addr: SocketAddr,
     raft: &openraft::Raft<TypeConfig>,
     cluster_state: &RwLock<ClusterState>,
-) -> Result<(RpcType, Vec<u8>)> {
-    let response = match rpc_type {
+    response_buf: &mut BytesMut,
+) -> Result<()> {
+    match rpc_type {
         RpcType::AppendEntries => {
             let req: AppendEntriesRequest<TypeConfig> = postcard::from_bytes(body)?;
             tracing::trace!(%peer_addr, "Received AppendEntries");
@@ -456,8 +505,7 @@ async fn process_request(
                 .append_entries(req)
                 .await
                 .map_err(|e| Error::Raft(e.to_string()))?;
-            let resp_bytes = postcard::to_allocvec(&resp)?;
-            (RpcType::AppendEntriesResponse, resp_bytes)
+            append_frame_serialize(response_buf, RpcType::AppendEntriesResponse, corr_id, &resp)
         }
         RpcType::Vote => {
             let req: VoteRequest<NodeId> = postcard::from_bytes(body)?;
@@ -485,8 +533,7 @@ async fn process_request(
                     .vote(req)
                     .await
                     .map_err(|e| Error::Raft(e.to_string()))?;
-                let resp_bytes = postcard::to_allocvec(&resp)?;
-                (RpcType::VoteResponse, resp_bytes)
+                append_frame_serialize(response_buf, RpcType::VoteResponse, corr_id, &resp)
             } else {
                 tracing::error!(
                     candidate_id = candidate_id,
@@ -527,14 +574,13 @@ async fn process_request(
                 // prolongs an election round — a rejection never binds the
                 // voter and this path can never *grant* a vote — so it is a
                 // liveness footnote, not a safety hazard.
-                let metrics_snapshot = raft.metrics().borrow().clone();
+                let vote = raft.metrics().borrow().vote;
                 let resp = VoteResponse::<NodeId> {
-                    vote: metrics_snapshot.vote,
+                    vote,
                     vote_granted: false,
                     last_log_id: None,
                 };
-                let resp_bytes = postcard::to_allocvec(&resp)?;
-                (RpcType::VoteResponse, resp_bytes)
+                append_frame_serialize(response_buf, RpcType::VoteResponse, corr_id, &resp)
             }
         }
         RpcType::InstallSnapshot => {
@@ -544,17 +590,17 @@ async fn process_request(
                 .install_snapshot(req)
                 .await
                 .map_err(|e| Error::Raft(e.to_string()))?;
-            let resp_bytes = postcard::to_allocvec(&resp)?;
-            (RpcType::InstallSnapshotResponse, resp_bytes)
+            append_frame_serialize(
+                response_buf,
+                RpcType::InstallSnapshotResponse,
+                corr_id,
+                &resp,
+            )
         }
-        _ => {
-            return Err(Error::Protocol(format!(
-                "Unexpected request type: {rpc_type:?}"
-            )));
-        }
-    };
-
-    Ok(response)
+        _ => Err(Error::Protocol(format!(
+            "Unexpected request type: {rpc_type:?}"
+        ))),
+    }
 }
 
 /// A persistent framed connection to a Raft peer.
@@ -599,7 +645,10 @@ impl PeerConnection {
     /// call resumes losslessly. An `Err` means the connection is genuinely
     /// broken (I/O error, EOF, no progress within `RPC_IO_TIMEOUT`, or a
     /// protocol violation) and must be discarded by the caller.
-    async fn exchange(&mut self, rpc_type: RpcType, body: &[u8]) -> Result<Vec<u8>> {
+    async fn exchange<T>(&mut self, rpc_type: RpcType, msg: &T) -> Result<BytesMut>
+    where
+        T: Serialize + Sync + ?Sized,
+    {
         // Each request type has exactly one valid response type; validating it
         // catches a desynced stream before postcard decodes the wrong frame.
         let expected = match rpc_type {
@@ -618,12 +667,12 @@ impl PeerConnection {
         match &mut self.stream {
             PeerStream::Plain(stream) => {
                 self.io
-                    .exchange_frames(stream, rpc_type, corr_id, body, expected, addr)
+                    .exchange_frames(stream, rpc_type, corr_id, msg, expected, addr)
                     .await
             }
             PeerStream::Tls(stream) => {
                 self.io
-                    .exchange_frames(stream.as_mut(), rpc_type, corr_id, body, expected, addr)
+                    .exchange_frames(stream.as_mut(), rpc_type, corr_id, msg, expected, addr)
                     .await
             }
         }
@@ -654,22 +703,27 @@ impl FramedIo {
     /// past this bound is misbehaving.
     const MAX_STALE_FRAMES_PER_EXCHANGE: usize = 64;
 
-    async fn exchange_frames<S>(
+    async fn exchange_frames<S, T>(
         &mut self,
         stream: &mut S,
         rpc_type: RpcType,
         corr_id: u64,
-        body: &[u8],
+        msg: &T,
         expected: RpcType,
         addr: SocketAddr,
-    ) -> Result<Vec<u8>>
+    ) -> Result<BytesMut>
     where
         S: AsyncRead + AsyncWrite + Unpin,
+        T: Serialize + Sync + ?Sized,
     {
+        // Release capacity a large InstallSnapshot left behind; a staged
+        // torn frame keeps its buffer untouched.
+        shrink_frame_buf(&mut self.write_buf);
+        shrink_frame_buf(&mut self.read_buf);
         // Stage this request after any torn predecessor, then drain. The
         // timeout bounds total progress; on expiry the connection is dead to
         // the caller, so partial state doesn't matter.
-        append_frame(&mut self.write_buf, rpc_type, corr_id, body)?;
+        append_frame_serialize(&mut self.write_buf, rpc_type, corr_id, msg)?;
         tokio::time::timeout(RPC_IO_TIMEOUT, async {
             while !self.write_buf.is_empty() {
                 let n = stream.write(&self.write_buf).await?;
@@ -727,7 +781,7 @@ impl FramedIo {
                              expected {expected:?}, got {resp_type:?}"
                         )));
                     }
-                    return Ok(frame.body.into());
+                    return Ok(frame.body);
                 }
                 // Need more bytes. Reserve so `read_buf` has room to append
                 // (it reads nothing into a full buffer); the frame-length
@@ -794,9 +848,8 @@ impl RaftRpcClient {
         addr: SocketAddr,
         req: AppendEntriesRequest<TypeConfig>,
     ) -> Result<AppendEntriesResponse<NodeId>> {
-        let body = postcard::to_allocvec(&req)?;
         let response = self
-            .request(conn, addr, RpcType::AppendEntries, &body)
+            .request(conn, addr, RpcType::AppendEntries, &req)
             .await?;
         let resp: AppendEntriesResponse<NodeId> = postcard::from_bytes(&response)?;
         Ok(resp)
@@ -812,8 +865,7 @@ impl RaftRpcClient {
         addr: SocketAddr,
         req: VoteRequest<NodeId>,
     ) -> Result<VoteResponse<NodeId>> {
-        let body = postcard::to_allocvec(&req)?;
-        let response = self.request(conn, addr, RpcType::Vote, &body).await?;
+        let response = self.request(conn, addr, RpcType::Vote, &req).await?;
         let resp: VoteResponse<NodeId> = postcard::from_bytes(&response)?;
         Ok(resp)
     }
@@ -828,9 +880,8 @@ impl RaftRpcClient {
         addr: SocketAddr,
         req: InstallSnapshotRequest<TypeConfig>,
     ) -> Result<InstallSnapshotResponse<NodeId>> {
-        let body = postcard::to_allocvec(&req)?;
         let response = self
-            .request(conn, addr, RpcType::InstallSnapshot, &body)
+            .request(conn, addr, RpcType::InstallSnapshot, &req)
             .await?;
         let resp: InstallSnapshotResponse<NodeId> = postcard::from_bytes(&response)?;
         Ok(resp)
@@ -850,15 +901,18 @@ impl RaftRpcClient {
     /// reaping), so one fresh connect + retry is attempted. A failure on the
     /// fresh connection fails the RPC — openraft handles RPC errors with its
     /// own retry logic, so no backoff here.
-    async fn request(
+    async fn request<T>(
         &self,
         conn: &mut Option<PeerConnection>,
         addr: SocketAddr,
         rpc_type: RpcType,
-        body: &[u8],
-    ) -> Result<Vec<u8>> {
+        msg: &T,
+    ) -> Result<BytesMut>
+    where
+        T: Serialize + Sync + ?Sized,
+    {
         if let Some(cached) = conn.as_mut() {
-            match cached.exchange(rpc_type, body).await {
+            match cached.exchange(rpc_type, msg).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     *conn = None;
@@ -875,7 +929,7 @@ impl RaftRpcClient {
                 "connection slot unexpectedly empty".to_string(),
             ));
         };
-        match fresh.exchange(rpc_type, body).await {
+        match fresh.exchange(rpc_type, msg).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 *conn = None;
@@ -969,6 +1023,102 @@ mod tests {
         assert!(validate_rpc_frame_len(MAX_RPC_FRAME_LEN + 1, "request").is_err());
     }
 
+    /// Test-side framing over the shipping [`append_frame_bytes`].
+    fn append_frame(
+        buf: &mut BytesMut,
+        rpc_type: RpcType,
+        corr_id: u64,
+        body: &[u8],
+    ) -> Result<()> {
+        append_frame_bytes(buf, rpc_type as u8, corr_id, body)
+    }
+
+    /// Serializes as its raw bytes with no length prefix (postcard writes
+    /// tuples unprefixed), so peer-side test readers see the body verbatim.
+    struct RawBody<'a>(&'a [u8]);
+
+    impl Serialize for RawBody<'_> {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            use serde::ser::SerializeTuple as _;
+            let mut tuple = serializer.serialize_tuple(self.0.len())?;
+            for b in self.0 {
+                tuple.serialize_element(b)?;
+            }
+            tuple.end()
+        }
+    }
+
+    #[derive(Serialize)]
+    struct SampleMsg {
+        term: u64,
+        entries: Vec<u32>,
+        tag: String,
+    }
+
+    fn sample_msg() -> SampleMsg {
+        SampleMsg {
+            term: 7,
+            entries: vec![1, 2, 3],
+            tag: "x".to_string(),
+        }
+    }
+
+    /// The serializing encoder and the byte-body encoder must emit identical
+    /// frames — the fuzz round-trip property covers the latter.
+    #[test]
+    fn append_frame_serialize_matches_byte_encoding() {
+        let msg = sample_msg();
+        let mut via_vec = BytesMut::new();
+        append_frame(
+            &mut via_vec,
+            RpcType::Vote,
+            9,
+            &postcard::to_allocvec(&msg).unwrap(),
+        )
+        .unwrap();
+        let mut direct = BytesMut::new();
+        append_frame_serialize(&mut direct, RpcType::Vote, 9, &msg).unwrap();
+        assert_eq!(via_vec, direct);
+    }
+
+    #[test]
+    fn append_frame_serialize_reuses_a_warm_buffer() {
+        let mut buf = BytesMut::with_capacity(4096);
+        let msg = sample_msg();
+        append_frame_serialize(&mut buf, RpcType::Vote, 1, &msg).unwrap();
+        buf.clear();
+        let (result, stats) = crate::alloc_meter::measure(|| {
+            append_frame_serialize(&mut buf, RpcType::Vote, 2, &msg)
+        });
+        result.unwrap();
+        assert_eq!(
+            stats.count, 0,
+            "warm-buffer encode must not allocate: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn shrink_frame_buf_releases_only_oversized_empty_buffers() {
+        let mut oversized = BytesMut::with_capacity(FRAME_BUF_RETAIN * 2);
+        shrink_frame_buf(&mut oversized);
+        assert!(oversized.capacity() <= FRAME_BUF_RETAIN);
+
+        let mut torn = BytesMut::with_capacity(FRAME_BUF_RETAIN * 2);
+        torn.put_u8(1);
+        shrink_frame_buf(&mut torn);
+        assert!(
+            torn.capacity() > FRAME_BUF_RETAIN,
+            "staged bytes pin the buffer"
+        );
+
+        let mut small = BytesMut::with_capacity(64);
+        shrink_frame_buf(&mut small);
+        assert!(small.capacity() <= FRAME_BUF_RETAIN);
+    }
+
     const TEST_ADDR: &str = "127.0.0.1:9";
 
     fn addr() -> SocketAddr {
@@ -1024,7 +1174,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response, b"granted");
+        assert_eq!(&response[..], b"granted");
         peer.await.unwrap();
     }
 
@@ -1050,7 +1200,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response, b"fresh");
+        assert_eq!(&response[..], b"fresh");
     }
 
     #[tokio::test]
@@ -1098,7 +1248,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response, b"fresh");
+        assert_eq!(&response[..], b"fresh");
         assert!(io.read_buf.is_empty());
     }
 
@@ -1109,7 +1259,7 @@ mod tests {
         // outbound frame staged in `write_buf`.
         let (mut ours, mut theirs) = tokio::io::duplex(64);
         let mut io = FramedIo::default();
-        let big_body = vec![0xAB_u8; 1024];
+        let big_body = [0xAB_u8; 1024];
 
         let cancelled = tokio::time::timeout(
             Duration::from_millis(50),
@@ -1117,7 +1267,7 @@ mod tests {
                 &mut ours,
                 RpcType::AppendEntries,
                 0,
-                &big_body,
+                &RawBody(&big_body),
                 RpcType::AppendEntriesResponse,
                 addr(),
             ),
@@ -1158,7 +1308,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response, b"resp-1");
+        assert_eq!(&response[..], b"resp-1");
         assert!(io.write_buf.is_empty());
         peer.await.unwrap();
     }

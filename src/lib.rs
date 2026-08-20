@@ -2,10 +2,11 @@
 //!
 //! Library root for testing and reuse.
 
-/// Test-only allocation counter. Installed as the global allocator for the
-/// library test binary so hot paths can assert an allocation budget.
+/// Test-only allocation counter (shared via `pgbattery-core` so every
+/// workspace crate can budget-test). Installed as the global allocator for
+/// the library test binary so hot paths can assert an allocation budget.
 #[cfg(test)]
-mod alloc_meter;
+pub(crate) use pgbattery_core::alloc_meter;
 
 #[cfg(test)]
 #[global_allocator]

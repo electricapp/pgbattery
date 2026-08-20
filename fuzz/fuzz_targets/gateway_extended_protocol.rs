@@ -162,7 +162,7 @@ fuzz_target!(|data: &[u8]| {
     check_parse_name_offsets(&parse_msg);
     if let Some(expected) = clean_name(name) {
         assert_eq!(
-            parse_statement_name(&parse_msg).as_deref(),
+            parse_statement_name(&parse_msg),
             Some(expected),
             "Parse name did not round-trip"
         );
@@ -185,7 +185,7 @@ fuzz_target!(|data: &[u8]| {
             };
             assert_eq!(
                 close_target(&close_msg),
-                Some((want, expected.to_owned())),
+                Some((want, expected)),
                 "Close target did not round-trip"
             );
         }

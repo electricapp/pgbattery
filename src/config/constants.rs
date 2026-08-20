@@ -24,6 +24,14 @@ pub const DEFAULT_METRICS_PORT: u16 = 9090;
 /// `PeerConfig::get_mgmt_addr` fallback when `mgmt_addr` is unset.
 pub const DEFAULT_MGMT_PORT: u16 = 9091;
 
+/// `PostgreSQL` major whose grammar the gateway's embedded SQL parser
+/// (`pg_query`, see Cargo.toml) carries.
+///
+/// Bump together with the `pg_query` major: crate 6.x embeds PG 17. A
+/// server ahead of this still works — the analyzer fails closed on syntax
+/// it cannot parse — but the startup probe warns so the gap is visible.
+pub const EMBEDDED_PARSER_PG_MAJOR: u32 = 17;
+
 /// Gateway buffer size (64KB)
 pub const GATEWAY_BUFFER_SIZE: usize = 65536;
 

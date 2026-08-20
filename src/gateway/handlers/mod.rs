@@ -3,10 +3,10 @@
 //! Commit verification ("no-lost-commit" probe) works for both simple query
 //! protocol (`Q`) and extended query protocol (`Parse`/`Bind`/`Execute`).
 //! For extended protocol, the gateway tracks Parse→Bind→Execute chains to
-//! detect COMMIT, captures `txid_current()` before the Execute is forwarded,
+//! detect COMMIT, captures `pg_current_xact_id()` before the Execute is forwarded,
 //! and probes the new leader with `txid_status()` on backend disconnect.
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,6 +43,16 @@ use crate::governor::raft::FenceState;
 /// client or backend drains far faster than this; expiry means the peer is
 /// gone or hostile, so the connection is severed.
 const PROXY_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Prebuilt `SELECT pg_current_xact_id()` Query message ('Q' + length + SQL
+/// + NUL), pipelined ahead of every probed COMMIT.
+///
+/// `pg_current_xact_id` (`PostgreSQL` 13+, matching the supported floor)
+/// rather than the soft-deprecated `txid_current` wrapper; both yield the
+/// same 64-bit epoch-qualified value, which `get_txid_status` already
+/// probes via `pg_xact_status(xid8)`. Pinned against
+/// [`ConnectionHandler::build_query_message`] by test.
+const TXID_PROBE_MESSAGE: [u8; 33] = *b"Q\x00\x00\x00\x20SELECT pg_current_xact_id()\x00";
 
 /// Maximum startup-packet length accepted.
 ///
@@ -107,9 +117,10 @@ pub struct ConnectionHandler {
     pub state: SharedConnectionState,
     pub leader_rx: watch::Receiver<Option<SocketAddr>>,
     pub fence_rx: watch::Receiver<FenceState>,
-    pub config: GatewayConfig,
+    pub config: Arc<GatewayConfig>,
     pub registry: Arc<ConnectionRegistry>,
-    pub startup_params: Option<BytesMut>,
+    /// `Bytes` so the failover replay paths clone a refcount, not the packet.
+    pub startup_params: Option<Bytes>,
     /// Transaction status verification state - tracks in-flight COMMITs
     pub commit_probe: CommitProbeState,
     /// Tracks extended protocol Parse→Bind→Execute COMMIT chains for probe support.
@@ -174,7 +185,7 @@ fn is_trivial_commit(query: &str) -> bool {
         || q.eq_ignore_ascii_case("end transaction")
 }
 
-/// Whether it is safe to splice a `SELECT txid_current()` probe into the
+/// Whether it is safe to splice a `SELECT pg_current_xact_id()` probe into the
 /// backend stream ahead of this simple-query COMMIT.
 ///
 /// The probe is a simple query pipelined immediately ahead of the COMMIT; its
@@ -427,7 +438,7 @@ fn leading_statement_keyword_matches(query: &str, keywords: &[&str]) -> bool {
 /// Tracks extended query protocol `Parse`→`Bind`→`Execute` chains to detect COMMIT.
 ///
 /// Most ORMs and drivers use extended protocol exclusively. Without this tracker,
-/// we could not capture `txid_current()` before a COMMIT Execute and the probe
+/// we could not capture `pg_current_xact_id()` before a COMMIT Execute and the probe
 /// would always fail. The tracker handles both unnamed ("") and named statements.
 ///
 /// `Vec<String>` with linear search is used instead of `HashSet` because in
@@ -608,7 +619,7 @@ impl ConnectionHandler {
         state: SharedConnectionState,
         leader_rx: watch::Receiver<Option<SocketAddr>>,
         fence_rx: watch::Receiver<FenceState>,
-        config: GatewayConfig,
+        config: Arc<GatewayConfig>,
         registry: Arc<ConnectionRegistry>,
         lease: crate::governor::SharedLeaseState,
         preread: Option<[u8; 8]>,
@@ -676,6 +687,7 @@ impl ConnectionHandler {
             self.client.flush().await.ok();
             return Ok(());
         }
+        let startup = startup.freeze();
         self.startup_params = Some(startup.clone());
 
         // Get current leader and connect
@@ -1790,7 +1802,7 @@ impl ConnectionHandler {
         // silently under-replaying a statement we chose not to record. The
         // cap decision runs before the full-message copy so a capped
         // connection pays no memcpy per Parse.
-        if !state.replay.prepared.contains_key(&name)
+        if !state.replay.prepared.contains_key(name)
             && state.replay.prepared.len() >= Self::MAX_TRACKED_PREPARED_STATEMENTS
         {
             if !state.not_migratable {
@@ -1804,7 +1816,7 @@ impl ConnectionHandler {
             return;
         }
         let bytes = session_replay::capture_parse_message(msg);
-        state.replay.prepared.insert(name, bytes);
+        state.replay.prepared.insert(name.to_owned(), bytes);
     }
 
     /// Handle a Close ('C') message in the client→server direction.
@@ -1816,11 +1828,11 @@ impl ConnectionHandler {
         };
         if target == CloseTarget::Statement && !name.is_empty() {
             let mut state = self.state.write();
-            state.replay.prepared.remove(&name);
+            state.replay.prepared.remove(name);
         }
     }
 
-    /// Write the `SELECT txid_current()` probe to the backend, pipelined
+    /// Write the `SELECT pg_current_xact_id()` probe to the backend, pipelined
     /// immediately ahead of the client's COMMIT (which the caller forwards
     /// right after this returns). The probe's response frames arrive as a
     /// prefix of the backend stream and are diverted — never forwarded — by
@@ -1844,8 +1856,7 @@ impl ConnectionHandler {
             return;
         }
         tracing::debug!(conn_id = self.id, "Detected COMMIT, capturing txid");
-        let msg = Self::build_query_message("SELECT txid_current()");
-        match write_all_within_deadline(backend, &msg, self.id).await {
+        match write_all_within_deadline(backend, &TXID_PROBE_MESSAGE, self.id).await {
             Ok(()) => {
                 self.commit_probe.txid = None;
                 self.commit_probe.pending_commit = true;
@@ -1875,7 +1886,7 @@ impl ConnectionHandler {
             MessageType::DataRow => {
                 if self.commit_probe.txid.is_none()
                     && let Some(field_data) = Self::extract_first_field(msg)
-                    && let Ok(val) = String::from_utf8_lossy(field_data).parse::<i64>()
+                    && let Ok(val) = String::from_utf8_lossy(field_data).parse::<u64>()
                 {
                     self.commit_probe.txid = Some(val);
                 }
@@ -2833,6 +2844,16 @@ impl ConnectionHandler {
             );
         }
 
+        // The whole text failed to parse. Salvage per-statement analysis for
+        // what the scanner can still separate (`contains_commit` for the
+        // probe path; tracked changes for observability), but fail closed
+        // regardless: the session-state prefilter fired and the parser could
+        // not fully understand the text — either a syntax error the server
+        // will reject (severing is harmless) or grammar newer than the
+        // embedded parser's PostgreSQL major, where the statement may leave
+        // session state the analyzer cannot see and migrating would silently
+        // lose it. The scanner can also swallow an unparseable tail entirely,
+        // so the ratchet keys off the whole-text failure, not the salvage.
         let mut analysis = QueryAnalysis::default();
         if let Ok(statements) = pg_query::split_with_scanner(query) {
             for statement in statements {
@@ -2845,6 +2866,10 @@ impl ConnectionHandler {
                 }
             }
         }
+        metrics::counter!("pgbattery_gateway_unparsed_statements_total").increment(1);
+        analysis.session_changes.push(SessionChange::NonMigratable(
+            "statement the embedded SQL parser cannot parse",
+        ));
         analysis
     }
 
@@ -3201,7 +3226,7 @@ impl ConnectionHandler {
     ///
     /// The probe runs through management API so it does not depend on client
     /// authentication method (trust/scram/md5).
-    async fn probe_txid_status(&self, txid: i64) -> Result<bool> {
+    async fn probe_txid_status(&self, txid: u64) -> Result<bool> {
         tracing::info!(
             conn_id = self.id,
             txid = txid,
@@ -3215,7 +3240,7 @@ impl ConnectionHandler {
         ))
     }
 
-    async fn query_txid_status_via_management_api(&self, txid: i64) -> Result<Option<String>> {
+    async fn query_txid_status_via_management_api(&self, txid: u64) -> Result<Option<String>> {
         #[derive(Debug, Deserialize)]
         struct TxidStatusApiResponse {
             status: Option<String>,
@@ -3278,7 +3303,7 @@ impl ConnectionHandler {
             .ok_or_else(|| Error::Protocol("No leader management address available".to_string()))
     }
 
-    fn interpret_probe_status(conn_id: u64, txid: i64, status_result: Option<&str>) -> bool {
+    fn interpret_probe_status(conn_id: u64, txid: u64, status_result: Option<&str>) -> bool {
         match status_result {
             Some("committed") => {
                 tracing::info!(
@@ -3486,6 +3511,14 @@ mod tests {
     }
 
     #[test]
+    fn txid_probe_message_matches_builder() {
+        assert_eq!(
+            &TXID_PROBE_MESSAGE[..],
+            &ConnectionHandler::build_query_message("SELECT pg_current_xact_id()")[..]
+        );
+    }
+
+    #[test]
     fn test_build_query_message() {
         let msg = ConnectionHandler::build_query_message("SELECT 1");
 
@@ -3584,6 +3617,34 @@ mod tests {
             .session_changes
             .iter()
             .any(|c| matches!(c, SessionChange::NonMigratable(_)))
+    }
+
+    /// A statement the embedded parser rejects — a syntax error, or grammar
+    /// newer than the parser's `PostgreSQL` major — must sever, not silently
+    /// migrate: the analyzer only runs when a session-state prefilter fired,
+    /// so an unparseable statement here may have left state on a newer
+    /// server that the parser simply cannot see.
+    #[test]
+    fn test_unparseable_session_state_statement_severs() {
+        // Trips the `set` leading-keyword prefilter, then fails to parse.
+        assert!(marks_non_migratable("SET application_name TO"));
+        // A parseable statement alongside an unparseable one: the tracked
+        // change survives AND the connection is ratcheted non-migratable.
+        let analysis = ConnectionHandler::analyze_query("LISTEN ch1; LISTEN ((");
+        assert!(
+            analysis
+                .session_changes
+                .iter()
+                .any(|c| matches!(c, SessionChange::Listen(ch) if ch == "ch1")),
+            "the parseable LISTEN must still be tracked: {analysis:?}"
+        );
+        assert!(
+            analysis
+                .session_changes
+                .iter()
+                .any(|c| matches!(c, SessionChange::NonMigratable(_))),
+            "the unparseable statement must ratchet non-migratable: {analysis:?}"
+        );
     }
 
     #[test]
@@ -3724,7 +3785,7 @@ mod tests {
     /// commit the client will never retry.
     #[test]
     fn interpret_probe_status_only_trusts_committed() {
-        const TXID: i64 = 4242;
+        const TXID: u64 = 4242;
         assert!(ConnectionHandler::interpret_probe_status(
             1,
             TXID,
@@ -3947,7 +4008,7 @@ mod tests {
             state,
             leader_rx,
             fence_rx,
-            config,
+            Arc::new(config),
             Arc::new(ConnectionRegistry::new()),
             crate::governor::new_shared_lease(),
             None,
@@ -4130,7 +4191,7 @@ mod tests {
             .write()
             .replay
             .prepared
-            .insert("ps1".to_string(), bytes::Bytes::from_static(b"parse-bytes"));
+            .insert("ps1".to_string(), Bytes::from_static(b"parse-bytes"));
         let mut handler = test_handler(state.clone()).await;
         handler
             .observe_parse_message(&parse_message("", "DEALLOCATE ps1"))

@@ -27,8 +27,10 @@ pub enum CloseTarget {
 /// The unnamed prepared statement has an empty name and is transient by
 /// definition — clients always re-issue it before Bind/Execute, so we don't
 /// need to capture it.  Returns `None` for the unnamed case or malformed
-/// messages.
-pub fn parse_statement_name(msg: &[u8]) -> Option<String> {
+/// messages. Borrowed, so the common already-tracked lookup allocates
+/// nothing; callers own the name only when they insert it.
+#[must_use]
+pub fn parse_statement_name(msg: &[u8]) -> Option<&str> {
     // Skip type byte (1) + length (4).  The payload starts at index 5.
     let payload = msg.get(5..)?;
     let null_pos = payload.iter().position(|&b| b == 0)?;
@@ -36,7 +38,7 @@ pub fn parse_statement_name(msg: &[u8]) -> Option<String> {
         return None; // unnamed statement
     }
     let name_bytes = payload.get(..null_pos)?;
-    std::str::from_utf8(name_bytes).ok().map(str::to_string)
+    std::str::from_utf8(name_bytes).ok()
 }
 
 /// Extract the target type and name from a Close ('C') message.
@@ -48,7 +50,7 @@ pub fn parse_statement_name(msg: &[u8]) -> Option<String> {
 /// the server->client direction it means `CommandComplete`.  This function
 /// only makes sense on client->server messages.
 #[must_use]
-pub fn close_target(msg: &[u8]) -> Option<(CloseTarget, String)> {
+pub fn close_target(msg: &[u8]) -> Option<(CloseTarget, &str)> {
     // Byte 5: target type marker.  Bytes 6..len-1: name (cstring, ends in \0).
     let target = match *msg.get(5)? {
         b'S' => CloseTarget::Statement,
@@ -58,7 +60,7 @@ pub fn close_target(msg: &[u8]) -> Option<(CloseTarget, String)> {
     let tail = msg.get(6..)?;
     let null_pos = tail.iter().position(|&b| b == 0)?;
     let name_bytes = tail.get(..null_pos)?;
-    let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+    let name = std::str::from_utf8(name_bytes).ok()?;
     Some((target, name))
 }
 
@@ -104,7 +106,7 @@ mod tests {
     #[test]
     fn parse_name_named() {
         let msg = build_parse("s1", "SELECT 1");
-        assert_eq!(parse_statement_name(&msg).as_deref(), Some("s1"));
+        assert_eq!(parse_statement_name(&msg), Some("s1"));
     }
 
     #[test]
@@ -126,10 +128,7 @@ mod tests {
         let mut msg = vec![b'C', 0, 0, 0, 10, b'S'];
         msg.extend_from_slice(b"s1");
         msg.push(0);
-        assert_eq!(
-            close_target(&msg),
-            Some((CloseTarget::Statement, "s1".to_string()))
-        );
+        assert_eq!(close_target(&msg), Some((CloseTarget::Statement, "s1")));
     }
 
     #[test]
@@ -137,10 +136,7 @@ mod tests {
         let mut msg = vec![b'C', 0, 0, 0, 10, b'P'];
         msg.extend_from_slice(b"p1");
         msg.push(0);
-        assert_eq!(
-            close_target(&msg),
-            Some((CloseTarget::Portal, "p1".to_string()))
-        );
+        assert_eq!(close_target(&msg), Some((CloseTarget::Portal, "p1")));
     }
 
     #[test]

@@ -32,6 +32,11 @@ const PG_ISREADY_BUDGET: Duration = Duration::from_secs(10);
 /// Budget for the single-row psql probes that gate backup creation.
 const SQL_PROBE_BUDGET: Duration = Duration::from_secs(30);
 
+/// Buffer size for streaming multi-GB backup data (copies, gzip, tar). The
+/// 8 KiB `BufReader`/`BufWriter` default measurably dominates walltime on
+/// large physical PG data files; see [`copy_file_buffered`].
+const COPY_BUF: usize = 64 * 1024;
+
 /// Backup manager for local `PostgreSQL` backups.
 #[derive(Debug)]
 pub struct BackupManager {
@@ -1512,8 +1517,8 @@ fn compress_file_to_gzip(input_path: &Path, output_path: &Path) -> Result<()> {
     })?;
     apply_secret_file_perms(&output, output_path)?;
 
-    let mut reader = BufReader::new(input);
-    let writer = BufWriter::new(output);
+    let mut reader = BufReader::with_capacity(COPY_BUF, input);
+    let writer = BufWriter::with_capacity(COPY_BUF, output);
     let mut encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
 
     std::io::copy(&mut reader, &mut encoder)
@@ -1561,8 +1566,8 @@ fn decompress_gzip_to_file(input_path: &Path, output_path: &Path) -> Result<()> 
         ))
     })?;
 
-    let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
-    let mut writer = BufWriter::new(output);
+    let mut decoder = flate2::read::GzDecoder::new(BufReader::with_capacity(COPY_BUF, input));
+    let mut writer = BufWriter::with_capacity(COPY_BUF, output);
 
     std::io::copy(&mut decoder, &mut writer)
         .map_err(|e| Error::Postgres(format!("Decompression failed: {e}")))?;
@@ -1759,8 +1764,6 @@ fn copy_directory_contents(source_dir: &Path, target_dir: &Path) -> Result<()> {
 fn copy_file_buffered(src: &Path, dst: &Path) -> Result<()> {
     use std::io::{BufReader, BufWriter};
 
-    const COPY_BUF: usize = 64 * 1024;
-
     let input = std::fs::File::open(src).map_err(|e| {
         Error::Postgres(format!(
             "Failed to open source file for copy {}: {}",
@@ -1932,7 +1935,7 @@ fn extract_gzip_tar_to_dir(tar_gz_path: &Path, target_dir: &Path) -> Result<()> 
             e
         ))
     })?;
-    let decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+    let decoder = flate2::read::GzDecoder::new(BufReader::with_capacity(COPY_BUF, input));
     extract_tar_stream_to_dir(decoder, target_dir, tar_gz_path)
 }
 
@@ -1946,7 +1949,11 @@ fn extract_plain_tar_to_dir(tar_path: &Path, target_dir: &Path) -> Result<()> {
             e
         ))
     })?;
-    extract_tar_stream_to_dir(BufReader::new(input), target_dir, tar_path)
+    extract_tar_stream_to_dir(
+        BufReader::with_capacity(COPY_BUF, input),
+        target_dir,
+        tar_path,
+    )
 }
 
 fn classify_archive_format(path: &Path) -> BackupArchiveFormat {

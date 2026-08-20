@@ -111,6 +111,9 @@ pub async fn run_doctor(
     // 6. Configuration checks
     checks.extend(check_configuration(&probes));
 
+    // 7. PostgreSQL version window
+    checks.extend(check_pg_versions(&probes));
+
     let report = build_report(checks);
 
     // Output
@@ -614,6 +617,86 @@ fn check_configuration(probes: &[NodeProbe]) -> Vec<CheckResult> {
         }
     }
 
+    results
+}
+
+/// Check each node's `PostgreSQL` version (from the
+/// `pgbattery_pg_server_version_num` gauge the startup probe publishes)
+/// against the supported window. An absent gauge means the node has not yet
+/// completed a successful health probe — reported as a skip, not a failure.
+fn check_pg_versions(probes: &[NodeProbe]) -> Vec<CheckResult> {
+    use pgbattery_core::{PgVersionSupport, classify_pg_version, constants};
+
+    let mut results = Vec::new();
+    for probe in probes {
+        let Ok(data) = &probe.result else {
+            continue;
+        };
+        let Some(version_num) = data
+            .metrics
+            .get("pgbattery_pg_server_version_num")
+            .map(|v| metric_to_u64(*v))
+            .and_then(|v| u32::try_from(v).ok())
+        else {
+            results.push(CheckResult {
+                name: format!("pg-version:{}", probe.addr),
+                status: CheckStatus::Skip,
+                message: format!(
+                    "Node {} has not reported its PostgreSQL version yet",
+                    probe.addr
+                ),
+                details: Some(
+                    "The gauge appears after the first successful health probe".to_string(),
+                ),
+            });
+            continue;
+        };
+        let major = version_num / 10_000;
+        let parser_major = crate::config::constants::EMBEDDED_PARSER_PG_MAJOR;
+        let (status, message, details) =
+            match classify_pg_version(version_num, constants::MIN_SUPPORTED_PG_MAJOR, parser_major)
+            {
+                PgVersionSupport::Supported => (
+                    CheckStatus::Pass,
+                    format!(
+                        "Node {} runs PostgreSQL {major} ({version_num})",
+                        probe.addr
+                    ),
+                    None,
+                ),
+                PgVersionSupport::BelowMinimum => (
+                    CheckStatus::Fail,
+                    format!(
+                        "Node {} runs PostgreSQL {major}, below the supported floor {}",
+                        probe.addr,
+                        constants::MIN_SUPPORTED_PG_MAJOR
+                    ),
+                    Some(
+                        "Managed settings (wal_keep_size, max_slot_wal_keep_size) require it"
+                            .to_string(),
+                    ),
+                ),
+                PgVersionSupport::AheadOfParser => (
+                    CheckStatus::Warn,
+                    format!(
+                        "Node {} runs PostgreSQL {major}, ahead of the embedded SQL parser \
+                     (PostgreSQL {parser_major})",
+                        probe.addr
+                    ),
+                    Some(
+                        "Statements in newer grammar sever on failover instead of migrating; \
+                     bump pg_query when a release for this major ships"
+                            .to_string(),
+                    ),
+                ),
+            };
+        results.push(CheckResult {
+            name: format!("pg-version:{}", probe.addr),
+            status,
+            message,
+            details,
+        });
+    }
     results
 }
 

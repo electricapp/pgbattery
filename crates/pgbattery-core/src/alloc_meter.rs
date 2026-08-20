@@ -2,6 +2,12 @@
 //! number and fail when it grows. A stray `format!` in a per-frame renderer
 //! is otherwise invisible to a normal test suite.
 //!
+//! Lives in the core crate so every workspace crate can install it as the
+//! global allocator of its own test binary (`#[cfg(test)]
+//! #[global_allocator]`) and write budget tests over its private functions.
+//! Nothing installs it outside tests, so shipping binaries run the plain
+//! system allocator.
+//!
 //! The counter is thread-local and only tallies while [`measure`] is on the
 //! stack, so `cargo test`'s parallel threads cannot contaminate each other.
 
@@ -19,7 +25,8 @@ thread_local! {
 }
 
 /// A `System` allocator that tallies allocations on measuring threads.
-pub(crate) struct CountingAllocator;
+#[derive(Debug)]
+pub struct CountingAllocator;
 
 impl CountingAllocator {
     fn record(size: usize) {
@@ -60,18 +67,21 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 /// What [`measure`] observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Allocations {
+pub struct Allocations {
     /// Number of `alloc`/`alloc_zeroed`/`realloc` calls.
-    pub(crate) count: u64,
+    pub count: u64,
     /// Total bytes requested across those calls.
-    pub(crate) bytes: u64,
+    pub bytes: u64,
 }
 
 /// Count the allocations `f` performs on this thread.
 ///
+/// Only meaningful when [`CountingAllocator`] is the test binary's global
+/// allocator; under any other allocator every measurement reads zero.
+///
 /// Nesting is not supported and not needed; an inner call would reset the
 /// outer tally, so keep exactly one on the stack.
-pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, Allocations) {
+pub fn measure<T>(f: impl FnOnce() -> T) -> (T, Allocations) {
     COUNT.set(0);
     BYTES.set(0);
     ACTIVE.set(true);
