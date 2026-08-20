@@ -2150,24 +2150,30 @@ nothing detects drift.
       model's.
       _Effort_ M
 
-- [ ] **H-50 — `witness-topology` does not describe the cluster it builds.**
-      Case nineteen of the control-plane nightly, and the first one the suite
-      reaches that is still red. It calls node4 a "witness learner", waits for
-      `nodes: 3` after starting it, and asserts a 3-node topology at the end —
-      while the witness is still up, since cleanup stops it afterwards.
+- [x] **H-50 — `witness-topology` now waits for the cluster it builds.** Case
+      nineteen of the control-plane nightly, and the first one the suite reached
+      once the earlier blockers were gone. Two defects, and the second is why
+      the first was hard to read.
 
-      The counts observed do not agree with each other, which is why this is
-      left open rather than patched to whichever number a run happened to
-      produce. In the nightly it timed out on `nodes=4, voters=3`; run alone
-      against a freshly rebuilt cluster it timed out on `nodes=3, voters=4`.
-      Starting the witness by hand and watching membership for thirty seconds,
-      node4 never appeared at all. `--voter` defaults to false and the compose
-      command does not pass it, so a voter count of four says either the join
-      raced into one or something promoted it — and a 2+1 topology whose
-      witness can become a voter is a different quorum than the case claims to
-      test.
-      **Done when** the case waits for and asserts the topology it actually
-      builds, and node4's role is deterministic rather than raced.
+      It waited for `nodes: 3` while running a four-node topology. The witness
+      joins as a learner — `--voter` defaults to false and the compose command
+      does not pass it — so membership is three voters plus node4, and
+      `/cluster/nodes` is four. It stays four across the `pkill` of node3 as
+      well, because registration is replicated `NodeInfo` rather than liveness.
+      All three counts are now four; the voter count is untouched at three.
+
+      What made that hard to see: `witness_state` is a **named** volume, and
+      nothing cleaned it. `down -v` skips it because the witness is not in the
+      default profile, and `rm -v` removes only anonymous volumes. A second run
+      therefore started a witness whose data directory was 151 MB ahead of a
+      freshly bootstrapped leader, `pg_rewind` refused the divergence exactly as
+      it should, and the witness never joined at all — so consecutive runs
+      disagreed about what the topology even was. Cleanup now empties the volume
+      through a throwaway container on it, the same shape `wipe_node_state`
+      uses, which derives the project from compose rather than naming it.
+
+      Verified by running the case twice in a row, since one run in isolation
+      could never have shown the pollution.
       _Effort_ M
 
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**

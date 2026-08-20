@@ -3180,7 +3180,8 @@
         },
         {
           "type": "wait_cluster",
-          "nodes": 3,
+          "comment": "Four registered nodes from the moment the witness joins, and it stays four across the kill: registration is replicated NodeInfo, not liveness, so killing node3 does not remove it. The witness is a learner, so the voter count stays three throughout.",
+          "nodes": 4,
           "leaders": 1,
           "timeout_sec": 60
         },
@@ -3191,7 +3192,8 @@
         },
         {
           "type": "wait_cluster",
-          "nodes": 3,
+          "comment": "And four once node3 is back, because the witness is still attached. It joins as a learner, so the voter count stays three throughout.",
+          "nodes": 4,
           "leaders": 1,
           "timeout_sec": 120
         },
@@ -3204,7 +3206,8 @@
       "assertions": [
         {
           "type": "cluster_topology",
-          "nodes": 3,
+          "comment": "The witness is still attached here — cleanup removes it afterwards — so the 2+1 topology is four registered nodes and three voters.",
+          "nodes": 4,
           "leaders": 1
         },
         {
@@ -3221,7 +3224,12 @@
         },
         {
           "type": "cmd",
-          "comment": "and remove it: a stopped-but-present container still answers `compose ps -a`, and the next case's cluster wait counts registered nodes.",
+          "comment": "Empty its state, or the next run inherits it. `witness_state` is a NAMED volume, so neither `down -v` (the witness is not in the default profile) nor `rm -v` (anonymous volumes only) touches it — a second run then starts a witness whose data directory is far ahead of a freshly bootstrapped leader, pg_rewind refuses the divergence, and it never joins. Wiped through a throwaway container on the same volume, which derives the project from compose rather than naming it.",
+          "cmd": "docker compose --profile witness run --rm --no-deps --entrypoint sh witness -c 'rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* /var/lib/postgresql/raft/* /var/lib/postgresql/raft/.[!.]* 2>/dev/null; ls -A /var/lib/postgresql/data; ls -A /var/lib/postgresql/raft'"
+        },
+        {
+          "type": "cmd",
+          "comment": "and remove the container: a stopped-but-present one still answers `compose ps -a`.",
           "cmd": "docker compose --profile witness rm -sf witness"
         }
       ]
