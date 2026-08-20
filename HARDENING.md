@@ -224,6 +224,15 @@ The pattern worth noting: the harness is densest exactly where the design is
 already strongest, and thinnest where the design documents its own residual
 risk.
 
+**The tiers below are the original analysis, not a status board.** They say what
+was missing when the roadmap was written and why it was worth building, in the
+present tense it was written in; most of it has since been built. The execution
+plan is where completion lives, one checkbox per tier item, and it is the only
+place it lives — a tier bullet restating its own state would be the same fact in
+two places, which is how the escape classes above came to describe a system that
+had moved on. Read a bullet for the argument, and its task for whether the
+argument still applies.
+
 ## Tier 1 — Close the oracles
 
 No new infrastructure. Highest ratio of confidence to effort.
