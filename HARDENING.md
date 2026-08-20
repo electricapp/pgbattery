@@ -2438,39 +2438,49 @@ nothing detects drift.
       answer while that `PostgreSQL` refuses connections — which is what makes
       it the right gate rather than another topology check.
 
-      **Why this stays open: the bound may be unreachable, and that is a new
-      question the build raised.** `handle_supervisor_health_tick` probes
-      `SELECT 1` every second with a 2 s budget and signals process shutdown
-      after five consecutive failures, so a node whose `PostgreSQL` refuses
-      connections asks to be restarted in **ten to twelve seconds** — far
-      inside a 60 s bound. If that is what happens, the watchdog never
-      accumulates the leadership it needs and this entry's original scenario is
-      handled by restart-and-re-elect rather than by yielding, which also means
-      the entry's own premise — that the lease loop "retries identically
-      forever while the node holds the lease" — needs re-checking against that
-      shutdown path. An attempt to measure it by `SIGSTOP`-ing a leader's
-      postmaster did not land the signal (`pkill` returned 137 and the
-      postmaster was still `S`), so this is a question, not a finding.
+      **Measured, and the premise this entry was built on is wrong.** A leader
+      does not hold leadership while its `PostgreSQL` answers nothing. Freezing
+      the postmaster of the leader on a live cluster — `SIGSTOP`, which is
+      alive to `try_wait` and answers no query, the same stand-in
+      `hung-postmaster-failover` uses:
 
-      The watchdog is kept either way, because the sub-case it certainly does
-      catch is real and persistent: a leader whose `PostgreSQL` is a **healthy
+      ```
+      t+ 0.0s  node1=running  leaders=[node1]
+      t+ 9.1s  node1=running  leaders=[node2]     <- leadership moved
+      t+11.3s  node1=running  restarts=1          <- health tick shut it down
+      ```
+
+      Leadership moves at **nine seconds** and the process asks to be restarted
+      at **eleven**, both far inside the 60 s bound. So
+      `LEADER_WITHOUT_PRIMARY_YIELD_MS` can never be reached in this state, the
+      watchdog is inert against it, and the sentence this entry opened with —
+      that the lease loop "retries it identically forever while the node holds
+      the lease" — describes something that does not happen. The health tick
+      and ordinary failover already handle it, and better than a yield would: a
+      restart repairs the node, where a yield only moves the leadership.
+
+      What the watchdog does still cover is the other half, and it is the half
+      with no other bound on it: a leader whose `PostgreSQL` is a **healthy
       standby** that cannot be promoted — refused by the LSN catch-up gate, by
       `verify_promotion_safe`, or looping on the lease hold-down. There
-      `SELECT 1` succeeds, the health tick is satisfied, the node keeps
+      `SELECT 1` succeeds, so the health tick is satisfied, the node keeps
       leadership indefinitely, and `promote_local_postgres` returns
-      `Some(false)` on every pass forever. That is the same symptom with a
-      different cause and no other bound on it.
+      `Some(false)` on every pass.
 
-      **Done when** the connection-refusing state is measured end to end —
-      whether the node holds leadership at all, and for how long — and the
-      bound is set from that measurement rather than from an estimate of what a
-      legitimate promotion costs. If it turns out the node dies at twelve
-      seconds, the remedy belongs on the election side (a node that cannot open
-      its database should not be winning on LSN), not in this watchdog.
-      **Done when** a leader that cannot promote its own PostgreSQL yields
-      leadership instead of holding it, or the demote-then-win race that creates
-      the state is closed, and `cascade-double-failover-wedge` returns to the
-      matrix.
+      **So the cascade is a livelock, not a stuck leader.** If every node that
+      wins the election has a `PostgreSQL` that cannot open, each wins, fails
+      its probes, restarts, and hands on — for as long as no peer can be
+      promoted. That fits what the case shows, minutes of no progress with the
+      cluster alive, and it is not something a yield can fix, because
+      leadership is already moving. The remedy belongs on the election side: a
+      node that cannot open its database should not be winning on LSN.
+
+      **Done when** a node whose `PostgreSQL` cannot open is kept from winning
+      an election it will then fail out of, so the cascade converges on
+      whichever peer can actually serve instead of rotating through all three,
+      and `cascade-double-failover-wedge` returns to the matrix. The watchdog
+      stays as the bound on the healthy-standby half; it is not the remedy for
+      this one and this entry no longer claims it is.
       _Effort_ M
 
 - [x] **H-52 — torn-raft loses its cluster to a corrupt catalog, sometimes.**
