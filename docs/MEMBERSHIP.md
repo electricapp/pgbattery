@@ -55,27 +55,44 @@ Never remove so many voters that the cluster loses majority (N/2+1).
 
 ## Bringing a Removed Node Back
 
-A removed node does not rejoin by restarting. `join` clones from the leader and
-refuses a data directory that already holds a cluster:
+A removed node rejoins with `join`, which discards the old data directory and
+clones the leader afresh:
+
+```bash
+pgbattery join --peer <any-member> --voter
+```
+
+The discard is gated on lineage. `join` compares the node's `PostgreSQL` system
+identifier against the leader's `/api/v1/cluster/identity`, and clears the data
+directory only on a proven match. A match means the leader holds every write
+this node was ever told was durable — synchronous replication puts each ack on a
+standby, and the LSN gate elects only from the furthest ahead — so nothing the
+cluster promised is lost. Anything beyond that was never acknowledged.
+
+An unproven lineage keeps the data and refuses the join:
 
 ```
 Error: Data directory /var/lib/postgresql/data is not empty.
 ```
 
-That refusal is deliberate — the node's data is from a membership it is no
-longer in, and nothing has reconciled it against the cluster's history — so the
-operator clears the state and lets the node join as a new one:
+Both differing identifiers and an unreadable one on either side count as
+unproven, so a peer that re-bootstrapped under the same node id cannot talk this
+node into destroying real data. Clearing it is then the operator's call:
 
 ```bash
 # with the node stopped
 rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/raft/*
-pgbattery join --peer <any-member> --voter
 ```
 
-The cost is a full basebackup rather than catch-up from the WAL the node
-already holds. Reattaching that WAL would need the node's data proven to be
-this cluster's (see `docs/STATE_MACHINE.md` §3a) and no further ahead than the
-leader; until that exists, the clone is the supported path.
+The same path covers a node whose Raft store is lost while its data directory
+survives — a torn `raft.db`, or a wiped state volume. It holds no Raft state, so
+it joins as new; before the lineage gate existed, the emptiness check refused it
+on every start and the node was unrecoverable without manual intervention.
+
+The cost is a full basebackup rather than catch-up from the WAL the node already
+holds. Reattaching that WAL would additionally need the node proven no further
+ahead than the leader (see `docs/STATE_MACHINE.md` §3a); until that exists, the
+clone is the supported path.
 
 ## API Reference
 

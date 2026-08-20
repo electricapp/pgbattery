@@ -2229,22 +2229,45 @@ impl App {
         Ok(leader)
     }
 
-    fn ensure_join_data_dir_ready(&self) -> Result<()> {
-        // A join that died mid-basebackup leaves the directory populated, and
-        // the emptiness check would then refuse every later start — a transient
-        // replication error costing the node permanently. Debris is
-        // recognisable: files but no PG_VERSION is not a data directory any
-        // PostgreSQL would open, so it can only be the remains of an attempt.
-        // A directory with PG_VERSION is never touched here.
-        if !self.has_existing_pg_data() && !dir_is_empty(&self.config.pg_data_dir)? {
-            warn!(
-                data_dir = %self.config.pg_data_dir.display(),
-                "Data directory holds no PG_VERSION — discarding the remains of an \
-                 interrupted join before retrying"
-            );
-            clear_dir_contents(&self.config.pg_data_dir)?;
+    async fn ensure_join_data_dir_ready(&self, leader_lineage: Option<u64>) -> Result<()> {
+        let data_dir = &self.config.pg_data_dir;
+        let holds_pg_data = self.has_existing_pg_data();
+        // Only read when a decision can turn on it: a complete data directory
+        // is the one case that needs the local lineage, and reading it spawns
+        // pg_controldata.
+        let local_lineage = if holds_pg_data {
+            self.local_cluster_lineage().await
+        } else {
+            None
+        };
+
+        match join_data_dir_disposition(
+            dir_is_empty(data_dir)?,
+            holds_pg_data,
+            local_lineage,
+            leader_lineage,
+        ) {
+            JoinDataDir::Usable => {}
+            JoinDataDir::ClearInterruptedClone => {
+                warn!(
+                    data_dir = %data_dir.display(),
+                    "Data directory holds no PG_VERSION — discarding the remains of an \
+                     interrupted join before retrying"
+                );
+                clear_dir_contents(data_dir)?;
+            }
+            JoinDataDir::ClearSupersededData => {
+                warn!(
+                    data_dir = %data_dir.display(),
+                    lineage = local_lineage,
+                    "Discarding a data directory consensus no longer accounts for; the leader \
+                     of the same lineage holds every acked write and will be cloned fresh"
+                );
+                clear_dir_contents(data_dir)?;
+            }
+            JoinDataDir::Refuse => {}
         }
-        ensure_data_dir_ready(&self.config.pg_data_dir)
+        ensure_data_dir_ready(data_dir)
     }
 
     /// Discard a partial basebackup so the next start can retry the join.
@@ -2626,7 +2649,9 @@ impl App {
                          re-provisioning from the leader"
                     );
                     let leader = self.discover_join_leader(&client, &peer_addr).await?;
-                    self.ensure_join_data_dir_ready()?;
+                    // No lineage to compare: this branch is reached precisely
+                    // because the data directory holds no PostgreSQL data.
+                    self.ensure_join_data_dir_ready(None).await?;
                     if let Err(e) = self.prepare_join_data(&leader).await {
                         // A basebackup that dies mid-stream leaves PGDATA
                         // populated, and the emptiness check would then fail
@@ -2650,10 +2675,9 @@ impl App {
                     return self.run(false).await;
                 }
                 Ok(false) => {
-                    // Removed from cluster. Wipe stale Raft state and fall
-                    // through to the rejoin path, which uses pg_rewind to
-                    // catch up the existing PG data dir against the current
-                    // leader rather than wiping it.
+                    // Removed from cluster. Wipe the stale Raft state and fall
+                    // through to the join path, which re-clones from the
+                    // leader once it has proved the same lineage.
                     self.wipe_raft_state()?;
                 }
                 Err(e) => {
@@ -2680,7 +2704,8 @@ impl App {
 
         let leader = self.discover_join_leader(&client, &peer_addr).await?;
 
-        self.ensure_join_data_dir_ready()?;
+        let leader_lineage = self.peer_cluster_lineage(&client, &leader.mgmt_addr).await;
+        self.ensure_join_data_dir_ready(leader_lineage).await?;
         self.register_as_learner(&client, &leader.mgmt_addr).await?;
 
         if let Err(e) = self.prepare_join_data(&leader).await {
@@ -2784,6 +2809,61 @@ const fn peer_speaks_for_lineage(local: Option<u64>, peer: Option<u64>) -> bool 
     }
 }
 
+/// Whether a clone from `leader` may replace local data of lineage `local`.
+///
+/// Only a proven match qualifies. This is the strict counterpart of
+/// [`peer_speaks_for_lineage`], and the asymmetry is the point: refusing to act
+/// on an unknown lineage costs a stalled membership answer there, and a wiped
+/// data directory here, so unknown resolves the safe way in each.
+const fn clone_supersedes_local_data(local: Option<u64>, leader: Option<u64>) -> bool {
+    matches!((local, leader), (Some(local), Some(leader)) if local == leader)
+}
+
+/// What a join should do with what it finds in the data directory.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinDataDir {
+    /// Empty. Clone into it.
+    Usable,
+    /// Files but no `PG_VERSION`: not a data directory `PostgreSQL` would open,
+    /// so it can only be the remains of an interrupted clone.
+    ClearInterruptedClone,
+    /// A complete data directory the leader provably supersedes.
+    ClearSupersededData,
+    /// A complete data directory of unproven provenance. Keep it, and let the
+    /// emptiness check refuse the join.
+    Refuse,
+}
+
+/// Decide from what the directory holds and whose lineage it carries.
+///
+/// Reaching a join at all means the node is not resuming: it holds no Raft
+/// state, or the cluster has said it is not a member. A complete data directory
+/// here is one consensus no longer accounts for, and refusing it outright is
+/// what left a node whose Raft store was lost meeting "Data directory is not
+/// empty" on every start, for good.
+///
+/// Discarding it is safe only against a leader of the same lineage, which by W1
+/// and V1 holds every acked write: synchronous replication puts each ack on a
+/// standby, and the LSN gate elects only from the furthest ahead. What this node
+/// holds beyond that was never promised to anyone.
+const fn join_data_dir_disposition(
+    is_empty: bool,
+    holds_pg_data: bool,
+    local_lineage: Option<u64>,
+    leader_lineage: Option<u64>,
+) -> JoinDataDir {
+    if is_empty {
+        return JoinDataDir::Usable;
+    }
+    if !holds_pg_data {
+        return JoinDataDir::ClearInterruptedClone;
+    }
+    if clone_supersedes_local_data(local_lineage, leader_lineage) {
+        return JoinDataDir::ClearSupersededData;
+    }
+    JoinDataDir::Refuse
+}
+
 /// Remove everything inside `data_dir`, leaving the directory itself.
 ///
 /// The directory is kept because compose mounts a volume at that path; removing
@@ -2866,8 +2946,8 @@ fn are_paths_on_same_mount(_path1: &PathBuf, _path2: &PathBuf) -> Result<bool> {
 )]
 mod tests {
     use super::{
-        clear_dir_contents, ensure_data_dir_ready, peer_speaks_for_lineage,
-        promotion_lease_holddown,
+        clear_dir_contents, clone_supersedes_local_data, ensure_data_dir_ready,
+        peer_speaks_for_lineage, promotion_lease_holddown,
     };
     use std::time::{Duration, Instant};
 
@@ -2954,6 +3034,90 @@ mod tests {
             assert!(ensure_data_dir_ready(&dir).is_ok());
             assert!(dir.is_dir());
             std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        }
+    }
+
+    mod join_data_dir {
+        use super::super::{JoinDataDir, join_data_dir_disposition};
+
+        #[test]
+        fn an_empty_directory_is_usable() {
+            assert_eq!(
+                join_data_dir_disposition(true, false, None, Some(7)),
+                JoinDataDir::Usable
+            );
+        }
+
+        #[test]
+        fn files_without_pg_version_are_an_interrupted_clone() {
+            assert_eq!(
+                join_data_dir_disposition(false, false, None, Some(7)),
+                JoinDataDir::ClearInterruptedClone
+            );
+        }
+
+        #[test]
+        fn a_complete_clone_of_the_leaders_lineage_is_discarded() {
+            // The state a node lands in when its Raft store is lost while
+            // PGDATA survives — a torn redb, or a removal. Refusing here is
+            // what made that permanent.
+            assert_eq!(
+                join_data_dir_disposition(false, true, Some(7), Some(7)),
+                JoinDataDir::ClearSupersededData
+            );
+        }
+
+        #[test]
+        fn a_complete_clone_of_another_lineage_is_kept() {
+            assert_eq!(
+                join_data_dir_disposition(false, true, Some(7), Some(8)),
+                JoinDataDir::Refuse
+            );
+        }
+
+        #[test]
+        fn an_unprovable_lineage_is_kept() {
+            for (local, leader) in [(None, Some(7)), (Some(7), None), (None, None)] {
+                assert_eq!(
+                    join_data_dir_disposition(false, true, local, leader),
+                    JoinDataDir::Refuse,
+                    "local={local:?} leader={leader:?}"
+                );
+            }
+        }
+    }
+
+    mod superseding_lineage {
+        use super::clone_supersedes_local_data;
+
+        #[test]
+        fn a_proven_match_supersedes() {
+            assert!(clone_supersedes_local_data(Some(42), Some(42)));
+        }
+
+        #[test]
+        fn a_different_lineage_never_supersedes() {
+            // The impostor case: a node that lost its state directory
+            // re-bootstraps under the same id and mints a new identifier.
+            // Cloning from it would destroy the only copy of real data.
+            assert!(!clone_supersedes_local_data(Some(42), Some(43)));
+        }
+
+        #[test]
+        fn an_unknown_lineage_never_supersedes() {
+            // Strictly the opposite of `peer_speaks_for_lineage`, which treats
+            // unknown as "no evidence of a mismatch". Here unknown must mean
+            // "no evidence it is safe" — the cost of being wrong is the data.
+            assert!(!clone_supersedes_local_data(None, Some(42)));
+            assert!(!clone_supersedes_local_data(Some(42), None));
+            assert!(!clone_supersedes_local_data(None, None));
+        }
+
+        #[test]
+        fn unknown_is_read_the_other_way_by_the_membership_guard() {
+            use super::peer_speaks_for_lineage;
+            assert!(peer_speaks_for_lineage(None, Some(42)));
+            assert!(!clone_supersedes_local_data(None, Some(42)));
         }
     }
 
