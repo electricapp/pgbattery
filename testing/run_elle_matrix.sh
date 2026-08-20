@@ -154,12 +154,10 @@ else
 fi
 
 # ── Density ──────────────────────────────────────────────────────────────────
-# Elle finds anomalies by detecting cycles in a dependency graph, so the two
-# things that matter are (a) how many committed transactions contend for the
-# same key, and (b) how many of them are in flight across a leadership
-# transition. `full` raises both: workers up and keys down (a 6-worker,
-# 3-key list-append workload puts ~4 concurrent transactions on every key,
-# vs ~1.6 at 4 workers / 5 keys), and four fault instants instead of one.
+# Elle builds its dependency graph from *committed* transactions, so the key
+# count is set where contention is highest without the aborts swallowing the
+# history: at 6 workers, 10 keys aborts 62% and commits 6,081 in 90 s, where 3
+# keys aborts 65% and commits 198.
 #
 # Workers come in multiples of 3 because the harness pins worker i to gateway
 # port i % 3; an uneven count loads one gateway (and one node) harder than the
@@ -180,13 +178,13 @@ PROFILE="${ELLE_PROFILE:-full}"
 case "$PROFILE" in
   full)
     P_WORKERS=6
-    P_KEYS=3
+    P_KEYS=10
     P_DURATION=90
     P_WAVES=4
     ;;
   smoke)
     P_WORKERS=4
-    P_KEYS=3
+    P_KEYS=10
     P_DURATION=30
     P_WAVES=1
     ;;
@@ -290,8 +288,17 @@ recover_cluster() {
   PYTHONPATH="$SCRIPT_DIR" uv run --project testing python - <<'PY' || true
 import linearizability_register as harness
 
+# Longer than the harness's own 120 s startup wait: a node restarted after a
+# leader kill may need a rewind before it rejoins, and an attack that begins
+# against a still-converging cluster dies on that startup wait and reports as
+# "the harness never finished" — a cleanup problem wearing the next attack's
+# name.
+RECOVERY_S = 240
+
 harness.start_killed_nodes()
 harness.scrub_chaos_residue()
+if not harness.wait_cluster_healthy(timeout=RECOVERY_S):
+    print(f"  [WARN] cluster still unhealthy {RECOVERY_S}s after cleanup")
 PY
 }
 

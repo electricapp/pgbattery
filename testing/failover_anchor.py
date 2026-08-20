@@ -14,19 +14,24 @@ leadership churn is what makes the watch coalesce, and `/debug/state` now
 reports the anchor's age so the assertion is on the anchor itself rather than
 on whether a hold-down happened to fire.
 
-Two properties:
+Three properties:
 
   settled   a cluster with a stable leader carries no anchor anywhere — one
             left behind is the stale-anchor bug, and it would be read as
             ancient at the next failover
   bounded   an anchor observed during a failover is younger than the failover
             it belongs to, never inherited from an earlier one
+  restamped a node whose election keeps failing re-anchors on every new term
+            (H-35, `restamp` below), because the instant the hold-down has to
+            bound is when a majority moved past the deposed leader's term, not
+            when this node first saw the leader go
 """
 
 from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -62,6 +67,65 @@ class Sample:
     is_leader: bool
     anchor_age_ms: int | None
     at: float
+
+
+@dataclass
+class RestampRun:
+    """One stranded-follower window, and what its anchor did across it."""
+
+    target: str
+    window_s: float
+    samples: list[Sample] = field(default_factory=list)
+
+    @property
+    def ages(self) -> list[int | None]:
+        return [s.anchor_age_ms for s in self.samples]
+
+    @property
+    def observed(self) -> int:
+        return sum(1 for a in self.ages if a is not None)
+
+    @property
+    def resets(self) -> int:
+        return anchor_resets(self.ages)
+
+    @property
+    def transitions(self) -> list[str]:
+        """One line per change in (leader, anchor present), for the record.
+
+        The verdict is a count; this is what produced it. A run whose anchor
+        went backwards because it was *cleared* and stamped afresh looks
+        identical to one that re-stamped on a term until you can see whether a
+        leader reappeared in between.
+        """
+        out: list[str] = []
+        previous: tuple[int | None, bool] | None = None
+        for s in self.samples:
+            key = (s.leader_id, s.anchor_age_ms is not None)
+            if key != previous:
+                age = "none" if s.anchor_age_ms is None else f"{s.anchor_age_ms} ms"
+                out.append(f"leader={s.leader_id} anchor={age}")
+                previous = key
+        return out
+
+    @property
+    def oldest_ms(self) -> int:
+        return max((a for a in self.ages if a is not None), default=0)
+
+    @property
+    def verdict(self) -> str:
+        if self.observed == 0:
+            return "SKIP: the stranded node never stamped an anchor, so nothing was tested"
+        if self.resets == 0:
+            return (
+                f"FAIL: the anchor only ever aged, to {self.oldest_ms} ms — "
+                "stamped once at the first sight of leaderlessness, not per term"
+            )
+        return f"PASS: {self.resets} re-stamps, oldest {self.oldest_ms} ms"
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict.startswith("PASS")
 
 
 @dataclass
@@ -172,6 +236,65 @@ def stale_anchors(samples: list[Sample], lease_ms: int) -> list[tuple[str, int]]
     ]
 
 
+def anchor_resets(ages: Sequence[int | None]) -> int:
+    """How many times the anchor age went backwards across a sample series.
+
+    An anchor stamped once grows monotonically for the whole leaderless window.
+    Each decrease is a re-stamp, and a re-stamp is the observable that says the
+    hold-down measures the newest term rather than the first sight of
+    leaderlessness — the H-35 defect, whose signature is an anchor that only
+    ever ages.
+
+    A gap (the node did not answer) breaks the chain rather than counting as a
+    decrease, and so does a clear: those are `should_clear_stale_failover_anchor`,
+    a different mechanism, and counting them here would let this pass without
+    a single term-driven re-stamp.
+    """
+    resets = 0
+    previous: int | None = None
+    for age in ages:
+        if age is None:
+            previous = None
+            continue
+        if previous is not None and age < previous:
+            resets += 1
+        previous = age
+    return resets
+
+
+def run_restamp(token: str, timings: fp.SystemTimings, window_s: float) -> RestampRun:
+    """Strand one follower's Raft port and watch its anchor across retries.
+
+    A node cut off from its peers campaigns, fails, and is force-triggered again
+    by the leaderless watchdog every few seconds — the same shape as an election
+    that splits or is dropped in a real partition, and the shape under which an
+    anchor stamped once has counted out long before the node could win.
+
+    Only the Raft port is dropped, so `/debug/state` stays reachable from the
+    host and the anchor can be read throughout.
+    """
+    settled = await_settled(token, RECOVERY_TIMEOUT_S)
+    leader = next((s.node for s in settled if s.is_leader), None)
+    if leader is None:
+        raise AnchorError("settled cluster with no node claiming leadership")
+    target = next((n for n in fp.NODES if n != leader), None)
+    if target is None:
+        raise AnchorError("no follower to strand")
+
+    peers = [n for n in fp.NODES if n != target]
+    run = RestampRun(target=target, window_s=window_s)
+    with fp.partition_channel(target, peers, fp.Channel.RAFT):
+        deadline = time.monotonic() + window_s
+        while time.monotonic() < deadline:
+            sample = read_state(target, token)
+            if sample is not None:
+                run.samples.append(sample)
+            time.sleep(SAMPLE_INTERVAL_S)
+
+    await_settled(token, RECOVERY_TIMEOUT_S)
+    return run
+
+
 def run_round(index: int, token: str, timings: fp.SystemTimings) -> Round:
     """One churn round: depose the leader, watch the anchor through recovery."""
     settled = await_settled(token, RECOVERY_TIMEOUT_S)
@@ -245,6 +368,45 @@ def run(
     if [r for r in results if not r.ok]:
         raise typer.Exit(code=1)
     console.print(f"[green]anchor cleared on every settled cluster across {len(results)} rounds[/]")
+
+
+@app.command()
+def restamp(
+    window_s: float = typer.Option(45.0, "--window", help="Seconds to keep the follower stranded."),
+    token: str = typer.Option("local-ci-token", "--token", help="Management API token."),
+) -> None:
+    """H-35: an election that keeps failing must re-anchor on every new term."""
+    timings = fp.read_system_timings()
+    console.print(
+        f"[bold]H-35 hold-down anchor per term[/] — lease {timings.lease_duration_ms} ms, "
+        f"{window_s:.0f} s stranded"
+    )
+
+    try:
+        run = run_restamp(token, timings, window_s)
+    except (AnchorError, fp.FaultError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from None
+
+    table = Table(title="Hold-down anchor across failed elections (H-35)")
+    table.add_column("Stranded")
+    table.add_column("Samples", justify="right")
+    table.add_column("Anchors seen", justify="right")
+    table.add_column("Re-stamps", justify="right")
+    table.add_column("Oldest ms", justify="right")
+    table.add_row(
+        run.target,
+        str(len(run.samples)),
+        str(run.observed),
+        str(run.resets),
+        str(run.oldest_ms),
+    )
+    console.print(table)
+    for line in run.transitions:
+        console.print(f"  {line}")
+    console.print(run.verdict if run.ok else f"[red]{run.verdict}[/]")
+    if not run.ok:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

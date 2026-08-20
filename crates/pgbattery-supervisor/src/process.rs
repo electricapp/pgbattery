@@ -21,6 +21,28 @@ use pgbattery_core::{Error, NodeId, PgAuthMode, ReplicationSlot, Result, WalLeve
 /// session. The full marker is `__PGBATTERY_SQL_END_<seq>__`.
 const END_MARKER_PREFIX: &str = "__PGBATTERY_SQL_END_";
 
+/// How long a read-only change waits for `pg_reload_conf()`'s SIGHUP to reach
+/// the backend that verifies it. Inside the caller's one-second lease-tick
+/// budget, with room for the psql spawn that issues the change.
+const READONLY_RELOAD_SETTLE: Duration = Duration::from_millis(300);
+
+/// Gap between verification reads while waiting for that reload.
+const READONLY_RELOAD_POLL: Duration = Duration::from_millis(25);
+
+/// Hard wall-clock budget for the *entire* rewind sequence (pre-flight wait +
+/// retry loop + each command). Without this an unreachable source can stretch
+/// demote latency unpredictably, pinning the supervisor mutex and stalling
+/// lease enforcement. Sized to comfortably contain the inner retry budget
+/// without ever becoming the dominant bound under healthy conditions.
+const PG_REWIND_BUDGET: Duration = Duration::from_mins(5);
+
+/// How long to wait for a SIGKILL'd `pg_rewind` to be reaped after the budget
+/// elapses. SIGKILL is prompt; the bounded wait only guards against a child
+/// stuck in uninterruptible I/O so we never block the supervisor mutex past the
+/// budget. A wait-timeout is best-effort — the OS reaper collects the zombie
+/// once we exit.
+const PG_REWIND_REAP_BUDGET: Duration = Duration::from_secs(5);
+
 /// Upper bound on a single newline-terminated line read from the persistent
 /// psql session. A wedged or garbage backend streaming an unterminated line
 /// would otherwise grow `line_buf` without limit; cap it so the session errors
@@ -129,7 +151,11 @@ impl LocalSqlClient {
             })?;
             let Some(line) = line else {
                 let detail = self.drain_stderr().await;
-                return Err(Error::Postgres(format!(
+                // Not-ready rather than a generic Postgres error: the session
+                // ended because the server went away, which callers deciding
+                // how alarming a failure is need to tell apart from the server
+                // answering and refusing.
+                return Err(Error::PostgresNotReady(format!(
                     "Local psql session closed while waiting for SQL result{detail}"
                 )));
             };
@@ -708,7 +734,11 @@ pub async fn read_system_identifier(
     .await
     {
         Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(Error::Postgres(format!("Failed to run pg_controldata: {e}"))),
+        Ok(Err(e)) => {
+            return Err(Error::Postgres(format!(
+                "Failed to run pg_controldata: {e}"
+            )));
+        }
         Err(_) => {
             metrics::counter!("pgbattery_pg_controldata_timeouts").increment(1);
             return Err(Error::Postgres(format!(
@@ -2612,25 +2642,81 @@ host all all ::/0 {auth_method}
         Ok(())
     }
 
+    /// One `pg_rewind` invocation: spawn it, drain its stderr while waiting,
+    /// and reap it if the budget runs out mid-copy. Returns the exit status
+    /// alongside the stderr the caller classifies the failure from.
+    ///
+    /// Spawned explicitly rather than through `Command::output()` so the
+    /// timeout path can `start_kill()` and then `wait()` the child.
+    /// `kill_on_drop(true)` SIGKILLs on drop but does not await, leaving an
+    /// orphan that could race a later `start()` on the same data directory.
+    async fn run_pg_rewind_attempt(
+        &self,
+        pg_rewind: &std::path::Path,
+        source_connstr: &str,
+        budget_deadline: Instant,
+    ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+        let mut child = Command::new(pg_rewind)
+            .arg("-D")
+            .arg(&self.config.pg_data_dir)
+            .arg("--source-server")
+            .arg(source_connstr)
+            .arg("--progress")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| Error::Postgres(format!("Failed to run pg_rewind: {e}")))?;
+
+        // Drain stderr concurrently with the wait, but keep the `child` handle
+        // (only borrowed by `wait`) so the timeout path can kill it.
+        // `wait_with_output` would move the child and leave nothing to reap.
+        // Draining the pipe also prevents a full pipe buffer from deadlocking
+        // pg_rewind against our wait.
+        let mut stderr_pipe = child.stderr.take();
+        let mut stderr_buf = Vec::new();
+        let collect = async {
+            let drain_err = async {
+                if let Some(p) = stderr_pipe.as_mut() {
+                    p.read_to_end(&mut stderr_buf).await
+                } else {
+                    Ok(0)
+                }
+            };
+            let (status, _) = tokio::join!(child.wait(), drain_err);
+            status
+        };
+
+        // Bound this attempt by the remaining budget so the wait can reap the
+        // child rather than dropping it (and only SIGKILLing).
+        let remaining = budget_deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, collect).await {
+            Ok(Ok(status)) => Ok((status, stderr_buf)),
+            Ok(Err(e)) => Err(Error::Postgres(format!("Failed to run pg_rewind: {e}"))),
+            Err(_) => {
+                // Budget exceeded mid-run. Reap the child before returning so
+                // no orphaned pg_rewind keeps writing into the data dir and
+                // races a later start().
+                child.start_kill().ok();
+                tokio::time::timeout(PG_REWIND_REAP_BUDGET, child.wait())
+                    .await
+                    .ok();
+                // "exceeded budget" is classified as target-touched by
+                // rewind_failure_left_target_untouched — a timeout can kill a
+                // copy mid-flight.
+                Err(Error::Postgres(format!(
+                    "pg_rewind exceeded {}s budget",
+                    PG_REWIND_BUDGET.as_secs()
+                )))
+            }
+        }
+    }
+
     async fn run_pg_rewind(
         &self,
         source_addr: SocketAddr,
         pre_stop_local_lsn: Option<u64>,
     ) -> Result<()> {
-        // Hard wall-clock budget for the *entire* rewind sequence (pre-flight
-        // wait + retry loop + each command). Without this an unreachable
-        // source can stretch demote latency unpredictably, pinning the
-        // supervisor mutex and stalling lease enforcement. Sized to comfortably
-        // contain the inner retry budget without ever becoming the dominant
-        // bound under healthy conditions.
-        const PG_REWIND_BUDGET: Duration = Duration::from_mins(5);
-        // How long to wait for a SIGKILL'd pg_rewind to be reaped after the
-        // budget elapses. SIGKILL is prompt; the bounded wait only guards
-        // against a child stuck in uninterruptible I/O so we never block the
-        // supervisor mutex past the budget. A wait-timeout is best-effort —
-        // the OS reaper collects the zombie once we exit.
-        const PG_REWIND_REAP_BUDGET: Duration = Duration::from_secs(5);
-
         let budget_deadline = Instant::now() + PG_REWIND_BUDGET;
 
         let inner = async {
@@ -2659,68 +2745,9 @@ host all all ::/0 {auth_method}
 
             // Retry up to PG_REWIND_MAX_RETRIES times with delay (new leader needs time to start)
             for attempt in 1..=PG_REWIND_MAX_RETRIES {
-                // Spawn explicitly (rather than `Command::output()`) so the
-                // budget timeout can `start_kill()` then `wait()` the child
-                // to reap it. `kill_on_drop(true)` SIGKILLs on drop but does
-                // not await the child, leaving an orphan that could race a
-                // later `start()` on the same data dir; the explicit reap
-                // below closes that window.
-                let mut child = Command::new(&pg_rewind)
-                    .arg("-D")
-                    .arg(&self.config.pg_data_dir)
-                    .arg("--source-server")
-                    .arg(&source_connstr)
-                    .arg("--progress")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true)
-                    .spawn()
-                    .map_err(|e| Error::Postgres(format!("Failed to run pg_rewind: {e}")))?;
-
-                // Drain stderr concurrently with the wait, but keep the
-                // `child` handle (only borrowed by `wait`) so the timeout path
-                // can kill it. `wait_with_output` would move the child and
-                // leave nothing to reap. Draining the pipe also prevents a
-                // full pipe buffer from deadlocking pg_rewind against our wait.
-                let mut stderr_pipe = child.stderr.take();
-                let mut stderr_buf = Vec::new();
-                let collect = async {
-                    let drain_err = async {
-                        if let Some(p) = stderr_pipe.as_mut() {
-                            p.read_to_end(&mut stderr_buf).await
-                        } else {
-                            Ok(0)
-                        }
-                    };
-                    let (status, _) = tokio::join!(child.wait(), drain_err);
-                    status
-                };
-
-                // Bound this attempt by the remaining budget so the wait can
-                // reap the child rather than dropping it (and only SIGKILLing).
-                let remaining = budget_deadline.saturating_duration_since(Instant::now());
-                let status = match tokio::time::timeout(remaining, collect).await {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(e)) => {
-                        return Err(Error::Postgres(format!("Failed to run pg_rewind: {e}")));
-                    }
-                    Err(_) => {
-                        // Budget exceeded mid-run. Reap the child before
-                        // returning so no orphaned pg_rewind keeps writing
-                        // into the data dir and races a later start().
-                        child.start_kill().ok();
-                        tokio::time::timeout(PG_REWIND_REAP_BUDGET, child.wait())
-                            .await
-                            .ok();
-                        // "exceeded budget" is classified as target-touched by
-                        // rewind_failure_left_target_untouched — a timeout can
-                        // kill a copy mid-flight.
-                        return Err(Error::Postgres(format!(
-                            "pg_rewind exceeded {}s budget",
-                            PG_REWIND_BUDGET.as_secs()
-                        )));
-                    }
-                };
+                let (status, stderr_buf) = self
+                    .run_pg_rewind_attempt(&pg_rewind, &source_connstr, budget_deadline)
+                    .await?;
 
                 if status.success() {
                     tracing::info!("pg_rewind completed successfully");
@@ -3056,11 +3083,25 @@ host all all ::/0 {auth_method}
             return Err(Error::Postgres("Failed to set read-only mode".to_string()));
         }
 
-        // Verify the setting actually took effect — pg_reload_conf can silently no-op
-        let actual = self.query_readonly_status().await?;
+        // Verify the setting actually took effect — pg_reload_conf can silently no-op.
+        //
+        // Polled, because `pg_reload_conf()` only signals: it returns as soon
+        // as the postmaster has been told, and each backend adopts the new
+        // value at its next command boundary. Reading straight back therefore
+        // races the reload and returns the old value often enough to matter —
+        // it is what made the fence report a failure it had not had, on a
+        // marker the durability oracles treat as split-brain evidence.
+        let deadline = Instant::now() + READONLY_RELOAD_SETTLE;
+        let mut actual = self.query_readonly_status().await?;
+        while actual != readonly && Instant::now() < deadline {
+            sleep(READONLY_RELOAD_POLL).await;
+            actual = self.query_readonly_status().await?;
+        }
         if actual != readonly {
             return Err(Error::Postgres(format!(
-                "read-only fence verification failed: expected {readonly}, got {actual}"
+                "read-only fence verification failed: expected {readonly}, got {actual} after \
+                 {}ms",
+                READONLY_RELOAD_SETTLE.as_millis()
             )));
         }
 
@@ -3074,8 +3115,10 @@ host all all ::/0 {auth_method}
     /// Used by lease enforcement loop to verify `PostgreSQL` state.
     ///
     /// Uses `pg_settings` (not SHOW) because SHOW returns the per-session value
-    /// which is cached on our persistent psql connection — it doesn't reflect
-    /// post-reload GUC changes. `pg_settings` reflects the live cluster value.
+    /// set by this connection, which never changes on a reload. `pg_settings`
+    /// gives the backend's effective value — still adopted at a command
+    /// boundary after SIGHUP, which is why `set_readonly` polls it rather than
+    /// reading it once.
     ///
     /// # Errors
     /// Returns an error if the `pg_settings` query fails.
@@ -4590,11 +4633,10 @@ mod tests {
         )));
     }
 
-    /// pg_rewind's exact wording when the target was never part of the
+    /// `pg_rewind`'s exact wording when the target was never part of the
     /// source's cluster. Verbatim from a node whose data directory had been
     /// re-initdb'd while the cluster still listed it as a member.
-    const FOREIGN_LINEAGE_STDERR: &str =
-        "pg_rewind: connected to server\npg_rewind: error: source and target clusters are from \
+    const FOREIGN_LINEAGE_STDERR: &str = "pg_rewind: connected to server\npg_rewind: error: source and target clusters are from \
          different systems";
 
     #[test]

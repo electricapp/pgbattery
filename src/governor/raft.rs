@@ -118,6 +118,9 @@ struct GovernorRunState {
     last_metrics_update: Instant,
     /// When did we last lose the leader? Used to measure election phase duration.
     leader_lost_at: Option<Instant>,
+    /// The Raft term at the previous metrics observation. Seeded from the
+    /// term at subscription, so the first observed advance is a real one.
+    prev_term: u64,
     /// When did the leaderless watchdog last fire? Suppresses retriggers
     /// at less than the recovery interval so multiple nodes don't all
     /// stampede into elections back-to-back.
@@ -244,6 +247,7 @@ impl Governor {
             prev_should_fence: None,
             last_metrics_update: self.lease.read().now(),
             leader_lost_at: None,
+            prev_term: metrics_rx.borrow().current_term,
             leaderless_recovery_last_fired_at: None,
         };
         // Tick wakes the loop so the watchdogs run even when no Raft
@@ -378,6 +382,22 @@ impl Governor {
             self.state.write().failover_started_at = Some(anchor);
         }
 
+        // A deposed leader keeps its quorum until a majority moves past its
+        // term, so every term this node observes moves that bound forward —
+        // including the term of the election it is about to win. Stamping only
+        // at the leader→none edge dates the anchor to the first attempt, and a
+        // second attempt promotes with the hold-down already spent.
+        if Self::should_anchor_term_advance(
+            runtime.prev_term,
+            metrics.current_term,
+            leader_id,
+            is_leader,
+        ) {
+            let anchor = self.lease.read().now();
+            self.state.write().failover_started_at = Some(anchor);
+        }
+        runtime.prev_term = metrics.current_term;
+
         let has_quorum = Self::has_quorum(metrics, is_leader);
         let quorum_ack_age = Self::quorum_ack_age(metrics, is_leader);
         // Expire lease BEFORE activating fence: the per-message lease check in
@@ -488,6 +508,35 @@ impl Governor {
             Some(prev) => prev != self_id,
             None => false,
         }
+    }
+
+    /// Whether this tick's Raft term advance must (re-)stamp the promotion
+    /// hold-down anchor.
+    ///
+    /// The anchor bounds the latest instant a deposed leader could still have
+    /// held quorum: when a majority moved past its term, not when this node
+    /// first saw the leader go. An election that splits or is retried wins
+    /// arbitrarily later, and an anchor dated to the first attempt has already
+    /// counted out — the winner promotes on winning while the deposed leader's
+    /// self-fence is still `QUORUM_TIMEOUT_MS` away (contract L1).
+    ///
+    /// Two exclusions. A term observed while a *different* node leads belongs
+    /// to a failover this node is not completing, and re-stamping would undo
+    /// `should_clear_stale_failover_anchor`. Term 0 means no predecessor
+    /// exists, so bootstrap does not hold itself down against nobody.
+    ///
+    /// Modeled as `RestampAnchorOnCampaign` in `tla/lease_fencing.tla`, with
+    /// `lease_fencing.inv-anchor-not-restamped.cfg` as the counterexample.
+    const fn should_anchor_term_advance(
+        prev_term: u64,
+        current_term: u64,
+        leader_id: Option<NodeId>,
+        is_leader: bool,
+    ) -> bool {
+        if leader_id.is_some() && !is_leader {
+            return false;
+        }
+        prev_term > 0 && current_term > prev_term
     }
 
     /// Whether a stale promotion-hold-down anchor must be cleared this tick.
@@ -2405,6 +2454,109 @@ mod tests {
         assert!(!Governor::should_clear_stale_failover_anchor(Some(3), true));
         // Leaderless (mid-failover): keep/stamp, don't clear.
         assert!(!Governor::should_clear_stale_failover_anchor(None, false));
+    }
+
+    // ---- Term-advance hold-down anchor (RW-1) ----
+
+    #[test]
+    fn a_term_advance_while_leaderless_moves_the_anchor() {
+        // Mid-failover: this node is campaigning, or watching somebody else
+        // campaign. Either way a majority is moving past the deposed leader's
+        // term right now, which is the bound the hold-down needs.
+        assert!(Governor::should_anchor_term_advance(4, 5, None, false));
+    }
+
+    #[test]
+    fn a_term_advance_on_the_winning_edge_moves_the_anchor() {
+        // The watch collapsed none → self: the leaderless edge was never
+        // observed, but the term advance across it was.
+        assert!(Governor::should_anchor_term_advance(4, 5, Some(3), true));
+    }
+
+    #[test]
+    fn a_steady_term_leaves_the_anchor_alone() {
+        // Heartbeat ticks must not push the anchor forward forever, or a
+        // leader would never clear its own hold-down.
+        assert!(!Governor::should_anchor_term_advance(5, 5, Some(3), true));
+        assert!(!Governor::should_anchor_term_advance(5, 5, None, false));
+    }
+
+    #[test]
+    fn a_term_advance_under_another_leader_does_not_re_anchor() {
+        // A different node won this term. `should_clear_stale_failover_anchor`
+        // is dropping the anchor on this same tick; re-stamping would put back
+        // exactly the stale value that clear exists to remove.
+        assert!(!Governor::should_anchor_term_advance(4, 5, Some(7), false));
+    }
+
+    #[test]
+    fn bootstrap_does_not_arm_a_holddown_against_nobody() {
+        // Term 0 means this node has never been in a term, so there is no
+        // predecessor whose lease could still be running. `Raft::initialize`
+        // takes term 0 → 1; holding the first promotion for a lease duration
+        // would delay every cluster creation to guard against no one.
+        assert!(!Governor::should_anchor_term_advance(0, 1, Some(3), true));
+        assert!(!Governor::should_anchor_term_advance(0, 1, None, false));
+    }
+
+    #[test]
+    fn a_retried_election_promotes_on_the_winning_term_not_the_first_one() {
+        // The RW-1 shape, in one node's decisions — the same behaviour
+        // `tla/lease_fencing.inv-anchor-not-restamped.cfg` makes TLC produce.
+        // Node 3 sees the leader vanish at term 4 and stamps its anchor, its
+        // term-5 candidacy does not win, and the leaderless watchdog's term-6
+        // attempt does, a full lease later. The deposed leader's last quorum
+        // ack is bounded by the vote that unseated it, not by node 3's first
+        // observation, so promoting on the term-4 anchor leaves both writable
+        // until the deposed leader's quorum-loss self-fence catches up.
+        const SELF_ID: NodeId = 3;
+        let lease = crate::governor::DEFAULT_LEASE_DURATION;
+        let lost_at = Instant::now();
+
+        // Term 5: this node campaigns and loses. Still leaderless, so the
+        // anchor follows the term.
+        let campaign_at = lost_at + std::time::Duration::from_millis(50);
+        assert!(Governor::should_anchor_term_advance(4, 5, None, false));
+
+        // A full lease passes with no leader, then the retry wins. An anchor
+        // left at the first observation is spent by now — this assertion is
+        // the defect, stated as the arithmetic that produces it.
+        let retry_at = campaign_at + lease + std::time::Duration::from_millis(10);
+        assert_eq!(
+            crate::app::promotion_lease_holddown(Some(lost_at), retry_at, lease),
+            None,
+            "the first observation has counted out; promoting on it is the split-brain"
+        );
+
+        // Term 6 arrives coalesced with the win, so the leaderless edge is
+        // never seen — the term advance is the only signal left, and it is
+        // enough.
+        assert!(Governor::should_anchor_term_advance(
+            5,
+            6,
+            Some(SELF_ID),
+            true
+        ));
+
+        // The gate now measures the winning candidacy and holds through it.
+        assert_eq!(
+            crate::app::promotion_lease_holddown(Some(retry_at), retry_at, lease),
+            Some(std::time::Duration::ZERO)
+        );
+        assert!(
+            crate::app::promotion_lease_holddown(
+                Some(retry_at),
+                retry_at + lease.saturating_sub(std::time::Duration::from_millis(1)),
+                lease
+            )
+            .is_some(),
+            "the hold-down must still be running one millisecond short of a lease"
+        );
+        assert_eq!(
+            crate::app::promotion_lease_holddown(Some(retry_at), retry_at + lease, lease),
+            None,
+            "and must release at exactly one lease duration, not later"
+        );
     }
 
     #[test]

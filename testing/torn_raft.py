@@ -449,6 +449,7 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
     tear is armed on a live member of the cluster, which makes them the writes
     most exposed to it; counting only the ones from before the first tear would
     have measured the safest keys in the run.
+
     """
     fp.arm_torn_write(victim, RAFT_DB, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT)
     lead = await_leader(CONVERGE_TIMEOUT_S)
@@ -468,12 +469,15 @@ def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
 def run_tears(*, tears: int, target: str, min_torn_bytes: int, max_attempts: int) -> Outcome:
     """Tear `target`'s Raft store `tears` times, retrying for a big enough tear.
 
-    `min_torn_bytes` exists because redb's next write after arming is usually a
-    short record. A 160-byte tear of a 320-byte append says little about how
-    the store handles damage to a page it has committed, so an attempt that
-    lands under the threshold is retried rather than counted. What each attempt
-    actually tore is recorded either way, because "redb never writes anything
-    larger in this workload" would itself be the answer.
+    `min_torn_bytes` is the floor below which a tear is too small to have
+    damaged anything, and an attempt under it is retried rather than counted.
+    What each attempt actually tore is recorded either way, because "redb never
+    writes anything larger in this workload" is itself an answer — and it is
+    the one this store gives. Every write LazyFS intercepts on `raft.db` is the
+    320-byte header at offset 0, so a `parts=2` tear persists 160 bytes of it
+    and nothing here can reach a btree page: redb maps the data region rather
+    than writing it through the FUSE path. That makes this a torn-header test,
+    which is a real one — the header is what redb reads to find anything else.
     """
     outcome = Outcome()
     lead = await_settled_cluster(CONVERGE_TIMEOUT_S)

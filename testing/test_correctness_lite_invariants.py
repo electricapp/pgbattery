@@ -460,6 +460,42 @@ class LogGrepTests(unittest.TestCase):
     def test_healthy_log_passes(self) -> None:
         self.assertEqual(_ids(self._check(HEALTHY_LOG)), [])
 
+    def test_a_failover_length_disagreement_is_not_a_violation(self) -> None:
+        """A deposed leader names itself until it learns better, so the nodes
+        disagree for the length of a failover. Flagging that made I4 fire on
+        every run that moved leadership — see docs/STATE_MACHINE.md section 1,
+        where write authority is the lease's business, not the poll's."""
+        rounds = [
+            cl.LeaderPollRound(ts=float(i), responses={9081: 2, 9082: 2, 9083: 3})
+            for i in range(20)
+        ]
+        self.assertEqual(cl.unconverged_leader_rounds(rounds), [])
+
+    def test_a_disagreement_that_never_resolves_is_a_violation(self) -> None:
+        """Past the convergence budget the cluster is not electing, it has
+        stopped — which the poll can legitimately say."""
+        span = cl.CONVERGENCE_BUDGET_S + 10.0
+        rounds = [
+            cl.LeaderPollRound(ts=t / 2.0, responses={9081: 2, 9082: 2, 9083: 3})
+            for t in range(int(span * 2) + 1)
+        ]
+        self.assertTrue(cl.unconverged_leader_rounds(rounds))
+
+    def test_agreement_between_two_long_disagreements_breaks_the_run(self) -> None:
+        """Two separate failovers are not one stuck cluster, however close
+        together they land."""
+        half = cl.CONVERGENCE_BUDGET_S * 0.75
+        first = [
+            cl.LeaderPollRound(ts=t / 2.0, responses={9081: 2, 9082: 2, 9083: 3})
+            for t in range(int(half * 2))
+        ]
+        agreed = cl.LeaderPollRound(ts=half + 0.5, responses={9081: 2, 9082: 2, 9083: 2})
+        second = [
+            cl.LeaderPollRound(ts=half + 1.0 + t / 2.0, responses={9081: 1, 9082: 1, 9083: 3})
+            for t in range(int(half * 2))
+        ]
+        self.assertEqual(cl.unconverged_leader_rounds([*first, agreed, *second]), [])
+
     def test_split_brain_signal_flags_l2(self) -> None:
         findings = self._check(
             HEALTHY_LOG + "node2-1  | ERROR Promotion safety check failed - potential split-brain\n"
@@ -477,6 +513,27 @@ class LogGrepTests(unittest.TestCase):
             HEALTHY_LOG + "node1-1  | ERROR EMERGENCY FENCE: Lease expired, forcing read-only\n"
         )
         self.assertIn("L3", _fatal_ids(findings))
+
+    def test_emergency_fence_on_a_dead_server_passes(self) -> None:
+        """The other way the path concludes safely: nothing left to fence.
+        Every run here kills nodes, so without this L3 fires on all of them."""
+        findings = self._check(
+            HEALTHY_LOG
+            + "node1-1  | ERROR EMERGENCY FENCE: Lease expired, forcing read-only\n"
+            + f"node1-1  | ERROR {cl.LOG_FENCE_MOOT}\n"
+        )
+        self.assertNotIn("L3", _fatal_ids(findings))
+
+    def test_a_dead_server_does_not_excuse_a_fence_that_failed(self) -> None:
+        """The escape is per-run and coarse, so it must not also swallow the
+        marker that says PostgreSQL answered and stayed writable."""
+        findings = self._check(
+            HEALTHY_LOG
+            + "node1-1  | ERROR EMERGENCY FENCE: Lease expired, forcing read-only\n"
+            + f"node1-1  | ERROR {cl.LOG_FENCE_MOOT}\n"
+            + "node2-1  | ERROR FAILED TO FENCE - will shut down if this persists\n"
+        )
+        self.assertIn("L2", _fatal_ids(findings))
 
     def test_emergency_fence_with_confirmation_passes(self) -> None:
         findings = self._check(
@@ -607,9 +664,7 @@ class ReplayFromSeedTests(unittest.TestCase):
             self.assertTrue(1 <= amount <= 100)
 
     def test_the_paused_node_is_reproduced_by_its_seed(self) -> None:
-        self.assertEqual(
-            random.Random(31).choice(cl.NODES), random.Random(31).choice(cl.NODES)
-        )
+        self.assertEqual(random.Random(31).choice(cl.NODES), random.Random(31).choice(cl.NODES))
 
     def test_every_attack_name_is_fireable(self) -> None:
         """`FAULT_KINDS` is what `--attack` is validated against, so a name in

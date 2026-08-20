@@ -979,6 +979,30 @@ def netem_add_cmd(
     return " ".join(parts)
 
 
+_ROOT_QDISC_LOCKS: Final[dict[tuple[str, str], threading.Lock]] = {}
+_ROOT_QDISC_REGISTRY_LOCK: Final[threading.Lock] = threading.Lock()
+
+ROOT_QDISC_WAIT_S: Final[float] = 60.0
+"""How long a netem fault waits for the device. Longer than any window the
+attacks hold (the longest is ~10 s), so queuing behind a real one succeeds and
+only a nested or leaked window reaches the bound."""
+
+
+def root_qdisc_lock(container: str, dev: str = NET_DEVICE) -> threading.Lock:
+    """The lock that stands in for tc's one-root-qdisc-per-device rule.
+
+    tc permits one root qdisc per device, so two netem faults on one container
+    cannot overlap — the second `add` fails with "Exclusivity flag on". A
+    concurrent caller (`chaos_storm` runs each fault in its own thread) waits
+    for the device instead, which is the only faithful reading of "both at
+    once" when the device says no. Keyed per (container, dev), so faults on
+    different nodes still overlap.
+    """
+    key = (container, dev)
+    with _ROOT_QDISC_REGISTRY_LOCK:
+        return _ROOT_QDISC_LOCKS.setdefault(key, threading.Lock())
+
+
 def netem_del_cmd(dev: str = NET_DEVICE) -> str:
     return f"tc qdisc del dev {dev} root"
 
@@ -2369,6 +2393,40 @@ def partition_lossy(
     _resolve_ip(container)
     _resolve_ip(peer)
 
+    # Held for the whole window, not just the add: the device is occupied until
+    # the heal removes the qdisc. See `root_qdisc_lock`. Bounded, because the
+    # lock is not reentrant: nesting two windows on one container on one thread
+    # would otherwise hang instead of failing the way tc used to.
+    device = root_qdisc_lock(container, dev)
+    if not device.acquire(timeout=ROOT_QDISC_WAIT_S):
+        raise FaultPreconditionError(
+            f"partition_lossy({container}): dev {dev}'s root qdisc was still held after "
+            f"{ROOT_QDISC_WAIT_S:g}s. Another netem window on this container has not "
+            "closed — nested windows on one thread cannot both hold the device."
+        )
+    try:
+        yield from _partition_lossy_locked(
+            container,
+            drop_pct,
+            latency_ms,
+            jitter_ms=jitter_ms,
+            dev=dev,
+            peer=peer,
+        )
+    finally:
+        device.release()
+
+
+def _partition_lossy_locked(
+    container: str,
+    drop_pct: float,
+    latency_ms: int,
+    *,
+    jitter_ms: int,
+    dev: str,
+    peer: str,
+) -> Iterator[NetemHandle]:
+    """`partition_lossy`'s body, run with the device's root qdisc held."""
     baseline_rc, baseline_s = probe_peer(container, peer, timeout_s=2.0)
     verify_probe_reachable(target=container, rc=baseline_rc, peer=peer)
 

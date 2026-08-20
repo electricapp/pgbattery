@@ -128,7 +128,8 @@ class ClassifierTests(unittest.TestCase):
 
     def test_a_refused_write_never_reads_as_an_acknowledgement(self) -> None:
         """Phantom-ack regression: reading the commit position separately made a
-        refused write print ACKED, since a read-only transaction runs SELECTs fine."""
+        refused write print ACKED, since a read-only transaction runs a SELECT
+        fine."""
         probe = ppsg.parse_probe("node3", REFUSED_PROBE)
         self.assertFalse(probe.acked, "a refused write must not read as acked")
         self.assertTrue(probe.refused_read_only)

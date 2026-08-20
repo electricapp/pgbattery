@@ -183,20 +183,20 @@ Ranked by expected severity. "Reachable" means the current harness can actually
 produce the conditions, not that a test asserts the right thing. "Tracked by"
 names the task that closes the window, so no row is open without an owner.
 
-| #     | Window                                                                                                                                                                                                                                                                                                                                          | Contract   | Reachable today                                                                                  | Tracked by        |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------ | ----------------- |
-| RW-1  | Deposed leader retains a quorum excluding the election winner; the promotion hold-down is vacuous and safety rests on the quorum-loss self-fence plus sync replication refusing acks                                                                                                                                                            | L1         | No — needs 5-node asymmetric partition shapes                                                    | H-06 (needs H-04) |
-| RW-2  | Post-promotion window: a freshly promoted primary acknowledged commits with zero standby acks. Closed by arming the sync list and the read-only fence before `pg_ctl promote`, and gating write recovery on a standby actually designated `sync` — the GUC's text was never the evidence, because PostgreSQL's enforcement of it lags promotion | W1, R2     | Closed — `post_promotion_sync_gap.py` enters the window on protocol state; the commit is refused | H-07 (done)       |
-| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL. **Measured, not bounded away: 20 of 20 acknowledged writes destroyed** (`rewind_loss.py`). Every write acknowledged while `synchronous_standby_names` is empty can be lost, up to 16 MiB of diverged WAL — the deliberate availability trade, now counted rather than asserted  | W1         | Yes — `rewind_loss.py` forces the fallback and counts the survivors                              | H-14 (measured)   |
-| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                                                                                                                                                       | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured             | H-13              |
-| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                                                                                                                                                               | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution              | covered           |
-| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                                                                                                                                                             | W1         | Partially — never driven through a _follower_ gateway specifically                               | H-05              |
-| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win                                                                                                                                           | L3         | Closed — aged-LSN tiebreak; `test_stale_restored_node_loses_a_leaderless_election`               | H-11 (done)       |
-| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                                                                                                                                                               | L1         | Partially — pure functions are unit-tested; the live coalescing race is not                      | H-18              |
-| RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                                                                                                                                                         | L1         | No                                                                                               | H-15              |
-| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash, a wiped bootstrap node impersonating the cluster                                                                                                                                    | R1, V2     | Yes — `join_edges.py` drives four cases; orphan-slot pinning is bounded, not assumed             | H-16 (closed)     |
-| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                                                                                                                                                          | W1, L3     | No                                                                                               | H-05              |
-| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                                                                                                                                                                  | W1, W2, S1 | Partially — one fixed timing, no sweep                                                           | H-17              |
+| #     | Window                                                                                                                                                                                                                                                                                                                                          | Contract   | Reachable today                                                                                                                            | Tracked by      |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
+| RW-1  | Deposed leader retains a quorum excluding the election winner, so its last ack can be later than the winner's first sight of leaderlessness and the promotion hold-down is already spent at election                                                                                                                                            | L1         | Closed — modeled with explicit quorum sets; the anchor tracks the newest observed term, and the un-fixed model is a checked counterexample | H-35 (closed)   |
+| RW-2  | Post-promotion window: a freshly promoted primary acknowledged commits with zero standby acks. Closed by arming the sync list and the read-only fence before `pg_ctl promote`, and gating write recovery on a standby actually designated `sync` — the GUC's text was never the evidence, because PostgreSQL's enforcement of it lags promotion | W1, R2     | Closed — `post_promotion_sync_gap.py` enters the window on protocol state; the commit is refused                                           | H-07 (done)     |
+| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL. **Measured, not bounded away: 20 of 20 acknowledged writes destroyed** (`rewind_loss.py`). Every write acknowledged while `synchronous_standby_names` is empty can be lost, up to 16 MiB of diverged WAL — the deliberate availability trade, now counted rather than asserted  | W1         | Yes — `rewind_loss.py` forces the fallback and counts the survivors                                                                        | H-14 (measured) |
+| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                                                                                                                                                                                                       | L1, L2     | Partially — SIGSTOP of the postmaster exists; the write path during it is unmeasured                                                       | H-13            |
+| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely (`trust` auth on the cluster network)                                                                                                                                                                                                               | L1         | Yes — `dual_writability_prober` writes all three internal ports at 50 ms resolution                                                        | covered         |
+| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                                                                                                                                                                                             | W1         | Partially — never driven through a _follower_ gateway specifically                                                                         | H-05            |
+| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold and both election and promotion gates fall back to bootstrap-permissive; a node restored from an old backup can win                                                                                                                                           | L3         | Closed — aged-LSN tiebreak; `test_stale_restored_node_loses_a_leaderless_election`                                                         | H-11 (done)     |
+| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor and promote immediately                                                                                                                                                                               | L1         | Partially — pure functions are unit-tested; the live coalescing race is not                                                                | H-18            |
+| RW-9  | `demote()` holds the supervisor mutex across stop, rewind, and recovery — the 100 ms lease tick, health watchdog, and LSN reporting all stall behind it                                                                                                                                                                                         | L1         | No                                                                                                                                         | H-15            |
+| RW-10 | Join and rejoin edges: basebackup against a leader that gets deposed mid-copy, orphan slots pinning WAL, a learner registration surviving a mid-join crash, a wiped bootstrap node impersonating the cluster                                                                                                                                    | R1, V2     | Yes — `join_edges.py` drives four cases; orphan-slot pinning is bounded, not assumed                                                       | H-16 (closed)   |
+| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active                                                                                                                                                                          | W1, L3     | No                                                                                                                                         | H-05            |
+| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                                                                                                                                                                                                  | W1, W2, S1 | Partially — one fixed timing, no sweep                                                                                                     | H-17            |
 
 The pattern worth noting: the harness is densest exactly where the design is
 already strongest, and thinnest where the design documents its own residual
@@ -2040,12 +2040,66 @@ nothing detects drift.
       `raft_lsn`, and an injected drift is caught.
       _Closes_ exit criterion 5 · _Blocked by_ H-33 · _Effort_ L
 
-- [ ] **H-35 — Model partial-quorum dynamics in `lease_fencing.tla`**, which
-      currently states plainly that it does not — the regime of RW-1.
+- [x] **H-35 — Partial-quorum dynamics are modeled, and the counterexample is
+      real.** The spec used to abstract quorum into a per-node ack counter that
+      only the current Raft leader could reset, which made a deposed leader's
+      staleness an axiom rather than a consequence — and made RW-1 unreachable
+      by construction. Quorums are now explicit node sets: elections and
+      heartbeat acks both name the majority that took part, and a node's term
+      decides whether it can be in one. Quorum intersection and Raft's own
+      election safety (`OneLeaderPerTerm`) are derived from that rather than
+      assumed, and a deposed leader holding a quorum that excludes the winner is
+      an ordinary reachable state.
       **Done when** the spec covers a deposed leader holding a quorum that
       excludes the winner, and TLC either proves safety or produces the
       counterexample.
-      _Effort_ L
+
+      **It produced the counterexample, and it was a real L1 defect.** The
+      promotion hold-down was anchored at the winner's first observation of
+      leaderlessness. The instant it needs to bound is a different one: when a
+      majority moved past the deposed leader's term, which is the vote the
+      winner is campaigning for. Those coincide only in a prompt failover. An
+      election that splits, is dropped, or is retried by the leaderless watchdog
+      wins arbitrarily later — openraft has no pre-vote, and the watchdog exists
+      precisely because elections do stall — and by then the anchor has counted
+      out. The winner promotes at the moment it wins, while the deposed leader's
+      last quorum ack is one message flight old and its quorum-loss self-fence
+      is still up to `QUORUM_TIMEOUT_MS` away. Two write authorities: contract
+      L1, FATAL. The same hole swallowed a second case, a node that restarts
+      into a leaderless window: with no prior leader ever observed it stamped no
+      anchor at all, so `promotion_lease_holddown(None, ..)` waived the gate
+      entirely.
+
+      Fixed by anchoring on the newest term this node has observed rather than
+      on the leaderless edge (`should_anchor_term_advance`), which costs nothing
+      in a prompt failover — the candidacy and the leader→none edge are the same
+      instant — and one hold-down per extra election round in exactly the case
+      that needs it. Two exclusions keep it from over-arming: a term observed
+      while a *different* node leads belongs to a failover this node is not
+      completing, and term 0 means there is no predecessor at all, so cluster
+      bootstrap does not hold itself down against nobody.
+
+      What the model does **not** bound, and no lease scheme can, is message
+      delay. `VoteDelay` is now an explicit constant and `HoldDown >= VoteDelay
+      + QuorumTimeout` is the load-bearing inequality; a vote that takes longer
+      than `DEFAULT_LEASE_DURATION - QUORUM_TIMEOUT_MS` (2 s − 1 s) to reach a
+      majority breaks it. That assumption is stated in the spec header instead
+      of hiding inside an abstraction.
+
+      The counterexample is a checked artifact, not a paragraph telling the
+      reader to edit a constant and see for themselves.
+      `lease_fencing.inv-anchor-not-restamped.cfg` names the invariant it
+      expects to break, and `make -C tla check` fails if TLC ever stops breaking
+      it — as it fails if such a model fails for some *other* reason, since a
+      violated `ASSUME` is not a counterexample. Both inversions of that target
+      were verified by probe configs (one that passes, one with no
+      `EXPECT-VIOLATION` header) before they were deleted.
+
+      Found while measuring the baseline: `make check-<spec>`, the documented way
+      to check one spec, was a silent no-op that exited 0. GNU make does not
+      apply pattern rules to phony targets, and every `check-<spec>` was listed
+      in `.PHONY`.
+      _Closes_ RW-1 · _Effort_ L
 
 - [x] **H-36 — Larger models nightly**: 5 nodes and higher term bounds. Current
       configs are 3 nodes with small bounds, and `raft_lsn.tla` abstracts the Raft
@@ -2057,25 +2111,32 @@ nothing detects drift.
       `make -C tla check-large` from a nightly job at 03:40 UTC. Measured on an
       M4 with `-workers auto`, all four clean:
 
-      | Spec                     | Nightly config              | Distinct states | Time   |
-      | ------------------------ | --------------------------- | --------------- | ------ |
-      | `lease_fencing`          | 5 nodes, MaxTerm 5          | 4.8M            | 14 s   |
+      | Spec                     | Nightly config               | Distinct states | Time   |
+      | ------------------------ | ---------------------------- | --------------- | ------ |
+      | `lease_fencing`          | 3 nodes, MaxTerm 4           | 1.5M            | 55 s   |
       | `raft_lsn`               | 4 nodes, MaxTerm 3, MaxLSN 3 | 7.0M            | 31 s   |
-      | `commit_probing`         | 3 connections, MaxTxid 4    | 7.8M            | 29 s   |
-      | `timeline_verification`  | 4 nodes, MaxTimeline 4      | 1.1M            | 5 s    |
+      | `commit_probing`         | 3 connections, MaxTxid 4     | 7.8M            | 29 s   |
+      | `timeline_verification`  | 4 nodes, MaxTimeline 4       | 1.1M            | 5 s    |
 
       Node count is not the axis to push everywhere, which is the substance of
-      the earlier measurements and of two more taken since. `raft_lsn` carries a
+      the earlier measurements and of several taken since. `raft_lsn` carries a
       term and an LSN per node, so at 5 nodes TLC was still 66M states from done
       after ten minutes; `MaxLSN` buys more, and a third LSN value is what makes
       "behind by more than the threshold" and "behind by exactly the threshold"
       both reachable in one behaviour. `timeline_verification` at 5 nodes and
       MaxTimeline 4 completes but costs 58.5M states and 4.5 minutes on an M4 —
       an order of magnitude past the 4-node model for no new shape, and far past
-      what a 2-core runner should spend. `lease_fencing` is the one that scales
-      cheaply to 5 nodes, and it is also the one where five matters: it admits
-      quorum shapes three cannot, including a deposed leader holding a quorum
-      that excludes the eventual winner, which is the shape RW-1 turns on.
+      what a 2-core runner should spend.
+
+      `lease_fencing` used to be the one that scaled cheaply to 5 nodes, and no
+      longer is: H-35 replaced its ack counter with explicit quorum node sets,
+      so every extra node multiplies the majorities each election and each
+      heartbeat can range over. At 5 nodes it did not finish in 15 minutes at
+      either MaxTerm 5 or MaxTerm 3. Three nodes already carries the minimal
+      quorum intersection the safety argument turns on, so the nightly model
+      spends its budget on a fourth term instead — enough for a node to be
+      deposed, return, and be deposed again in one behaviour, which is where a
+      stale anchor gets a second chance to surface.
 
       Two properties keep the target honest. A hard per-spec timeout (900 s)
       distinguishes "this model outgrew its budget" from a stuck runner, and a
@@ -2087,6 +2148,41 @@ nothing detects drift.
       away, so its `ElectionSafety` remains the textbook theorem rather than a
       statement about openraft. Closing that is H-34's business, not a bigger
       model's.
+      _Effort_ M
+
+- [ ] **H-48 — Tear a redb data page, not only its header.** `torn_raft.py`
+      arms LazyFS for the next write to `raft.db`, and every write it
+      intercepts is the 320-byte header at offset 0: redb maps the data region
+      rather than writing it through the FUSE path, so a btree page cannot be
+      torn this way at all. The suite therefore proves the header case — which
+      is real, since the header is what redb reads to find everything else, and
+      a torn one is tolerated cleanly today — and nothing about a page the store
+      has committed.
+
+      This was hidden behind a threshold. `--min-torn-bytes 512` asked for a
+      tear the workload cannot produce, so the job failed intermittently saying
+      "redb's write pattern changed" when the pattern had never been different.
+      **Done when** a torn write lands on a committed btree page and the node is
+      shown to tolerate it or refuse to start — which needs LazyFS to intercept
+      the mapped region (`msync`), or redb configured off mmap for the test.
+      _Effort_ M
+
+- [ ] **H-47 — A counterexample model for every spec.** `make -C tla check` now
+      runs the `<spec>.inv-<name>.cfg` models and fails if one stops producing
+      the violation it names, but only `lease_fencing` has one. The other three
+      rest on the same argument every other assertion in this repo is refused:
+      an invariant nobody has watched fail is an invariant whose passing means
+      nothing, and TLC's own report of "no error" is exactly what a vacuous
+      model produces.
+
+      Each needs a modeled-defect switch, because none of the three can be
+      broken by constants alone — `commit_probing`'s invariants are about the
+      probe logic, `timeline_verification` checks a monotonicity property, and
+      `raft_lsn`'s gate is already deliberately advisory. That is spec work, not
+      config work, which is why it is not folded into H-35.
+      **Done when** `make -C tla check-counterexamples` covers all four specs and
+      fails when any spec lacks one, the way `check-large` already does for the
+      nightly configs.
       _Effort_ M
 
 ### Wave 7 — Real Jepsen (Tier 6)

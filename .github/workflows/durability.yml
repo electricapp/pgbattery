@@ -231,19 +231,22 @@ jobs:
         run: docker compose up -d --build node1 node2 node3
 
       # The inversion mangles one node's raft.db past repair and requires it to
-      # stop rather than run on it, then rebuilds the cluster. Most tears land
-      # in uncommitted pages and are correctly a non-event, so without that a
+      # stop rather than run on it, then rebuilds the cluster. Without that a
       # green run could not be told apart from a fault that injected nothing.
-      # --min-torn-bytes skips redb's 320-byte header writes so the tear that
-      # counts lands on a btree page. Header writes dominate -- a hunt takes a
-      # handful of attempts -- and if twelve produce nothing larger the run
-      # fails saying so, which would mean redb's write pattern changed rather
-      # than that the fault stopped working.
-      - name: Prove the oracle can fail, then tear a Raft btree page
+      #
+      # Every write LazyFS sees on raft.db is redb's 320-byte header at offset
+      # 0 -- redb maps the data region instead of writing it through FUSE -- so
+      # a parts=2 tear persists 160 bytes and a btree page is out of reach on
+      # this path. --min-torn-bytes is set below what the header produces and
+      # above nothing, so the run still fails loudly if the fault stops landing
+      # at all. What it proves is that a torn header leaves the node tolerating
+      # cleanly or refusing to start, which is the contract; the data-page half
+      # is H-48.
+      - name: Prove the oracle can fail, then tear the Raft store's header
         run: |
           uv run --project testing python testing/torn_raft.py \
             --prove-oracle --target ${{ matrix.target }} --tears 1 \
-            --min-torn-bytes 512 --attempts 12
+            --min-torn-bytes 128 --attempts 12
 
       - name: Collect diagnostics
         if: failure()

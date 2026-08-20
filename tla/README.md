@@ -3,16 +3,18 @@
 Formal models of pgbattery's core safety properties, **machine-checked** with TLC.
 
 > **Validation.** `make check` (below) runs all four specs through TLC and fails
-> on any violation. The model checker (`tla2tools.jar`) is pinned by version +
-> SHA-256 in the `Makefile`, so every run — local or CI — uses an identical,
-> verified binary. CI runs the same target: `.github/workflows/tla.yml`.
+> on any violation, then runs the counterexample models and fails if any of them
+> _passes_. The model checker (`tla2tools.jar`) is pinned by version + SHA-256 in
+> the `Makefile`, so every run — local or CI — uses an identical, verified
+> binary. CI runs the same target: `.github/workflows/tla.yml`.
 
 ## Run
 
 ```bash
 cd tla/
-make check                      # download (pinned) + check ALL specs
+make check                      # download (pinned) + check ALL specs + counterexamples
 make check-large                # the nightly models (more nodes, wider bounds)
+make check-counterexamples      # the models that must fail, and how
 make check-lease_fencing        # one spec, full TLC output
 make tools                      # just fetch + verify the jar
 make clean                      # remove downloaded jar + TLC state
@@ -31,6 +33,16 @@ measurement behind the choice. Node count is not always the right axis —
 where a wider `MaxLSN` buys more. `check-large` fails rather than skips when a
 spec has no large config.
 
+A third kind of model is a **counterexample**: `<spec>.inv-<name>.cfg` disables
+one mechanism the safety argument rests on and names, in an `EXPECT-VIOLATION:`
+header, the invariant TLC then has to report. A run that succeeds is the failure,
+and so is one that fails for a different reason — a parse error or a violated
+`ASSUME` is not a counterexample. This is the same rule the Python harnesses live
+under: an assertion nobody has watched fail is an assertion whose passing means
+nothing. `lease_fencing` has one; the other three do not yet (H-47 in
+`HARDENING.md`), and `make check-counterexamples` says so by only checking what
+exists rather than claiming per-spec coverage.
+
 ## What each spec checks
 
 | Spec                        | Verified property                                                         |
@@ -42,22 +54,30 @@ spec has no large config.
 
 ## Properties (checked by each `.cfg`)
 
-**`lease_fencing.tla`** — passes (14,974 distinct states)
+**`lease_fencing.tla`** — passes (492,689 distinct states)
 
 - `AtMostOneWriteAuthority` — at most one node has a valid lease **and** writable
-  PG at any instant. **Non-vacuous**: leadership transfers in the model, so a
-  deposed and a new leader coexist; only the promotion hold-down plus the
-  quorum-ack-anchored lease keep their write windows apart. Removing
-  `ASSUME HoldDown >= LeaseDuration` and setting `HoldDown = 0` makes TLC produce
-  the two-writer (split-brain) counterexample — confirming the invariant has teeth.
+  PG at any instant. **Non-vacuous, and not on the honour system**: leadership
+  transfers in the model, so a deposed and a new leader coexist, and
+  `lease_fencing.inv-anchor-not-restamped.cfg` is a checked config in which TLC
+  produces the two-writer counterexample.
 - `SelfFenceOnQuorumLoss` — a leader that stops getting acks loses write authority
-  within `QuorumTimeout` of its last ack.
+  within `QuorumTimeout` of its last ack. This is the bound the hold-down is sized
+  against, and the one that actually ends a deposed leader's authority, since
+  `QuorumTimeout < LeaseDuration`.
+- `OneLeaderPerTerm` — Raft's election safety, here **derived** rather than
+  assumed: elections and acks both name the majority that took part, and voters
+  grant only strictly higher terms.
+- Quorums are node sets, not an ack counter, which is what makes the RW-1 shape —
+  a deposed leader holding a quorum that excludes the winner — a reachable state,
+  and what makes quorum intersection a consequence instead of a premise.
 - Time is modeled **relatively** (bounded countdowns advanced by one global tick),
   not as an absolute clock, so the state space stays small and finite.
-- Scope: the hold-down is modeled at the election instant; the implementation
-  anchors at the new leader's local leader-loss observation, which coincides only
-  for fast failover. The partial-partition case and its sync-replication backstop
-  are documented in the spec header.
+- Scope: the Raft log is abstracted away (that is `raft_lsn.tla`), and message
+  loss appears only as a candidacy that did not win in time. `VoteDelay` is the
+  network bound the argument cannot escape — a vote slower than
+  `LeaseDuration - QuorumTimeout` breaks the inequality, and no lease scheme
+  bounds that without assuming it.
 
 **`raft_lsn.tla`** — passes (33,957 distinct states)
 

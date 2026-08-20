@@ -1610,6 +1610,8 @@ impl App {
         // fences first — `demote` sets read-only before stopping, `promote`
         // arms it before `pg_ctl promote` — so a tick that cannot look is
         // looking at a node that is already not writable.
+        // clock-lint: allow — histogram sample. The gate is tokio's timer on
+        // LEASE_CHECK_INTERVAL, not this instant.
         let lock_wait_start = Instant::now();
         let Ok(pg) = tokio::time::timeout(
             crate::governor::lease::LEASE_CHECK_INTERVAL,
@@ -1622,6 +1624,7 @@ impl App {
                 clippy::cast_precision_loss,
                 reason = "a lock wait in seconds always fits in f64"
             )]
+            // clock-lint: allow — histogram sample, not a gate.
             metrics::histogram!("pgbattery_lease_tick_lock_wait_seconds")
                 .record(lock_wait_start.elapsed().as_secs_f64());
             return false;
@@ -1630,6 +1633,7 @@ impl App {
             clippy::cast_precision_loss,
             reason = "a lock wait in seconds always fits in f64"
         )]
+        // clock-lint: allow — histogram sample, not a gate.
         metrics::histogram!("pgbattery_lease_tick_lock_wait_seconds")
             .record(lock_wait_start.elapsed().as_secs_f64());
         let (in_recovery, pg_writable, sync_observation) = Self::probe_pg_state(&*pg).await;
@@ -1813,6 +1817,23 @@ impl App {
         }
     }
 
+    /// Whether a failed fence attempt is evidence this node may still be
+    /// serving writes.
+    ///
+    /// A `PostgreSQL` that is not answering is not serving writes through the
+    /// socket the fence would have used, so it is not a split-brain signal and
+    /// must not carry the marker the durability oracles grep for — a run that
+    /// kills a node produces those failures by the dozen, and a marker that
+    /// fires on them says nothing. Everything else is a risk: the server
+    /// answered and did not go read-only.
+    ///
+    /// The failure is counted either way. `FENCE_FAILURE_SHUTDOWN_THRESHOLD`
+    /// exists to stop a node that cannot be fenced, and "cannot be reached
+    /// right now" becomes exactly that if the server comes back writable.
+    const fn fence_failure_is_split_brain_risk(error: &pgbattery_core::Error) -> bool {
+        !matches!(error, pgbattery_core::Error::PostgresNotReady(_))
+    }
+
     /// CRITICAL PATH: lease expired but PG is writable. Issue ALTER SYSTEM,
     /// budgeted. Returns `true` if the caller should break the loop (fence
     /// failures exceeded threshold).
@@ -1836,6 +1857,12 @@ impl App {
         *fence_failures = fence_failures.saturating_add(1);
         metrics::counter!("pgbattery_emergency_fence_failures").increment(1);
         match fence_result {
+            Ok(Err(e)) if !Self::fence_failure_is_split_brain_risk(&e) => tracing::error!(
+                error = %e,
+                consecutive_failures = *fence_failures,
+                threshold = Self::FENCE_FAILURE_SHUTDOWN_THRESHOLD,
+                "Fence not applied: PostgreSQL is not answering"
+            ),
             Ok(Err(e)) => tracing::error!(
                 error = %e,
                 consecutive_failures = *fence_failures,
@@ -2079,11 +2106,7 @@ impl App {
     /// Unknown on either side is not a mismatch: a witness has no data
     /// directory, and a node that has never been provisioned has nothing to
     /// protect.
-    async fn peer_speaks_for_our_cluster(
-        &self,
-        client: &reqwest::Client,
-        peer_addr: &str,
-    ) -> bool {
+    async fn peer_speaks_for_our_cluster(&self, client: &reqwest::Client, peer_addr: &str) -> bool {
         let local = self.local_cluster_lineage().await;
         let peer = self.peer_cluster_lineage(client, peer_addr).await;
         if peer_speaks_for_lineage(local, peer) {
@@ -2780,7 +2803,7 @@ fn clear_dir_contents(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn promotion_lease_holddown(
+pub(crate) fn promotion_lease_holddown(
     failover_started_at: Option<Instant>,
     now: Instant,
     lease: Duration,
@@ -3318,11 +3341,13 @@ mod tests {
             )
             .await;
 
-            let guard = pg.lock().await;
+            let (readonly, calls) = {
+                let guard = pg.lock().await;
+                (guard.is_readonly(), guard.calls())
+            };
             assert!(
-                guard.is_readonly(),
-                "the tick after the lock freed left PostgreSQL writable: {:?}",
-                guard.calls()
+                readonly,
+                "the tick after the lock freed left PostgreSQL writable: {calls:?}"
             );
         }
 
@@ -3593,6 +3618,30 @@ mod tests {
         }
     }
 
+    /// A node the harness just killed logs a fence failure on every lease tick
+    /// until it dies. Treating those as split-brain evidence made the durability
+    /// oracle's log grep fire on any run that kills a node — which is all of
+    /// them.
+    #[test]
+    fn test_an_unreachable_server_is_not_a_split_brain_signal() {
+        assert!(!App::fence_failure_is_split_brain_risk(
+            &pgbattery_core::Error::PostgresNotReady(
+                "Local psql session closed while waiting for SQL result".to_string()
+            )
+        ));
+    }
+
+    /// The dangerous case, and the reason the marker exists: the server
+    /// answered, the fence was issued, and it is still writable.
+    #[test]
+    fn test_a_server_that_refused_to_go_read_only_is_a_split_brain_signal() {
+        assert!(App::fence_failure_is_split_brain_risk(
+            &pgbattery_core::Error::Postgres(
+                "read-only fence verification failed: expected true, got false".to_string()
+            )
+        ));
+    }
+
     /// No tracked failover (bootstrap, or already consumed) → nothing to wait out.
     #[test]
     fn test_holddown_without_tracked_failover() {
@@ -3643,8 +3692,14 @@ mod tests {
     /// would strand every legitimate rejoin.
     #[test]
     fn test_an_unknown_lineage_is_not_a_mismatch() {
-        assert!(peer_speaks_for_lineage(None, Some(7_675_741_024_400_711_708)));
-        assert!(peer_speaks_for_lineage(Some(7_675_741_024_400_711_708), None));
+        assert!(peer_speaks_for_lineage(
+            None,
+            Some(7_675_741_024_400_711_708)
+        ));
+        assert!(peer_speaks_for_lineage(
+            Some(7_675_741_024_400_711_708),
+            None
+        ));
         assert!(peer_speaks_for_lineage(None, None));
     }
 

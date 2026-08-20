@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import tomllib
 import unittest
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 from unittest import mock
 
@@ -78,6 +80,7 @@ from fault_primitives import (
     partition_lossy,
     ps_cmd,
     read_system_timings,
+    root_qdisc_lock,
     scrub,
     select_pg_processes,
     set_command_runner,
@@ -811,6 +814,80 @@ class PartitionLossyTests(RunnerFixture):
             self.fail("body must not run")
         self.assertIn("Exclusivity flag on", str(caught.exception))
         self.assertIn("already owns dev eth0 root", str(caught.exception))
+
+    def test_the_same_device_hands_back_the_same_lock(self) -> None:
+        """One root qdisc per device means one lock per device, not per call."""
+        self.assertIs(root_qdisc_lock("node2"), root_qdisc_lock("node2"))
+
+    def test_a_different_node_is_a_different_device(self) -> None:
+        """Serialising every node against every other would throw away most of
+        what a storm is for — faults on separate nodes really do overlap."""
+        self.assertIsNot(root_qdisc_lock("node2"), root_qdisc_lock("node3"))
+
+    def test_partition_lossy_waits_for_the_device_instead_of_colliding(self) -> None:
+        """The chaos_storm regression: two netem faults drawn onto one node.
+
+        tc permits one root qdisc per device, so the second `add` used to fail
+        with "Exclusivity flag on" and end the run — a collision between two
+        faults reported as though the cluster had done something wrong. Holding
+        the device here stands in for the first fault's window: the second must
+        issue no command at all until the device is free.
+        """
+        runner = self.install(
+            ScriptedRunner(
+                [
+                    ("tc -s qdisc show", ok(NETEM_QDISC)),
+                    ("curl", ok("0.4")),
+                ]
+            )
+        )
+        device = root_qdisc_lock("node2")
+        finished = threading.Event()
+        self.assertTrue(device.acquire(timeout=1.0), "device lock was already held")
+
+        def second_fault() -> None:
+            # This scripting cannot produce an observable latency rise, so the
+            # window raises. Irrelevant here: what is under test is whether tc
+            # was touched before the device was free.
+            with (
+                suppress(FaultEffectNotObserved),
+                partition_lossy("node2", drop_pct=0.0, latency_ms=200),
+            ):
+                pass
+            finished.set()
+
+        worker = threading.Thread(target=second_fault, daemon=True)
+        worker.start()
+        try:
+            self.assertFalse(
+                finished.wait(timeout=0.5),
+                "the second fault ran to completion while the device was held",
+            )
+            self.assertEqual(runner.calls, [], "the second fault ran tc before it owned the device")
+        finally:
+            device.release()
+        worker.join(timeout=5.0)
+        self.assertTrue(finished.is_set(), "the second fault never ran after the device freed")
+        self.assertTrue(
+            runner.matching("netem delay 200ms"),
+            "the second fault never installed its qdisc once the device was free",
+        )
+
+    def test_a_device_that_never_frees_fails_rather_than_hanging(self) -> None:
+        """The lock is not reentrant, so a nested or leaked window would block
+        forever. tc used to reject that case immediately; the bound keeps it a
+        failure rather than turning it into a hung run."""
+        self.install(ScriptedRunner([]))
+        device = root_qdisc_lock("node2")
+        self.assertTrue(device.acquire(timeout=1.0), "device lock was already held")
+        self.addCleanup(device.release)
+        with (
+            mock.patch.object(fp, "ROOT_QDISC_WAIT_S", 0.05),
+            self.assertRaises(FaultPreconditionError) as caught,
+            partition_lossy("node2", drop_pct=0.0, latency_ms=200),
+        ):
+            self.fail("body must not run")
+        self.assertIn("root qdisc was still held", str(caught.exception))
 
     def test_red_when_the_delay_is_not_observable_end_to_end(self) -> None:
         self.install(

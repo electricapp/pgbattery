@@ -162,7 +162,8 @@ import random
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass, field
@@ -204,6 +205,16 @@ PSQL_TIMEOUT: Final[int] = 5
 
 LEADER_POLL_INTERVAL: Final[float] = 0.5
 """Seconds between background leader-poll rounds."""
+
+CONVERGENCE_BUDGET_S: Final[float] = 30.0
+"""How long the nodes may name different leaders before it stops being a
+failover in progress.
+
+An election that openraft's own timers do not settle is driven by the
+leaderless watchdog, whose last rank fires at 21 election timeouts (21 s at the
+1 s default), plus the election window and the lease grant. A disagreement
+shorter than that is a cluster converging; one longer is a cluster that has
+stopped."""
 
 BANK_LEDGER_TABLE: Final[str] = "bank_ledger"
 """Table recording one row per *applied* transfer, keyed by transfer id."""
@@ -280,6 +291,13 @@ LOG_FENCE_MARKERS: Final[tuple[str, ...]] = (
 
 LOG_FENCE_CONFIRMED: Final[str] = "PostgreSQL fenced (read-only)"
 """Confirmation that a fired fence actually made PostgreSQL read-only."""
+
+LOG_FENCE_MOOT: Final[str] = "Fence not applied: PostgreSQL is not answering"
+"""The other way an emergency fence concludes safely.
+
+A server that is not answering is serving no writes through the socket the
+fence would have used, so there is nothing left to fence. Every run here kills
+nodes, so without this L3 fires on all of them."""
 
 ATTEMPT_ACKED: Final[str] = "acked"
 """psql exited 0: the write is committed and durable from the client's view."""
@@ -396,9 +414,27 @@ class LeaderPollRound:
         return {v for v in self.responses.values() if v is not None}
 
     @property
-    def is_split_brain(self) -> bool:
-        """Two distinct nodes simultaneously claim leadership."""
+    def leaders_disagree(self) -> bool:
+        """The responding nodes named more than one leader this round.
+
+        Not split-brain on its own. `RaftMetrics::current_leader` is a local
+        belief and an isolated node cannot refresh it, so a deposed leader keeps
+        naming itself until it hears otherwise — with its lease already expired
+        and writes already refused. See docs/STATE_MACHINE.md section 1: the
+        only reliable reading is agreement across a majority, and write
+        authority is what L1 is about, which `dual_writability_prober.py`
+        measures directly.
+        """
         return len(self.unique_leaders) > 1
+
+    @property
+    def quorum_leader(self) -> int | None:
+        """The leader a majority of *all* nodes named, or None without one."""
+        counts = Counter(v for v in self.responses.values() if v is not None)
+        if not counts:
+            return None
+        leader, votes = counts.most_common(1)[0]
+        return leader if votes * 2 > len(self.responses) else None
 
 
 @dataclass
@@ -1398,9 +1434,7 @@ def step_final_steady(history: History, console: Console) -> None:
     do_inserts(50, history, console)
 
 
-def bank_transfer_plan(
-    rng: random.Random, count: int, accounts: int
-) -> list[tuple[int, int, int]]:
+def bank_transfer_plan(rng: random.Random, count: int, accounts: int) -> list[tuple[int, int, int]]:
     """The (from, to, amount) each transfer attempt will use.
 
     Drawn up front and pure, so a run that finds a ledger violation can be
@@ -1920,6 +1954,33 @@ def classify_ack_vs_quorum_loss(
     return ACK_OUTSIDE, None
 
 
+def unconverged_leader_rounds(rounds: Sequence[LeaderPollRound]) -> list[LeaderPollRound]:
+    """Rounds inside a disagreement that outlasted `CONVERGENCE_BUDGET_S`.
+
+    Pure, so the self-test can hand it a failover-length disagreement and
+    require silence, then a stuck one and require it back.
+
+    Any single round of disagreement is expected: a deposed leader keeps naming
+    itself until it learns better, and the poll is not synchronised with the
+    cluster's own convergence. What is not expected is disagreement that never
+    resolves — a cluster that has stopped electing rather than one mid-election.
+    """
+    runs: list[list[LeaderPollRound]] = []
+    current: list[LeaderPollRound] = []
+    for r in rounds:
+        if r.leaders_disagree:
+            current.append(r)
+            continue
+        runs.append(current)
+        current = []
+    runs.append(current)
+    return [r for run in runs if _run_span_s(run) > CONVERGENCE_BUDGET_S for r in run]
+
+
+def _run_span_s(run: Sequence[LeaderPollRound]) -> float:
+    return 0.0 if len(run) < 2 else run[-1].ts - run[0].ts
+
+
 def check_invariants(
     history: History,
     db_final: set[int],
@@ -1966,13 +2027,14 @@ def check_invariants(
         )
 
     # I4: SINGLE_LEADER
-    split_rounds = [r for r in history.leader_polls if r.is_split_brain]
+    split_rounds = unconverged_leader_rounds(history.leader_polls)
     if split_rounds:
         example = split_rounds[0]
         violations.append(
             Violation(
                 "I4",
-                f"{len(split_rounds)} poll round(s) observed two simultaneous leaders",
+                f"{len(split_rounds)} poll round(s) in a run of leader disagreement "
+                f"longer than a failover can explain",
                 {"example_ts": example.ts, "example_responses": example.responses},
             )
         )
@@ -2110,7 +2172,8 @@ def _check_log_grep(logs_path: Path, quorum_loss_windows: int = 0) -> list[Viola
 
     # L3: FENCE_CONFIRMED_AFTER_EMERGENCY
     fence_markers = [m for m in LOG_FENCE_MARKERS if m in log_text]
-    if "EMERGENCY FENCE" in log_text and LOG_FENCE_CONFIRMED not in log_text:
+    fence_resolved = LOG_FENCE_CONFIRMED in log_text or LOG_FENCE_MOOT in log_text
+    if "EMERGENCY FENCE" in log_text and not fence_resolved:
         violations.append(
             Violation(
                 "L3",
@@ -2327,7 +2390,10 @@ def run(
         f"{sum(1 for tr in history.transfers if tr.outcome == 'indeterminate')}",
     )
     t.add_row("Leader poll rounds", str(len(history.leader_polls)))
-    t.add_row("Split-brain rounds", str(sum(1 for r in history.leader_polls if r.is_split_brain)))
+    t.add_row(
+        "Leader-disagreement rounds",
+        str(sum(1 for r in history.leader_polls if r.leaders_disagree)),
+    )
     t.add_row("Fault windows", str(len(history.faults)))
     t.add_row("Intermediate snapshots", str(len(history.snapshots)))
     t.add_row("Wall clock", f"{elapsed:.0f}s")
@@ -2428,7 +2494,8 @@ def run(
             for tr in history.transfers
         ],
         "leader_poll_rounds": len(history.leader_polls),
-        "split_brain_rounds": sum(1 for r in history.leader_polls if r.is_split_brain),
+        "leader_disagreement_rounds": sum(1 for r in history.leader_polls if r.leaders_disagree),
+        "unconverged_leader_rounds": len(unconverged_leader_rounds(history.leader_polls)),
         "fault_windows": [
             {
                 "kind": fw.kind,

@@ -61,7 +61,7 @@ SET statement_timeout = '20s';
 -- The commit under test. The LSN comes back from the INSERT itself, not from a
 -- following statement: a refused write leaves `commit_lsn` unset, so the ACKED
 -- marker below cannot print. Read separately it would still have succeeded —
--- a read-only transaction happily runs SELECTs — and the probe would announce
+-- a read-only transaction happily runs a SELECT — and the probe would announce
 -- an acknowledgement for a commit that never happened.
 INSERT INTO rw2_probe(tag) VALUES ('gap-write')
 RETURNING pg_current_wal_lsn() AS commit_lsn \gset

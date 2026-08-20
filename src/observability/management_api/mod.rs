@@ -346,7 +346,10 @@ pub async fn start_management_api(
         // Which cluster this node's data belongs to, so a starting node can
         // tell whether the cluster answering it is its own before acting on
         // what it says.
-        .route("/api/v1/cluster/identity", get(discovery::get_cluster_identity))
+        .route(
+            "/api/v1/cluster/identity",
+            get(discovery::get_cluster_identity),
+        )
         // Join info (for simplified join command)
         .route("/api/v1/cluster/join-info", get(discovery::get_join_info))
         // Replication lag (for health-based promotion)

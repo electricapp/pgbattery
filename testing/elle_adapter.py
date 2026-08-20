@@ -26,7 +26,10 @@ JAR_PATH: Path = (
     Path(__file__).resolve().parent / "third_party" / "elle" / "elle-cli-standalone.jar"
 )
 DEFAULT_TIMEOUT_S: int = 300
-JVM_HEAP_MAX: str = "2g"
+JVM_HEAP_MAX: str = "4g"
+"""A list-append read returns the whole list, so history size grows with the
+square of the committed count: the `full` profile's densest attacks produce
+histories in the hundreds of MB, and Elle holds the parsed graph in memory."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -747,6 +747,7 @@ def _harness_log_markers() -> dict[str, tuple[str, ...]]:
         "LOG_SPLIT_BRAIN_SIGNALS": correctness_lite.LOG_SPLIT_BRAIN_SIGNALS,
         "LOG_FENCE_MARKERS": correctness_lite.LOG_FENCE_MARKERS,
         "LOG_FENCE_CONFIRMED": (correctness_lite.LOG_FENCE_CONFIRMED,),
+        "LOG_FENCE_MOOT": (correctness_lite.LOG_FENCE_MOOT,),
     }
 
 

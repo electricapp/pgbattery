@@ -2,7 +2,8 @@ name: TLA+
 
 # Machine-checks the formal specs in tla/. Reproducible: the model checker
 # (tla2tools.jar) is pinned by version + SHA-256 in tla/Makefile, and CI runs
-# the very same `make -C tla check` you run locally.
+# the very same `make -C tla check` you run locally — which checks the specs and
+# then requires every counterexample model to still produce its counterexample.
 
 on:
   push:
@@ -44,11 +45,11 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: Model-check all specs (downloads + verifies pinned TLC jar)
+      - name: Model-check all specs and counterexamples (verifies pinned TLC jar)
         run: make -C tla check
 
-  # The models a PR cannot afford: five nodes for lease_fencing, four for
-  # raft_lsn and timeline_verification, a third connection for commit_probing.
+  # The models a PR cannot afford: a fourth term for lease_fencing, four nodes
+  # for raft_lsn and timeline_verification, a third connection for commit_probing.
   # Each `<spec>.large.cfg` records what it widens and the measurement behind
   # the choice; `check-large` refuses to run if any spec lacks one.
   tlc-large:
