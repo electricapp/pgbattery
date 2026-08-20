@@ -2611,17 +2611,45 @@ nothing detects drift.
       "configured off mmap"; both halves of the old **Done when** describe work
       that cannot be done because the condition it assumes does not hold.
 
-      What is left is the arming window. LazyFS hardcodes a torn-op arriving
-      over the FIFO to occurrence 1 — `occurrence=` parses and is then ignored,
-      which `lazyfs_torn_op_cmd` already documents — so the tear fires on the
-      very next write to the path, and after a quiet moment that is the commit
-      header. Reaching a btree page means arming immediately before a write
-      known to be one: drive a value large enough to force a data page and arm
-      in the gap, or drop the fault through LazyFS's config file if that form
-      honours `occurrence`. Neither is confirmed yet, and the cheap first step
-      is to record the offset and size of every write LazyFS sees on `raft.db`
-      across a workload — the harness already keeps the offsets it tears, so it
-      is a matter of keeping the ones it does not.
+      **Measured, and the arming window is the whole of it.** Setting
+      `log_all_operations = true` on the Raft LazyFS instance and running the
+      cluster records every write it sees, which is how to repeat this. In one
+      run against `raft.db`: **2431 writes of 4096 bytes at non-zero offsets,
+      against 444 of 320 bytes at offset 0.** Data pages are 85% of the traffic
+      and they go through FUSE like everything else, so there was never a
+      visibility problem to solve.
+
+      The sequence is the answer:
+
+      ```
+      write(size=320,off=0)      <- header, first in every commit
+      write(size=4096,off=16384)
+      write(size=4096,off=77824)
+      ...
+      fsync(isdatasync=1)
+      ```
+
+      redb opens **every** commit with the header and only then writes its
+      pages. A FIFO torn-op fires on the very next write to the path, so arming
+      into a store that is between commits can only ever tear the header. That
+      is the entire reason this suite has only the header case, and it is a
+      property of the arming, not of redb or of LazyFS.
+
+      **Driving traffic first does not fix it**, which is worth writing down
+      because it is the obvious repair and it was tried: `tear_once` was changed
+      to start a 400-write batch, wait for the first ack, and arm into it. Four
+      attempts, all still 160 bytes at offset 0. The reason is the architecture
+      — client transactions never enter the Raft log, so SQL load produces no
+      redb commits at all. The store only commits on control-plane appends
+      (LSN reports, membership, sync mode), on their own cadence, and the
+      page-write burst inside one commit is microseconds wide.
+
+      So timing cannot reach a page, and the change was reverted rather than
+      kept for looking like progress. What is left is occurrence selection: the
+      FIFO form pins it to 1 (`lazyfs_torn_op_cmd` documents that `occurrence=`
+      parses there and is ignored), so the next thing to establish is whether
+      LazyFS honours it in a config-file `[[injection]]` block, which would let
+      a fault be baked at occurrence 2 and land on the first page of a commit.
       **Done when** a torn write lands on a committed btree page and the node is
       shown to tolerate it or refuse to start.
       _Effort_ M
