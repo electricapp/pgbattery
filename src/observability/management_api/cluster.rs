@@ -715,6 +715,33 @@ async fn drop_replication_slot_for_removed(state: &Arc<ManagementApiState>, node
     }
 }
 
+/// Drop a removed node's replicated record: its `NodeInfo` and its LSN.
+///
+/// Changing membership takes the node out of the voter set and nothing else.
+/// `ClusterState` keeps its own map, so without this the node is served by
+/// `/api/v1/cluster/nodes` forever — and, worse, its last LSN stays in
+/// `node_lsns` feeding `max_cluster_lsn`, which is the bar every candidate is
+/// measured against. A node removed while ahead would raise that bar
+/// permanently against the nodes still in the cluster.
+///
+/// Best-effort and logged: the membership change has already committed by the
+/// time this runs, so failing here must not turn a completed removal into an
+/// error. The next removal attempt re-issues it.
+async fn forget_removed_node(state: &Arc<ManagementApiState>, node_id: NodeId) {
+    let req = crate::governor::raft::ClusterRequest {
+        command: crate::governor::state_machine::ClusterCommand::RemoveNode(node_id),
+    };
+    match state.raft.client_write(req).await {
+        Ok(_) => tracing::info!(node_id, "Dropped replicated record for removed node"),
+        Err(e) => tracing::warn!(
+            node_id,
+            error = %e,
+            "Removed from membership but its replicated record remains; \
+             /cluster/nodes will still list it and its LSN still counts"
+        ),
+    }
+}
+
 /// Remove node from cluster
 pub(super) async fn remove_node(
     State(state): State<Arc<ManagementApiState>>,
@@ -815,6 +842,7 @@ pub(super) async fn remove_node(
                 );
             }
             drop_replication_slot_for_removed(&state, node_id).await;
+            forget_removed_node(&state, node_id).await;
             let members = get_current_members(&state);
             (
                 StatusCode::OK,

@@ -2174,7 +2174,31 @@ nothing detects drift.
 
       Verified by running the case twice in a row, since one run in isolation
       could never have shown the pollution.
+
+      Chasing the residue turned up a product defect behind it. Stopping the
+      witness left it in `/api/v1/cluster/nodes` forever, because
+      `change_membership` takes a node out of the voter set and touches nothing
+      else: the API never committed `ClusterCommand::RemoveNode`, so the node's
+      `NodeInfo` **and its LSN** stayed in the replicated state. The LSN is the
+      part that matters — `node_lsns` feeds `max_cluster_lsn`, the bar every
+      candidate is measured against, so a node removed while ahead raised that
+      bar permanently against the nodes still in the cluster. Removal now
+      commits it, and `/cluster/nodes` returns to three after the case where it
+      used to stay at four.
       _Effort_ M
+
+- [ ] **H-51 — `tests_md_ref` points at a document that does not exist.** All
+      eighty cases carry one, in the shape `"Control Plane 27. Witness Node 2+1
+Topology"`, and `docs/TESTS.md` has never been in the repository — not
+      deleted, never added. The field reads as the case's specification, which
+      is exactly what somebody reaches for when a case and the product disagree
+      about what it should do; three of the cases fixed this week disagreed, and
+      the reference was no help with any of them.
+      **Done when** the field either resolves to something, or is removed and
+      the descriptions carry the intent on their own — and `lint_matrix.py`
+      checks whichever is chosen, since an unchecked cross-reference is how this
+      one survived eighty cases.
+      _Effort_ S
 
 - [ ] **H-49 — Run every `ha-parallel` case, or say which are not run.**
       `ha-ci.yml` hardcodes five case names into the parallel matrix while the

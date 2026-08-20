@@ -2064,6 +2064,7 @@ SETNS_FAILURE = (
     "OCI runtime exec failed: exec failed: unable to start container process: "
     "error executing setns process: exit status 1"
 )
+OCI_STOPPED = "OCI runtime exec failed: exec failed: cannot exec in a stopped container"
 
 LAZYFS_MOUNTS = (
     "proc /proc proc rw,relatime 0 0\n"
@@ -2155,6 +2156,15 @@ class ContainerReachabilityTests(unittest.TestCase):
 
     def test_a_stopped_container_makes_a_read_indeterminate(self) -> None:
         self.install(SequencedRunner([fail(DAEMON_STOPPED)]))
+        with self.assertRaises(fp.ContainerNotRunning):
+            fp.read_processes("node2")
+
+    def test_the_oci_wording_for_a_stopped_container_is_indeterminate_too(self) -> None:
+        """The daemon's phrasing is not the only one: on a container that has
+        not started yet the OCI runtime's own message comes through instead, and
+        reading it as a genuine failure is what stopped the torn-raft suite
+        waiting for its cluster and failed it on the mount check."""
+        self.install(SequencedRunner([fail(OCI_STOPPED)]))
         with self.assertRaises(fp.ContainerNotRunning):
             fp.read_processes("node2")
 

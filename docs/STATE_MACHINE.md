@@ -97,7 +97,8 @@ Every state transition is driven by a **definitive source of truth** — never b
 - **Shape**: single `ClusterState` struct holding `leader_id`, `leader_addr`, members, `node_lsns`, `max_cluster_lsn`, `failover_started_at`.
 - **Source of truth**: the Raft log itself (every change is a `ClusterCommand` applied via `apply()`).
 - **Transition trigger**: openraft applying a committed log entry.
-- **Code**: `src/governor/state_machine.rs`.
+- **Membership and this map are two writes, not one.** `change_membership` moves a node out of the voter set and touches nothing here, so removal also commits `ClusterCommand::RemoveNode` (`forget_removed_node`). Without it the node stays in `nodes` — served by `/api/v1/cluster/nodes` for the rest of the cluster's life — and, worse, its last LSN stays in `node_lsns` feeding `max_cluster_lsn`, which is the bar `evaluate_lsn_acceptable` measures every candidate against: a node removed while ahead would raise that bar permanently against the nodes still present. The write is best-effort and logged, because the membership change has already committed by the time it runs and a failure here must not report a completed removal as an error.
+- **Code**: `src/governor/state_machine.rs`, `management_api::cluster::remove_node`.
 
 ### 6. Gateway leader routing
 

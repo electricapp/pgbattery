@@ -3218,6 +3218,13 @@
       ],
       "cleanup": [
         {
+          "type": "http",
+          "method": "POST",
+          "comment": "Take node4 out of membership first, while it is still up so the leader can drop its replication slot. Stopping the container is not enough: registration is replicated NodeInfo, so node4 stays in /cluster/nodes after its container is gone, and every later case waiting for three nodes then sees four and times out.",
+          "url": "http://localhost:9081/api/v1/cluster/remove/4",
+          "expect_status": 200
+        },
+        {
           "type": "cmd",
           "comment": "stop witness so it does not affect subsequent test cases",
           "cmd": "docker compose --profile witness stop witness"

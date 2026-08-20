@@ -1850,11 +1850,15 @@ EXEC_UNAVAILABLE_MARKERS: Final[tuple[str, ...]] = (
     "is restarting, wait until the container is running",
     "is not running",
     "error executing setns process",
+    "cannot exec in a stopped container",
 )
 """Failures that mean the command never reached the container.
 
 The first two are the daemon refusing a stopped container; the third is runc
 unable to enter its namespaces, which happens while a container is coming up.
+The fourth is the same refusal in the OCI runtime's own words, which is what
+the daemon passes through on a container that has not started yet — missing it
+made every wait-for-startup path fail instead of waiting.
 
 ``No such container`` is excluded: a name resolving to nothing is topology
 drift, which must fail rather than be waited on.
