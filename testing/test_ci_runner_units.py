@@ -20,7 +20,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -201,6 +201,52 @@ class AbortingSuiteRunner(ClusterStartRunner):
 
     def _save_run_summary(self) -> None:
         return None
+
+
+class WritableProbeRunner(StubRunner):
+    """Answers the writable probe from a queue of thunks.
+
+    A thunk that raises models the attempt being killed at its per-attempt
+    budget, which is what a commit blocked on a severed synchronous standby
+    does to it.
+
+    Attributes:
+        attempts: How many probe attempts were made.
+    """
+
+    def __init__(
+        self,
+        artifact_dir: Path,
+        replies: Sequence[Callable[[], subprocess.CompletedProcess[str]]],
+    ) -> None:
+        super().__init__(artifact_dir)
+        self.replies = list(replies)
+        self.attempts = 0
+
+    def _run_shell(
+        self,
+        command: str,
+        log_path: Path,
+        expect_exit: int | list[int] | None = 0,
+        timeout_sec: int = ci_runner.DEFAULT_SHELL_TIMEOUT_SEC,
+        render: bool = True,
+        stdin_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        self.attempts += 1
+        reply: subprocess.CompletedProcess[str] = self.replies[
+            min(self.attempts - 1, len(self.replies) - 1)
+        ]()
+        return reply
+
+
+def probe_accepted() -> subprocess.CompletedProcess[str]:
+    """A probe attempt the node answered by taking the write."""
+    return subprocess.CompletedProcess(args="", returncode=0, stdout="", stderr="")
+
+
+def probe_killed_at_its_budget() -> subprocess.CompletedProcess[str]:
+    """A probe attempt that hung and was killed."""
+    raise ci_runner.RunnerError("STEP TIMEOUT: command exceeded 15s and was killed")
 
 
 def make_runner() -> StubRunner:
@@ -1878,6 +1924,39 @@ def test_a_started_cluster_is_waited_on_for_replication_health() -> None:
     assert runner.waits, "the cluster was never waited on"
     assert runner.waits[0].get("require_replication_health") is True, (
         f"started a case against a cluster whose replication was never checked: {runner.waits[0]}"
+    )
+
+
+def test_a_writable_probe_that_hangs_is_retried_not_propagated() -> None:
+    """A commit that cannot reach its synchronous standby blocks rather than
+    erroring, so the probe hangs and is killed at its per-attempt budget. That
+    is the condition being waited out; failing the case there fails it on the
+    very state it is about — which is how `replication-severed-raft-healthy`
+    died, on a gate 15s long guarding a step that declares 180."""
+    runner = WritableProbeRunner(
+        Path(tempfile.mkdtemp(prefix="ci-runner-probe-")),
+        [probe_killed_at_its_budget, probe_killed_at_its_budget, probe_accepted],
+    )
+    node = ci_runner.ClusterNodeConfig(
+        id=1, name="node1", mgmt_url="http://localhost:9081", metrics_url="http://localhost:9091"
+    )
+    runner._await_node_accepts_writes(node, Path("step.log"), budget_sec=180)
+    assert runner.attempts == 3, f"gave up before the path took writes: {runner.attempts}"
+
+
+def test_a_writable_probe_that_never_lands_still_fails() -> None:
+    """The retry must not become an unbounded wait: a path that never takes a
+    write has to say so rather than hold the suite open."""
+    runner = WritableProbeRunner(
+        Path(tempfile.mkdtemp(prefix="ci-runner-probe-never-")), [probe_killed_at_its_budget]
+    )
+    node = ci_runner.ClusterNodeConfig(
+        id=1, name="node1", mgmt_url="http://localhost:9081", metrics_url="http://localhost:9091"
+    )
+    assert_raises(
+        ci_runner.RunnerError,
+        lambda: runner._await_node_accepts_writes(node, Path("step.log"), budget_sec=0),
+        "never accepted a write",
     )
 
 

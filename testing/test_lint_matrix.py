@@ -123,5 +123,47 @@ class ProseExemptionTest(unittest.TestCase):
         self.assertIn("prose.md", str(caught.exception))
 
 
+class MembershipWaitTest(unittest.TestCase):
+    """A wait for fewer members than the cluster has can only time out."""
+
+    def test_the_matrix_as_committed_passes(self) -> None:
+        lm.check_waits_do_not_ask_membership_to_shrink()
+
+    def test_a_wait_for_one_fewer_member_after_a_kill_is_caught(self) -> None:
+        """Two nightly cases were written this way and neither could ever
+        pass; both sat behind an earlier failure where nothing ran them."""
+        cases = [
+            {
+                "id": "kills-then-waits-for-two",
+                "actions": [
+                    {"type": "cmd", "cmd": "docker compose kill node1"},
+                    {"type": "wait_cluster", "nodes": 2, "leaders": 1},
+                ],
+            }
+        ]
+        problems = lm.waits_that_ask_membership_to_shrink(cases, 3)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("live_nodes=2", problems[0])
+
+    def test_saying_live_nodes_instead_is_accepted(self) -> None:
+        cases = [
+            {
+                "id": "says-which-are-live",
+                "actions": [{"type": "wait_cluster", "nodes": 3, "live_nodes": 2, "leaders": 1}],
+            }
+        ]
+        self.assertEqual(lm.waits_that_ask_membership_to_shrink(cases, 3), [])
+
+    def test_a_topology_that_adds_a_member_is_left_alone(self) -> None:
+        """`witness-topology` joins a fourth node and waits for four."""
+        cases = [
+            {
+                "id": "adds-a-witness",
+                "actions": [{"type": "wait_cluster", "nodes": 4, "leaders": 1}],
+            }
+        ]
+        self.assertEqual(lm.waits_that_ask_membership_to_shrink(cases, 3), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

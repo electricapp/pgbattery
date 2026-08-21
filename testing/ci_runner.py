@@ -201,6 +201,11 @@ FAULT_PROBE_TIMEOUT_SEC: Final[int] = 60
 # node which is never going to accept writes says so rather than eating the
 # case's own timeout.
 SQL_WRITABLE_TIMEOUT_SEC: Final[int] = 60
+# Per-attempt budget inside that wait. Long enough that a healthy path answers,
+# short enough that a blocked one is retried rather than sat on: a commit
+# waiting for a synchronous standby hangs, so the attempt has to be abandoned
+# to make the next one.
+WRITABLE_PROBE_ATTEMPT_SEC: Final[int] = 15
 
 # Lines a single node may log across one cluster's lifetime before the run is
 # called a hot loop.
@@ -2456,14 +2461,22 @@ class CIRunner:
         if measured_tps < min_tps:
             raise RunnerError(f"pgbench TPS {measured_tps:.0f} below minimum {min_tps:.0f}")
 
-    def _await_node_accepts_writes(self, node: ClusterNodeConfig, step_log: Path) -> None:
+    def _await_node_accepts_writes(
+        self, node: ClusterNodeConfig, step_log: Path, budget_sec: int
+    ) -> None:
         """Block until `node` runs a write, or raise saying it never did.
 
         The probe is a rolled-back temp table: refused in a read-only
         transaction the same way the case's own INSERT would be, and
         session-local, so a passing probe leaves nothing behind.
+
+        `budget_sec` is the owning step's own budget, because a step that
+        declares a long one is declaring that its path may be slow to take
+        writes — a commit waiting on a severed synchronous standby blocks until
+        the walsender times out, and a gate shorter than the step it guards
+        fails the case on the state the case is about.
         """
-        deadline = time.time() + SQL_WRITABLE_TIMEOUT_SEC
+        deadline = time.time() + max(SQL_WRITABLE_TIMEOUT_SEC, budget_sec)
         last = "no attempt made"
         probe = (
             f"{container_exec_prefix(node.name)} "
@@ -2471,20 +2484,29 @@ class CIRunner:
             '-c "CREATE TEMP TABLE ci_runner_writable_probe(x int)"'
         )
         while time.time() < deadline:
-            proc = self._run_shell(
-                probe,
-                step_log.with_suffix(".writable-probe.log"),
-                expect_exit=None,
-                timeout_sec=15,
-                render=False,
-            )
+            try:
+                proc = self._run_shell(
+                    probe,
+                    step_log.with_suffix(".writable-probe.log"),
+                    expect_exit=None,
+                    timeout_sec=WRITABLE_PROBE_ATTEMPT_SEC,
+                    render=False,
+                )
+            except RunnerError as exc:
+                # A probe that hangs is the condition being waited out, not a
+                # failure: a commit that cannot reach its synchronous standby
+                # blocks rather than erroring. Killing the attempt and trying
+                # again is the wait; propagating it fails the case here.
+                last = str(exc).splitlines()[0]
+                continue
             if proc.returncode == 0:
                 return
             last = (proc.stderr or proc.stdout).strip()
             time.sleep(1.0)
         raise RunnerError(
-            f"{node.name} never accepted a write within {SQL_WRITABLE_TIMEOUT_SEC}s of being "
-            f"resolved as the leader; last psql error: {last}"
+            f"{node.name} never accepted a write within "
+            f"{max(SQL_WRITABLE_TIMEOUT_SEC, budget_sec)}s of being resolved as the leader; "
+            f"last psql error: {last}"
         )
 
     def _execute_sql_step(self, step: dict[str, Any], step_log: Path) -> None:
@@ -2529,7 +2551,9 @@ class CIRunner:
         # transaction" — which reads like the case's own subject failing —
         # back into what it is, a step that started too early.
         if sql_step_needs_a_writable_path(step, sql_content):
-            self._await_node_accepts_writes(node, step_log)
+            self._await_node_accepts_writes(
+                node, step_log, resolve_shell_timeout(step, SQL_WRITABLE_TIMEOUT_SEC)
+            )
 
         port = 5434 if step.get("direct") else 5432
         on_error_stop = "1" if step.get("on_error_stop", True) else "0"

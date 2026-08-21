@@ -24,11 +24,13 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -703,6 +705,37 @@ class ReplayFromSeedTests(unittest.TestCase):
         ):
             findings = cl.check_contention_invariant()
         self.assertEqual(_fatal_ids(findings), ["C1"])
+
+    def test_a_leader_without_a_synced_replica_is_not_yet_healthy(self) -> None:
+        """A freshly bootstrapped primary answers `/cluster/leader` before its
+        synchronous standby is in force. A workload that starts there measures
+        the bootstrap gap and reports it as lost acknowledged writes — which is
+        what the weekly job, whose only readiness gate is this one, has been
+        doing."""
+
+        def lag_reply(is_synced: bool) -> Callable[..., subprocess.CompletedProcess[str]]:
+            def run(*args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                argv = args[0]
+                assert isinstance(argv, list)
+                assert "/lag" in argv[-1], argv
+                body = json.dumps({"lag_bytes": 0, "is_synced": is_synced})
+                return subprocess.CompletedProcess(args=argv, returncode=0, stdout=body, stderr="")
+
+            return run
+
+        with (
+            mock.patch.object(cl, "find_leader", return_value=("node1", 5432)),
+            mock.patch("subprocess.run", side_effect=lag_reply(False)),
+            mock.patch("time.sleep"),
+        ):
+            self.assertFalse(cl.wait_cluster_healthy(timeout=1))
+
+        with (
+            mock.patch.object(cl, "find_leader", return_value=("node1", 5432)),
+            mock.patch("subprocess.run", side_effect=lag_reply(True)),
+            mock.patch("time.sleep"),
+        ):
+            self.assertTrue(cl.wait_cluster_healthy(timeout=1))
 
     def test_every_attack_name_is_fireable(self) -> None:
         """`FAULT_KINDS` is what `--attack` is validated against, so a name in

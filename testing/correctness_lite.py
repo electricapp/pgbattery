@@ -741,12 +741,44 @@ def find_leader() -> tuple[str | None, int | None]:
     return None, None
 
 
+def synced_replica_count() -> int:
+    """How many peers the leader currently counts as synchronously replicated."""
+    synced = 0
+    for index, port in enumerate(MGMT_PORTS, start=1):
+        try:
+            r = subprocess.run(
+                ["curl", "-sf", f"http://localhost:{port}/api/v1/cluster/node/{index}/lag"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if r.returncode != 0:
+            continue
+        try:
+            if json.loads(r.stdout).get("is_synced"):
+                synced += 1
+        except json.JSONDecodeError:
+            continue
+    return synced
+
+
 def wait_cluster_healthy(timeout: int = 60) -> bool:
-    """Poll until a leader is discoverable or *timeout* seconds pass."""
+    """Poll until the cluster is *serving*, or *timeout* seconds pass.
+
+    A discoverable leader is not enough. A freshly bootstrapped primary answers
+    `/cluster/leader` before its synchronous standby is in force, and a write
+    acknowledged in that window is durable on one node — so a workload that
+    starts there measures the bootstrap gap and reports it as lost
+    acknowledged writes. `ci_runner` learned the same thing and now waits on
+    replication health before its first case; a run driven straight from a
+    workflow has only this gate.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         leader, _ = find_leader()
-        if leader is not None:
+        if leader is not None and synced_replica_count() >= 1:
             return True
         time.sleep(2)
     return False

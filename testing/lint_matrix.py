@@ -688,6 +688,47 @@ def implicit_build_targets(compose: topology.ComposeDocument, filename: str) -> 
     return problems
 
 
+def waits_that_ask_membership_to_shrink(
+    cases: list[dict[str, Any]], expected_nodes: int
+) -> list[str]:
+    """Waits whose `nodes` is below the cluster's membership.
+
+    `nodes` counts what `/api/v1/cluster/nodes` reports, which is Raft
+    membership: killing, pausing or partitioning a node does not change it.
+    A case that kills one and then waits for one fewer is waiting for something
+    the fault cannot produce, so it can only time out. `live_nodes` is how a
+    case says a member is down, and it is what the working partition cases use.
+
+    Above the cluster count is fine — `witness-topology` adds a fourth member
+    and waits for four.
+    """
+    problems: list[str] = []
+    for case in cases:
+        for phase in ("actions", "assertions", "cleanup"):
+            for index, step in enumerate(case.get(phase) or []):
+                if step.get("type") not in ("wait_cluster", "cluster_topology"):
+                    continue
+                nodes = step.get("nodes")
+                if nodes is None or nodes >= expected_nodes:
+                    continue
+                problems.append(
+                    f"{case['id']} {phase}[{index}] waits for nodes={nodes} against a "
+                    f"{expected_nodes}-member cluster; membership does not shrink when a node "
+                    f"goes down — say live_nodes={nodes} instead"
+                )
+    return problems
+
+
+def check_waits_do_not_ask_membership_to_shrink() -> None:
+    """No wait asks the cluster to forget a member a fault cannot remove."""
+    data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    problems = waits_that_ask_membership_to_shrink(
+        data["cases"], int(data["cluster"]["expected_nodes"])
+    )
+    if problems:
+        raise AssertionError(" | ".join(problems))
+
+
 def check_build_targets_are_explicit() -> None:
     """Every building service must name the Dockerfile stage it wants.
 
@@ -1426,6 +1467,7 @@ def lint() -> None:
     check("Matrix cluster matches docker-compose", check_matrix_cluster_matches_compose)
     check("Compose services pin a build target", check_build_targets_are_explicit)
     check("Transfers can wait out a demote", check_transfers_can_wait_out_a_demote)
+    check("Waits do not ask membership to shrink", check_waits_do_not_ask_membership_to_shrink)
     check("Log markers the harness greps for exist", check_log_markers_still_exist)
     check("Elle matrix driver names resolve", check_elle_driver_names_resolve)
     check("Harness subcommands the matrix calls exist", check_harness_subcommands_exist)

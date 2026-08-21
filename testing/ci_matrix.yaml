@@ -3720,9 +3720,12 @@
         },
         {
           "type": "wait_cluster",
-          "nodes": 2,
+          "comment": "`nodes` is the membership the management API reports, which a kill does not change; `live_nodes` is how a case says one of them is down. Replication health is not asserted while node1 is dead — the new leader keeps it in `pg_stat_replication` until `wal_sender_timeout`.",
+          "nodes": 3,
+          "live_nodes": 2,
           "leaders": 1,
-          "timeout_sec": 30
+          "require_replication_health": false,
+          "timeout_sec": 60
         },
         {
           "type": "record_leader",
@@ -3784,8 +3787,8 @@
         },
         {
           "type": "cmd",
-          "comment": "Verify sync_standby_names includes both followers (query the leader)",
-          "cmd": "for n in node1 node2 node3; do ssn=$(docker compose exec -T $n psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SHOW synchronous_standby_names;' 2>/dev/null); echo \"$ssn\" | grep -q 'pgbattery_node_' && echo \"$ssn\" | grep -c 'pgbattery_node_' | grep -q '[2-3]' && exit 0; done; exit 1"
+          "comment": "Verify both followers are in the leader's synchronous standby set. Asked of pg_stat_replication rather than of synchronous_standby_names, per docs/STATE_MACHINE.md: a primary can carry the GUC text without PostgreSQL yet honouring it, and only the leader has rows here. The previous form counted `grep -c` on a single-line GUC, which is 1 for any value and never the 2 it demanded.",
+          "cmd": "for n in node1 node2 node3; do cnt=$(docker compose exec -T $n psql -h 127.0.0.1 -p 5434 -U postgres -tAc \"SELECT count(*) FROM pg_stat_replication WHERE sync_state IN ('sync','potential');\" 2>/dev/null | tr -d ' '); [ \"$cnt\" = \"2\" ] && exit 0; done; exit 1"
         },
         {
           "type": "sql",
@@ -4596,6 +4599,7 @@
     },
     {
       "id": "disk-full-wal-pressure",
+      "ci_excluded_reason": "It needs a cluster the nightly suite does not build. ENOSPC is unreachable on Docker's local volume driver, so the case requires PGBATTERY_STATE_SUFFIX=_bounded — RAM-backed tmpfs with a hard size — and nothing sets that for a shared suite cluster; giving one to all thirty-four cases would put every node's PGDATA on a multi-gigabyte tmpfs. It has therefore never run: it fails loudly on its own anti-vacuity guard, which is the design working. The property is covered by durability.yml's `wal-enospc` job, which builds exactly that cluster (`PGBATTERY_STATE_SUFFIX=_bounded`, `PGBATTERY_BOUNDED_STATE_SIZE=2g`) for the inversion-gated harness in testing/wal_enospc.py. Run this case by name against a bounded cluster.",
       "contracts": [
         "W1",
         "V1",
