@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use openraft::error::{InitializeError, InstallSnapshotError, NetworkError, RPCError, RaftError};
+use openraft::error::{InitializeError, InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -206,9 +206,10 @@ impl Governor {
         let log_storage = LogStorageAdapter::new(storage.clone());
 
         // Create network factory (with optional TLS)
+        let heartbeat = Duration::from_millis(heartbeat_interval_ms);
         let network_factory = tls_config.map_or_else(
-            || NetworkFactory::new(node_id, peers.clone()),
-            |tls| NetworkFactory::with_tls(node_id, peers.clone(), tls),
+            || NetworkFactory::new(node_id, peers.clone(), heartbeat),
+            |tls| NetworkFactory::with_tls(node_id, peers.clone(), heartbeat, tls),
         );
 
         // Build the Raft node
@@ -255,7 +256,7 @@ impl Governor {
         // watchdog has to recover from (e.g., post-SIGSTOP chaos where
         // openraft's election timeout stays suppressed because every
         // voter has already cast its vote for the current term).
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -454,17 +455,17 @@ impl Governor {
     /// from actual quorum contact. A single-voter cluster is its own quorum, so
     /// the ack is "now" (age zero). For non-leaders the lease is never renewed,
     /// so the value is unused (returns zero).
-    fn quorum_ack_age(metrics: &MetricsView, is_leader: bool) -> std::time::Duration {
+    fn quorum_ack_age(metrics: &MetricsView, is_leader: bool) -> Duration {
         if !is_leader {
-            return std::time::Duration::ZERO;
+            return Duration::ZERO;
         }
         let voter_count = metrics.membership_config.membership().voter_ids().count();
         if voter_count == 1 {
-            return std::time::Duration::ZERO;
+            return Duration::ZERO;
         }
         metrics
             .millis_since_quorum_ack
-            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis)
+            .map_or(Duration::ZERO, Duration::from_millis)
     }
 
     /// Whether this metrics tick must (re)apply the election gate via
@@ -634,12 +635,7 @@ impl Governor {
         runtime.prev_is_leader = is_leader;
     }
 
-    fn update_lease_state(
-        &self,
-        is_leader: bool,
-        has_quorum: bool,
-        quorum_ack_age: std::time::Duration,
-    ) {
+    fn update_lease_state(&self, is_leader: bool, has_quorum: bool, quorum_ack_age: Duration) {
         self.lease
             .write()
             .update_from_raft(is_leader, has_quorum, quorum_ack_age);
@@ -726,8 +722,7 @@ impl Governor {
         runtime: &mut GovernorRunState,
         metrics_rx: &watch::Receiver<openraft::RaftMetrics<NodeId, BasicNode>>,
     ) {
-        let timeout =
-            std::time::Duration::from_millis(crate::config::constants::METRICS_WATCHDOG_TIMEOUT_MS);
+        let timeout = Duration::from_millis(crate::config::constants::METRICS_WATCHDOG_TIMEOUT_MS);
         let elapsed = self
             .lease
             .read()
@@ -871,11 +866,11 @@ impl Governor {
     /// among sorted voter ids) forces an election:
     /// `(BASE + rank * STAGGER) * election_timeout`. Pure so the stagger
     /// ordering can be unit-tested without a live cluster.
-    fn leaderless_threshold(rank: u32, election_timeout_ms: u64) -> std::time::Duration {
+    fn leaderless_threshold(rank: u32, election_timeout_ms: u64) -> Duration {
         let timeouts = crate::config::constants::LEADERLESS_RECOVERY_BASE_TIMEOUTS.saturating_add(
             rank.saturating_mul(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS),
         );
-        std::time::Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
+        Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
     }
 
     /// How long a voter waits before forcing a *second* election: one full pass
@@ -889,11 +884,11 @@ impl Governor {
     /// the cluster stays leaderless through the case's whole budget, which is
     /// the `leaderless-wedge-recovery` flake. Repeating the cycle keeps every
     /// fire, in every round, a full stagger from every other.
-    fn leaderless_cooldown(voters: u32, election_timeout_ms: u64) -> std::time::Duration {
+    fn leaderless_cooldown(voters: u32, election_timeout_ms: u64) -> Duration {
         let timeouts = voters
             .max(1)
             .saturating_mul(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS);
-        std::time::Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
+        Duration::from_millis(u64::from(timeouts).saturating_mul(election_timeout_ms))
     }
 
     /// Initialize the cluster with the given members.
@@ -1791,6 +1786,8 @@ pub struct NetworkFactory {
     peers: Vec<PeerConfig>,
     /// Shared RPC client (may have TLS configured)
     rpc_client: RaftRpcClient,
+    /// Configured heartbeat interval, the floor of [`unreachable_backoff`].
+    heartbeat: Duration,
 }
 
 impl NetworkFactory {
@@ -1798,10 +1795,11 @@ impl NetworkFactory {
     ///
     /// Note: `node_id` is accepted for API compatibility but not currently used.
     #[must_use]
-    pub const fn new(_node_id: NodeId, peers: Vec<PeerConfig>) -> Self {
+    pub const fn new(_node_id: NodeId, peers: Vec<PeerConfig>, heartbeat: Duration) -> Self {
         Self {
             peers,
             rpc_client: RaftRpcClient::new(),
+            heartbeat,
         }
     }
 
@@ -1812,11 +1810,13 @@ impl NetworkFactory {
     pub fn with_tls(
         _node_id: NodeId,
         peers: Vec<PeerConfig>,
+        heartbeat: Duration,
         tls_config: &super::tls::RaftTlsConfig,
     ) -> Self {
         Self {
             peers,
             rpc_client: RaftRpcClient::with_tls(tls_config),
+            heartbeat,
         }
     }
 }
@@ -1838,8 +1838,48 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             target_addr: addr,
             rpc_client: self.rpc_client.clone(),
             conn: None,
+            heartbeat: self.heartbeat,
         }
     }
+}
+
+/// Report a transport failure as openraft's [`Unreachable`], never as
+/// `NetworkError`.
+///
+/// `NetworkError` is documented as "retry immediately", and
+/// `RaftRpcClient::request` has already reconnected and retried once by the
+/// time an error reaches here — so immediately means a connect-refused spin,
+/// thousands of attempts a second against a peer that is merely down.
+/// `Unreachable` is the only variant openraft applies [`RaftNetwork::backoff`]
+/// to.
+fn unreachable<E, R>(cause: &E) -> RPCError<NodeId, BasicNode, R>
+where
+    E: std::error::Error + 'static,
+    R: std::error::Error,
+{
+    RPCError::Unreachable(Unreachable::new(cause))
+}
+
+/// A peer openraft asked for that membership and the peer config both lack an
+/// address for. Unreachable in the same sense: no attempt can succeed until
+/// something else changes.
+fn no_target_addr<R: std::error::Error>() -> RPCError<NodeId, BasicNode, R> {
+    unreachable(&std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no address for this peer in membership or peer config",
+    ))
+}
+
+/// Sleep intervals between attempts to reach a peer, from one heartbeat
+/// interval doubling to four.
+///
+/// The floor is the heartbeat interval because a retry sooner than that
+/// carries nothing the next heartbeat would not. The cap keeps a peer that
+/// stays down at a couple of connect attempts per election timeout, and keeps
+/// one that returns waiting no longer than that to be picked up again.
+fn unreachable_backoff(heartbeat: Duration) -> impl Iterator<Item = Duration> {
+    let cap = heartbeat * 4;
+    std::iter::successors(Some(heartbeat), move |d| Some((*d * 2).min(cap)))
 }
 
 /// Network connection to a single Raft peer.
@@ -1853,9 +1893,15 @@ pub struct NetworkConnection {
     /// client `take()`s it for the duration of each exchange and
     /// re-establishes it on failure (see `RaftRpcClient::request`).
     conn: Option<super::network::PeerConnection>,
+    /// Configured heartbeat interval, the floor of [`unreachable_backoff`].
+    heartbeat: Duration,
 }
 
 impl RaftNetwork<TypeConfig> for NetworkConnection {
+    fn backoff(&self) -> openraft::network::Backoff {
+        openraft::network::Backoff::new(unreachable_backoff(self.heartbeat))
+    }
+
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest<TypeConfig>,
@@ -1872,12 +1918,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
             "NetworkConnection::append_entries called"
         );
 
-        let addr = self.target_addr.ok_or_else(|| {
-            RPCError::Network(NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Target address not found",
-            )))
-        })?;
+        let addr = self.target_addr.ok_or_else(no_target_addr)?;
 
         let result = self
             .rpc_client
@@ -1901,7 +1942,7 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
             }
         }
 
-        result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
+        result.map_err(|e| unreachable(&e))
     }
 
     async fn install_snapshot(
@@ -1912,17 +1953,12 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let addr = self.target_addr.ok_or_else(|| {
-            RPCError::Network(NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Target address not found",
-            )))
-        })?;
+        let addr = self.target_addr.ok_or_else(no_target_addr)?;
 
         self.rpc_client
             .install_snapshot(&mut self.conn, addr, req)
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+            .map_err(|e| unreachable(&e))
     }
 
     async fn vote(
@@ -1931,17 +1967,12 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         _option: openraft::network::RPCOption,
     ) -> std::result::Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
     {
-        let addr = self.target_addr.ok_or_else(|| {
-            RPCError::Network(NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Target address not found",
-            )))
-        })?;
+        let addr = self.target_addr.ok_or_else(no_target_addr)?;
 
         self.rpc_client
             .vote(&mut self.conn, addr, req)
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+            .map_err(|e| unreachable(&e))
     }
 }
 
@@ -2272,6 +2303,108 @@ mod tests {
     use super::*;
     use crate::governor::state_machine::ClusterCommand;
 
+    /// A `NetworkConnection` aimed at a port nothing is listening on.
+    async fn connection_to_a_closed_port() -> NetworkConnection {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        NetworkConnection {
+            target_addr: Some(addr),
+            rpc_client: RaftRpcClient::new(),
+            conn: None,
+            heartbeat: Duration::from_millis(250),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_peer_is_reported_unreachable_so_openraft_backs_off() {
+        // NetworkError would have openraft retry at once, and a refused
+        // connect refuses again instantly: thousands of attempts a second
+        // against a peer that is simply down.
+        let mut conn = connection_to_a_closed_port().await;
+        let appended = conn
+            .append_entries(
+                AppendEntriesRequest {
+                    vote: openraft::Vote::new(1, 1),
+                    prev_log_id: None,
+                    entries: vec![],
+                    leader_commit: None,
+                },
+                openraft::network::RPCOption::new(Duration::from_secs(1)),
+            )
+            .await;
+        let Err(err) = appended else {
+            panic!("nothing is listening on that port");
+        };
+        assert!(
+            matches!(err, RPCError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+
+        let mut conn = connection_to_a_closed_port().await;
+        let voted = conn
+            .vote(
+                VoteRequest {
+                    vote: openraft::Vote::new(1, 1),
+                    last_log_id: None,
+                },
+                openraft::network::RPCOption::new(Duration::from_secs(1)),
+            )
+            .await;
+        let Err(err) = voted else {
+            panic!("nothing is listening on that port");
+        };
+        assert!(
+            matches!(err, RPCError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_with_no_address_is_unreachable_rather_than_retried_at_once() {
+        let mut conn = NetworkConnection {
+            target_addr: None,
+            rpc_client: RaftRpcClient::new(),
+            conn: None,
+            heartbeat: Duration::from_millis(250),
+        };
+        let voted = conn
+            .vote(
+                VoteRequest {
+                    vote: openraft::Vote::new(1, 1),
+                    last_log_id: None,
+                },
+                openraft::network::RPCOption::new(Duration::from_secs(1)),
+            )
+            .await;
+        let Err(err) = voted else {
+            panic!("no address to dial");
+        };
+        assert!(
+            matches!(err, RPCError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_backoff_runs_from_one_heartbeat_to_four_forever() {
+        // Read through `backoff()` — openraft only consults that, so an
+        // unused iterator would leave the default 500 ms constant in force.
+        let conn = connection_to_a_closed_port().await;
+        let waits: Vec<Duration> = conn.backoff().take(6).collect();
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ]
+        );
+    }
+
     #[test]
     fn voter_set_matches_is_allocation_free_and_correct() {
         let current: std::collections::HashSet<NodeId> = (1..=5).collect();
@@ -2418,9 +2551,9 @@ mod tests {
 
         // Concrete values at the default election timeout: the staggered
         // 5 s / 13 s / 21 s schedule the watchdog is tuned for.
-        assert_eq!(t0, std::time::Duration::from_secs(5));
-        assert_eq!(t1, std::time::Duration::from_secs(13));
-        assert_eq!(t2, std::time::Duration::from_secs(21));
+        assert_eq!(t0, Duration::from_secs(5));
+        assert_eq!(t1, Duration::from_secs(13));
+        assert_eq!(t2, Duration::from_secs(21));
     }
 
     #[test]
@@ -2430,12 +2563,12 @@ mod tests {
         // force an election within a stagger of each other, however many rounds
         // the cluster stays leaderless.
         let et = 1_000u64;
-        let stagger = std::time::Duration::from_millis(
+        let stagger = Duration::from_millis(
             u64::from(crate::config::constants::LEADERLESS_RECOVERY_STAGGER_TIMEOUTS) * et,
         );
         for voters in 1..=7u32 {
             let cooldown = Governor::leaderless_cooldown(voters, et);
-            let mut fires: Vec<(u32, std::time::Duration)> = Vec::new();
+            let mut fires: Vec<(u32, Duration)> = Vec::new();
             for rank in 0..voters {
                 for round in 0..4u32 {
                     fires.push((
@@ -2637,13 +2770,13 @@ mod tests {
 
         // Term 5: this node campaigns and loses. Still leaderless, so the
         // anchor follows the term.
-        let campaign_at = lost_at + std::time::Duration::from_millis(50);
+        let campaign_at = lost_at + Duration::from_millis(50);
         assert!(Governor::should_anchor_term_advance(4, 5, None, false));
 
         // A full lease passes with no leader, then the retry wins. An anchor
         // left at the first observation is spent by now — this assertion is
         // the defect, stated as the arithmetic that produces it.
-        let retry_at = campaign_at + lease + std::time::Duration::from_millis(10);
+        let retry_at = campaign_at + lease + Duration::from_millis(10);
         assert_eq!(
             crate::app::promotion_lease_holddown(Some(lost_at), retry_at, lease),
             None,
@@ -2663,12 +2796,12 @@ mod tests {
         // The gate now measures the winning candidacy and holds through it.
         assert_eq!(
             crate::app::promotion_lease_holddown(Some(retry_at), retry_at, lease),
-            Some(std::time::Duration::ZERO)
+            Some(Duration::ZERO)
         );
         assert!(
             crate::app::promotion_lease_holddown(
                 Some(retry_at),
-                retry_at + lease.saturating_sub(std::time::Duration::from_millis(1)),
+                retry_at + lease.saturating_sub(Duration::from_millis(1)),
                 lease
             )
             .is_some(),
@@ -2999,7 +3132,7 @@ mod tests {
     ///
     /// Proving a negative needs a bound, and this is a test, not a state gate:
     /// the assertion is "made no progress", which has no edge to wait on.
-    const LOCK_BLOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+    const LOCK_BLOCK_GRACE: Duration = Duration::from_millis(200);
 
     /// `install_snapshot` must hold `snapshot_consistency` across BOTH the redb
     /// write and the in-memory state swap.
@@ -3132,7 +3265,7 @@ mod tests {
         let gap = Governor::leaderless_threshold(1, et)
             .saturating_sub(Governor::leaderless_threshold(0, et));
         assert!(
-            gap > std::time::Duration::from_millis(2 * et),
+            gap > Duration::from_millis(2 * et),
             "per-rank stagger ({gap:?}) must exceed 2x election timeout"
         );
     }
