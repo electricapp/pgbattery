@@ -84,6 +84,15 @@ pub enum Error {
     #[error("PostgreSQL not ready: {0}")]
     PostgresNotReady(String),
 
+    /// The postmaster exited on its own during a start: it will not open this
+    /// data directory, and will refuse it the same way at every attempt.
+    ///
+    /// Distinct from [`Error::PostgresNotReady`], which is a start that had
+    /// not finished — a slow recovery, or a postmaster killed from outside.
+    /// Only this one is a reason to rebuild the directory rather than retry.
+    #[error("PostgreSQL refused to open the data directory: {0}")]
+    PostgresRefusedToOpen(String),
+
     #[error("Storage error: {0}")]
     Storage(String),
 

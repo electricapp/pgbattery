@@ -916,7 +916,17 @@ def reset_cluster() -> None:
     means removing the node from membership and re-joining it as a learner.
     Recreating the cluster is that, done bluntly.
     """
-    fp.run("docker compose down -v", timeout_s=180.0)
+    # Checked, because a teardown that half-succeeded is the worst input this
+    # can have: a node whose volume survived comes back holding a complete data
+    # directory from a cluster the others no longer are, `join` refuses to
+    # discard data of unproven lineage, and the node restarts into that refusal
+    # for as long as the run lasts. The symptom is a voter set that never
+    # fills, which says nothing about the teardown that caused it.
+    removed = fp.run("docker compose down -v", timeout_s=180.0)
+    if not removed.ok:
+        raise fp.FaultPreconditionError(
+            f"could not tear the cluster down before rebuilding it: {removed.output}"
+        )
     started = fp.run("docker compose up -d node1 node2 node3", timeout_s=300.0)
     if not started.ok:
         raise fp.FaultPreconditionError(f"could not restart the cluster: {started.output}")

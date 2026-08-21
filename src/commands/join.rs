@@ -1,6 +1,7 @@
 //! Join command implementation.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -209,7 +210,7 @@ pub async fn run_join(
     if let Some(output_path) = write_config {
         let client = http_client(30)?;
         ceprintln!("Fetching cluster information from {peer}...");
-        let join_info = fetch_join_info(&client, &peer).await?;
+        let join_info = fetch_join_info(&client, &peer, JOIN_PEER_WAIT).await?;
         let actual_node_id = node_id.unwrap_or(join_info.next_node_id);
         return write_join_config(&output_path, actual_node_id, &join_info);
     }
@@ -274,7 +275,7 @@ pub async fn run_join(
     );
     let client = http_client(30)?;
     info!(peer = %peer, "Fetching cluster information");
-    let join_info = fetch_join_info(&client, &peer).await?;
+    let join_info = fetch_join_info(&client, &peer, JOIN_PEER_WAIT).await?;
 
     // A node re-provisioning its data directory keeps the identity its Raft
     // state already carries; a freshly assigned one would enrol it twice and
@@ -334,16 +335,57 @@ pub async fn run_join(
     app.run_join_flow(peer, voter).await
 }
 
-async fn fetch_join_info(client: &reqwest::Client, peer: &str) -> Result<JoinInfoResponse> {
+/// How long a join waits for the peer's management API to start listening.
+///
+/// A cold cluster starts every node at once, and the bootstrap node has to run
+/// `initdb` and open its API before it can answer anyone. A peer that is not
+/// listening yet is the normal state during that window, not a wrong address.
+const JOIN_PEER_WAIT: Duration = Duration::from_secs(90);
+
+/// Gap between attempts inside that window.
+const JOIN_PEER_RETRY: Duration = Duration::from_secs(1);
+
+async fn fetch_join_info(
+    client: &reqwest::Client,
+    peer: &str,
+    wait: Duration,
+) -> Result<JoinInfoResponse> {
     let url = format!("http://{peer}/api/v1/cluster/join-info");
-    client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("{}\nError: {}", hints::connection_failed(peer), e))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to parse join info: {e}"))
+    let deadline = Instant::now() + wait;
+    loop {
+        let sent = client.get(&url).send().await;
+        let error = match sent {
+            Ok(response) => {
+                return response
+                    .json()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to parse join info: {e}"));
+            }
+            Err(e) => e,
+        };
+        // Only a peer we could not reach is worth waiting on. Anything else —
+        // a wrong address that resolves, a proxy answering for something else
+        // — is a mistake the operator wants told now, not in ninety seconds.
+        if !peer_not_listening_yet(&error) || Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "{}\nError: {}",
+                hints::connection_failed(peer),
+                error
+            ));
+        }
+        info!(peer, "Peer is not answering yet; waiting for it to come up");
+        tokio::time::sleep(JOIN_PEER_RETRY).await;
+    }
+}
+
+/// Whether a failed join-info request means the peer has not started serving.
+///
+/// Exiting on the first refusal makes the container's restart policy the retry
+/// loop, and that costs a whole re-initialisation each time — on the `LazyFS`
+/// compose, two filesystem mounts and a gigabyte of pre-allocation before the
+/// process gets back to asking.
+fn peer_not_listening_yet(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
 }
 
 /// Write a configuration file for joining a cluster.
@@ -413,6 +455,7 @@ fn write_join_config(output_path: &str, node_id: u64, join_info: &JoinInfoRespon
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::panic,
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
@@ -479,6 +522,46 @@ mod tests {
         // Conflicting explicit or config identity is a hard error.
         assert!(resolve_resume_node_id(dir.path(), Some(1), 0).is_err());
         assert!(resolve_resume_node_id(dir.path(), None, 1).is_err());
+    }
+
+    /// A port nothing is listening on, so the join has a peer it cannot reach.
+    async fn a_closed_port() -> String {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_is_not_listening_yet_is_waited_for() {
+        // A cold cluster starts every node at once and the bootstrap node has
+        // to run initdb before it can answer. Exiting on the first refusal
+        // makes the container's restart policy the retry loop, at the cost of
+        // a full re-initialisation each time round.
+        let client = reqwest::Client::builder().build().unwrap();
+        let peer = a_closed_port().await;
+        let started = Instant::now();
+        let result = fetch_join_info(&client, &peer, Duration::from_secs(2)).await;
+        let waited = started.elapsed();
+
+        assert!(result.is_err(), "nothing is listening on that port");
+        assert!(
+            waited >= Duration::from_secs(1),
+            "gave up without waiting for the peer: {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_comes_up_still_fails_with_the_hint() {
+        let client = reqwest::Client::builder().build().unwrap();
+        let peer = a_closed_port().await;
+        let Err(error) = fetch_join_info(&client, &peer, Duration::ZERO).await else {
+            panic!("nothing is listening on that port");
+        };
+        assert!(
+            error.to_string().contains(&peer),
+            "the operator is not told which peer: {error}"
+        );
     }
 
     #[test]

@@ -1139,6 +1139,13 @@ impl Supervisor {
 
         // Wait for PostgreSQL to be ready
         if let Err(e) = self.wait_for_ready(30).await {
+            // A postmaster that exited under us refused this directory and
+            // will refuse it again; one still running was merely slow, or was
+            // killed from outside. Read that before `stop()` clears the
+            // handle, and fail toward "not refused" if the poll itself cannot
+            // answer — nothing should be rebuilt on an unreadable signal.
+            let refused = self.postmaster_state().unwrap_or(PostmasterState::Running)
+                == PostmasterState::Exited;
             // Shut down gracefully: a fast shutdown preserves replay
             // progress (restartpoints / minRecoveryPoint), while SIGKILL
             // forces the next start to redo recovery from the previous
@@ -1159,7 +1166,11 @@ impl Supervisor {
                     );
                 }
             }
-            return Err(e);
+            return Err(if refused {
+                Error::PostgresRefusedToOpen(e.to_string())
+            } else {
+                e
+            });
         }
 
         tracing::info!(
@@ -2506,7 +2517,10 @@ host all all ::/0 {auth_method}
 
         self.configure_standby(new_leader_addr).await?;
         if let Err(e) = self.start().await {
-            if needs_rewind {
+            // A rewound directory that will not start has nothing left to try
+            // here, and a start that merely did not finish is not a refusal —
+            // both go back to the reconcile loop rather than escalating.
+            if needs_rewind || !matches!(e, Error::PostgresRefusedToOpen(_)) {
                 return Err(e);
             }
             // The re-point was chosen because this node looked able to adopt
@@ -2548,8 +2562,16 @@ host all all ::/0 {auth_method}
     /// arrives here.
     async fn restart_or_repair_standby(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
         self.configure_standby(new_leader_addr).await?;
-        if self.start().await.is_ok() {
-            return Ok(());
+        match self.start().await {
+            Ok(()) => return Ok(()),
+            // A start that did not finish is not a directory that will not
+            // open: a postmaster killed from outside, or a recovery slower
+            // than the readiness budget, both come back on a later tick.
+            // Rebuilding on those clones a healthy node — and holds the
+            // supervisor lock across the clone, which reads as a dead node to
+            // everything that needs it.
+            Err(e) if !matches!(e, Error::PostgresRefusedToOpen(_)) => return Err(e),
+            Err(_) => {}
         }
         // Straight to a clone, not through `pg_rewind`: the divergence gate
         // needs a local WAL position, that comes from a running server, and
@@ -5364,6 +5386,29 @@ mod tests {
         // An unreadable sync marker or count is a failed probe, not a default.
         assert!(parse_role_readonly("false,off,maybe,0").is_err());
         assert!(parse_role_readonly("false,off,set,many").is_err());
+    }
+
+    /// The distinction `restart_or_repair_standby` and the re-point escalation
+    /// both branch on. Stated as a test because getting it backwards rebuilds
+    /// a healthy node — and holds the supervisor lock across the clone, so the
+    /// node reads as dead to everything that needs it.
+    #[test]
+    fn only_a_refused_start_is_grounds_for_rebuilding_the_directory() {
+        assert!(matches!(
+            Error::PostgresRefusedToOpen("FATAL: could not open pg_control".to_string()),
+            Error::PostgresRefusedToOpen(_)
+        ));
+        // A start killed from outside, and one whose recovery outran the
+        // readiness budget, both come back on a later tick.
+        for did_not_finish in [
+            Error::PostgresNotReady("30s (pg_isready exit code 2)".to_string()),
+            Error::Postgres("Failed to start postgres: broken pipe".to_string()),
+        ] {
+            assert!(
+                !matches!(did_not_finish, Error::PostgresRefusedToOpen(_)),
+                "{did_not_finish} would rebuild a directory nothing is wrong with"
+            );
+        }
     }
 
     #[test]

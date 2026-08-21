@@ -591,5 +591,39 @@ class PageTearDisarmTest(SeamTest):
         self.assertIn("commit header at offset 0", str(caught.exception))
 
 
+class RestartClusterTests(unittest.TestCase):
+    """The rebuild between the inversion and the real run."""
+
+    def install(self, runner: hf.ScriptedRunner) -> hf.ScriptedRunner:
+        previous = fp.set_command_runner(runner)
+        self.addCleanup(fp.set_command_runner, previous)
+        return runner
+
+    def test_a_teardown_that_did_not_remove_the_volumes_is_not_built_on(self) -> None:
+        """A node whose volume survived comes back holding a data directory
+        from a cluster the others no longer are; `join` refuses to discard data
+        of unproven lineage and the node restarts into that refusal for the
+        rest of the run. The symptom is a voter set that never fills, which
+        says nothing about the teardown that caused it."""
+        runner = self.install(
+            hf.ScriptedRunner(
+                [
+                    (
+                        "docker compose down -v",
+                        hf.fail("Error response from daemon: volume is in use"),
+                    )
+                ]
+            )
+        )
+        with self.assertRaises(fp.FaultPreconditionError) as caught:
+            tr.reset_cluster()
+        self.assertIn("tear the cluster down", str(caught.exception))
+        self.assertEqual(
+            runner.matching("docker compose up -d"),
+            [],
+            "brought a cluster up on volumes it failed to remove",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
