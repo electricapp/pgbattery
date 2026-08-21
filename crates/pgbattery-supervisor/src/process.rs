@@ -54,6 +54,30 @@ const PG_REWIND_BUDGET: Duration = Duration::from_mins(5);
 /// once we exit.
 const PG_REWIND_REAP_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long a libpq client we spawn waits on a peer's `PostgreSQL` — to
+/// connect, and to have data acknowledged once it has.
+///
+/// libpq bounds neither by default, so a peer severed mid-copy leaves
+/// `pg_rewind` blocked on the OS TCP timeout with `PostgreSQL` stopped and the
+/// supervisor mutex held: the node stays down, and its promotion and lease
+/// ticks stay queued behind the mutex, long after the cluster elected someone
+/// else. `tcp_user_timeout` bounds a connection that dies with data in flight,
+/// the keepalives one that dies while idle.
+const PEER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A libpq conninfo for `addr` that fails rather than hangs once the peer
+/// stops answering. See [`PEER_LIVENESS_TIMEOUT`].
+fn bounded_peer_conninfo(addr: SocketAddr, user: &str) -> String {
+    let secs = PEER_LIVENESS_TIMEOUT.as_secs();
+    format!(
+        "host={} port={} user={user} connect_timeout={secs} tcp_user_timeout={} \
+         keepalives=1 keepalives_idle={secs} keepalives_interval={secs} keepalives_count=1",
+        addr.ip(),
+        addr.port(),
+        PEER_LIVENESS_TIMEOUT.as_millis(),
+    )
+}
+
 /// Upper bound on a single newline-terminated line read from the persistent
 /// psql session. A wedged or garbage backend streaming an unterminated line
 /// would otherwise grow `line_buf` without limit; cap it so the session errors
@@ -641,6 +665,10 @@ fn classify_pg_rewind_failure(stderr: &str) -> PreCopyOutcome {
         "password authentication failed",
         "no pg_hba.conf entry",
         "target server must be shut down cleanly",
+        // `pg_rewind` reads the source's whole file list before it writes
+        // the first byte to the target, so a source that goes away during
+        // that fetch leaves the directory intact.
+        "could not fetch file list",
     ];
     let lower = stderr.to_ascii_lowercase();
     if lower.contains(REWIND_SAME_TIMELINE_MARKER) || lower.contains(REWIND_FOREIGN_LINEAGE_MARKER)
@@ -687,6 +715,45 @@ fn rewind_failure_left_target_untouched(error: &Error) -> bool {
         return true;
     }
     pg_rewind_failure_is_pre_copy(&msg)
+}
+
+/// What a rewind attempt left behind for the caller to finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewindOutcome {
+    /// The directory is rewound; the caller configures and starts it.
+    Rewound,
+    /// The directory was replaced from the leader and is already configured,
+    /// started, and following.
+    Reprovisioned,
+}
+
+/// How a node recovers the data directory a `pg_rewind` failure left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewindRecovery {
+    /// The directory is intact and still the standby state it was before —
+    /// start it and let the reconcile loop retry.
+    RestartInPlace,
+    /// The directory can no longer follow this leader in place: either it is
+    /// from another lineage, or a copy died partway and left a mix of old and
+    /// new blocks. Only a fresh clone recovers it.
+    Reprovision,
+}
+
+/// Decide [`RewindRecovery`] for a failed `run_pg_rewind`.
+///
+/// A compromised directory has to be rebuilt here rather than left stopped
+/// for an operator: `PostgreSQL` dies on the half-rewound state at every
+/// start, so "stopped pending a rebuild" is a permanent restart loop for a
+/// node the cluster is otherwise ready to take back.
+fn rewind_recovery(error: &Error) -> RewindRecovery {
+    // A foreign lineage leaves the directory untouched but unusable — no
+    // retry can give two lineages a common ancestor.
+    if matches!(error, Error::ForeignDataDirectory { .. })
+        || !rewind_failure_left_target_untouched(error)
+    {
+        return RewindRecovery::Reprovision;
+    }
+    RewindRecovery::RestartInPlace
 }
 
 /// Remove everything inside `dir`, leaving the directory itself.
@@ -2227,13 +2294,140 @@ host all all ::/0 {auth_method}
         }
     }
 
+    /// Demote's in-recovery half: a standby that is already following
+    /// someone, pointed at `new_leader_addr`.
+    ///
+    /// Decision tree, ordered cheapest-first to keep the hot path
+    /// (steady-state follower) at one local SQL round-trip:
+    ///
+    ///   1. `standby_config_would_change` — local file read.
+    ///   2. `streaming_active`            — local SQL: is our
+    ///      `pg_stat_wal_receiver` row in 'streaming' state?
+    ///   3. `check_timeline_state`        — remote psql to leader,
+    ///      <=1.5s wall-clock, `Unknown` on unreachable.
+    ///
+    /// Truth table:
+    ///
+    ///   `config_changed=true`                      → restart with new conninfo
+    ///   `config_changed=false`, streaming OK       → no-op (steady state)
+    ///   `config_changed=false`, streaming broken   → probe leader timeline:
+    ///       `timeline=Mismatch` → `pg_rewind`
+    ///       `timeline=Match`    → no-op (transient disconnect; PG retries)
+    ///       `timeline=Unknown`  → defer (leader unreachable)
+    ///
+    /// The Unknown branch keeps the supervisor task responsive after a leader
+    /// dies; the streaming check keeps the cascade path fast by skipping the
+    /// remote probe when streaming is healthy (timelines must match in that
+    /// case by definition).
+    async fn repoint_standby(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
+        let needs_rewind = match self.decide_standby_action(new_leader_addr).await? {
+            StandbyAction::NoOp | StandbyAction::Defer => return Ok(()),
+            StandbyAction::RestartOnly => false,
+            StandbyAction::Rewind => true,
+        };
+
+        // The divergence gate's local-LSN input must be read while PG is
+        // still up — stop() comes next. Captured on both paths because the
+        // re-point can still escalate to a rewind below, and the gate fails
+        // closed without it.
+        let pre_stop_lsn = self.capture_lsn_for_rewind_gate().await;
+
+        self.stop().await?;
+
+        if needs_rewind {
+            tracing::warn!(
+                new_leader = %new_leader_addr,
+                "Timeline mismatch detected while already in recovery - running pg_rewind"
+            );
+            if self
+                .rewind_onto_leader(new_leader_addr, pre_stop_lsn)
+                .await?
+                == RewindOutcome::Reprovisioned
+            {
+                return Ok(());
+            }
+        }
+
+        tracing::info!(
+            new_leader = %new_leader_addr,
+            "Switching standby to new primary (requires restart)"
+        );
+
+        self.configure_standby(new_leader_addr).await?;
+        if let Err(e) = self.start().await {
+            if needs_rewind {
+                return Err(e);
+            }
+            // The re-point was chosen because this node looked able to adopt
+            // the leader's timeline by streaming. It could not: `PostgreSQL`
+            // refuses to open at all when the leader's timeline is not a child
+            // of its history, and no later restart changes that, so nothing
+            // retries this node back into the cluster. Take the rewind that
+            // was declined.
+            metrics::counter!("pgbattery_standby_repoint_escalated_to_rewind").increment(1);
+            tracing::warn!(
+                error = %e,
+                new_leader = %new_leader_addr,
+                "Standby did not open after re-pointing - rewinding onto the leader"
+            );
+            if self
+                .rewind_onto_leader(new_leader_addr, pre_stop_lsn)
+                .await?
+                == RewindOutcome::Rewound
+            {
+                self.configure_standby(new_leader_addr).await?;
+                self.start().await?;
+            }
+        }
+        // Sweep slots this node may still own from a prior leadership term.
+        if let Err(e) = self.drop_inactive_replica_slots().await {
+            tracing::warn!(error = %e, "Could not enumerate slots to sweep after demote");
+        }
+        Ok(())
+    }
+
+    /// `pg_rewind` this stopped standby onto `new_leader_addr`, resolving a
+    /// failure per [`rewind_recovery`].
+    async fn rewind_onto_leader(
+        &mut self,
+        new_leader_addr: SocketAddr,
+        pre_stop_lsn: Option<u64>,
+    ) -> Result<RewindOutcome> {
+        if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
+            tracing::error!(error = %e, "pg_rewind failed while following new leader");
+            match rewind_recovery(&e) {
+                RewindRecovery::RestartInPlace => {
+                    // The failure preceded any modification, so the standby
+                    // state on disk is intact — bring PG back up and let the
+                    // reconcile loop retry.
+                    self.ensure_standby_signal().await?;
+                    self.configure_standby(new_leader_addr).await?;
+                    self.start().await.ok();
+                    return Err(e);
+                }
+                RewindRecovery::Reprovision => {
+                    metrics::counter!("pgbattery_pg_rewind_target_compromised").increment(1);
+                    tracing::error!(
+                        "pg_rewind left a data directory that cannot follow this leader; rebuilding from it"
+                    );
+                    self.reprovision_from(new_leader_addr).await?;
+                    return Ok(RewindOutcome::Reprovisioned);
+                }
+            }
+        }
+        // pg_rewind syncs from a source primary which has no standby.signal.
+        self.ensure_standby_signal().await?;
+        Ok(RewindOutcome::Rewound)
+    }
+
     /// Demote this node to standby of `new_leader_addr` (idempotent).
     ///
     /// Three cases:
     /// - Already a standby of the right leader on a matching timeline →
     ///   no-op (no file write, no PG restart).
     /// - Already a standby but config is stale or timeline diverged →
-    ///   stop, optionally `pg_rewind`, rewrite config, start.
+    ///   stop, optionally `pg_rewind`, rewrite config, start; a start that
+    ///   fails on a re-point escalates to the rewind it declined.
     /// - Currently a primary → full demote with `pg_rewind`.
     ///
     /// # Errors
@@ -2246,92 +2440,7 @@ host all all ::/0 {auth_method}
             ))
         })?;
         if in_recovery {
-            // Decision tree, ordered cheapest-first to keep the hot path
-            // (steady-state follower) at one local SQL round-trip:
-            //
-            //   1. `standby_config_would_change` — local file read.
-            //   2. `streaming_active`            — local SQL: is our
-            //      `pg_stat_wal_receiver` row in 'streaming' state?
-            //   3. `check_timeline_state`        — remote psql to leader,
-            //      ≤1.5s wall-clock, `Unknown` on unreachable.
-            //
-            // Truth table:
-            //
-            //   config_changed=true                      → restart with new conninfo
-            //   config_changed=false, streaming OK       → no-op (steady state)
-            //   config_changed=false, streaming broken   → probe leader timeline:
-            //       timeline=Mismatch → pg_rewind
-            //       timeline=Match    → no-op (transient disconnect; PG retries)
-            //       timeline=Unknown  → defer (leader unreachable)
-            //
-            // The Unknown branch keeps the supervisor task responsive
-            // after a leader dies; the streaming check keeps the cascade
-            // path fast by skipping the remote probe when streaming is
-            // healthy (timelines must match in that case by definition).
-            let needs_rewind = match self.decide_standby_action(new_leader_addr).await? {
-                StandbyAction::NoOp | StandbyAction::Defer => return Ok(()),
-                StandbyAction::RestartOnly => false,
-                StandbyAction::Rewind => true,
-            };
-
-            // The divergence gate's local-LSN input must be read while PG
-            // is still up — stop() comes next.
-            let pre_stop_lsn = if needs_rewind {
-                self.capture_lsn_for_rewind_gate().await
-            } else {
-                None
-            };
-
-            self.stop().await?;
-
-            if needs_rewind {
-                tracing::warn!(
-                    new_leader = %new_leader_addr,
-                    "Timeline mismatch detected while already in recovery - running pg_rewind"
-                );
-                if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
-                    tracing::error!(error = %e, "pg_rewind failed while following new leader");
-                    if matches!(e, Error::ForeignDataDirectory { .. }) {
-                        // No retry can relate two lineages, so retrying is a
-                        // restart loop rather than recovery. Replace the
-                        // directory instead — see `reprovision_from`.
-                        return self.reprovision_from(new_leader_addr).await;
-                    }
-                    if rewind_failure_left_target_untouched(&e) {
-                        // The failure preceded any modification, so the
-                        // standby state on disk is intact — bring PG back
-                        // up and let the reconcile loop retry.
-                        self.ensure_standby_signal().await?;
-                        self.configure_standby(new_leader_addr).await?;
-                        self.start().await.ok();
-                    } else {
-                        // pg_rewind may have died mid-copy, leaving a mix
-                        // of old and new blocks. Starting PG on that risks
-                        // corruption — stay stopped (out of the cluster)
-                        // pending a rebuild.
-                        metrics::counter!("pgbattery_pg_rewind_target_compromised").increment(1);
-                        tracing::error!(
-                            "pg_rewind may have modified the data directory before failing; leaving PostgreSQL stopped pending rebuild"
-                        );
-                    }
-                    return Err(e);
-                }
-                // pg_rewind syncs from a source primary which has no standby.signal.
-                self.ensure_standby_signal().await?;
-            }
-
-            tracing::info!(
-                new_leader = %new_leader_addr,
-                "Switching standby to new primary (requires restart)"
-            );
-
-            self.configure_standby(new_leader_addr).await?;
-            self.start().await?;
-            // Sweep slots this node may still own from a prior leadership term.
-            if let Err(e) = self.drop_inactive_replica_slots().await {
-                tracing::warn!(error = %e, "Could not enumerate slots to sweep after demote");
-            }
-            return Ok(());
+            return self.repoint_standby(new_leader_addr).await;
         }
 
         tracing::info!(
@@ -2362,13 +2471,16 @@ host all all ::/0 {auth_method}
         //    This is necessary because the former primary may have WAL on a different timeline
         tracing::info!("Running pg_rewind to sync timelines");
         if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
-            // A directory from another cluster has no common ancestor to
-            // rewind to, on this path as on the in-recovery one: replace it
-            // rather than retry forever. See `reprovision_from`.
-            if matches!(e, Error::ForeignDataDirectory { .. }) {
-                return self.reprovision_from(new_leader_addr).await;
+            // Same recovery as the in-recovery path: a directory this leader
+            // cannot be followed from in place is rebuilt from it, never left
+            // stopped for someone to notice. See `rewind_recovery`.
+            match rewind_recovery(&e) {
+                RewindRecovery::RestartInPlace => return Err(e),
+                RewindRecovery::Reprovision => {
+                    metrics::counter!("pgbattery_pg_rewind_target_compromised").increment(1);
+                    return self.reprovision_from(new_leader_addr).await;
+                }
             }
-            return Err(e);
         }
 
         // 3. Create standby.signal (pg_rewind does not manage this — see ensure_standby_signal)
@@ -2725,12 +2837,8 @@ host all all ::/0 {auth_method}
         let slot = ReplicationSlot::for_node(self.config.node_id).to_string();
         let status = Command::new(self.config.pg_bin_dir.join("pg_basebackup"))
             .arg("-w")
-            .arg("-h")
-            .arg(source_addr.ip().to_string())
-            .arg("-p")
-            .arg(source_addr.port().to_string())
-            .arg("-U")
-            .arg(&self.config.pg_user)
+            .arg("-d")
+            .arg(bounded_peer_conninfo(source_addr, &self.config.pg_user))
             .arg("-D")
             .arg(&self.config.pg_data_dir)
             .arg("-Fp")
@@ -2830,12 +2938,7 @@ host all all ::/0 {auth_method}
 
         let inner = async {
             let pg_rewind = self.config.pg_bin_dir.join("pg_rewind");
-            let source_connstr = format!(
-                "host={} port={} user={}",
-                source_addr.ip(),
-                source_addr.port(),
-                self.config.pg_user
-            );
+            let source_connstr = bounded_peer_conninfo(source_addr, &self.config.pg_user);
 
             // Pre-flight: wait for the target to be a usable rewind source — PG
             // accepting connections AND not in recovery (i.e. promoted).  Without
@@ -5068,6 +5171,63 @@ mod tests {
         // An unreadable sync marker or count is a failed probe, not a default.
         assert!(parse_role_readonly("false,off,maybe,0").is_err());
         assert!(parse_role_readonly("false,off,set,many").is_err());
+    }
+
+    #[test]
+    fn losing_the_source_while_reading_its_file_list_leaves_the_target_intact() {
+        // pg_rewind's own phase order: it fetches the whole source file list
+        // before writing the first byte to the target.
+        let stderr = "pg_rewind: connected to server\n\
+             pg_rewind: servers diverged at WAL location 0/418F420 on timeline 3\n\
+             pg_rewind: rewinding from last common checkpoint at 0/4171C28 on timeline 3\n\
+             pg_rewind: reading source file list\n\
+             pg_rewind: error: could not fetch file list: could not receive data from server: \
+             Connection timed out\n";
+        assert_eq!(
+            classify_pg_rewind_failure(stderr),
+            PreCopyOutcome::Retryable
+        );
+        assert!(pg_rewind_failure_is_pre_copy(stderr));
+    }
+
+    #[test]
+    fn a_directory_this_leader_cannot_be_followed_from_is_rebuilt_not_abandoned() {
+        // PostgreSQL dies on a half-rewound directory at every start, so
+        // leaving it stopped is a permanent restart loop, not a hold.
+        let mid_copy = Error::Postgres(
+            "pg_rewind failed: pg_rewind: error: could not read file \"base/1/2601\"".to_string(),
+        );
+        assert_eq!(rewind_recovery(&mid_copy), RewindRecovery::Reprovision);
+
+        let foreign = Error::ForeignDataDirectory {
+            rewind_source: "172.28.0.11:5434".to_string(),
+            detail: "are from different systems".to_string(),
+        };
+        assert_eq!(rewind_recovery(&foreign), RewindRecovery::Reprovision);
+
+        let source_went_away = Error::Postgres(
+            "pg_rewind failed: pg_rewind: error: could not fetch file list: \
+             could not receive data from server"
+                .to_string(),
+        );
+        assert_eq!(
+            rewind_recovery(&source_went_away),
+            RewindRecovery::RestartInPlace
+        );
+    }
+
+    #[test]
+    fn a_peer_conninfo_bounds_the_connect_and_a_connection_that_goes_quiet() {
+        let conninfo = bounded_peer_conninfo("172.28.0.11:5434".parse().unwrap(), "postgres");
+        assert!(conninfo.contains("host=172.28.0.11"), "{conninfo}");
+        assert!(conninfo.contains("port=5434"), "{conninfo}");
+        assert!(conninfo.contains("user=postgres"), "{conninfo}");
+        // libpq waits forever on both by default, and pg_rewind inherits that
+        // with PostgreSQL stopped and the supervisor mutex held.
+        assert!(conninfo.contains("connect_timeout=10"), "{conninfo}");
+        assert!(conninfo.contains("tcp_user_timeout=10000"), "{conninfo}");
+        assert!(conninfo.contains("keepalives=1"), "{conninfo}");
+        assert!(conninfo.contains("keepalives_idle=10"), "{conninfo}");
     }
 
     #[test]
