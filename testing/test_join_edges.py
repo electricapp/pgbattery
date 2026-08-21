@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import api_models
 import fault_primitives as fp
@@ -116,8 +117,40 @@ class ResultTests(unittest.TestCase):
         final else and drive the wrong edge."""
         self.assertEqual(
             {c.value for c in je.Case},
-            {"deposed-mid-copy", "orphan-slot", "learner-crash", "bootstrap-wiped"},
+            {
+                "deposed-mid-copy",
+                "clone-interrupted",
+                "orphan-slot",
+                "learner-crash",
+                "bootstrap-wiped",
+            },
         )
+
+
+class CloneInterruptedTests(unittest.TestCase):
+    """The verdict turns on reading a clone failure out of one node's log. A
+    node that failed a clone in an earlier case would otherwise satisfy this one
+    without the fault having landed at all, so the read is scoped to the
+    incarnation the case started."""
+
+    def test_the_basebackup_message_is_evidence_the_clone_failed(self) -> None:
+        log = 'pg_basebackup: error: could not send replication command "START_REPLICATION"'
+        with mock.patch.object(je, "_sh", return_value=(0, log)) as shell:
+            self.assertTrue(je.clone_failed_since("node3", "2026-08-21T18:00:00Z"))
+        self.assertIn("--since 2026-08-21T18:00:00Z", shell.call_args.args[0])
+
+    def test_pgbatterys_own_retry_line_is_evidence(self) -> None:
+        log = "WARN pgbattery::app: Clone from the leader failed; discarding what it left"
+        with mock.patch.object(je, "_sh", return_value=(0, log)):
+            self.assertTrue(je.clone_failed_since("node3", "2026-08-21T18:00:00Z"))
+
+    def test_a_clean_log_is_not_evidence(self) -> None:
+        with mock.patch.object(je, "_sh", return_value=(0, "pg_basebackup: completed")):
+            self.assertFalse(je.clone_failed_since("node3", "2026-08-21T18:00:00Z"))
+
+    def test_an_unreadable_log_is_not_evidence(self) -> None:
+        with mock.patch.object(je, "_sh", return_value=(1, "no such service")):
+            self.assertFalse(je.clone_failed_since("node3", "2026-08-21T18:00:00Z"))
 
 
 if __name__ == "__main__":

@@ -285,6 +285,51 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans || true
 
+  # H-16's cases had self-tests in CI and no runner: `join_edges.py` was driven
+  # by hand and nothing else, so a regression in a join edge could only be found
+  # by someone going looking for it.
+  join-edges:
+    name: Join and rejoin edges (H-16)
+    needs: lint-test-harness
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_joinedges_${{ github.run_id }}_${{ github.run_attempt }}
+      PGBATTERY_MANAGEMENT_API_TOKEN: ci-joinedges-token
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Start the cluster
+        run: docker compose up -d --build node1 node2 node3
+
+      - name: Drive the join and rejoin edges
+        run: uv run --project testing python testing/join_edges.py --token ci-joinedges-token
+
+      - name: Collect diagnostics
+        if: failure()
+        run: docker compose logs --no-color --tail 4000 > compose.log || true
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: join-edges-${{ github.run_id }}-${{ github.run_attempt }}
+          path: compose.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans || true
+
   ha-controlplane-nightly:
     name: HA Control Plane Nightly
     runs-on: ubuntu-latest

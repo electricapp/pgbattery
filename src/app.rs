@@ -2662,6 +2662,37 @@ impl App {
         anyhow::bail!("Leader rejected join request ({status})");
     }
 
+    /// Clone the leader's data directory, asking again when the copy dies.
+    ///
+    /// The learner registration is left standing across attempts:
+    /// [`Self::register_as_learner`] is idempotent, and rolling it back between
+    /// tries would put a membership change through Raft for every one.
+    async fn clone_from_leader(&self, leader: &JoinLeaderInfo) -> Result<()> {
+        retry_join_step(
+            JOIN_CLONE_ATTEMPTS,
+            JOIN_CLONE_RETRY,
+            |attempt| async move {
+                let outcome = self.prepare_join_data(leader).await;
+                if let Err(ref e) = outcome {
+                    warn!(
+                        node_id = self.config.node_id,
+                        attempt,
+                        of = JOIN_CLONE_ATTEMPTS,
+                        error = %e,
+                        "Clone from the leader failed; discarding what it left and retrying"
+                    );
+                    // A basebackup that dies mid-stream leaves PGDATA populated, and
+                    // the emptiness check on the next attempt would then refuse
+                    // forever: a transient replication error would cost the node
+                    // permanently.
+                    self.discard_partial_join_data();
+                }
+                outcome
+            },
+        )
+        .await
+    }
+
     async fn prepare_join_data(&self, leader: &JoinLeaderInfo) -> Result<()> {
         self.run_pg_basebackup(leader).await?;
         self.ensure_standby_signal()?;
@@ -3020,18 +3051,13 @@ impl App {
         self.ensure_join_data_dir_ready(leader_lineage).await?;
         self.register_as_learner(&client, &leader.mgmt_addr).await?;
 
-        if let Err(e) = self.prepare_join_data(&leader).await {
+        if let Err(e) = self.clone_from_leader(&leader).await {
             warn!(
                 node_id = self.config.node_id,
                 error = %e,
                 "Join failed after learner registration, rolling back membership"
             );
             Self::rollback_join_registration(&client, &leader.mgmt_addr, self.config.node_id).await;
-            // Both halves, or the rollback is not one. A basebackup that dies
-            // mid-stream leaves PGDATA populated, and the emptiness check on the
-            // next start would then fail forever: a transient replication error
-            // would cost the node permanently.
-            self.discard_partial_join_data();
             return Err(e);
         }
 
@@ -3195,6 +3221,38 @@ fn clear_dir_contents(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Attempts the clone gets before the join gives up, and the pause between them.
+///
+/// A `pg_basebackup` that dies mid-stream is the leader having a bad moment far
+/// more often than it is this node being unable to join, and the cheapest way
+/// through it is to ask again. Ending the process instead hands the retry to
+/// the container runtime, which pays for a fresh `initdb` and a fresh
+/// filesystem mount every time and spaces its restarts further apart at each
+/// one.
+const JOIN_CLONE_ATTEMPTS: u32 = 12;
+const JOIN_CLONE_RETRY: Duration = Duration::from_secs(2);
+
+/// Run `attempt` until it succeeds, up to `attempts` times, pausing `delay`
+/// between tries. The caller sees the last failure.
+async fn retry_join_step<F, Fut>(attempts: u32, delay: Duration, mut attempt: F) -> Result<()>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let attempts = attempts.max(1);
+    let mut last = None;
+    for n in 1..=attempts {
+        match attempt(n).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        if n < attempts {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no attempt was made")))
+}
+
 pub(crate) fn promotion_lease_holddown(
     failover_started_at: Option<Instant>,
     now: Instant,
@@ -3259,9 +3317,67 @@ fn are_paths_on_same_mount(_path1: &PathBuf, _path2: &PathBuf) -> Result<bool> {
 mod tests {
     use super::{
         clear_dir_contents, clone_supersedes_local_data, ensure_data_dir_ready,
-        peer_speaks_for_lineage, promotion_lease_holddown,
+        peer_speaks_for_lineage, promotion_lease_holddown, retry_join_step,
     };
     use std::time::{Duration, Instant};
+
+    /// The clone is the one join step that fails for reasons outside this node,
+    /// so it is the one that must not end the process on a first refusal.
+    mod clone_retry {
+        use super::{Duration, retry_join_step};
+        use std::cell::Cell;
+
+        const NONE: Duration = Duration::ZERO;
+
+        #[tokio::test]
+        async fn a_clone_that_fails_once_is_asked_again() {
+            let attempts = Cell::new(0);
+            let seen = &attempts;
+            let result = retry_join_step(12, NONE, |_| async move {
+                seen.set(seen.get() + 1);
+                if seen.get() < 2 {
+                    anyhow::bail!("unexpected termination of replication stream");
+                }
+                Ok(())
+            })
+            .await;
+
+            assert!(result.is_ok());
+            assert_eq!(
+                attempts.get(),
+                2,
+                "the second attempt is the one that joins"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_clone_that_never_succeeds_spends_the_budget_and_reports_the_last_failure() {
+            let attempts = Cell::new(0);
+            let seen = &attempts;
+            let result = retry_join_step(4, NONE, |n| async move {
+                seen.set(seen.get() + 1);
+                Err(anyhow::anyhow!("attempt {n} failed"))
+            })
+            .await;
+
+            assert_eq!(attempts.get(), 4);
+            assert_eq!(result.unwrap_err().to_string(), "attempt 4 failed");
+        }
+
+        #[tokio::test]
+        async fn a_clone_that_works_first_time_is_not_retried() {
+            let attempts = Cell::new(0);
+            let seen = &attempts;
+            retry_join_step(12, NONE, |_| async move {
+                seen.set(seen.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(attempts.get(), 1);
+        }
+    }
 
     /// A join that dies partway leaves PGDATA populated, and the emptiness
     /// check on the next start then fails forever. Observed in CI: a

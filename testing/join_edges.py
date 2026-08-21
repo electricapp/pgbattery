@@ -1,11 +1,16 @@
 #!/usr/bin/env -S uv run --project testing python
 """H-16: the join and rejoin edges, and what they leave behind.
 
-Three cases, each an edge the happy path never visits:
+Five cases, each an edge the happy path never visits:
 
   deposed-mid-copy    the source a joining node is cloning from is deposed
                       while `pg_basebackup` is running. The node must not end
                       up running on a half-copied data directory.
+  clone-interrupted   the replication slot a clone streams through is taken
+                      away, so `pg_basebackup` fails for a reason that is the
+                      leader's. The node must finish its join without its
+                      container restarting: a transient clone failure is the
+                      join's to retry, not the container runtime's.
   orphan-slot         a replication slot nobody consumes pins WAL forever.
                       The reconciler is supposed to drop it; "supposed to" is
                       the part this measures.
@@ -67,6 +72,7 @@ SLOT_INTERVALS_ALLOWED: Final[int] = 3
 
 class Case(StrEnum):
     DEPOSED_MID_COPY = "deposed-mid-copy"
+    CLONE_INTERRUPTED = "clone-interrupted"
     ORPHAN_SLOT = "orphan-slot"
     LEARNER_CRASH = "learner-crash"
     BOOTSTRAP_WIPED = "bootstrap-wiped"
@@ -271,6 +277,131 @@ def run_deposed_mid_copy() -> Result:
         fp.start_container(leader)
 
 
+def restart_count(node: str) -> int:
+    """How many times the container runtime has restarted `node`'s process."""
+    state = fp.read_container_runstate(node)
+    if state is None:
+        raise EdgeError(f"could not read the container state of {node}")
+    return state.restart_count
+
+
+def take_slot_away(leader: str, slot: str) -> None:
+    """Drop `slot` if it is there and idle.
+
+    Best effort by construction: a slot a clone is already streaming through
+    cannot be dropped, and one that is already gone is the state this wants.
+    """
+    _psql(
+        leader,
+        f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots "
+        f"WHERE slot_name = '{slot}' AND active_pid IS NULL",
+    )
+
+
+def give_slot_back(leader: str, slot: str) -> bool:
+    """Recreate `slot`, so the next clone attempt has one to stream through.
+
+    By hand rather than by waiting for the reconciler: it ensures slots on a
+    30s interval, longer than the join's own retry budget, and what is being
+    measured here is the retry rather than the reconciler.
+    """
+    rc, _ = _psql(
+        leader,
+        f"SELECT pg_create_physical_replication_slot('{slot}') WHERE NOT EXISTS "
+        f"(SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}')",
+    )
+    return rc == 0
+
+
+CLONE_FAILURE_MARKERS: Final[tuple[str, ...]] = (
+    "pg_basebackup: error:",
+    "Clone from the leader failed",
+)
+"""What a clone that could not finish says. `pg_basebackup`'s own message and
+pgbattery's: the second only appears once the join retries rather than exits,
+and the first proves the copy failed either way."""
+
+CLONE_FAULT_BUDGET_S: Final[float] = 120.0
+"""How long to keep taking the slot away while waiting for a clone to meet its
+absence. Long enough to cover the container restarts the unfixed code needs to
+get to its next attempt."""
+
+
+def clone_failed_since(node: str, since: str) -> bool:
+    """Whether `node` has failed a clone since `since` (an RFC3339 timestamp).
+
+    Scoped to this incarnation rather than the whole log: these nodes are
+    re-wiped by other cases, and an older failure would read as this one.
+    """
+    rc, out = _sh(f"docker compose logs --no-color --since {since} {node}", timeout=30.0)
+    return rc == 0 and any(marker in out for marker in CLONE_FAILURE_MARKERS)
+
+
+def run_clone_interrupted() -> Result:
+    """Take the replication slot a clone needs out from under it.
+
+    `pg_basebackup` fails, for a reason that is the leader's and not this
+    node's. A join that reads that as final ends the process, which hands the
+    retry to the container runtime — at the cost of a fresh `initdb` and a
+    fresh filesystem mount per attempt, and a longer wait before each one. The
+    node must finish its join anyway, and its container must not restart to do
+    it.
+
+    The slot is taken repeatedly rather than once: a clone of this cluster is
+    over in about a tenth of a second, so a single drop lands only by luck.
+    """
+    leader = await_healthy(RECOVERY_TIMEOUT_S)
+    target = wipe_target(leader)
+    slot = f"{fp.replication_slot_prefix()}{fp.NODE_IDS[target]}"
+
+    fp.wipe_node_state(target, [RAFT_DIR, PGDATA_DIR])
+    take_slot_away(leader, slot)
+    fp.start_container(target)
+    started = fp.read_container_runstate(target)
+    if started is None:
+        raise EdgeError(f"could not read the container state of {target}")
+
+    deadline = time.monotonic() + CLONE_FAULT_BUDGET_S
+    while time.monotonic() < deadline and not clone_failed_since(target, started.started_at):
+        take_slot_away(leader, slot)
+        time.sleep(0.3)
+
+    if not clone_failed_since(target, started.started_at):
+        return Result(
+            Case.CLONE_INTERRUPTED,
+            f"{target} cloned without ever meeting a missing slot, so nothing was measured",
+            ok=False,
+        )
+
+    if not give_slot_back(leader, slot):
+        raise EdgeError(f"could not put {slot} back on {leader}")
+
+    settle = time.monotonic() + 180.0
+    while time.monotonic() < settle:
+        if _pg_answers(target):
+            restarts_after = restart_count(target)
+            if restarts_after != started.restart_count:
+                return Result(
+                    Case.CLONE_INTERRUPTED,
+                    f"{target} joined, but only after its container restarted "
+                    f"{restarts_after - started.restart_count} time(s): the clone was "
+                    f"retried by the runtime rather than by the join",
+                    ok=False,
+                )
+            return Result(
+                Case.CLONE_INTERRUPTED,
+                f"{target} joined through a failed clone without restarting",
+                ok=True,
+            )
+        time.sleep(2.0)
+
+    return Result(
+        Case.CLONE_INTERRUPTED,
+        f"{target} never served after its clone was interrupted",
+        ok=False,
+    )
+
+
 def node_lineage(node: str) -> int | None:
     """The PostgreSQL lineage a node reports for its own data directory."""
     port = fp.MGMT_PORTS[node]
@@ -392,6 +523,8 @@ def run(
                 results.append(run_orphan_slot(timings))
             elif chosen is Case.DEPOSED_MID_COPY:
                 results.append(run_deposed_mid_copy())
+            elif chosen is Case.CLONE_INTERRUPTED:
+                results.append(run_clone_interrupted())
             elif chosen is Case.BOOTSTRAP_WIPED:
                 results.append(run_bootstrap_wiped(token))
             else:

@@ -1301,7 +1301,8 @@ No new infrastructure. Highest confidence per unit of effort.
       bounded rather than assumed.
       _Closes_ RW-10 · _Effort_ M
 
-      `join_edges.py` drives four cases. Orphan-slot pinning is bounded against
+      `join_edges.py` drives five cases, from the `Join and rejoin edges (H-16)`
+      job in `ha-ci.yml`. Orphan-slot pinning is bounded against
       the reconciler's own interval, read from `constants.rs` rather than
       restated: a slot for a node id that is not in membership is dropped in
       13 s against a 90 s budget, and an operator's slot beside it is left
@@ -2292,6 +2293,51 @@ nothing detects drift.
       bar permanently against the nodes still in the cluster. Removal now
       commits it, and `/cluster/nodes` returns to three after the case where it
       used to stay at four.
+      _Effort_ M
+
+- [x] **H-54 — a clone that fails once costs a container restart, and the
+      runtime charges more for the next one.** `pg_basebackup` fails for
+      reasons that belong to the leader — a walsender that went away, a WAL read
+      that came back short — and `run_join_flow` treated any of them as final:
+      roll back the learner registration, discard the partial data directory,
+      return `Err`, exit. The container restart policy was then the retry loop,
+      which pays for a fresh `initdb` and, on the LazyFS compose, two FUSE
+      mounts and a gigabyte of pre-allocation per attempt, and spaces its
+      restarts further apart at each one.
+
+      Measured on the torn-raft follower job: node3 got eleven attempts into
+      180 s, the last two 29 s and 54 s apart, and never joined. Every one of
+      those attempts also forced a checkpoint and a WAL switch on the leader,
+      which is where that run's 528 MB of WAL on an idle cluster came from.
+
+      The join now retries the clone itself — `JOIN_CLONE_ATTEMPTS` tries, 2 s
+      apart, discarding what each failure left before the next — and leaves the
+      learner registration standing across them, because `register_as_learner`
+      is idempotent and rolling it back between tries put a membership change
+      through Raft for every attempt. Only an exhausted budget rolls it back and
+      ends the process.
+
+      What that run was actually failing on is a LazyFS artifact and not a
+      pgbattery defect: every `pg_basebackup` in it died on
+      `could not read from WAL segment ..., offset N: read 0 of M` raised by the
+      leader's own walsender, on a segment PostgreSQL had written and LazyFS
+      served short. The retry is the right answer either way — the joining node
+      cannot tell a leader having a bad moment from a filesystem having one, and
+      neither is a reason to throw away a mounted filesystem and an `initdb`.
+
+      `clone-interrupted` in `join_edges.py` is the regression case: take the
+      replication slot the clone streams through out from under it, keep taking
+      it until a clone has provably met its absence, then put it back and
+      require the node to join with its container's restart count unchanged.
+      Proven red against the previous binary — `node2 joined, but only after its
+      container restarted 1 time(s)`.
+
+      Two harness defects surfaced beside it. `join_edges.py` had never run in
+      CI at all: five cases, self-tested and hand-driven, with no workflow job —
+      now `Join and rejoin edges (H-16)` in `ha-ci.yml`. And `stall_reason`
+      matched a bare `FATAL:`, so `connection to client lost` — which PostgreSQL
+      logs every time a client goes away — outranked the reason a node was
+      stuck, because the most recent match is the one reported.
       _Effort_ M
 
 - [x] **H-53 — a leader whose standby never reached consistency can never be

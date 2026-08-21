@@ -2280,5 +2280,48 @@ class ContainerReachabilityTests(unittest.TestCase):
         self.assertIn("is not a LazyFS mount", str(caught.exception))
 
 
+class StallReasonTests(unittest.TestCase):
+    """What a harness that gave up waiting says about why. Reported to a human
+    reading a failed CI job, so a line that names a routine event instead of the
+    reason sends the next hour in the wrong direction."""
+
+    def test_a_torn_clone_is_named(self) -> None:
+        log = (
+            "node3-1  | waiting for checkpoint\n"
+            "node3-1  | pg_basebackup: error: unexpected termination of "
+            "replication stream: ERROR:  could not read from WAL segment\n"
+            "node3-1  | Error: pg_basebackup failed with exit code: Some(1)\n"
+        )
+        reason = fp.stall_reason(log)
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("unexpected termination of replication stream", reason)
+
+    def test_a_dropped_client_does_not_outrank_the_real_reason(self) -> None:
+        """The most recent match is the one reported, and PostgreSQL logs a
+        FATAL every time a client goes away — which is how a node whose clone
+        kept failing was reported as having lost a connection."""
+        log = (
+            "node1-1  | pg_basebackup: error: unexpected termination of replication stream\n"
+            "node1-1  | 2026-08-21 17:57:04 UTC [555] FATAL:  connection to client lost\n"
+        )
+        reason = fp.stall_reason(log)
+        assert reason is not None
+        self.assertIn("pg_basebackup", reason)
+
+    def test_a_log_of_nothing_but_routine_lines_has_no_reason(self) -> None:
+        log = (
+            "node2-1  | 2026-08-21 17:56:47 UTC [761] FATAL:  the database system is starting up\n"
+            "node2-1  | 2026-08-21 17:56:48 UTC [762] FATAL:  connection to client lost\n"
+        )
+        self.assertIsNone(fp.stall_reason(log))
+
+    def test_a_real_fatal_is_still_reported(self) -> None:
+        log = "node2-1  | 2026-08-21 17:56:47 UTC [761] FATAL:  Data directory is not empty\n"
+        reason = fp.stall_reason(log)
+        assert reason is not None
+        self.assertIn("is not empty", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

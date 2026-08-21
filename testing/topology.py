@@ -355,6 +355,10 @@ TOPOLOGY: Final[Topology] = load()
 NODES: Final[tuple[str, ...]] = TOPOLOGY.voter_services
 JOINING_NODES: Final[tuple[str, ...]] = TOPOLOGY.joining_services
 NODE_IPS: Final[dict[str, str]] = {n.service: n.ip for n in TOPOLOGY.nodes}
+NODE_IDS: Final[dict[str, int]] = {n.service: n.node_id for n in TOPOLOGY.nodes}
+"""Raft node id by service. Names derived from an id — a replication slot, a
+management API path — need this rather than the digit in the service name,
+which is a naming convention and not the identity."""
 GATEWAY_PORTS: Final[tuple[int, ...]] = tuple(n.gateway_port for n in TOPOLOGY.voters)
 GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = {n.service: n.gateway_port for n in TOPOLOGY.voters}
 """The same ports keyed by service, so a harness that has a node name does not

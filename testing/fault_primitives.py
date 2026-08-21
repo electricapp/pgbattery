@@ -201,6 +201,9 @@ under an id the cluster still lists — see H-16 in HARDENING.md."""
 NODE_IPS: Final[dict[str, str]] = topology.NODE_IPS
 """Static addresses on the cluster network, for peer-level faults."""
 
+NODE_IDS: Final[dict[str, int]] = topology.NODE_IDS
+"""Raft node id by service, for names derived from an id such as a slot."""
+
 MGMT_PORTS: Final[dict[str, int]] = topology.MGMT_PORTS
 GATEWAY_PORT_BY_NODE: Final[dict[str, int]] = topology.GATEWAY_PORT_BY_NODE
 """Host-published management API ports."""
@@ -664,6 +667,7 @@ STALL_SIGNATURES: Final[tuple[str, ...]] = (
     "is not empty",
     "Raft DB corrupted",
     "Failed to create database",
+    "pg_basebackup: error:",
     "PANIC:",
     "FATAL:",
     "Shutting down after",
@@ -673,9 +677,20 @@ STALL_SIGNATURES: Final[tuple[str, ...]] = (
 
 A harness that gives up waiting reports what it was waiting for and almost never
 why it never arrived, so a node shut down by the fence threshold over a catalog
-it cannot open reads exactly like a slow start. Both shapes seen in CI are here:
-the corrupt index (`unexpected zero page`) and the join that met a populated
-data directory (`is not empty`)."""
+it cannot open reads exactly like a slow start. The shapes seen in CI are here:
+the corrupt index (`unexpected zero page`), the join that met a populated data
+directory (`is not empty`), and the clone whose replication stream died
+(`pg_basebackup: error:`)."""
+
+ROUTINE_LINES: Final[tuple[str, ...]] = (
+    "connection to client lost",
+    "the database system is starting up",
+    "terminating connection due to administrator command",
+)
+"""FATAL lines PostgreSQL emits in normal operation. They are not why a node is
+stalled, and because the most recent match is the one reported, leaving them in
+lets a dropped client connection outrank the reason the harness is looking
+for."""
 
 
 def stall_reason(log_text: str) -> str | None:
@@ -687,6 +702,8 @@ def stall_reason(log_text: str) -> str | None:
     harness has seen before.
     """
     for line in reversed(log_text.splitlines()):
+        if any(routine in line for routine in ROUTINE_LINES):
+            continue
         if any(signature in line for signature in STALL_SIGNATURES):
             return line.strip()
     return None
