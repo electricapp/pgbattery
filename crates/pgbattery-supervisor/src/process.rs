@@ -751,10 +751,26 @@ pub enum PostmasterState {
     Running,
     /// It was running under this node and has exited — a crash, and the
     /// node's cue to hand off.
-    Exited,
+    ///
+    /// `refused` when the postmaster gave up on its own: a nonzero exit code
+    /// is the data directory refusing to open, and it will refuse identically
+    /// at every attempt. Death by signal is not that — a `SIGKILL` from
+    /// outside says nothing about the directory, and rebuilding on one clones
+    /// a healthy node.
+    Exited { refused: bool },
     /// This node is not running one: never started this boot, deliberately
     /// stopped, or left down after a start that would not open.
     NotRunning,
+}
+
+/// Whether a postmaster's exit was it giving up on the data directory.
+///
+/// `code` is `None` when a signal killed it. That is the case this exists to
+/// keep out: a `SIGKILL` from outside — a test, an operator, the OOM killer —
+/// looks identical from here to a refusal, and the answer decides whether the
+/// data directory is discarded and cloned from the leader.
+const fn exit_was_a_refusal(code: Option<i32>) -> bool {
+    matches!(code, Some(code) if code != 0)
 }
 
 /// What a rewind attempt left behind for the caller to finish.
@@ -1061,7 +1077,9 @@ impl Supervisor {
                 // after a crash. Only on this transition: once `child` is
                 // None, later polls report NotRunning and never re-emit.
                 metrics::gauge!("pgbattery_pg_is_primary").set(0.0);
-                Ok(PostmasterState::Exited)
+                Ok(PostmasterState::Exited {
+                    refused: exit_was_a_refusal(status.code()),
+                })
             }
             Ok(None) => Ok(PostmasterState::Running),
             Err(e) => Err(Error::Postgres(format!(
@@ -1139,13 +1157,19 @@ impl Supervisor {
 
         // Wait for PostgreSQL to be ready
         if let Err(e) = self.wait_for_ready(30).await {
-            // A postmaster that exited under us refused this directory and
-            // will refuse it again; one still running was merely slow, or was
-            // killed from outside. Read that before `stop()` clears the
-            // handle, and fail toward "not refused" if the poll itself cannot
-            // answer — nothing should be rebuilt on an unreadable signal.
-            let refused = self.postmaster_state().unwrap_or(PostmasterState::Running)
-                == PostmasterState::Exited;
+            // A postmaster that gave up on this directory will give up on it
+            // again; one still running was merely slow, and one killed from
+            // outside says nothing about the directory at all. Read that before
+            // `stop()` clears the handle, and fail toward "not refused" if the
+            // poll itself cannot answer — nothing should be rebuilt on an
+            // unreadable signal. The wait reports the refusal itself when it
+            // saw the exit, and reaped the child in doing so, so that verdict
+            // stands on its own.
+            let refused = matches!(e, Error::PostgresRefusedToOpen(_))
+                || matches!(
+                    self.postmaster_state(),
+                    Ok(PostmasterState::Exited { refused: true })
+                );
             // Shut down gracefully: a fast shutdown preserves replay
             // progress (restartpoints / minRecoveryPoint), while SIGKILL
             // forces the next start to redo recovery from the previous
@@ -1470,7 +1494,7 @@ host all all ::/0 {auth_method}
     ///   base budget would never finish.
     /// - exit 2/3 (no response / probe not attempted) — only the caller's
     ///   base `timeout_secs` applies.
-    async fn wait_for_ready(&self, timeout_secs: u64) -> Result<()> {
+    async fn wait_for_ready(&mut self, timeout_secs: u64) -> Result<()> {
         /// Budget for a postmaster that is alive and replaying WAL
         /// (`pg_isready` exit 1). Sized for worst-case crash recovery of a
         /// busy node, not for connection establishment.
@@ -1498,6 +1522,21 @@ host all all ::/0 {auth_method}
 
             if status.success() {
                 return Ok(());
+            }
+
+            // A postmaster that has given up will not become ready, and sitting
+            // out the budget for one holds the supervisor lock for the whole
+            // budget: a directory `PostgreSQL` refused in thirty milliseconds
+            // was reported thirty seconds later, with the node looking dead to
+            // everything that needed the lock in between.
+            if matches!(
+                self.postmaster_state(),
+                Ok(PostmasterState::Exited { refused: true })
+            ) {
+                return Err(Error::PostgresRefusedToOpen(format!(
+                    "the postmaster gave up during startup (pg_isready exit code {})",
+                    status.code().unwrap_or(-1)
+                )));
             }
 
             let rejecting = status.code() == Some(1);
@@ -2604,7 +2643,29 @@ host all all ::/0 {auth_method}
                     // reconcile loop retry.
                     self.ensure_standby_signal().await?;
                     self.configure_standby(new_leader_addr).await?;
-                    self.start().await.ok();
+                    match self.start().await {
+                        Ok(()) => {}
+                        // A directory `PostgreSQL` refuses is not something a
+                        // later tick fixes, and the repair for it is the rewind
+                        // that just failed — so leaving it here leaves the node
+                        // with no postmaster at all, still a voter and possibly
+                        // still the leader. Take the rebuild instead.
+                        Err(Error::PostgresRefusedToOpen(refusal)) => {
+                            metrics::counter!("pgbattery_unopenable_standby_rebuilt").increment(1);
+                            tracing::error!(
+                                error = %refusal,
+                                new_leader = %new_leader_addr,
+                                "PostgreSQL will not open after a failed pg_rewind — rebuilding \
+                                 from the leader"
+                            );
+                            self.reprovision_from(new_leader_addr).await?;
+                            return Ok(RewindOutcome::Reprovisioned);
+                        }
+                        Err(restart) => tracing::warn!(
+                            error = %restart,
+                            "PostgreSQL did not come back after a failed pg_rewind"
+                        ),
+                    }
                     return Err(e);
                 }
                 RewindRecovery::Reprovision => {
@@ -5476,6 +5537,16 @@ mod tests {
                 "{can_continue:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_postmaster_that_gave_up_is_told_apart_from_one_that_was_killed() {
+        // The verdict decides whether the data directory is discarded and
+        // cloned. A node whose PostgreSQL is SIGKILLed — which the restart
+        // budget case does six times in a row — must not be rebuilt for it.
+        assert!(exit_was_a_refusal(Some(1)), "refused the data directory");
+        assert!(!exit_was_a_refusal(None), "killed by a signal");
+        assert!(!exit_was_a_refusal(Some(0)), "exited cleanly");
     }
 
     #[test]

@@ -1075,7 +1075,10 @@ impl App {
         let probe_params = {
             let mut pg = postgres.lock().await;
             match pg.postmaster_state() {
-                Ok(PostmasterState::Exited) => {
+                // Refused or killed alike: either way this node is not serving
+                // and must hand off. What the two mean for the data directory
+                // is `demote`'s to sort out, not the health tick's.
+                Ok(PostmasterState::Exited { .. }) => {
                     error!("PostgreSQL process died - triggering graceful shutdown for failover");
                     drop(pg);
                     let _ = shutdown_tx.send(true);

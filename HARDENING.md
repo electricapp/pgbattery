@@ -2295,6 +2295,59 @@ nothing detects drift.
       used to stay at four.
       _Effort_ M
 
+- [x] **H-56 — a failed `pg_rewind` could leave a leader with no PostgreSQL at
+      all.** `rewind_onto_leader`'s retryable arm restarts the standby in place
+      and hands the rewind error back for the reconcile loop to retry, which is
+      right when the restart works. It called `self.start().await.ok()`, so when
+      the restart did **not** work the refusal was discarded and the caller saw
+      the original rewind error instead.
+
+      Observed on `leader-network-partition-real`, and it is what that case has
+      been failing on. node2's `pg_rewind` failed with
+      `could not fetch file list: server closed the connection unexpectedly` —
+      retryable, correctly classified — and the restart that followed met
+      `FATAL: requested timeline 5 is not a child of this server's history`.
+      Nothing escalated. node2 stayed the Raft leader with its postmaster down,
+      refusing its own promotion fail-closed (`Could not read local recovery
+      state`) and emergency-fencing itself at 10 Hz for four and a half minutes,
+      while node1 sat in a two-second loop logging
+      `New leader's timeline could not be probed - deferring demote` because the
+      leader it was told to follow had no PostgreSQL to probe. It ended only
+      when the harness forced an election elsewhere.
+
+      A restart refused after a failed rewind now re-provisions, the same
+      escalation the re-point path already takes for the same reason.
+
+      Beside it, `start()` waited out its whole 30 s readiness budget for a
+      postmaster that had exited 30 ms in, holding the supervisor lock for all
+      of it — every endpoint that needs that lock reads as a dead node
+      meanwhile. `wait_for_ready` now polls the child and reports the refusal as
+      soon as it sees the exit.
+
+      Which made a latent misclassification worth fixing rather than merely
+      slower to reach: "exited" was read as "refused", and a postmaster
+      `SIGKILL`ed from outside exits too. `restart-budget-sustained-pg-death`
+      kills PostgreSQL six times in a row; a kill landing inside a `start()`
+      would have rebuilt the data directory from the leader for it. The exit
+      code is the difference and it is only readable at the moment the child is
+      reaped, so `PostmasterState::Exited` now carries `refused`, set from a
+      nonzero exit code — a signal death and a clean exit are both `false`.
+
+      **Not covered by a deterministic case.** Reaching that arm needs a
+      `pg_rewind` that fails retryably *and* a directory PostgreSQL then
+      refuses, and nothing in the harness can arrange both on demand — the CI
+      artifact is the evidence. What is now watched is the property rather than
+      the door: `unopenable-standby-rebuilt` zeroes a stopped follower's control
+      file and requires the node back in the cluster, which is the first
+      assertion of any kind over the three rebuild escalations
+      (`pgbattery_unopenable_standby_rebuilt`,
+      `pgbattery_standby_repoint_escalated_to_rewind`,
+      `pgbattery_pg_rewind_target_compromised`) — all three were unobserved.
+      Its inversion is proven: pointed at a scratch file instead of the control
+      file, it goes red on the metric that never arrives rather than passing on
+      a node that never needed repairing.
+      _Effort_ M
+
 - [x] **H-55 — `wait_sync` asked for a number the system never promises.** The
       step polled `/api/v1/cluster/node/{id}/lag` until `is_synced` **and**
       `lag_bytes == 0`. `is_synced` is already pgbattery's own judgement, taken

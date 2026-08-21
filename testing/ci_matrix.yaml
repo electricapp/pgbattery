@@ -49,6 +49,7 @@
         "backup-restore-valid",
         "leaderless-wedge-recovery",
         "restart-budget-sustained-pg-death",
+        "unopenable-standby-rebuilt",
         "mgmt-api-no-stale-leader-after-pg-death",
         "hung-postmaster-failover",
         "cascade-double-failover-wedge",
@@ -575,6 +576,65 @@
         {
           "type": "leader_equals_var",
           "var": "leader_before"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "unopenable-standby-rebuilt",
+      "contracts": [
+        "V2"
+      ],
+      "description": "Zero a stopped follower's control file so PostgreSQL refuses to open its data directory, and require the node back in the cluster. A directory PostgreSQL will not open is not a state a restart repairs: the supervisor has to discard it and clone the leader's, which is what pgbattery_unopenable_standby_rebuilt counts. Three escalation paths reach that rebuild and none of them had ever been asserted on. Leadership is moved to node1 first, so the target is node3 and the metric is read from a node this case knows the id of.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90
+        },
+        {
+          "type": "cmd",
+          "comment": "Stop node3 first: a live node holds its control file open and rewrites it at every checkpoint.",
+          "cmd": "docker compose stop node3"
+        },
+        {
+          "type": "cmd",
+          "comment": "Zero the control file through a throwaway container on the same volume, and read it back. A corruption that silently did nothing would leave a node that restarts cleanly, and a green run measuring that instead.",
+          "cmd": "docker compose run --rm --no-deps --entrypoint sh node3 -c 'dd if=/dev/zero of=/var/lib/postgresql/data/global/pg_control bs=8192 count=1 conv=notrunc 2>/dev/null; if cmp -s -n 8192 /var/lib/postgresql/data/global/pg_control /dev/zero; then echo \"control file zeroed\"; else echo \"FAIL: control file still holds data\"; exit 1; fi'"
+        },
+        {
+          "type": "cmd",
+          "cmd": "docker compose start node3"
+        },
+        {
+          "type": "wait_metric",
+          "node_id": 3,
+          "metric": "pgbattery_unopenable_standby_rebuilt",
+          "timeout_sec": 300,
+          "comment": "The rebuild itself, not a node that merely came back: the counter is only incremented on the path that discards the directory and clones the leader's."
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 180,
+          "min_healthy_replicas": 2
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals",
+          "value": 1,
+          "comment": "The rebuild is a follower's; it must not have cost the cluster its leader."
         },
         {
           "type": "cluster_topology",
