@@ -2295,6 +2295,27 @@ nothing detects drift.
       used to stay at four.
       _Effort_ M
 
+- [x] **H-55 — `wait_sync` asked for a number the system never promises.** The
+      step polled `/api/v1/cluster/node/{id}/lag` until `is_synced` **and**
+      `lag_bytes == 0`. `is_synced` is already pgbattery's own judgement, taken
+      against `SYNC_LAG_THRESHOLD_BYTES`; restating it as byte-for-byte equality
+      with the leader made the wait unsatisfiable in every case that keeps
+      writing across it, because the leader takes another commit between the two
+      reads and the follower is behind again.
+
+      `cascade-double-failover-wedge` is one of those: its three write loopers
+      each retry a 3 s-timeout `psql` a hundred times, so they can still be
+      firing five minutes in — well past the 180 s the wait allows. It failed on
+      CI reporting `{1: lag 0 is_synced True, 2: lag 18312 is_synced True}`: both
+      followers synchronous, one of them 18 KB behind a leader that was still
+      committing, and the step calling that a timeout.
+
+      The target is now fixed at the first reading — a follower must replay past
+      where the leader was when the wait began — which is reachable under load
+      and is what the wait means. A follower that is not replicating at all still
+      never reaches it.
+      _Effort_ S
+
 - [x] **H-54 — a clone that fails once costs a container restart, and the
       runtime charges more for the next one.** `pg_basebackup` fails for
       reasons that belong to the leader — a walsender that went away, a WAL read

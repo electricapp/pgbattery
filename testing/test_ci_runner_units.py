@@ -2018,6 +2018,36 @@ def test_two_leaders_still_fail_when_a_third_node_is_down() -> None:
         raise AssertionError("two leaders must fail regardless of a down node")
 
 
+def test_a_follower_level_with_the_target_has_caught_up() -> None:
+    lag = {"is_synced": True, "node_lsn": 5_000, "lag_bytes": 0}
+    assert ci_runner.follower_has_caught_up(lag, 5_000)
+
+
+def test_a_follower_short_of_the_target_has_not() -> None:
+    lag = {"is_synced": True, "node_lsn": 4_999, "lag_bytes": 1}
+    assert not ci_runner.follower_has_caught_up(lag, 5_000)
+
+
+def test_a_leader_that_kept_writing_does_not_hold_the_wait_open() -> None:
+    """The case this was written for: a write workload runs across the wait, so
+    the follower is always some bytes behind a leader that is still committing.
+    What the wait means is that everything written before it began has landed,
+    and that is reached."""
+    lag = {"is_synced": True, "node_lsn": 5_200, "lag_bytes": 18_312}
+    assert ci_runner.follower_has_caught_up(lag, 5_000)
+
+
+def test_a_follower_outside_the_sync_threshold_has_not_caught_up() -> None:
+    """`is_synced` is pgbattery's own judgement and stays the gate: a follower
+    level with a stale target but a megabyte behind the leader is not synced."""
+    lag = {"is_synced": False, "node_lsn": 5_000, "lag_bytes": 2_000_000}
+    assert not ci_runner.follower_has_caught_up(lag, 5_000)
+
+
+def test_a_lag_answer_missing_its_fields_is_not_caught_up() -> None:
+    assert not ci_runner.follower_has_caught_up({}, 5_000)
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------

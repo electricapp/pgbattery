@@ -116,9 +116,10 @@ class StepType(StrEnum):
             set in the container environment).
         CLOCK_HEAL: Restore a node's faketime offset to ``+0s`` (real time).
         WAIT_SYNC: Poll ``/api/v1/cluster/node/{id}/lag`` on all follower nodes
-            until ``lag_bytes == 0`` and ``is_synced == true``, or timeout.
-            Optional ``nodes`` parameter (list of int IDs) to restrict which
-            nodes are checked; defaults to all nodes minus the current leader.
+            until each has replayed past the leader position this wait started
+            at and reports ``is_synced``, or timeout. Optional ``nodes``
+            parameter (list of int IDs) to restrict which nodes are checked;
+            defaults to all nodes minus the current leader.
         NETWORK_DELAY: Add ``tc netem delay`` to a node's ``eth0`` interface
             (requires ``NET_ADMIN`` capability and ``iproute2`` in the image).
             Parameters: ``node`` (int), ``delay_ms`` (int, default 200),
@@ -308,6 +309,20 @@ def as_ints(value: Any) -> list[int]:
             return [value]
         case _:
             return [int(item) for item in value]
+
+
+def follower_has_caught_up(lag: Mapping[str, Any], catch_up_to: int) -> bool:
+    """Whether a follower has replayed everything the leader held at `catch_up_to`.
+
+    Two conditions, and the second is the one that has to be relative. pgbattery
+    publishes `is_synced` against its own threshold, and restating that here as
+    byte-for-byte equality with the leader made the wait unsatisfiable in every
+    case that keeps writing across it: the leader takes another commit between
+    the two reads and the follower is behind again. A fixed target is reachable
+    and still says what the wait means — everything written before it began has
+    landed.
+    """
+    return bool(lag.get("is_synced", False)) and int(lag.get("node_lsn", 0)) >= catch_up_to
 
 
 def validate_timeout_value(raw: Any, key: str) -> int:
@@ -3523,6 +3538,13 @@ class CIRunner:
                 follower_ids = [nid for nid in check_nodes if nid != leader_id]
                 deadline = time.time() + timeout_sec
                 last_status: dict[int, Any] = {}
+                # The leader position each follower has to reach, fixed at the
+                # first reading. A moving target is never reached: several cases
+                # run a write workload across this wait, and demanding that the
+                # follower be byte-for-byte level with a leader still taking
+                # commits is a race the case wins or loses on timing rather than
+                # on whether replication works.
+                catch_up_to: dict[int, int] = {}
                 while True:
                     all_synced = True
                     for nid in follower_ids:
@@ -3534,10 +3556,19 @@ class CIRunner:
                             http_status, body = self._http_request("GET", url, timeout_sec=5)
                             if http_status == 200:
                                 parsed = self._parse_json(body, url)
-                                lag = int(parsed.get("lag_bytes", 999999))
+                                lag = int(parsed.get("lag_bytes", 999_999))
                                 is_synced = bool(parsed.get("is_synced", False))
-                                last_status[nid] = {"lag_bytes": lag, "is_synced": is_synced}
-                                if not is_synced or lag > 0:
+                                node_lsn = int(parsed.get("node_lsn", 0))
+                                target = catch_up_to.setdefault(
+                                    nid, int(parsed.get("leader_lsn", 0))
+                                )
+                                last_status[nid] = {
+                                    "lag_bytes": lag,
+                                    "is_synced": is_synced,
+                                    "node_lsn": node_lsn,
+                                    "catch_up_to": target,
+                                }
+                                if not follower_has_caught_up(last_status[nid], target):
                                     all_synced = False
                             else:
                                 all_synced = False
