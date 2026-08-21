@@ -501,22 +501,23 @@ enum StandbyAction {
 /// What a "timelines match but we are not streaming" gap means for the
 /// standby, given the two probes that can distinguish the cases.
 ///
-/// `local_ahead` is `Supervisor::local_ahead_of_leader`; `leader_has_our_wal`
-/// is `Supervisor::leader_retains_our_wal`. `None` from either is a probe that
-/// could not answer, and nothing is done on an unanswered probe.
+/// `local_ahead` is `Supervisor::local_ahead_of_leader`; `can_continue` is
+/// `Supervisor::replay_can_continue`. `None` from either is a probe that could
+/// not answer, and nothing is done on an unanswered probe.
 const fn streaming_gap_action(
     local_ahead: Option<bool>,
-    leader_has_our_wal: Option<bool>,
+    can_continue: Option<bool>,
 ) -> StandbyAction {
-    match (local_ahead, leader_has_our_wal) {
+    match (local_ahead, can_continue) {
         // The leader was rewound past our replay position (a backup restore,
         // say): PG can never reconnect, and `pg_rewind` is what converges us.
         (Some(true), _) => StandbyAction::Rewind,
-        // The leader is at-or-ahead and no longer holds the segment we stopped
-        // in. No node can hold WAL from before it was leader, so no retry and
-        // no rewind reaches across the hole — only a fresh clone does.
+        // The leader is at-or-ahead, we hold no WAL past where replay stopped,
+        // and the leader no longer holds the segment it stopped in. No node
+        // holds WAL from before it was leader, so no retry and no rewind
+        // reaches across the hole — only a fresh clone does.
         (Some(false), Some(false)) => StandbyAction::Reprovision,
-        // The WAL we need is still there, so PG's own retry recovers this.
+        // There is WAL left to replay or receive, so PG recovers this itself.
         (Some(false), Some(true) | None) | (None, _) => StandbyAction::Defer,
     }
 }
@@ -2305,19 +2306,24 @@ host all all ::/0 {auth_method}
         }
     }
 
-    /// Whether the leader still holds the WAL segment this standby's replay
-    /// stopped in. `None` when either side could not answer.
+    /// Whether replay has anywhere left to go: this standby holds WAL past
+    /// where replay stopped, or the leader still holds the segment it stopped
+    /// in. `None` when either side could not answer.
     ///
     /// The leader names the segment, because `pg_walfile_name` cannot run in
-    /// recovery and would use the leader's timeline anyway. Only correct on a
-    /// matching timeline, which is the one branch that calls this — a diverged
-    /// standby is a `pg_rewind`, decided before we get here.
-    ///
+    /// recovery and would use the leader's own timeline anyway. That makes
+    /// this correct only on a matching timeline, which is the one branch that
+    /// calls it — a diverged standby is a `pg_rewind`, decided before here.
     /// `pg_walfile_name` names the segment an LSN falls in, and a replay
-    /// position is inside a record rather than on a segment boundary (each
-    /// segment opens with a page header), so this is the segment whose
+    /// position sits inside a record rather than on a segment boundary (every
+    /// segment opens with a page header), so that is the segment whose
     /// remainder the standby is waiting for.
-    async fn leader_retains_our_wal(&self, leader_addr: SocketAddr) -> Option<bool> {
+    ///
+    /// The local half matters for a standby restarting with a backlog: it can
+    /// hold whole segments the leader has since recycled and still replay
+    /// forward into ones the leader kept, and cloning it would throw away a
+    /// recovery already in progress.
+    async fn replay_can_continue(&self, leader_addr: SocketAddr) -> Option<bool> {
         let replay = self
             .execute_sql("SELECT pg_last_wal_replay_lsn()::text;")
             .await
@@ -2326,12 +2332,31 @@ host all all ::/0 {auth_method}
         // Reject anything that is not an LSN rather than interpolate it: this
         // string is about to be part of a query on another node.
         parse_lsn_local(replay)?;
-        let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM pg_ls_waldir() \
-             WHERE name = pg_walfile_name('{replay}'::pg_lsn));"
-        );
-        let answer = self.query_leader(leader_addr, &sql).await?;
-        match answer.trim() {
+        let answer = self
+            .query_leader(
+                leader_addr,
+                &format!(
+                    "SELECT pg_walfile_name('{replay}'::pg_lsn), \
+                     EXISTS (SELECT 1 FROM pg_ls_waldir() \
+                     WHERE name = pg_walfile_name('{replay}'::pg_lsn));"
+                ),
+            )
+            .await?;
+        let (needed, retained) = answer.trim().split_once('|')?;
+        if retained == "t" {
+            return Some(true);
+        }
+        // Same timeline only: `pg_wal` keeps segments from older ones, and the
+        // 8-character prefix is the timeline in both names.
+        let local = self
+            .execute_sql(&format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_ls_waldir() \
+                 WHERE length(name) = 24 AND left(name, 8) = left('{needed}', 8) \
+                 AND name > '{needed}');"
+            ))
+            .await
+            .ok()?;
+        match local.trim() {
             "t" => Some(true),
             "f" => Some(false),
             _ => None,
@@ -2346,12 +2371,12 @@ host all all ::/0 {auth_method}
         let local_ahead = self.local_ahead_of_leader(new_leader_addr).await;
         // Only asked when the answer can change the action, which keeps the
         // extra round trip off every path but a standby that is already stuck.
-        let leader_has_our_wal = if local_ahead == Some(false) {
-            self.leader_retains_our_wal(new_leader_addr).await
+        let can_continue = if local_ahead == Some(false) {
+            self.replay_can_continue(new_leader_addr).await
         } else {
             None
         };
-        match streaming_gap_action(local_ahead, leader_has_our_wal) {
+        match streaming_gap_action(local_ahead, can_continue) {
             StandbyAction::Rewind => {
                 tracing::warn!(
                     new_leader = %new_leader_addr,
@@ -2373,7 +2398,7 @@ host all all ::/0 {auth_method}
                 tracing::debug!(
                     new_leader = %new_leader_addr,
                     ?local_ahead,
-                    ?leader_has_our_wal,
+                    ?can_continue,
                     "Streaming broken with the WAL we need still on the leader; deferring \
                      (PG will retry)"
                 );
@@ -5273,8 +5298,8 @@ mod tests {
     }
 
     #[test]
-    fn a_standby_the_leader_can_no_longer_feed_is_rebuilt() {
-        // "PG will retry" is only true while the leader still has the WAL.
+    fn a_standby_replay_cannot_carry_forward_is_rebuilt() {
+        // "PG will retry" is only true while there is WAL left to reach.
         assert_eq!(
             streaming_gap_action(Some(false), Some(false)),
             StandbyAction::Reprovision
@@ -5282,7 +5307,7 @@ mod tests {
         assert_eq!(
             streaming_gap_action(Some(false), Some(true)),
             StandbyAction::Defer,
-            "the WAL is there, so PG's own retry recovers this"
+            "a backlog left to replay, or a leader that still holds the segment"
         );
     }
 
@@ -5305,11 +5330,11 @@ mod tests {
     fn a_standby_ahead_of_its_leader_rewinds_rather_than_rebuilds() {
         // Rewind runs the divergence gate; a rebuild would discard the WAL
         // that gate exists to protect.
-        for leader_has_our_wal in [Some(true), Some(false), None] {
+        for can_continue in [Some(true), Some(false), None] {
             assert_eq!(
-                streaming_gap_action(Some(true), leader_has_our_wal),
+                streaming_gap_action(Some(true), can_continue),
                 StandbyAction::Rewind,
-                "{leader_has_our_wal:?}"
+                "{can_continue:?}"
             );
         }
     }
