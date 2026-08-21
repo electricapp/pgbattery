@@ -2922,7 +2922,7 @@
       "contracts": [
         "V2"
       ],
-      "description": "Stops node3, advances the leader's WAL far enough that old segments may be recycled (80,000 rows + CHECKPOINT + pg_switch_wal twice), then restarts node3. If WAL replay is not possible pgbattery must trigger a full pg_basebackup resync. Verifies all 80,000 rows are present on node3 after convergence.",
+      "description": "Stops node3, removes what protects the WAL it still needs — its replication slot and wal_keep_size — and recycles the segment it stopped in, then restarts it. Replay can no longer cross the hole, so pgbattery must rebuild node3 from the leader. Verifies all 80,000 rows are present on node3 after convergence.",
       "actions": [
         {
           "type": "transfer_leadership",
@@ -2944,10 +2944,20 @@
           "cmd": "docker compose stop node3"
         },
         {
+          "type": "cmd",
+          "comment": "Put the leader in the state a newly promoted one is already in for a lagging peer: its slot reserves from its own promotion point, so nothing holds the WAL from before that. The managed wal_keep_size of 1GB would otherwise keep every segment this case writes, which is why the fault never fired while it was left in place.",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h 127.0.0.1 -p 5434 -d postgres -v ON_ERROR_STOP=1 -c \"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'replica_3'\" -c \"ALTER SYSTEM SET wal_keep_size = 0\" -c \"SELECT pg_reload_conf()\""
+        },
+        {
           "type": "sql",
           "comment": "generate ~20MB of WAL then force segment recycling",
           "file": "wal-hole-resync-advance.sql",
           "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "Assert the fault landed rather than that it was asked for: the leader must no longer hold the segment containing the mark node3 stopped at. Without this the case passes on a leader that kept everything.",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h 127.0.0.1 -p 5434 -d postgres -v ON_ERROR_STOP=1 -tAc \"SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_ls_waldir() WHERE name = (SELECT pg_walfile_name(lsn) FROM ci_wal_hole_mark)) THEN 'still-retained' ELSE 'recycled' END\" | grep -qx recycled"
         },
         {
           "type": "cmd",
@@ -2957,15 +2967,15 @@
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 180
         },
         {
           "type": "wait_sync",
           "nodes": [
             3
           ],
-          "timeout_sec": 120,
-          "comment": "full resync via pg_basebackup may take longer than WAL replay"
+          "timeout_sec": 300,
+          "comment": "node3 has to be seen stalled before it is rebuilt, and the rebuild is a full pg_basebackup"
         }
       ],
       "assertions": [
@@ -2988,10 +2998,15 @@
           "cmd": "docker compose start node3"
         },
         {
+          "type": "cmd",
+          "comment": "restore the retention the fault removed, so later cases in a reused cluster run against the managed configuration",
+          "cmd": "docker compose exec -T node1 psql -U postgres -h 127.0.0.1 -p 5434 -d postgres -c \"ALTER SYSTEM RESET wal_keep_size\" -c \"SELECT pg_reload_conf()\""
+        },
+        {
           "type": "wait_cluster",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120
+          "timeout_sec": 180
         }
       ]
     },

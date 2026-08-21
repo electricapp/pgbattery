@@ -493,6 +493,32 @@ enum StandbyAction {
     /// Timeline divergence (either via remote probe or via local-LSN-ahead
     /// detection) — `pg_rewind` required before restart.
     Rewind,
+    /// The leader no longer holds WAL this standby still needs — discard the
+    /// directory and clone the leader's. See [`streaming_gap_action`].
+    Reprovision,
+}
+
+/// What a "timelines match but we are not streaming" gap means for the
+/// standby, given the two probes that can distinguish the cases.
+///
+/// `local_ahead` is `Supervisor::local_ahead_of_leader`; `leader_has_our_wal`
+/// is `Supervisor::leader_retains_our_wal`. `None` from either is a probe that
+/// could not answer, and nothing is done on an unanswered probe.
+const fn streaming_gap_action(
+    local_ahead: Option<bool>,
+    leader_has_our_wal: Option<bool>,
+) -> StandbyAction {
+    match (local_ahead, leader_has_our_wal) {
+        // The leader was rewound past our replay position (a backup restore,
+        // say): PG can never reconnect, and `pg_rewind` is what converges us.
+        (Some(true), _) => StandbyAction::Rewind,
+        // The leader is at-or-ahead and no longer holds the segment we stopped
+        // in. No node can hold WAL from before it was leader, so no retry and
+        // no rewind reaches across the hole — only a fresh clone does.
+        (Some(false), Some(false)) => StandbyAction::Reprovision,
+        // The WAL we need is still there, so PG's own retry recovers this.
+        (Some(false), Some(true) | None) | (None, _) => StandbyAction::Defer,
+    }
 }
 
 /// Timeline info from `pg_controldata` output.
@@ -754,6 +780,15 @@ fn rewind_recovery(error: &Error) -> RewindRecovery {
         return RewindRecovery::Reprovision;
     }
     RewindRecovery::RestartInPlace
+}
+
+/// Relay the postmaster's stderr into our own log until the pipe closes,
+/// which it does when `PostgreSQL` exits.
+async fn relay_postgres_log(stderr: tokio::process::ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        tracing::info!(target: "postgres", "{line}");
+    }
 }
 
 /// Remove everything inside `dir`, leaving the directory itself.
@@ -1044,15 +1079,23 @@ impl Supervisor {
             "Starting PostgreSQL"
         );
 
-        let child = Command::new(&postgres_path)
+        let mut child = Command::new(&postgres_path)
             .arg("-D")
             .arg(&self.config.pg_data_dir)
             .arg("-p")
             .arg(self.config.pg_port.to_string())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::Postgres(format!("Failed to start postgres: {e}")))?;
+
+        // PostgreSQL's own log is the only account of why a start refused, why
+        // recovery stopped, or why a walsender rejected a standby. Discarding
+        // it leaves those undiagnosable from the outside — including from the
+        // logs CI keeps as a failure's evidence.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(relay_postgres_log(stderr));
+        }
 
         self.child = Some(child);
 
@@ -2190,7 +2233,7 @@ host all all ::/0 {auth_method}
     /// Probe local + leader state to decide the demote action. Pure decision
     /// logic — no `stop()`, no config writes, no `pg_rewind` — so the caller
     /// can act atomically once it has the answer. See [`StandbyAction`] for
-    /// the four outcomes and `demote()` for the decision table.
+    /// the outcomes and `demote()` for the decision table.
     async fn decide_standby_action(&self, new_leader_addr: SocketAddr) -> Result<StandbyAction> {
         let config_changed = self.standby_config_would_change(new_leader_addr).await?;
 
@@ -2262,13 +2305,54 @@ host all all ::/0 {auth_method}
         }
     }
 
+    /// Whether the leader still holds the WAL segment this standby's replay
+    /// stopped in. `None` when either side could not answer.
+    ///
+    /// The leader names the segment, because `pg_walfile_name` cannot run in
+    /// recovery and would use the leader's timeline anyway. Only correct on a
+    /// matching timeline, which is the one branch that calls this — a diverged
+    /// standby is a `pg_rewind`, decided before we get here.
+    ///
+    /// `pg_walfile_name` names the segment an LSN falls in, and a replay
+    /// position is inside a record rather than on a segment boundary (each
+    /// segment opens with a page header), so this is the segment whose
+    /// remainder the standby is waiting for.
+    async fn leader_retains_our_wal(&self, leader_addr: SocketAddr) -> Option<bool> {
+        let replay = self
+            .execute_sql("SELECT pg_last_wal_replay_lsn()::text;")
+            .await
+            .ok()?;
+        let replay = replay.trim();
+        // Reject anything that is not an LSN rather than interpolate it: this
+        // string is about to be part of a query on another node.
+        parse_lsn_local(replay)?;
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_ls_waldir() \
+             WHERE name = pg_walfile_name('{replay}'::pg_lsn));"
+        );
+        let answer = self.query_leader(leader_addr, &sql).await?;
+        match answer.trim() {
+            "t" => Some(true),
+            "f" => Some(false),
+            _ => None,
+        }
+    }
+
     /// Resolve a "timelines match but we're not streaming" gap by comparing
     /// LSNs: if local is ahead, the leader was rewound past our replay LSN
     /// (e.g. backup restore) and we must `pg_rewind` to converge; otherwise
     /// PG's own retry will recover and we defer.
     async fn classify_streaming_gap(&self, new_leader_addr: SocketAddr) -> StandbyAction {
-        match self.local_ahead_of_leader(new_leader_addr).await {
-            Some(true) => {
+        let local_ahead = self.local_ahead_of_leader(new_leader_addr).await;
+        // Only asked when the answer can change the action, which keeps the
+        // extra round trip off every path but a standby that is already stuck.
+        let leader_has_our_wal = if local_ahead == Some(false) {
+            self.leader_retains_our_wal(new_leader_addr).await
+        } else {
+            None
+        };
+        match streaming_gap_action(local_ahead, leader_has_our_wal) {
+            StandbyAction::Rewind => {
                 tracing::warn!(
                     new_leader = %new_leader_addr,
                     "Local replay is ahead of leader's WAL — pg_rewind required \
@@ -2276,18 +2360,22 @@ host all all ::/0 {auth_method}
                 );
                 StandbyAction::Rewind
             }
-            Some(false) => {
-                tracing::debug!(
+            StandbyAction::Reprovision => {
+                metrics::counter!("pgbattery_wal_hole_reprovisions").increment(1);
+                tracing::error!(
                     new_leader = %new_leader_addr,
-                    "Streaming broken but leader is at-or-ahead; deferring \
-                     (PG will retry)"
+                    "The leader no longer holds the WAL segment this standby stopped in — \
+                     replay cannot cross the hole, so rebuilding from the leader"
                 );
-                StandbyAction::Defer
+                StandbyAction::Reprovision
             }
-            None => {
+            _ => {
                 tracing::debug!(
                     new_leader = %new_leader_addr,
-                    "Could not compare LSNs; deferring demote work"
+                    ?local_ahead,
+                    ?leader_has_our_wal,
+                    "Streaming broken with the WAL we need still on the leader; deferring \
+                     (PG will retry)"
                 );
                 StandbyAction::Defer
             }
@@ -2324,6 +2412,7 @@ host all all ::/0 {auth_method}
             StandbyAction::NoOp | StandbyAction::Defer => return Ok(()),
             StandbyAction::RestartOnly => false,
             StandbyAction::Rewind => true,
+            StandbyAction::Reprovision => return self.reprovision_from(new_leader_addr).await,
         };
 
         // The divergence gate's local-LSN input must be read while PG is
@@ -2545,6 +2634,17 @@ host all all ::/0 {auth_method}
     /// 64-bit value. Fast-fail with the same 1.5s wall-clock budget as
     /// `get_remote_timeline` — both run on the hot `ensure_follows` path.
     async fn get_remote_lsn(&self, addr: SocketAddr) -> Option<u64> {
+        let answer = self
+            .query_leader(addr, "SELECT pg_current_wal_lsn()::text;")
+            .await?;
+        parse_lsn_local(answer.trim())
+    }
+
+    /// One unaligned single-value query against a peer's `PostgreSQL`, with the
+    /// same 1.5 s wall-clock budget as `get_remote_timeline` — every caller is
+    /// on the hot `ensure_follows` path. `None` on an unreachable peer, a
+    /// failed query, or the budget running out.
+    async fn query_leader(&self, addr: SocketAddr, sql: &str) -> Option<String> {
         let psql = self.config.pg_bin_dir.join("psql");
         let conninfo = format!(
             "host={} port={} user={} dbname=postgres connect_timeout=1",
@@ -2558,7 +2658,7 @@ host all all ::/0 {auth_method}
             .arg("-w")
             .arg("-tAXq")
             .arg("-c")
-            .arg("SELECT pg_current_wal_lsn()::text;")
+            .arg(sql)
             .arg(&conninfo)
             .kill_on_drop(true)
             .output();
@@ -2569,8 +2669,7 @@ host all all ::/0 {auth_method}
         if !output.status.success() {
             return None;
         }
-        let s = String::from_utf8_lossy(&output.stdout);
-        parse_lsn_local(s.trim())
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Are we currently streaming WAL from the configured leader?
@@ -5171,6 +5270,48 @@ mod tests {
         // An unreadable sync marker or count is a failed probe, not a default.
         assert!(parse_role_readonly("false,off,maybe,0").is_err());
         assert!(parse_role_readonly("false,off,set,many").is_err());
+    }
+
+    #[test]
+    fn a_standby_the_leader_can_no_longer_feed_is_rebuilt() {
+        // "PG will retry" is only true while the leader still has the WAL.
+        assert_eq!(
+            streaming_gap_action(Some(false), Some(false)),
+            StandbyAction::Reprovision
+        );
+        assert_eq!(
+            streaming_gap_action(Some(false), Some(true)),
+            StandbyAction::Defer,
+            "the WAL is there, so PG's own retry recovers this"
+        );
+    }
+
+    #[test]
+    fn a_streaming_gap_acts_on_nothing_a_probe_could_not_answer() {
+        // Both probes cross a process boundary and a network; neither failing
+        // is evidence for discarding a data directory.
+        assert_eq!(
+            streaming_gap_action(Some(false), None),
+            StandbyAction::Defer
+        );
+        assert_eq!(streaming_gap_action(None, None), StandbyAction::Defer);
+        assert_eq!(
+            streaming_gap_action(None, Some(false)),
+            StandbyAction::Defer
+        );
+    }
+
+    #[test]
+    fn a_standby_ahead_of_its_leader_rewinds_rather_than_rebuilds() {
+        // Rewind runs the divergence gate; a rebuild would discard the WAL
+        // that gate exists to protect.
+        for leader_has_our_wal in [Some(true), Some(false), None] {
+            assert_eq!(
+                streaming_gap_action(Some(true), leader_has_our_wal),
+                StandbyAction::Rewind,
+                "{leader_has_our_wal:?}"
+            );
+        }
     }
 
     #[test]
