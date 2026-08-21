@@ -144,5 +144,43 @@ class EnsureTableTests(unittest.TestCase):
             self.assertEqual(dc.ensure_table("node3"), "node3")
 
 
+NO_SUCH_PROCESS = CommandResult(1, "", "sh: 1: kill: No such process")
+
+
+class FreezeWalFlushTests(unittest.TestCase):
+    """PostgreSQL under a node restarts on its own — a demote stops it to
+    rewind, a directory that will not open is rebuilt — so the pids read a
+    moment ago can be gone by the time the signal lands."""
+
+    def test_pids_that_turn_over_between_the_read_and_the_signal_are_reread(self) -> None:
+        """This failed a whole durability run as an injection error, when what
+        it saw was PostgreSQL restarting under it."""
+        with (
+            mock.patch.object(dc, "wal_flush_pids", side_effect=[[42, 43], [51, 52]]),
+            mock.patch.object(dc, "await_postgres_running"),
+            mock.patch.object(
+                fp, "exec_in", side_effect=[NO_SUCH_PROCESS, CommandResult(0, "", "")]
+            ),
+            mock.patch.object(
+                fp,
+                "read_processes",
+                return_value=[fp.ProcessInfo(pid=51, state="T", args="postgres: checkpointer")],
+            ),
+        ):
+            dc.freeze_wal_flush(["node3"])
+
+    def test_a_node_that_never_holds_a_flusher_still_fails(self) -> None:
+        """The retry must not turn 'nothing to freeze' into a silent pass: the
+        inversion would go green having widened no window at all."""
+        with (
+            mock.patch.object(dc, "wal_flush_pids", return_value=[]),
+            mock.patch.object(dc, "await_postgres_running"),
+            mock.patch.object(dc, "FREEZE_REACQUIRE_TIMEOUT_S", 0.0),
+            self.assertRaises(fp.FaultPreconditionError) as caught,
+        ):
+            dc.freeze_wal_flush(["node3"])
+        self.assertIn("nothing to freeze", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

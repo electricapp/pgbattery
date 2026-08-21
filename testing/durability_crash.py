@@ -260,6 +260,12 @@ def restart(ids: dict[str, str]) -> None:
     fp.start_containers_by_id(ids)
 
 
+def wal_flush_pids(node: str) -> list[int]:
+    """PIDs of the background WAL-flush processes currently on `node`."""
+    running = fp.read_processes(node)
+    return [p.pid for p in running if any(name in p.args for name in WAL_FLUSH_PROCESSES)]
+
+
 def freeze_wal_flush(nodes: list[str]) -> None:
     """SIGSTOP the background WAL-flush processes on every named node.
 
@@ -267,39 +273,48 @@ def freeze_wal_flush(nodes: list[str]) -> None:
     crash that follows kills them, and the node comes back with fresh ones.
     """
     for node in nodes:
+        _freeze_one(node)
+
+
+def _freeze_one(node: str) -> None:
+    """SIGSTOP `node`'s WAL-flush processes, re-reading if they turn over.
+
+    A `PostgreSQL` under this node can restart at any moment — a demote stops
+    it to rewind, and a data directory that will not open is rebuilt — so both
+    the read and the signal race that turnover: the read can come back empty,
+    and pids read a moment ago can be gone by the time `kill` runs. Neither is
+    "there is nothing to freeze", and failing the run on either reports a
+    harness race as a durability result.
+    """
+    deadline = time.monotonic() + FREEZE_REACQUIRE_TIMEOUT_S
+    while True:
         # PIDs are selected first and signalled by number. `pkill -f` cannot be
         # used here: the pattern would have to name these processes, and the
         # shell running pkill carries that pattern on its own command line, so
         # pkill SIGSTOPs its own caller and the exec hangs until it times out.
-        running = fp.read_processes(node)
-        pids = [p.pid for p in running if any(name in p.args for name in WAL_FLUSH_PROCESSES)]
-        if not pids:
-            # `await_postgres_running` cleared every node moments ago, so an
-            # empty read here is a node that lost its PostgreSQL in between —
-            # a demote stops it to rewind, and comes back. Wait it out once
-            # rather than failing the run on the gap between the check and the
-            # use; a node that genuinely has none still raises below.
-            await_postgres_running([node], FREEZE_REACQUIRE_TIMEOUT_S)
-            running = fp.read_processes(node)
-            pids = [p.pid for p in running if any(name in p.args for name in WAL_FLUSH_PROCESSES)]
-        if not pids:
+        pids = wal_flush_pids(node)
+        if pids:
+            joined = " ".join(str(pid) for pid in pids)
+            stopped = fp.exec_in(node, f"kill -STOP {joined}")
+            if stopped.ok:
+                break
+            last = f"could not stop WAL flush: {stopped.output}"
+        else:
+            last = f"none of {WAL_FLUSH_PROCESSES} are running"
+        if time.monotonic() >= deadline:
             raise fp.FaultPreconditionError(
-                f"{node}: none of {WAL_FLUSH_PROCESSES} are running, so there is "
-                f"nothing to freeze and the un-fsynced window cannot be widened"
+                f"{node}: {last}; there is nothing to freeze and the un-fsynced "
+                f"window cannot be widened"
             )
-        joined = " ".join(str(pid) for pid in pids)
-        stopped = fp.exec_in(node, f"kill -STOP {joined}")
-        if not stopped.ok:
-            raise fp.FaultInjectionError(f"{node}: could not stop WAL flush: {stopped.output}")
-        frozen = [
-            p for p in fp.read_processes(node) if p.pid in set(pids) and p.state.startswith("T")
-        ]
-        if not frozen:
-            raise fp.FaultEffectNotObserved(
-                f"{node}: asked to stop {WAL_FLUSH_PROCESSES} but no process is in state T; "
-                f"the un-fsynced window was never widened and the inversion would "
-                f"go green for the wrong reason"
-            )
+        await_postgres_running([node], FREEZE_REACQUIRE_TIMEOUT_S)
+
+    frozen = [p for p in fp.read_processes(node) if p.pid in set(pids) and p.state.startswith("T")]
+    if not frozen:
+        raise fp.FaultEffectNotObserved(
+            f"{node}: asked to stop {WAL_FLUSH_PROCESSES} but no process is in state T; "
+            f"the un-fsynced window was never widened and the inversion would "
+            f"go green for the wrong reason"
+        )
 
 
 def await_postgres_running(nodes: list[str], timeout_s: float) -> None:

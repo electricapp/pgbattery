@@ -3545,9 +3545,12 @@
         },
         {
           "type": "wait_cluster",
-          "nodes": 2,
+          "comment": "`nodes` is the membership the management API reports, which a kill does not change — `live_nodes` is how a case says one of them is down. Asking for `nodes: 2` here asked the cluster to forget a member it still has, so this wait could never pass. Replication health is not asserted mid-fault for the same reason `leader-network-partition-real` does not: the new leader keeps the killed node in `pg_stat_replication` until `wal_sender_timeout`.",
+          "nodes": 3,
+          "live_nodes": 2,
           "leaders": 1,
           "leader_not_var": "leader_before",
+          "require_replication_health": false,
           "timeout_sec": 60
         },
         {

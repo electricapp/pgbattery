@@ -165,6 +165,44 @@ class ClusterStartRunner(StubRunner):
         return subprocess.CompletedProcess(args="", returncode=0, stdout="", stderr="")
 
 
+class AbortingSuiteRunner(ClusterStartRunner):
+    """Runs a reuse-cluster suite whose second case fails, without docker.
+
+    Attributes:
+        ran: Case ids `run` actually dispatched.
+    """
+
+    def __init__(self, artifact_dir: Path) -> None:
+        super().__init__(artifact_dir)
+        self.suite_name = "ha-controlplane-pr"
+        self.suite_config = self.matrix.suites[self.suite_name]
+        self.selected_case_ids = ["first", "second", "third", "fourth"]
+        self.ran: list[str] = []
+
+    def _run_case(self, case_id: str) -> bool:
+        self.ran.append(case_id)
+        if case_id == "second":
+            self.failed = True
+            self.summary.append(
+                ci_runner.CaseSummary(case_id=case_id, passed=False, detail="stub failure")
+            )
+            return False
+        self.summary.append(ci_runner.CaseSummary(case_id=case_id, passed=True, detail="0.0s"))
+        return True
+
+    def _start_cluster(self, label: str) -> None:
+        return None
+
+    def _stop_cluster(self, label: str) -> None:
+        return None
+
+    def _check_log_budget(self, label: str) -> None:
+        return None
+
+    def _save_run_summary(self) -> None:
+        return None
+
+
 def make_runner() -> StubRunner:
     """Build a stub runner writing artifacts to a throwaway directory."""
     return StubRunner(Path(tempfile.mkdtemp(prefix="ci-runner-units-")))
@@ -1841,6 +1879,47 @@ def test_a_started_cluster_is_waited_on_for_replication_health() -> None:
     assert runner.waits[0].get("require_replication_health") is True, (
         f"started a case against a cluster whose replication was never checked: {runner.waits[0]}"
     )
+
+
+def test_cases_a_suite_abort_skipped_are_named_in_the_summary() -> None:
+    """A reuse-cluster suite stops at its first failure, and a summary listing
+    only what ran reads as coverage of the whole suite. The nightly matrix hid
+    half its cases that way for weeks, every one of them reported green by
+    omission."""
+    runner = StubRunner(Path(tempfile.mkdtemp(prefix="ci-runner-notrun-")))
+    runner.selected_case_ids = ["first", "second", "third", "fourth"]
+    runner._record_cases_not_reached("second")
+
+    skipped = {entry.case_id: entry for entry in runner.summary}
+    assert set(skipped) == {"third", "fourth"}, (
+        f"cases after the failure are missing from the summary: {sorted(skipped)}"
+    )
+    for case_id, entry in skipped.items():
+        assert not entry.passed, f"{case_id} was never run and must not read as a pass"
+        assert "NOT RUN" in entry.detail, entry.detail
+
+
+def test_an_aborted_suite_run_reports_the_cases_it_never_reached() -> None:
+    """The wiring, not just the helper: a run that stops early must leave the
+    skipped cases in its own summary, or the omission reads as coverage."""
+    runner = AbortingSuiteRunner(Path(tempfile.mkdtemp(prefix="ci-runner-abort-")))
+    exit_code = runner.run()
+
+    assert exit_code == 1
+    assert runner.ran == ["first", "second"], f"kept going after a failure: {runner.ran}"
+    reported = {entry.case_id: entry for entry in runner.summary}
+    for case_id in ("third", "fourth"):
+        assert case_id in reported, f"{case_id} never ran and is absent from the summary"
+        assert "NOT RUN" in reported[case_id].detail, reported[case_id].detail
+
+
+def test_a_suite_that_fails_on_its_last_case_reports_nothing_skipped() -> None:
+    """There is nothing after it, and an empty 'not run' line would train the
+    reader to skip the one that matters."""
+    runner = StubRunner(Path(tempfile.mkdtemp(prefix="ci-runner-notrun-last-")))
+    runner.selected_case_ids = ["first", "second"]
+    runner._record_cases_not_reached("second")
+    assert runner.summary == []
 
 
 def test_two_leaders_still_fail_when_a_third_node_is_down() -> None:

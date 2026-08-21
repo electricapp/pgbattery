@@ -2170,6 +2170,25 @@ class CIRunner:
         )
         self._collect_snapshot(f"{label}-cluster-started")
 
+    def _record_cases_not_reached(self, stopped_at: str) -> None:
+        """Put the cases a suite abort skipped into the summary.
+
+        Args:
+            stopped_at: Case id whose failure ended the suite.
+        """
+        remaining = self.selected_case_ids[self.selected_case_ids.index(stopped_at) + 1 :]
+        if not remaining:
+            return
+        self.log(f"[not-run] {len(remaining)} case(s) after {stopped_at}: {', '.join(remaining)}")
+        for case_id in remaining:
+            self.summary.append(
+                CaseSummary(
+                    case_id=case_id,
+                    passed=False,
+                    detail=f"NOT RUN — suite stopped at {stopped_at}",
+                )
+            )
+
     def _check_log_budget(self, label: str) -> None:
         """Fail the run when a node logged like a hot loop.
 
@@ -3720,6 +3739,12 @@ class CIRunner:
                             require_replication_health=True,
                         )
                     if not self._run_case(case_id):
+                        self._record_cases_not_reached(case_id)
+                        # The cluster is no longer in a state later cases can
+                        # start from, so the suite stops — but it says which
+                        # cases that cost, because a summary listing only what
+                        # ran reads as coverage of the whole suite. This one
+                        # hid half the nightly matrix for weeks.
                         break
             finally:
                 if cluster_started:
