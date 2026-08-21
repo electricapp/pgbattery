@@ -38,6 +38,11 @@ use crate::supervisor::{PgWriteState, TimelineInfo};
 /// the supervisor lock across them and the surrounding code documents why that
 /// is bounded.
 pub trait PgControl: Send + Sync {
+    /// Whether this node currently owns a postmaster. False when it has not
+    /// started one, stopped one, or reaped one that exited — in every case
+    /// there is no server to probe or set a GUC on.
+    fn has_postmaster(&self) -> bool;
+
     /// `pg_is_in_recovery()`. True for a standby.
     fn is_in_recovery(&self) -> impl Future<Output = Result<bool>> + Send;
 
@@ -94,6 +99,10 @@ pub trait PgControl: Send + Sync {
 }
 
 impl PgControl for crate::supervisor::Supervisor {
+    fn has_postmaster(&self) -> bool {
+        Self::has_postmaster(self)
+    }
+
     async fn is_in_recovery(&self) -> Result<bool> {
         Self::is_in_recovery(self).await
     }
@@ -173,6 +182,10 @@ impl PgControl for crate::supervisor::Supervisor {
 #[derive(Debug)]
 pub struct ModelPg {
     pub in_recovery: bool,
+    /// Whether this node owns a postmaster. False models the node that left
+    /// `PostgreSQL` down for a repair — the one case where fail-closed
+    /// "assume writable" is a false premise rather than caution.
+    pub has_postmaster: bool,
     /// Which operation, if any, this model refuses. One field rather than a
     /// bool per operation: the interesting scenarios fail exactly one step, and
     /// a set of independent bools invites states that cannot occur.
@@ -205,6 +218,7 @@ impl Default for ModelPg {
     fn default() -> Self {
         Self {
             in_recovery: false,
+            has_postmaster: true,
             fails: None,
             replication_stats: Vec::new(),
             sync_list_empty: true,
@@ -273,6 +287,10 @@ impl ModelPg {
 
 #[cfg(test)]
 impl PgControl for ModelPg {
+    fn has_postmaster(&self) -> bool {
+        self.has_postmaster
+    }
+
     async fn is_in_recovery(&self) -> Result<bool> {
         self.note("is_in_recovery");
         if self.fails == Some(ModelOp::IsInRecovery) {

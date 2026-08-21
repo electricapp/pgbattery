@@ -28,7 +28,7 @@ use crate::governor::{Governor, parse_lsn};
 use crate::observability::management_api::{
     LeaderResponse, ManagementApiState, start_management_api,
 };
-use crate::supervisor::{BackupManager, Supervisor};
+use crate::supervisor::{BackupManager, PostmasterState, Supervisor};
 use metrics::gauge;
 
 use openraft::BasicNode;
@@ -357,6 +357,25 @@ impl App {
         Ok(())
     }
 
+    /// Start a stored standby, or leave `PostgreSQL` down for the reconcile
+    /// loop to repair against the leader.
+    ///
+    /// `PostgreSQL` refuses to open a standby whose last checkpoint sits on
+    /// the leader's timeline fork rather than before it, and refuses it again
+    /// at every start. Failing here makes that a restart loop with no repair
+    /// in it: `demote` can rewind or rebuild the directory onto the leader,
+    /// and Raft has not started yet, so this path does not know who that is.
+    async fn start_standby_or_defer_repair(supervisor: &mut Supervisor) {
+        if let Err(e) = supervisor.start().await {
+            metrics::counter!("pgbattery_standby_start_deferred_to_repair").increment(1);
+            error!(
+                error = %e,
+                "Stored standby did not open — leaving PostgreSQL down for the reconcile \
+                 loop to repair it against the leader"
+            );
+        }
+    }
+
     async fn start_supervisor_for_mode(
         &self,
         supervisor: &mut Supervisor,
@@ -375,7 +394,7 @@ impl App {
         // honor that on restart even if --bootstrap was passed.
         if has_existing_data && is_standby {
             info!("Starting as replica (standby.signal present)");
-            supervisor.start().await?;
+            Self::start_standby_or_defer_repair(supervisor).await;
             return Ok(());
         }
 
@@ -402,7 +421,7 @@ impl App {
         if has_existing_data {
             if is_standby {
                 info!("Starting as replica (standby.signal present)");
-                supervisor.start().await?;
+                Self::start_standby_or_defer_repair(supervisor).await;
                 return Ok(());
             }
 
@@ -1055,18 +1074,26 @@ impl App {
         // Step 1: alive check + read params (holds lock briefly).
         let probe_params = {
             let mut pg = postgres.lock().await;
-            match pg.is_alive() {
-                Ok(false) => {
+            match pg.postmaster_state() {
+                Ok(PostmasterState::Exited) => {
                     error!("PostgreSQL process died - triggering graceful shutdown for failover");
                     drop(pg);
                     let _ = shutdown_tx.send(true);
+                    return;
+                }
+                Ok(PostmasterState::NotRunning) => {
+                    // Nothing died: this node is not running one. A stored
+                    // standby that would not open is left down for
+                    // `demote` to rewind or rebuild against the leader, and
+                    // shutting down here would restart into the same refusal
+                    // without ever reaching that repair.
                     return;
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to check PostgreSQL health");
                     return;
                 }
-                Ok(true) => {}
+                Ok(PostmasterState::Running) => {}
             }
             pg.local_psql_probe_params()
         };
@@ -1554,7 +1581,7 @@ impl App {
         // `should_fence_before_demote`. A steady-state follower takes the
         // probe-and-skip path every reconcile tick, leaving hot-standby
         // reader sessions untouched.
-        if Self::should_fence_before_demote(pg.is_in_recovery().await.ok()) {
+        if Self::should_fence_before_demote(pg.has_postmaster(), pg.is_in_recovery().await.ok()) {
             if let Err(e) = pg.set_readonly(true).await {
                 metrics::counter!("pgbattery_demote_fence_failures").increment(1);
                 error!(error = %e, "Failed to fence before {context} - aborting demote");
@@ -1982,8 +2009,15 @@ impl App {
     /// backends would evict hot-standby readers on every reconcile tick for
     /// no safety gain. `None` (probe failed) fences: an unknown role must be
     /// treated as a possibly-writable primary.
-    const fn should_fence_before_demote(in_recovery: Option<bool>) -> bool {
-        !matches!(in_recovery, Some(true))
+    ///
+    /// A node that owns no postmaster is the exception to that fail-closed
+    /// rule, and not by leniency: there is no server to set a GUC on, so the
+    /// fence can only fail, and `demote_to_leader` aborts on a failed fence —
+    /// which would keep a standby that will not open from ever reaching the
+    /// repair that fixes it. Nothing is served through a socket that no
+    /// process is listening on.
+    const fn should_fence_before_demote(has_postmaster: bool, in_recovery: Option<bool>) -> bool {
+        has_postmaster && !matches!(in_recovery, Some(true))
     }
 
     /// Pure decision for `lease_enforcement_tick`, given the post-probe lease
@@ -2048,9 +2082,18 @@ impl App {
     /// One SQL round trip — this runs every 100 ms under the supervisor lock,
     /// and the fields must come from one consistent snapshot.
     /// Budgeted: a hung postmaster must not pin the lock past one tick.
+    ///
+    /// Fail-closed stops at a node that owns no postmaster. There is no socket
+    /// to serve a write through, so "assume writable" is not caution, it is a
+    /// false premise — and the fence it triggers can only fail, five times,
+    /// until the node shuts itself down over a split-brain that has no server
+    /// to happen on.
     async fn probe_pg_state<P: crate::governor::pg_control::PgControl>(
         pg: &P,
     ) -> (Option<bool>, bool, Option<(bool, usize)>) {
+        if !pg.has_postmaster() {
+            return (None, false, None);
+        }
         match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.probe_role_and_readonly()).await
         {
             Ok(Ok(state)) => {
@@ -3418,6 +3461,28 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_node_with_no_postmaster_is_not_assumed_writable() {
+            // Fail-closed is caution while a server exists to be wrong about.
+            // With none, "assume writable" fences nothing five times over and
+            // then shuts the node down for a split-brain it cannot be in —
+            // which is how a standby left down for repair never got repaired.
+            let model = ModelPg {
+                has_postmaster: false,
+                fails: Some(ModelOp::IsInRecovery),
+                ..ModelPg::default()
+            };
+            let (in_recovery, writable, sync) = App::probe_pg_state(&model).await;
+            assert_eq!(in_recovery, None);
+            assert!(!writable, "no socket serves a write");
+            assert_eq!(sync, None);
+            assert!(
+                model.calls().is_empty(),
+                "probed a server that is not running: {:?}",
+                model.calls()
+            );
+        }
+
+        #[tokio::test]
         async fn a_primary_is_left_alone() {
             // Fast-path idempotency: no failover has happened, so promoting
             // again would be a pointless pg_controldata shell-out on every tick.
@@ -4381,14 +4446,27 @@ mod tests {
     fn test_fence_before_demote_only_for_possible_primary() {
         // A confirmed standby cannot accept writes; fencing it would only
         // evict hot-standby reader sessions on every reconcile tick.
-        assert!(!App::should_fence_before_demote(Some(true)));
+        assert!(!App::should_fence_before_demote(true, Some(true)));
 
         // A confirmed primary must be fenced before demote so no in-flight
         // write lands in WAL that pg_rewind then discards.
-        assert!(App::should_fence_before_demote(Some(false)));
+        assert!(App::should_fence_before_demote(true, Some(false)));
 
         // Probe failure: role unknown → treat as a possibly-writable primary
         // and fence (fail closed).
-        assert!(App::should_fence_before_demote(None));
+        assert!(App::should_fence_before_demote(true, None));
+    }
+
+    #[test]
+    fn a_node_with_no_postmaster_is_not_fenced_before_demote() {
+        // The fence can only fail with no server to set the GUC on, and
+        // demote_to_leader aborts on a failed fence — which is how a standby
+        // that will not open never reached the repair that rebuilds it.
+        for in_recovery in [Some(true), Some(false), None] {
+            assert!(
+                !App::should_fence_before_demote(false, in_recovery),
+                "{in_recovery:?}"
+            );
+        }
     }
 }

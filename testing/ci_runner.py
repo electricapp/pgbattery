@@ -202,6 +202,16 @@ FAULT_PROBE_TIMEOUT_SEC: Final[int] = 60
 # case's own timeout.
 SQL_WRITABLE_TIMEOUT_SEC: Final[int] = 60
 
+# Lines a single node may log across one cluster's lifetime before the run is
+# called a hot loop.
+#
+# A node that cannot reach a peer used to retry the connection with no backoff,
+# and one CI run collected 2.4 million lines for four minutes of cluster — a
+# burnt core and a starved data plane on a two-vCPU runner, invisible to every
+# layer because the cases it broke failed for other-looking reasons. Healthy
+# runs sit three orders of magnitude below this; see `_check_log_budget`.
+LOG_LINES_PER_SERVICE_BUDGET: Final[int] = 250_000
+
 # Statement-leading verbs that need a path accepting writes. Matched at the
 # start of a line so a verb inside a string or a comment does not count; the
 # cost of a false positive is one wait that returns immediately, and of a false
@@ -2160,6 +2170,45 @@ class CIRunner:
         )
         self._collect_snapshot(f"{label}-cluster-started")
 
+    def _check_log_budget(self, label: str) -> None:
+        """Fail the run when a node logged like a hot loop.
+
+        Counts lines per service while the containers still exist, and keeps
+        the offender's log so the repeated line is one ``sort | uniq -c`` away.
+        A loop that retries something thousands of times a second starves the
+        data plane it shares a machine with, and every case it breaks fails
+        looking like something else.
+
+        Args:
+            label: Descriptive label for log files.
+        """
+        for node in self.matrix.cluster.nodes:
+            result = self._run_shell(
+                f"docker compose logs --no-color {node.name} | wc -l",
+                self.system_dir / f"{utc_timestamp()}-{safe_name(label)}-logvol-{node.name}.log",
+                expect_exit=None,
+                timeout_sec=DIAGNOSTIC_TIMEOUT_SEC,
+            )
+            lines = int(result.stdout.strip() or 0)
+            if lines <= LOG_LINES_PER_SERVICE_BUDGET:
+                self.log(f"    [log-volume] {node.name}: {lines} lines")
+                continue
+            self.failed = True
+            detail = (
+                f"logged {lines} lines this run, over the {LOG_LINES_PER_SERVICE_BUDGET} "
+                f"budget — something is retrying in a tight loop"
+            )
+            self.log(f"[fail] log volume: {node.name} {detail}")
+            self.summary.append(
+                CaseSummary(case_id=f"log-volume:{node.name}", passed=False, detail=detail)
+            )
+            self._run_shell(
+                f"docker compose logs --no-color {node.name}",
+                self.system_dir / f"{utc_timestamp()}-{safe_name(label)}-hotloop-{node.name}.log",
+                expect_exit=None,
+                timeout_sec=DIAGNOSTIC_TIMEOUT_SEC,
+            )
+
     def _stop_cluster(self, label: str) -> None:
         """Tear down the Docker Compose cluster and remove volumes.
 
@@ -3674,6 +3723,9 @@ class CIRunner:
                         break
             finally:
                 if cluster_started:
+                    # Before teardown: the containers have to still exist for
+                    # `docker compose logs` to have anything to count.
+                    self._check_log_budget(self.suite_name)
                     if self.failed and self.keep_cluster_on_failure:
                         self.log(
                             "[cluster] preserving cluster for debugging (--keep-cluster-on-failure)"
@@ -3689,6 +3741,7 @@ class CIRunner:
                     self._run_case(case_id)
                 finally:
                     if cluster_started:
+                        self._check_log_budget(case_id)
                         if self.failed and self.keep_cluster_on_failure:
                             self.log(
                                 "[cluster] preserving cluster for debugging "

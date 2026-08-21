@@ -1794,10 +1794,10 @@
         },
         {
           "type": "wait_cluster",
-          "comment": "Demand full replication health (2 healthy followers) AND require it to hold for stable_for_sec before returning. When the partitioned former leader (node1) rejoins it can briefly force one re-election (it campaigned with a bumped term while isolated), so the cluster flickers 1->0->1 leaders for ~an election timeout. A one-shot wait could catch the momentary leaders==1 and return right before the dip, then the cluster_topology assertion below would see leaders=0. Requiring 10s of continuous convergence proves the re-election has settled \u2014 a brief re-election is normal Raft liveness (never 2 leaders == no split-brain), a persistent one still fails here.",
+          "comment": "Demand full replication health (2 healthy followers) AND require it to hold for stable_for_sec before returning. When the partitioned former leader (node1) rejoins it can briefly force one re-election (it campaigned with a bumped term while isolated), so the cluster flickers 1->0->1 leaders for ~an election timeout. A one-shot wait could catch the momentary leaders==1 and return right before the dip, then the cluster_topology assertion below would see leaders=0. Requiring 10s of continuous convergence proves the re-election has settled \u2014 a brief re-election is normal Raft liveness (never 2 leaders == no split-brain), a persistent one still fails here. The budget covers a rebuild: a node whose PostgreSQL will not open on the new leader's timeline is cloned from it, and that clone is then the dominant term — measured at 104s against 44s for a run where no node needed one.",
           "nodes": 3,
           "leaders": 1,
-          "timeout_sec": 120,
+          "timeout_sec": 240,
           "min_healthy_replicas": 2,
           "stable_for_sec": 10
         },

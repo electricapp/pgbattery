@@ -19,6 +19,6 @@ static ALLOC: pgbattery_core::alloc_meter::CountingAllocator =
 
 pub use backup::BackupManager;
 pub use process::{
-    PgWriteState, ReplicationStat, ReplicationState, Supervisor, SupervisorConfig, SyncState,
-    TimelineInfo, read_system_identifier,
+    PgWriteState, PostmasterState, ReplicationStat, ReplicationState, Supervisor, SupervisorConfig,
+    SyncState, TimelineInfo, read_system_identifier,
 };

@@ -744,6 +744,19 @@ fn rewind_failure_left_target_untouched(error: &Error) -> bool {
     pg_rewind_failure_is_pre_copy(&msg)
 }
 
+/// What a liveness poll found of the postmaster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostmasterState {
+    /// This node started it and it is still running.
+    Running,
+    /// It was running under this node and has exited — a crash, and the
+    /// node's cue to hand off.
+    Exited,
+    /// This node is not running one: never started this boot, deliberately
+    /// stopped, or left down after a start that would not open.
+    NotRunning,
+}
+
 /// What a rewind attempt left behind for the caller to finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RewindOutcome {
@@ -1004,32 +1017,56 @@ impl Supervisor {
     /// # Errors
     /// Returns an error if the OS call to check process status fails.
     pub fn is_alive(&mut self) -> Result<bool> {
-        if let Some(child) = &mut self.child {
-            // try_wait() returns Ok(Some(status)) if exited, Ok(None) if still running
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::error!(
-                        exit_status = ?status,
-                        "PostgreSQL process exited unexpectedly"
-                    );
-                    // CRITICAL: Clear child reference after reaping zombie
-                    // Otherwise next is_alive() call returns Err instead of Ok(false)
-                    self.child = None;
-                    // Clear the role gauge on the running→exited transition so
-                    // monitoring does not show a stale primary/standby role
-                    // after a crash. Only on this transition: once `child` is
-                    // None, later polls take the branch below and never re-emit.
-                    metrics::gauge!("pgbattery_pg_is_primary").set(0.0);
-                    Ok(false) // Dead
-                }
-                Ok(None) => Ok(true), // Alive
-                Err(e) => Err(Error::Postgres(format!(
-                    "Failed to check process status: {e}"
-                ))),
+        Ok(self.postmaster_state()? == PostmasterState::Running)
+    }
+
+    /// Whether this node owns a postmaster at all — false when it has not
+    /// started one, stopped one, or already reaped one that exited.
+    ///
+    /// The cheap half of [`Self::postmaster_state`], for callers that only
+    /// need "is there a server to talk to" and hold `&self`.
+    #[must_use]
+    pub const fn has_postmaster(&self) -> bool {
+        self.child.is_some()
+    }
+
+    /// Poll the postmaster, distinguishing one that exited from one this node
+    /// is not running.
+    ///
+    /// The difference is load-bearing: an exit under us is a crash and the
+    /// node hands off, while a postmaster we never started (or deliberately
+    /// stopped) is a state the reconcile loop repairs. Collapsing them is why
+    /// a restore has to hold the supervisor lock from `stop` to `start` — the
+    /// health tick would otherwise read the gap as a crash and shut the node
+    /// down mid-restore.
+    ///
+    /// # Errors
+    /// Returns an error if the OS call to check process status fails.
+    pub fn postmaster_state(&mut self) -> Result<PostmasterState> {
+        let Some(child) = &mut self.child else {
+            return Ok(PostmasterState::NotRunning);
+        };
+        // try_wait() returns Ok(Some(status)) if exited, Ok(None) if still running
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::error!(
+                    exit_status = ?status,
+                    "PostgreSQL process exited unexpectedly"
+                );
+                // CRITICAL: Clear child reference after reaping zombie
+                // Otherwise the next poll returns Err instead of Exited
+                self.child = None;
+                // Clear the role gauge on the running→exited transition so
+                // monitoring does not show a stale primary/standby role
+                // after a crash. Only on this transition: once `child` is
+                // None, later polls report NotRunning and never re-emit.
+                metrics::gauge!("pgbattery_pg_is_primary").set(0.0);
+                Ok(PostmasterState::Exited)
             }
-        } else {
-            // No child process - treat as dead
-            Ok(false)
+            Ok(None) => Ok(PostmasterState::Running),
+            Err(e) => Err(Error::Postgres(format!(
+                "Failed to check process status: {e}"
+            ))),
         }
     }
 
@@ -2500,6 +2537,35 @@ host all all ::/0 {auth_method}
         Ok(())
     }
 
+    /// Bring a stopped `PostgreSQL` back as a standby of `new_leader_addr`,
+    /// repairing the data directory if it will not open on that leader.
+    ///
+    /// Startup cannot do this: a stored standby whose directory `PostgreSQL`
+    /// refuses — the leader's timeline forked at, rather than after, its last
+    /// checkpoint — fails identically at every boot, and the node has no
+    /// leader address to repair against until Raft has started. So it leaves
+    /// `PostgreSQL` down and the reconcile loop, which does know the leader,
+    /// arrives here.
+    async fn restart_or_repair_standby(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
+        self.configure_standby(new_leader_addr).await?;
+        if self.start().await.is_ok() {
+            return Ok(());
+        }
+        // Straight to a clone, not through `pg_rewind`: the divergence gate
+        // needs a local WAL position, that comes from a running server, and
+        // this one will not start — so every rewind from here fails closed on
+        // an unreadable local LSN and leaves the node exactly as stuck. What
+        // the gate protects is not at risk either: an acknowledged write
+        // required the leader as well as a standby, and `PostgreSQL` cannot
+        // read this directory to ship what is in it regardless.
+        metrics::counter!("pgbattery_unopenable_standby_rebuilt").increment(1);
+        tracing::error!(
+            new_leader = %new_leader_addr,
+            "PostgreSQL will not open on this data directory — rebuilding it from the leader"
+        );
+        self.reprovision_from(new_leader_addr).await
+    }
+
     /// `pg_rewind` this stopped standby onto `new_leader_addr`, resolving a
     /// failure per [`rewind_recovery`].
     async fn rewind_onto_leader(
@@ -2548,6 +2614,9 @@ host all all ::/0 {auth_method}
     /// Returns an error if the recovery-state probe fails, or the node cannot
     /// be reconfigured and restarted to follow `new_leader_addr`.
     pub async fn demote(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
+        if self.postmaster_state()? == PostmasterState::NotRunning {
+            return self.restart_or_repair_standby(new_leader_addr).await;
+        }
         let in_recovery = self.is_in_recovery().await.map_err(|e| {
             Error::Postgres(format!(
                 "Failed to probe recovery state before demotion: {e}"
@@ -5295,6 +5364,31 @@ mod tests {
         // An unreadable sync marker or count is a failed probe, not a default.
         assert!(parse_role_readonly("false,off,maybe,0").is_err());
         assert!(parse_role_readonly("false,off,set,many").is_err());
+    }
+
+    #[test]
+    fn a_postmaster_this_node_never_started_is_not_a_crash() {
+        // The health tick hands leadership off on a crash. A stored standby
+        // that would not open is left down on purpose for `demote` to rewind
+        // or rebuild, and reading that as a crash restarts into the same
+        // refusal without ever reaching the repair.
+        let mut supervisor = Supervisor::new(SupervisorConfig {
+            pg_bin_dir: PathBuf::from("/nonexistent"),
+            pg_data_dir: PathBuf::from("/nonexistent"),
+            pg_port: 5_432,
+            pg_user: "postgres".to_string(),
+            wal_level: WalLevel::Replica,
+            node_id: 1,
+            pg_auth_mode: PgAuthMode::Trust,
+        });
+        assert_eq!(
+            supervisor.postmaster_state().unwrap(),
+            PostmasterState::NotRunning
+        );
+        assert!(
+            !supervisor.is_alive().unwrap(),
+            "not running is still not alive"
+        );
     }
 
     #[test]
