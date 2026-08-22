@@ -2295,6 +2295,81 @@ nothing detects drift.
       used to stay at four.
       _Effort_ M
 
+- [x] **H-59 — the canonical doc was appended to rather than maintained.**
+      Fifteen commits touched `docs/STATE_MACHINE.md` in eight days, nearly all
+      adding one or two lines, while `process.rs` grew by around 800 and
+      `app.rs` by 500. Every one of them satisfied the maintenance rule: the
+      file was edited in the same commit. None of them updated the structured
+      part. Section 3 still led with five states, three truth sources and six
+      transition triggers from before that week, while four dense prose bullets
+      accumulated underneath carrying `StandbyAction`'s five outcomes,
+      `Reprovision` as a transition, and `PostmasterState`'s exit-code
+      refinement — none of which appeared in any list.
+
+      The truth-source table was wrong in a way that mattered: it named
+      `Child::try_wait()` for process liveness, when the load-bearing fact had
+      become the exit **code**, which decides whether a data directory is
+      rebuilt, and which is consumed on read.
+
+      Section 3 is rewritten as a state machine — the `StandbyAction` table is
+      the transition surface, the three re-provision doors are named with what
+      each one is reached from, and the truth source says what it now is.
+      `lint_matrix.py` gained three checks so the rule has a property behind
+      it: every type the doc names must resolve to a definition, naming an enum
+      on its own requires describing every state it has, and the register of
+      deliberately-foreign names may not outlive its entries. The second one
+      found `ClusterCommand` described by three of its five commands on its
+      first run.
+      _Effort_ M
+
+- [x] **H-58 — the supervisor re-read its own error messages to decide whether
+      to destroy a data directory.** `rewind_failure_left_target_untouched`
+      substring-matched `error.to_string()` for `did not become ready in time`,
+      `failed to probe rewind source` and `failed to run pg_rewind`. All three
+      were strings this crate had formatted into `Error::Postgres(String)` a
+      few hundred lines earlier: the typed information existed at the throw
+      site and was flattened into prose so it could be recovered by grep.
+
+      The answer feeds `rewind_recovery`, which returns `Reprovision` — discard
+      the data directory and clone the leader. So a reworded message destroys
+      an intact directory, and the inverse leaves a half-rewound one in a
+      permanent restart loop. Proven, not reasoned about: with the string
+      version in place, `recovery_does_not_depend_on_how_a_failure_is_worded`
+      fails on "rewind source X was not ready in time".
+
+      `Error::RewindFailed` now carries `target_intact` as data, set where the
+      failure happens — at the boundary holding `pg_rewind`'s own stderr, or at
+      a pre-flight that knows the rewind never started. `rewind_recovery`
+      matches on the type and never on the text. Matching `pg_rewind`'s stderr
+      stays, confined to `classify_pg_rewind_failure`, which is a real foreign
+      boundary with no typed channel.
+      _Effort_ M
+
+- [x] **H-57 — nothing tells a `sql` step that its node is up.** `wait_cluster`
+      and `wait_sync` both read the Raft-replicated cluster state, and a node
+      whose PostgreSQL is down still appears there — present, and synced at the
+      last LSN it reported. A step that then talks to that node **directly**
+      has nothing standing between it and a refused connection.
+
+      `backup-restore-valid` lost that race on CI. Its restored standby came up
+      at 19:46:58.44, the reconcile loop found the timeline mismatch it was
+      always going to find (local 1, leader 2) and re-pointed it — stop at
+      .815, back up at 19:46:59.04 — and the assertion ran at .7. Two hundred
+      milliseconds, and both waits ahead of it had passed instantly and
+      correctly: `lag_bytes 0, is_synced true`, because that is what the last
+      report said.
+
+      The first fix written for this was a blanket retry of psql exit 2 on
+      every `sql` step, and it was the wrong shape: it inferred a node's state
+      from a timeout instead of asking, and a genuine minute-long outage would
+      have read as a slow pass. What landed instead is `wait_pg_ready`, which
+      polls `pg_isready` against the node's own internal port — the one truth
+      source for "is this postmaster accepting connections" — and is declared
+      by the cases that need it. `pg_isready` exit 3, the probe declining to
+      try, fails immediately rather than spending the budget and then reporting
+      a healthy node as down.
+      _Effort_ S
+
 - [x] **H-56 — a failed `pg_rewind` could leave a leader with no PostgreSQL at
       all.** `rewind_onto_leader`'s retryable arm restarts the standby in place
       and hands the rewind error back for the reconcile loop to retry, which is

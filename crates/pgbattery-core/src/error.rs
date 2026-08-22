@@ -120,6 +120,18 @@ pub enum Error {
         threshold_bytes: u64,
     },
 
+    /// A `pg_rewind` that did not complete, carrying what the failure means
+    /// for the target data directory.
+    ///
+    /// `target_intact` is decided where the failure happens: at the boundary
+    /// holding `pg_rewind`'s own stderr, or at a call site that knows the
+    /// rewind never started. Recovery reads the flag
+    /// (`Supervisor::rewind_recovery`), never the message — a directory is
+    /// discarded on that answer, and no rewording of a string may be able to
+    /// change it.
+    #[error("pg_rewind failed: {detail}")]
+    RewindFailed { target_intact: bool, detail: String },
+
     /// The local data directory was never part of the cluster it is being
     /// asked to follow: `pg_rewind` compares control files on connect and
     /// reports the two clusters are from different systems.

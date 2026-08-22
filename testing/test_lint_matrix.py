@@ -165,5 +165,83 @@ class MembershipWaitTest(unittest.TestCase):
         self.assertEqual(lm.waits_that_ask_membership_to_shrink(cases, 3), [])
 
 
+class StateMachineDocTest(unittest.TestCase):
+    """The canonical doc is pinned to the code it claims to describe.
+
+    The drift these catch is the one the maintenance rule alone did not: a
+    commit that touches the doc — satisfying the rule — by appending a prose
+    bullet, while the states and truth sources the doc leads with quietly stop
+    matching the code.
+    """
+
+    def test_the_doc_as_committed_passes(self) -> None:
+        lm.check_state_machine_names_resolve()
+        lm.check_state_machine_describes_whole_enums()
+        lm.check_state_machine_foreign_names_are_still_needed()
+
+    def test_a_type_the_workspace_no_longer_defines_is_caught(self) -> None:
+        doc = "- **States**: held in `TheRenamedThing`, which nothing defines.\n"
+        with (
+            mock.patch.object(Path, "read_text", return_value=doc),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            lm.check_state_machine_names_resolve()
+        self.assertIn("TheRenamedThing", str(caught.exception))
+
+    def test_an_acronym_is_not_mistaken_for_a_type(self) -> None:
+        """`WAL`, `GUC` and SQL keywords are all-caps; our types are not."""
+        self.assertFalse(lm.is_rust_type_name("WAL"))
+        self.assertFalse(lm.is_rust_type_name("WHERE"))
+        self.assertTrue(lm.is_rust_type_name("StandbyAction"))
+
+    def test_a_variant_the_doc_never_describes_is_caught(self) -> None:
+        index = {"StandbyAction": {"NoOp", "Defer", "TheNewOne"}}
+        doc = "- `StandbyAction` is `NoOp` or `Defer`.\n"
+        with (
+            mock.patch.object(lm, "enum_variant_index", return_value=index),
+            mock.patch.object(Path, "read_text", return_value=doc),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            lm.check_state_machine_describes_whole_enums()
+        self.assertIn("TheNewOne", str(caught.exception))
+
+    def test_citing_one_variant_does_not_claim_the_whole_enum(self) -> None:
+        """`Error::ForeignDataDirectory` is a citation, not a promise to
+        describe every error the workspace can return."""
+        index = {"Error": {"ForeignDataDirectory", "Io", "Tls"}}
+        doc = "- The rewind path returns `Error::ForeignDataDirectory`.\n"
+        with (
+            mock.patch.object(lm, "enum_variant_index", return_value=index),
+            mock.patch.object(Path, "read_text", return_value=doc),
+        ):
+            lm.check_state_machine_describes_whole_enums()
+
+    def test_a_variant_after_an_attribute_holding_braces_is_still_seen(self) -> None:
+        """`#[error("... {field} ...")]` sits between an enum's variants, and
+        counting its braces closed the enum early — hiding every variant after
+        the first one that carried a format string."""
+        source = (
+            "pub enum Error {\n"
+            '    #[error("Connection idle timeout (id={conn_id}, limit={idle_ms}ms)")]\n'
+            "    IdleTimeout { conn_id: u64, idle_ms: u64 },\n"
+            '    #[error("later: {0}")]\n'
+            "    ArrivesAfterTheBraces(String),\n"
+            "}\n"
+        )
+        with mock.patch.object(Path, "read_text", return_value=source):
+            index = lm.enum_variant_index([Path("error.rs")])
+        self.assertEqual(index["Error"], {"IdleTimeout", "ArrivesAfterTheBraces"})
+
+    def test_a_foreign_name_the_workspace_now_defines_is_caught(self) -> None:
+        with (
+            mock.patch.object(
+                lm, "STATE_MACHINE_FOREIGN_TYPES", {"StandbyAction": "claimed to be foreign"}
+            ),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            lm.check_state_machine_foreign_names_are_still_needed()
+        self.assertIn("StandbyAction", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

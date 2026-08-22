@@ -718,30 +718,25 @@ fn pg_rewind_failure_is_pre_copy(stderr: &str) -> bool {
     !matches!(classify_pg_rewind_failure(stderr), PreCopyOutcome::Touched)
 }
 
-/// Whether a `run_pg_rewind` failure is known to have left the target data
-/// directory untouched, so the pre-rewind on-disk state is still startable.
+/// A `pg_rewind` failure that never reached the target data directory.
 ///
-/// Pre-flight failures (source readiness probe, divergence gate, spawn)
-/// never ran `pg_rewind` at all; subprocess failures are classified by
-/// their embedded stderr via [`pg_rewind_failure_is_pre_copy`]. The
-/// wall-clock budget timeout matches no marker and so counts as touched —
-/// it can kill a copy mid-flight.
-fn rewind_failure_left_target_untouched(error: &Error) -> bool {
-    if matches!(
-        error,
-        Error::RewindDataLossRisk { .. } | Error::ForeignDataDirectory { .. }
-    ) {
-        return true;
+/// The pre-flight failures — source readiness probe, divergence gate, spawn —
+/// happen before `pg_rewind` writes anything, so the caller knows the on-disk
+/// state is the standby state it was, without inspecting any message.
+fn rewind_untouched(detail: impl Into<String>) -> Error {
+    Error::RewindFailed {
+        target_intact: true,
+        detail: detail.into(),
     }
-    let msg = error.to_string();
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("did not become ready in time")
-        || lower.contains("failed to probe rewind source")
-        || lower.contains("failed to run pg_rewind")
-    {
-        return true;
+}
+
+/// A `pg_rewind` failure the copy phase may have reached, leaving a mix of old
+/// and new blocks. Fail closed: only a fresh clone recovers it.
+fn rewind_compromised(detail: impl Into<String>) -> Error {
+    Error::RewindFailed {
+        target_intact: false,
+        detail: detail.into(),
     }
-    pg_rewind_failure_is_pre_copy(&msg)
 }
 
 /// What a liveness poll found of the postmaster.
@@ -797,19 +792,30 @@ pub(crate) enum RewindRecovery {
 
 /// Decide [`RewindRecovery`] for a failed `run_pg_rewind`.
 ///
+/// Reads the failure's type, never its message. A directory is discarded on
+/// this answer, so the on-disk verdict is carried as data from the site that
+/// knows it — `Error::RewindFailed::target_intact`, set at the boundary that
+/// holds `pg_rewind`'s stderr or at the pre-flight that never ran it.
+///
 /// A compromised directory has to be rebuilt here rather than left stopped
 /// for an operator: `PostgreSQL` dies on the half-rewound state at every
 /// start, so "stopped pending a rebuild" is a permanent restart loop for a
 /// node the cluster is otherwise ready to take back.
-fn rewind_recovery(error: &Error) -> RewindRecovery {
-    // A foreign lineage leaves the directory untouched but unusable — no
-    // retry can give two lineages a common ancestor.
-    if matches!(error, Error::ForeignDataDirectory { .. })
-        || !rewind_failure_left_target_untouched(error)
-    {
-        return RewindRecovery::Reprovision;
+///
+/// Anything else is a failure this function was not written for, and the
+/// unrecognised case is a rebuild — the same fail-closed default the on-disk
+/// verdict itself takes.
+const fn rewind_recovery(error: &Error) -> RewindRecovery {
+    match error {
+        // The gate refused before `pg_rewind` ran; the standby state is intact.
+        Error::RewindDataLossRisk { .. } => RewindRecovery::RestartInPlace,
+        Error::RewindFailed { target_intact, .. } if *target_intact => {
+            RewindRecovery::RestartInPlace
+        }
+        // A foreign lineage leaves the directory untouched but unusable — no
+        // retry can give two lineages a common ancestor.
+        _ => RewindRecovery::Reprovision,
     }
-    RewindRecovery::RestartInPlace
 }
 
 /// Relay the postmaster's stderr into our own log until the pipe closes,
@@ -1807,10 +1813,9 @@ host all all ::/0 {auth_method}
     ///
     /// Fails CLOSED on probe failure: if the local WAL position is unavailable,
     /// or the source LSN cannot be read after `REWIND_GATE_LSN_RETRIES` bounded
-    /// retries, returns `Error::Postgres("failed to probe rewind source: …")`
-    /// rather than rewinding blind — without both LSNs we cannot prove the
-    /// rewind will not discard client-acked WAL. That message is classified
-    /// "target untouched" (the gate runs before `pg_rewind` modifies anything),
+    /// retries, returns [`rewind_untouched`] rather than rewinding blind —
+    /// without both LSNs we cannot prove the rewind will not discard
+    /// client-acked WAL. The gate runs before `pg_rewind` modifies anything,
     /// so recovery is a clean retry rather than a wedge: the in-recovery
     /// reconcile loop re-runs the whole demote (re-capturing the pre-stop LSN
     /// while PG is up), and a deposed primary restarts and rejoins. A transient
@@ -1833,18 +1838,16 @@ host all all ::/0 {auth_method}
         // Local WAL position: captured pre-stop and passed in. If that failed we
         // try once more, but PG is stopped by now so this usually fails too.
         // Without the local LSN we CANNOT prove the rewind won't discard acked
-        // WAL, so we fail CLOSED rather than rewinding blind. The message is
-        // classified as "target untouched" (the gate runs before pg_rewind
-        // modifies anything), so the reconcile loop retries the whole demote —
-        // re-capturing the pre-stop LSN while PG is up.
+        // WAL, so we fail CLOSED rather than rewinding blind. The gate runs
+        // before pg_rewind modifies anything, so the reconcile loop retries the
+        // whole demote — re-capturing the pre-stop LSN while PG is up.
         let local_lsn = match pre_stop_local_lsn {
             Some(lsn) => lsn,
             None => self.capture_lsn_for_rewind_gate().await.ok_or_else(|| {
                 metrics::counter!("pgbattery_pg_rewind_gate_probe_failed").increment(1);
-                Error::Postgres(
-                    "failed to probe rewind source: local WAL position unavailable, refusing \
-                     pg_rewind (cannot verify it will not discard acked WAL)"
-                        .to_string(),
+                rewind_untouched(
+                    "local WAL position unavailable, refusing pg_rewind (cannot verify it will \
+                     not discard acked WAL)",
                 )
             })?,
         };
@@ -1864,10 +1867,9 @@ host all all ::/0 {auth_method}
         }
         let Some(source_lsn) = source_lsn else {
             metrics::counter!("pgbattery_pg_rewind_gate_probe_failed").increment(1);
-            return Err(Error::Postgres(format!(
-                "failed to probe rewind source: could not read source LSN from {source_addr} \
-                 after {REWIND_GATE_LSN_RETRIES} attempts, refusing pg_rewind (cannot verify it \
-                 will not discard acked WAL)"
+            return Err(rewind_untouched(format!(
+                "could not read source LSN from {source_addr} after {REWIND_GATE_LSN_RETRIES} \
+                 attempts, refusing pg_rewind (cannot verify it will not discard acked WAL)"
             )));
         };
 
@@ -3159,7 +3161,7 @@ host all all ::/0 {auth_method}
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| Error::Postgres(format!("Failed to run pg_rewind: {e}")))?;
+            .map_err(|e| rewind_untouched(format!("could not spawn pg_rewind: {e}")))?;
 
         // Drain stderr concurrently with the wait, but keep the `child` handle
         // (only borrowed by `wait`) so the timeout path can kill it.
@@ -3185,7 +3187,11 @@ host all all ::/0 {auth_method}
         let remaining = budget_deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, collect).await {
             Ok(Ok(status)) => Ok((status, stderr_buf)),
-            Ok(Err(e)) => Err(Error::Postgres(format!("Failed to run pg_rewind: {e}"))),
+            // The child was spawned and then could not be waited on, so it may
+            // be copying still.
+            Ok(Err(e)) => Err(rewind_compromised(format!(
+                "could not wait on pg_rewind: {e}"
+            ))),
             Err(_) => {
                 // Budget exceeded mid-run. Reap the child before returning so
                 // no orphaned pg_rewind keeps writing into the data dir and
@@ -3194,10 +3200,8 @@ host all all ::/0 {auth_method}
                 tokio::time::timeout(PG_REWIND_REAP_BUDGET, child.wait())
                     .await
                     .ok();
-                // "exceeded budget" is classified as target-touched by
-                // rewind_failure_left_target_untouched — a timeout can kill a
-                // copy mid-flight.
-                Err(Error::Postgres(format!(
+                // Compromised: the budget can expire with a copy in flight.
+                Err(rewind_compromised(format!(
                     "pg_rewind exceeded {}s budget",
                     PG_REWIND_BUDGET.as_secs()
                 )))
@@ -3299,23 +3303,25 @@ host all all ::/0 {auth_method}
                 }
 
                 // Terminal pre-copy, non-retryable error, or max attempts
-                // reached. The error string still carries the original
-                // stderr, so rewind_failure_left_target_untouched can
-                // classify the data-safety outcome (same-timeline stays
-                // untouched).
+                // reached. This is the one place holding pg_rewind's own
+                // stderr, so the on-disk verdict is decided here and carried
+                // as data — a same-timeline failure stays untouched.
                 tracing::warn!(stderr = %stderr, "pg_rewind failed");
-                return Err(Error::Postgres(format!("pg_rewind failed: {stderr}")));
+                return Err(Error::RewindFailed {
+                    target_intact: pg_rewind_failure_is_pre_copy(&stderr),
+                    detail: stderr.trim().to_string(),
+                });
             }
 
-            Err(Error::Postgres(
-                "pg_rewind failed after all retries".to_string(),
-            ))
+            // Unreachable: the loop's last iteration cannot take the retry
+            // branch. Fail closed anyway.
+            Err(rewind_compromised("pg_rewind failed after all retries"))
         };
 
         tokio::time::timeout(PG_REWIND_BUDGET, inner)
             .await
             .unwrap_or_else(|_| {
-                Err(Error::Postgres(format!(
+                Err(rewind_compromised(format!(
                     "pg_rewind exceeded {}s budget",
                     PG_REWIND_BUDGET.as_secs()
                 )))
@@ -3376,8 +3382,8 @@ host all all ::/0 {auth_method}
                     }
                 }
                 Ok(Err(e)) => {
-                    return Err(Error::Postgres(format!(
-                        "Failed to probe rewind source: {e}"
+                    return Err(rewind_untouched(format!(
+                        "could not probe rewind source: {e}"
                     )));
                 }
                 Err(_) => {
@@ -3390,8 +3396,8 @@ host all all ::/0 {auth_method}
             }
 
             if Instant::now() >= deadline {
-                return Err(Error::Postgres(format!(
-                    "Rewind source {source_addr} did not become ready in time (not accepting connections or still in recovery)"
+                return Err(rewind_untouched(format!(
+                    "rewind source {source_addr} did not become ready in time (not accepting connections or still in recovery)"
                 )));
             }
             sleep(Duration::from_millis(PG_REWIND_RETRY_DELAY_MS)).await;
@@ -5002,59 +5008,112 @@ mod tests {
     }
 
     #[test]
+    fn recovery_does_not_depend_on_how_a_failure_is_worded() {
+        // The directory is discarded on this answer. Every one of these is the
+        // same failure — the rewind never started — written differently, and
+        // all of them have to recover in place.
+        for detail in [
+            "Rewind source 172.28.0.11:5434 did not become ready in time",
+            "rewind source 172.28.0.11:5434 was not ready in time",
+            "the source never came up",
+            "",
+        ] {
+            assert_eq!(
+                rewind_recovery(&Error::RewindFailed {
+                    target_intact: true,
+                    detail: detail.to_string(),
+                }),
+                RewindRecovery::RestartInPlace,
+                "an untouched directory was rebuilt over the wording {detail:?}"
+            );
+        }
+        // And the inverse: a directory the copy reached is rebuilt whatever it
+        // says, including when it says nothing.
+        for detail in ["pg_rewind exceeded 300s budget", "could not write file", ""] {
+            assert_eq!(
+                rewind_recovery(&Error::RewindFailed {
+                    target_intact: false,
+                    detail: detail.to_string(),
+                }),
+                RewindRecovery::Reprovision,
+                "a compromised directory was restarted over the wording {detail:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_rewind_untouched_pre_flight_errors() {
-        // Failures from before the pg_rewind subprocess ran at all.
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "Rewind source 172.28.0.11:5434 did not become ready in time (not accepting connections or still in recovery)".to_string()
-        )));
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "Failed to probe rewind source: spawn failed".to_string()
-        )));
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "Failed to run pg_rewind: No such file or directory".to_string()
-        )));
-        assert!(rewind_failure_left_target_untouched(
-            &Error::RewindDataLossRisk {
+        // Every failure from before the pg_rewind subprocess ran is built by
+        // the constructor that says so, so the directory survives it.
+        assert_eq!(
+            rewind_recovery(&rewind_untouched("did not become ready in time")),
+            RewindRecovery::RestartInPlace
+        );
+        assert_eq!(
+            rewind_recovery(&rewind_untouched("could not spawn pg_rewind: not found")),
+            RewindRecovery::RestartInPlace
+        );
+        // The divergence gate refusing is the same: it runs before pg_rewind
+        // modifies anything, so the node comes back up as a standby and the
+        // reconcile loop retries rather than being left stopped.
+        assert_eq!(
+            rewind_recovery(&Error::RewindDataLossRisk {
                 local_lsn_bytes: 100,
                 source_lsn_bytes: 50,
                 divergence_bytes: 50,
                 threshold_bytes: 8,
-            }
-        ));
-        // The divergence gate's new fail-closed errors (local/source LSN
-        // unreadable) must also be classified as "target untouched": the gate
-        // runs before pg_rewind modifies anything, so the node is brought back
-        // up as a standby and the reconcile loop retries, rather than being
-        // left stopped.
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "failed to probe rewind source: local WAL position unavailable, refusing pg_rewind \
-             (cannot verify it will not discard acked WAL)"
-                .to_string()
-        )));
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "failed to probe rewind source: could not read source LSN from 172.28.0.11:5434 after \
-             3 attempts, refusing pg_rewind (cannot verify it will not discard acked WAL)"
-                .to_string()
-        )));
-    }
-
-    #[test]
-    fn test_rewind_untouched_connection_phase_stderr() {
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "pg_rewind failed: pg_rewind: error: could not connect to server".to_string()
-        )));
+            }),
+            RewindRecovery::RestartInPlace
+        );
     }
 
     #[test]
     fn test_rewind_touched_budget_timeout_and_unknown() {
-        // Budget timeout can kill a copy mid-flight — must count as touched.
-        assert!(!rewind_failure_left_target_untouched(&Error::Postgres(
-            "pg_rewind exceeded 300s budget".to_string()
-        )));
-        assert!(!rewind_failure_left_target_untouched(&Error::Postgres(
-            "pg_rewind failed: pg_rewind: error: could not write file \"global/pg_control\""
-                .to_string()
-        )));
+        // A budget timeout can kill a copy mid-flight.
+        assert_eq!(
+            rewind_recovery(&rewind_compromised("pg_rewind exceeded 300s budget")),
+            RewindRecovery::Reprovision
+        );
+        // A foreign lineage leaves the directory intact but unusable.
+        assert_eq!(
+            rewind_recovery(&Error::ForeignDataDirectory {
+                rewind_source: "172.28.0.11:5434".to_string(),
+                detail: "are from different systems".to_string(),
+            }),
+            RewindRecovery::Reprovision
+        );
+        // And an error this function was not written for fails closed.
+        assert_eq!(
+            rewind_recovery(&Error::Postgres("something else entirely".to_string())),
+            RewindRecovery::Reprovision
+        );
+    }
+
+    #[test]
+    fn a_rewind_stderr_decides_the_on_disk_verdict_once() {
+        // The one place that holds pg_rewind's own stderr is the one place
+        // that classifies it. Connection-phase and same-timeline failures
+        // leave the directory startable; a write that failed partway does not.
+        for stderr in [
+            "pg_rewind: error: could not connect to server",
+            "pg_rewind: error: source and target cluster are on the same timeline",
+        ] {
+            assert_eq!(
+                rewind_recovery(&Error::RewindFailed {
+                    target_intact: pg_rewind_failure_is_pre_copy(stderr),
+                    detail: stderr.to_string(),
+                }),
+                RewindRecovery::RestartInPlace
+            );
+        }
+        let mid_copy = "pg_rewind: error: could not write file \"global/pg_control\"";
+        assert_eq!(
+            rewind_recovery(&Error::RewindFailed {
+                target_intact: pg_rewind_failure_is_pre_copy(mid_copy),
+                detail: mid_copy.to_string(),
+            }),
+            RewindRecovery::Reprovision
+        );
     }
 
     #[test]
@@ -5095,10 +5154,6 @@ mod tests {
         assert!(pg_rewind_failure_is_pre_copy(
             "pg_rewind: error: source and target cluster are on the same timeline"
         ));
-        assert!(rewind_failure_left_target_untouched(&Error::Postgres(
-            "pg_rewind failed: pg_rewind: error: source and target cluster are on the same timeline"
-                .to_string()
-        )));
     }
 
     /// Verbatim from a node whose catalog lost an un-fsynced page to a
@@ -5141,12 +5196,15 @@ mod tests {
             PreCopyOutcome::Terminal
         );
         assert!(pg_rewind_failure_is_pre_copy(FOREIGN_LINEAGE_STDERR));
-        assert!(rewind_failure_left_target_untouched(
-            &Error::ForeignDataDirectory {
+        // Untouched and still rebuilt: it is the one failure that proves the
+        // directory holds no write this cluster acknowledged.
+        assert_eq!(
+            rewind_recovery(&Error::ForeignDataDirectory {
                 rewind_source: "172.28.0.13:5434".to_string(),
                 detail: FOREIGN_LINEAGE_STDERR.to_string(),
-            }
-        ));
+            }),
+            RewindRecovery::Reprovision
+        );
     }
 
     #[test]
@@ -5568,12 +5626,21 @@ mod tests {
 
     #[test]
     fn a_directory_this_leader_cannot_be_followed_from_is_rebuilt_not_abandoned() {
+        // Each error is built the way `run_pg_rewind` builds it: the verdict
+        // is taken from pg_rewind's stderr at the boundary and carried as data.
+        let from_stderr = |stderr: &str| Error::RewindFailed {
+            target_intact: pg_rewind_failure_is_pre_copy(stderr),
+            detail: stderr.to_string(),
+        };
+
         // PostgreSQL dies on a half-rewound directory at every start, so
         // leaving it stopped is a permanent restart loop, not a hold.
-        let mid_copy = Error::Postgres(
-            "pg_rewind failed: pg_rewind: error: could not read file \"base/1/2601\"".to_string(),
+        assert_eq!(
+            rewind_recovery(&from_stderr(
+                "pg_rewind: error: could not read file \"base/1/2601\""
+            )),
+            RewindRecovery::Reprovision
         );
-        assert_eq!(rewind_recovery(&mid_copy), RewindRecovery::Reprovision);
 
         let foreign = Error::ForeignDataDirectory {
             rewind_source: "172.28.0.11:5434".to_string(),
@@ -5581,13 +5648,10 @@ mod tests {
         };
         assert_eq!(rewind_recovery(&foreign), RewindRecovery::Reprovision);
 
-        let source_went_away = Error::Postgres(
-            "pg_rewind failed: pg_rewind: error: could not fetch file list: \
-             could not receive data from server"
-                .to_string(),
-        );
         assert_eq!(
-            rewind_recovery(&source_went_away),
+            rewind_recovery(&from_stderr(
+                "pg_rewind: error: could not fetch file list: could not receive data from server"
+            )),
             RewindRecovery::RestartInPlace
         );
     }

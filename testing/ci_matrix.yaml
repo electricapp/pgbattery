@@ -2629,6 +2629,12 @@
           ],
           "timeout_sec": 120,
           "comment": "Streaming is not caught up. The step above passes while the restored node is still replaying, which made the row count below a race that happened to win on a slower image and lose on a faster one; this waits for lag_bytes == 0 on the restored node specifically."
+        },
+        {
+          "type": "wait_pg_ready",
+          "node": 1,
+          "timeout_sec": 90,
+          "comment": "Neither wait above can see this. A restore lands on the leader's timeline fork, so the reconcile loop stops and restarts node1's PostgreSQL to re-point it — 200ms in the run that caught this — and both waits read Raft-replicated state, where node1 stays present and synced at the LSN it last reported throughout. The direct assertion below is the only step that talks to node1's own postmaster, so it is the only one that can lose that race."
         }
       ],
       "assertions": [

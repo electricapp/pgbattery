@@ -1419,6 +1419,225 @@ def check_prose_file_references_resolve() -> None:
         )
 
 
+STATE_MACHINE_DOC: Final[str] = "docs/STATE_MACHINE.md"
+
+RUST_SOURCE_DIRS: Final[tuple[str, ...]] = ("src", "crates")
+
+STATE_MACHINE_FOREIGN_TYPES: Final[dict[str, str]] = {
+    "RaftMetrics": "openraft",
+    "Instant": "std::time",
+    "Child": "tokio::process",
+    "SocketAddr": "std::net",
+    "Drop": "std::ops",
+    "None": "the Option variant, not a type of ours",
+    "Some": "the same",
+    "SelectStmt": "a libpg_query parse node",
+    "ExplainStmt": "the same",
+    "PostgreSQL": "the database, written as a name rather than a type",
+    "Database": "from the `Database system identifier` field of pg_controldata",
+    "Fence": "from the `Fence not applied` log line",
+    "RestampAnchorOnCampaign": "an action in tla/lease_fencing.tla, not Rust",
+    "Stopped": "section 3's PostgreSQL role is a model, not an enum: it is derived "
+    "from pg_is_in_recovery() and PostmasterState, and no type spells it",
+    "Starting": "the same",
+    "Primary": "the same",
+    "Standby": "the same",
+    "Recovering": "the same",
+}
+"""CamelCase names the state-machine doc uses that are not our types.
+
+Each is written down rather than filtered by shape, so the check can say which
+of our types has gone missing instead of quietly widening to cover it.
+"""
+
+
+def is_rust_type_name(token: str) -> bool:
+    """Whether a token from the doc is shaped like one of our type names.
+
+    CamelCase and nothing else. An all-caps token is an acronym the prose uses
+    (`WAL`, `GUC`, `RPO`) or a SQL keyword from a quoted query, and neither is
+    a type this document could have renamed.
+    """
+    return token.isidentifier() and token[:1].isupper() and not token.isupper()
+
+
+def without_string_literals(line: str) -> str:
+    """A Rust line with its double-quoted spans removed.
+
+    Brace counting has to skip them: `#[error("... {conn_id} ...")]` sits
+    between an enum's variants and would otherwise close the enum early,
+    hiding every variant after it.
+    """
+    pieces = line.split('"')
+    return "".join(piece for index, piece in enumerate(pieces) if index % 2 == 0)
+
+
+def doc_tokens(spans: Iterable[str]) -> set[str]:
+    """The identifiers a set of markdown code spans names.
+
+    Paths and call syntax are separators, so `Error::RewindFailed` and
+    `Some(true)` each yield the names inside them rather than themselves.
+    """
+    tokens: set[str] = set()
+    for span in spans:
+        for raw in span.replace("::", " ").replace("(", " ").replace(")", " ").split():
+            tokens.add(raw.strip(".,;:*_`'\"!?"))
+    return tokens
+
+
+def rust_sources() -> list[Path]:
+    """Every Rust file in the workspace, tests included."""
+    files: list[Path] = []
+    for directory in RUST_SOURCE_DIRS:
+        files.extend(sorted((PROJECT_ROOT / directory).rglob("*.rs")))
+    return files
+
+
+def code_spans(markdown: str) -> list[str]:
+    """The backtick-delimited spans of a markdown document.
+
+    Split on backticks and take the odd pieces: the doc uses single backticks
+    throughout, and a span never crosses a blank line, so this is the whole of
+    its inline-code grammar.
+    """
+    spans: list[str] = []
+    for block in markdown.split("\n\n"):
+        pieces = block.split("`")
+        spans.extend(piece for index, piece in enumerate(pieces) if index % 2 == 1)
+    return spans
+
+
+def declared_types(sources: Iterable[Path]) -> dict[str, Path]:
+    """Every `enum`, `struct` and `trait` the workspace defines, to its file."""
+    keywords = ("enum ", "struct ", "trait ", "type ")
+    found: dict[str, Path] = {}
+    for path in sources:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip().removeprefix("pub(crate) ").removeprefix("pub ")
+            for keyword in keywords:
+                if not stripped.startswith(keyword):
+                    continue
+                name = stripped[len(keyword) :].strip()
+                for terminator in ("<", "{", "(", ";", ":", "=", " "):
+                    name = name.split(terminator, maxsplit=1)[0]
+                if name:
+                    found.setdefault(name, path)
+    return found
+
+
+def enum_variant_index(sources: Iterable[Path]) -> dict[str, set[str]]:
+    """Every enum the workspace defines, mapped to its variant names.
+
+    Scanned by brace depth from each `enum` line: a variant is an identifier at
+    depth one that starts a line, which covers the fieldless, tuple and struct
+    forms alike without needing to understand any of their bodies.
+    """
+    index: dict[str, set[str]] = {}
+    for path in sources:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for start, line in enumerate(lines):
+            stripped = line.strip().removeprefix("pub(crate) ").removeprefix("pub ")
+            if not stripped.startswith("enum "):
+                continue
+            name = stripped[len("enum ") :].split("<")[0].split("{")[0].strip()
+            if not name.isidentifier() or name in index:
+                continue
+            variants: set[str] = set()
+            depth = 0
+            opened = False
+            for body_line in lines[start:]:
+                if depth == 1:
+                    head = body_line.strip().split("(")[0].split("{")[0].split(",")[0].strip()
+                    if head[:1].isupper() and head.isidentifier():
+                        variants.add(head)
+                code = without_string_literals(body_line)
+                depth += code.count("{") - code.count("}")
+                opened = opened or depth > 0
+                if opened and depth == 0:
+                    break
+            index[name] = variants
+    return index
+
+
+def check_state_machine_names_resolve() -> None:
+    """Every type the canonical state-machine doc names must still exist.
+
+    The doc is the reference a reader consults when the code and their
+    expectation disagree, so a type it describes that no longer exists is a
+    wrong answer given with confidence — and the way that happens is a rename
+    landing in the code alone.
+    """
+    sources = rust_sources()
+    variants = enum_variant_index(sources)
+    known = declared_types(sources).keys() | set().union(*variants.values(), set())
+    text = (PROJECT_ROOT / STATE_MACHINE_DOC).read_text(encoding="utf-8")
+    missing = {
+        token
+        for token in doc_tokens(code_spans(text))
+        if is_rust_type_name(token)
+        and token not in known
+        and token not in STATE_MACHINE_FOREIGN_TYPES
+    }
+    if missing:
+        raise AssertionError(
+            f"{STATE_MACHINE_DOC} names types the workspace does not define: "
+            f"{', '.join(sorted(missing))} — rename them in the doc, or add a foreign "
+            "name to STATE_MACHINE_FOREIGN_TYPES with its origin"
+        )
+
+
+def check_state_machine_describes_whole_enums() -> None:
+    """An enum the canonical doc discusses must have all its variants described.
+
+    This is the drift the maintenance rule alone did not stop: a new variant
+    lands in the code, the commit adds a prose bullet about the behaviour, and
+    the state list the doc leads with silently stops being the set of states.
+
+    The claim is made by naming the enum **on its own** — a bare `StandbyAction`
+    says "this document describes that state machine", and every state it has
+    has to appear. A qualified mention (`Error::ForeignDataDirectory`) is a
+    citation of one variant and claims nothing about the rest, which is what
+    keeps this off the wide enums the doc only ever cites into.
+    """
+    index = enum_variant_index(rust_sources())
+    text = (PROJECT_ROOT / STATE_MACHINE_DOC).read_text(encoding="utf-8")
+    spans = code_spans(text)
+    named = {span.strip() for span in spans if is_rust_type_name(span.strip())}
+    mentioned = doc_tokens(spans)
+    problems = []
+    for name in sorted(named & index.keys()):
+        if undescribed := sorted(index[name] - mentioned):
+            problems.append(f"{name}: {', '.join(undescribed)}")
+    if problems:
+        raise AssertionError(
+            f"{STATE_MACHINE_DOC} discusses these state machines without describing "
+            "every state they have — " + " | ".join(problems)
+        )
+
+
+def check_state_machine_foreign_names_are_still_needed() -> None:
+    """No exemption may name a type the workspace now defines, or nothing cites.
+
+    An exemption that has outlived its reason is a hole in the two checks
+    above, which is the same failure they exist to catch, one level up.
+    """
+    known = declared_types(rust_sources())
+    text = (PROJECT_ROOT / STATE_MACHINE_DOC).read_text(encoding="utf-8")
+    cited = doc_tokens(code_spans(text))
+    stale = sorted(name for name in STATE_MACHINE_FOREIGN_TYPES if name in known)
+    uncited = sorted(name for name in STATE_MACHINE_FOREIGN_TYPES if name not in cited)
+    problems = []
+    if stale:
+        problems.append(f"now defined in the workspace: {', '.join(stale)}")
+    if uncited:
+        problems.append(f"no longer named by the doc: {', '.join(uncited)}")
+    if problems:
+        raise AssertionError(
+            "STATE_MACHINE_FOREIGN_TYPES entries have outlived their reason — "
+            + " | ".join(problems)
+        )
+
+
 def check_prose_exemptions_are_still_needed() -> None:
     """Verify no exemption names a file that now exists, or that nothing cites.
 
@@ -1480,6 +1699,12 @@ def lint() -> None:
     check("HARDENING citations resolve", check_hardening_citations_resolve)
     check("Docs name real files", check_prose_file_references_resolve)
     check("Doc reference exemptions still apply", check_prose_exemptions_are_still_needed)
+    check("State machine doc names real types", check_state_machine_names_resolve)
+    check("State machine doc describes whole enums", check_state_machine_describes_whole_enums)
+    check(
+        "State machine foreign names still apply",
+        check_state_machine_foreign_names_are_still_needed,
+    )
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

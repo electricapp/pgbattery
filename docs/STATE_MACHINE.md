@@ -3,6 +3,8 @@
 Canonical reference for every state machine in pgbattery: states, transitions, and the **definitive source of truth** for each piece of state.
 
 > **Maintenance rule.** Changes to consensus, supervisor, lease, replication, fencing, or gateway-routing logic update this document _in the same commit_ — but only when the change adds, removes, or renames a state, transition, or truth source, or introduces a new cache, timer, or polling loop. Bug fixes that don't alter the state model belong in the git log, not here. If the discipline below ever drifts from the code, the _code_ is wrong — fix the code, don't update the doc to match.
+>
+> **Update the model, not just the file.** A new transition goes in the section's states and transitions, not only in a bullet underneath them. Appending prose while the structured lists stay as they were satisfies the rule in letter and drifts anyway, which is how the supervisor's `Reprovision` transition came to exist for a week without appearing in any list of transitions. `lint_matrix.py` holds three checks against that: every type this document names must still be defined, naming an enum on its own requires describing all of its states, and the register of names that are deliberately not ours must stay minimal.
 
 ---
 
@@ -25,7 +27,7 @@ Every state transition is driven by a **definitive source of truth** — never b
 | Standby intent on disk                  | presence of `standby.signal`                                                                                                                                                       |
 | Current WAL position                    | `pg_current_wal_lsn()` / `pg_last_wal_replay_lsn()` (local safety gates); the reportable LSN adds `pg_last_wal_receive_lsn()` — what the node holds on disk                        |
 | Timeline ID                             | `pg_walfile_name(pg_current_wal_lsn())` parsed                                                                                                                                     |
-| PG process alive                        | `Child::try_wait()` on the postmaster                                                                                                                                              |
+| PG process alive                        | `PostmasterState` — `Child::try_wait()` on the postmaster, plus the exit code, which says whether the directory refused. Consumed on read; see section 3                           |
 | Lease validity                          | `is_leader && has_quorum && now < expires_at` derived from `RaftMetrics`                                                                                                           |
 | Maximum cluster LSN                     | Raft state machine `node_lsns` map (replicated, durable). Fresh entries when any exist; **aged entries as a tiebreak when none do** — see below                                    |
 
@@ -64,22 +66,38 @@ Every state transition is driven by a **definitive source of truth** — never b
 
 ### 3. PostgreSQL process role (supervisor)
 
-- **States**: `Stopped | Starting | Primary | Standby | Recovering`.
+- **States**: `Stopped | Starting | Primary | Standby | Recovering`. A node holding no postmaster is `Stopped` whether it never started one, stopped one, or reaped one that exited — `PostmasterState` is what tells those apart, and only at the moment of the exit.
 - **Source of truth**:
-  - **Authoritative**: `pg_is_in_recovery()`.
+  - **Authoritative role**: `pg_is_in_recovery()`.
   - **On-disk intent**: presence/absence of `standby.signal`.
-  - **Process liveness**: `Child::try_wait()`.
+  - **Process liveness**: `PostmasterState`, from `Child::try_wait()` **plus the exit code**. `Running`, `NotRunning`, or `Exited { refused }`, where `refused` is a nonzero exit — the directory declining to open, which it will decline identically next time. Death by signal is not that, and rebuilding on one clones a healthy node.
+  - **Consumed on read**: an exit is reaped once. `postmaster_state()` clears the child handle, so the `refused` bit is readable by exactly one caller and every later one sees `NotRunning`. It is an edge, not a level: whoever observes it converts it into `Error::PostgresRefusedToOpen` before anything else looks.
 - **Transition triggers** (initiated by `App::ensure_follows`):
-  - `start()` — at app startup.
+  - `start()` — at app startup. A refusal is not fatal: PG is left down and the reconcile loop, which has a leader address where startup does not, performs the repair.
   - `promote()` — when `current_leader == Some(self.node_id)`. **Idempotent**: early-return if `pg_is_in_recovery() == false`.
   - `demote(addr)` — when `current_leader == Some(other)`. **Idempotent**: early-return if already in recovery, configured for `addr`, and timeline matches the leader.
-  - **Both demote paths defer on an unreachable leader** (`TimelineCheck::Unknown`), rather than stopping for one nobody could probe. The caller has already fenced this node, so what stays up cannot write but can still serve the WAL the leader may be waiting for. Stopping regardless is how a returning former primary and a leader that cannot open ended up waiting on each other (`HARDENING.md` H-53).
   - `stop()` — on shutdown.
-- **A directory that will not open → re-provision**: `PostgreSQL` can refuse to start on a stored standby — a corrupt control file, or a leader whose timeline forked at rather than after its last checkpoint — and it refuses identically at every start. Startup no longer treats that as fatal: it leaves `PostgreSQL` down and returns, because the repair needs a leader address and Raft has not started yet. The reconcile loop, which has one, reaches `demote`, and a node owning no postmaster goes straight to the clone (`restart_or_repair_standby`) — not through `pg_rewind`, whose divergence gate needs a local WAL position that only a running server can report. Two decisions had to stop reading "no postmaster" as "crashed" for that path to exist at all: the health tick, which hands leadership off on a crash and would otherwise restart into the same refusal, and the pre-demote fence, which can only fail with no server to set the GUC on and aborted the demote when it did.
-- **A WAL hole the leader cannot fill → re-provision**: a standby that is not streaming with its config unchanged is usually transient, and `PostgreSQL` reconnects on its own. It is not transient when the leader no longer holds the WAL segment the standby stopped in: nothing on either side can produce it, because a node holds no WAL from before it was leader and its slot for a lagging peer reserves only from its own promotion point. `pg_walfile_name` cannot run in recovery, so the standby sends its replay position and the leader names the segment and answers whether it still has it; a standby that holds WAL past its replay position still has somewhere to go and is left alone (`replay_can_continue`). Asked only when the standby is already not streaming and not ahead of its leader. `streaming_gap_action` is the table; an unanswered probe on either side defers rather than discards.
-- **A re-point that will not open escalates to a rewind**: a standby whose timeline merely lags the leader's adopts the new one by streaming, so `standby_action_for_mismatch` re-points it without a `pg_rewind` when its replay LSN is at-or-behind the leader's. That prediction can be wrong at the boundary — `PostgreSQL` compares the leader's timeline against its last _checkpoint_, which lags replay, and refuses to open at all when the fork is not after it. `repoint_standby` acts on that verdict rather than the prediction: a `start()` that fails on a re-point takes the rewind it declined. Without the escalation the node never opens again, so no later tick can re-decide, and it restarts into the same refusal forever.
+- **`demote(addr)` resolves to one `StandbyAction`**, decided by `decide_standby_action` and applied by `repoint_standby`. This is the whole transition surface:
+
+  | Action        | Meaning                                                   | Effect                                 |
+  | ------------- | --------------------------------------------------------- | -------------------------------------- |
+  | `NoOp`        | Already streaming from this leader on a matching timeline | nothing                                |
+  | `Defer`       | A probe could not answer, or PG will recover on its own   | nothing; the reconcile loop re-decides |
+  | `RestartOnly` | Config stale, timelines compatible                        | rewrite conninfo, restart              |
+  | `Rewind`      | Local WAL is ahead of the leader's                        | `pg_rewind`, then restart              |
+  | `Reprovision` | The directory cannot follow this leader in place          | discard it, clone the leader           |
+
+  **Every unanswered probe is `Defer`.** Nothing is stopped, rewound or discarded on a question the cluster did not answer.
+
+- **Both demote paths defer on an unreachable leader** (`TimelineCheck::Unknown`) rather than stopping for one nobody could probe. The caller has already fenced this node, so what stays up cannot write but can still serve the WAL the leader may be waiting for. Stopping regardless is how a returning former primary and a leader that cannot open ended up waiting on each other (`HARDENING.md` H-53).
+- **The three `Reprovision` doors**, each reached from a state no restart repairs:
+  - **A directory `PostgreSQL` will not open.** A corrupt control file, or a leader whose timeline forked at rather than after this node's last checkpoint. A node owning no postmaster goes straight to the clone (`restart_or_repair_standby`), never through `pg_rewind`, whose divergence gate needs a local WAL position only a running server reports.
+  - **A WAL hole the leader cannot fill.** Not streaming, config unchanged, and the leader no longer holds the segment replay stopped in. Nothing on either side can produce it: a node holds no WAL from before it was leader, and its slot for a lagging peer reserves only from its own promotion point. The standby sends its replay position, the leader names the segment and says whether it still has it; a standby holding WAL past its own replay position still has somewhere to go and is left alone (`replay_can_continue`). `streaming_gap_action` is the table.
+  - **A `pg_rewind` that left the directory unfollowable.** `rewind_recovery` reads `Error::RewindFailed::target_intact` — set as data where the failure happens, never re-read out of a message — plus `Error::ForeignDataDirectory`. An intact directory restarts in place and the loop retries; a compromised one, and a foreign lineage, are cloned.
+- **Why discarding is safe at all three**: an acknowledged write required a standby as well as the leader (W1), and the LSN gate elects only from the furthest ahead (V1), so a leader of this lineage holds everything this node was promised. A foreign lineage holds no write this cluster acknowledged; a half-rewound directory already lost whatever the divergence gate let it rewind past. A diverged _but related_ history never reaches here — it goes to the divergence gate, which refuses rather than discards.
+- **Why they must be doors and not holds**: `PostgreSQL` dies on each of these states at every start, so "stopped pending an operator" is a permanent restart loop for a node the cluster is otherwise ready to take back.
+- **A prediction that turns out wrong is re-decided on the verdict, not re-predicted.** `standby_action_for_mismatch` re-points a lagging standby without a rewind when its replay LSN is at-or-behind the leader's, which is right except at the boundary: `PostgreSQL` compares the fork against its last _checkpoint_, which lags replay. `repoint_standby` acts on the refusal rather than the prediction and takes the rewind it declined.
 - **Cache**: none. There is no `Supervisor::role` field. The `pgbattery_pg_is_primary` metric is set from the actual `pg_is_in_recovery()` result by the writer that just performed the role change.
-- **Unfollowable directory → re-provision**: `demote(addr)` runs `pg_rewind` when the timelines diverge, and `rewind_recovery` sorts each failure into the two on-disk outcomes. A failure from before the copy phase leaves the standby state intact, so `PostgreSQL` restarts on it and the reconcile loop retries — unless that restart is itself refused, which is a directory the repair for is the rewind that just failed, so it re-provisions here rather than leaving the node with no postmaster at all. The other two the supervisor resolves rather than reports, by discarding the data directory and cloning the leader's (`reprovision_from`): a foreign lineage (`Error::ForeignDataDirectory` — `pg_rewind` compares control files on connect and refuses when the two directories were never the same cluster), and a copy that died partway and left a mix of old and new blocks. Discarding is safe in both cases — a foreign lineage cannot hold a write this cluster acknowledged, and a half-rewound directory has already lost whatever the divergence gate let it rewind past — and it is necessary because neither state can be started: the alternative is a node that fails to open, restarts, and repeats forever. A diverged _but related_ history never reaches here; it goes to the divergence gate, which refuses rather than discards.
 
 ### 3a. Cluster lineage (identity)
 
@@ -105,6 +123,12 @@ Every state transition is driven by a **definitive source of truth** — never b
 
 - **Shape**: single `ClusterState` struct holding `leader_id`, `leader_addr`, members, `node_lsns`, `max_cluster_lsn`, `failover_started_at`.
 - **Source of truth**: the Raft log itself (every change is a `ClusterCommand` applied via `apply()`).
+- **Transitions** — the whole command set, and nothing writes this state except by committing one of them:
+  - `AddNode` — register a node in `nodes`.
+  - `RemoveNode` — drop its record, including its `node_lsns` entry. See below.
+  - `UpdateNode` — change a node's recorded role.
+  - `UpdateLsn` — record a node's reported WAL position, stamped with the leader's local commit time rather than the reporter's clock (the reported timestamp is carried and ignored, so a skewed node cannot make its own report look fresh).
+  - `SetSyncMode` — record whether synchronous replication is currently in force, committed by the leader on transitions.
 - **Transition trigger**: openraft applying a committed log entry.
 - **Membership and this map are two writes, not one.** `change_membership` moves a node out of the voter set and touches nothing here, so removal also commits `ClusterCommand::RemoveNode` (`forget_removed_node`). Without it the node stays in `nodes` — served by `/api/v1/cluster/nodes` for the rest of the cluster's life — and, worse, its last LSN stays in `node_lsns` feeding `max_cluster_lsn`, which is the bar `evaluate_lsn_acceptable` measures every candidate against: a node removed while ahead would raise that bar permanently against the nodes still present. The write is best-effort and logged, because the membership change has already committed by the time it runs and a failure here must not report a completed removal as an error.
 - **Code**: `src/governor/state_machine.rs`, `management_api::cluster::remove_node`.

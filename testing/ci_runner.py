@@ -27,7 +27,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, Final
 
@@ -120,6 +120,14 @@ class StepType(StrEnum):
             at and reports ``is_synced``, or timeout. Optional ``nodes``
             parameter (list of int IDs) to restrict which nodes are checked;
             defaults to all nodes minus the current leader.
+        WAIT_PG_READY: Poll ``pg_isready`` against one node's **own**
+            PostgreSQL until it accepts connections, or timeout. The only step
+            that answers "is this node's postmaster up"; ``WAIT_CLUSTER`` and
+            ``WAIT_SYNC`` both read Raft-replicated state, where a node whose
+            PostgreSQL is down still reads present and synced. Declare it
+            before any step that addresses a node directly across a window
+            where the reconcile loop may restart it. Parameters: ``node``
+            (int), ``timeout_sec`` (int, default 60).
         NETWORK_DELAY: Add ``tc netem delay`` to a node's ``eth0`` interface
             (requires ``NET_ADMIN`` capability and ``iproute2`` in the image).
             Parameters: ``node`` (int), ``delay_ms`` (int, default 200),
@@ -159,6 +167,7 @@ class StepType(StrEnum):
     CLOCK_SKEW = "clock_skew"
     CLOCK_HEAL = "clock_heal"
     WAIT_SYNC = "wait_sync"
+    WAIT_PG_READY = "wait_pg_ready"
     NETWORK_DELAY = "network_delay"
     NETWORK_HEAL = "network_heal"
     PGBENCH = "pgbench"
@@ -207,6 +216,13 @@ SQL_WRITABLE_TIMEOUT_SEC: Final[int] = 60
 # waiting for a synchronous standby hangs, so the attempt has to be abandoned
 # to make the next one.
 WRITABLE_PROBE_ATTEMPT_SEC: Final[int] = 15
+# How long a `wait_pg_ready` step waits for a node's own postmaster by default.
+# Sized on the reconcile loop's stop-and-restart of a standby it re-points onto
+# the leader's timeline, plus the recovery that follows.
+PG_READY_TIMEOUT_SEC: Final[int] = 60
+# Per-attempt budget for one `pg_isready`. It connects and returns; anything
+# longer is a container that is not answering, which the next attempt re-asks.
+PG_READY_PROBE_ATTEMPT_SEC: Final[int] = 10
 
 # Lines a single node may log across one cluster's lifetime before the run is
 # called a hot loop.
@@ -309,6 +325,48 @@ def as_ints(value: Any) -> list[int]:
             return [value]
         case _:
             return [int(item) for item in value]
+
+
+class PostmasterReadiness(Enum):
+    """What one `pg_isready` run says about a node's own PostgreSQL.
+
+    `pg_isready` is the truth source for "is this postmaster accepting
+    connections". Nothing in the management API answers that question: both
+    `wait_cluster` and `wait_sync` read Raft-replicated cluster state, where a
+    node whose PostgreSQL is down still reads present, and synced at the last
+    LSN it reported.
+    """
+
+    ACCEPTING = "accepting"
+    """Answering connections. The only outcome a wait ends on."""
+
+    NOT_YET = "not_yet"
+    """Rejecting or silent — starting up, stopped, or being restarted under us.
+    Worth waiting on."""
+
+    BAD_INVOCATION = "bad_invocation"
+    """`pg_isready` made no attempt: bad parameters, or missing from the image.
+    No amount of waiting resolves it, so the step fails now rather than
+    reporting a healthy node as down a minute later."""
+
+
+def postmaster_readiness(returncode: int) -> PostmasterReadiness:
+    """Classify a `pg_isready` exit code.
+
+    0 accepting, 1 rejecting, 2 no response, 3 no attempt made — the four
+    documented codes, and checked against the image rather than the man page:
+    nothing listening on the port gives 2, an unresolvable host gives 2, an
+    unknown flag gives 3. An unrecognised code is a `pg_isready` that is not the
+    one this was written against, which is a bad invocation rather than a node
+    to keep waiting on.
+    """
+    match returncode:
+        case 0:
+            return PostmasterReadiness.ACCEPTING
+        case 1 | 2:
+            return PostmasterReadiness.NOT_YET
+        case _:
+            return PostmasterReadiness.BAD_INVOCATION
 
 
 def follower_has_caught_up(lag: Mapping[str, Any], catch_up_to: int) -> bool:
@@ -2476,6 +2534,61 @@ class CIRunner:
         if measured_tps < min_tps:
             raise RunnerError(f"pgbench TPS {measured_tps:.0f} below minimum {min_tps:.0f}")
 
+    def _await_postmaster_accepting(
+        self, node: ClusterNodeConfig, step_log: Path, timeout_sec: int
+    ) -> float:
+        """Block until `node`'s own PostgreSQL accepts connections.
+
+        Returns how long that took. Raises if it never did, or if `pg_isready`
+        could not make the attempt at all — a missing binary or a bad port
+        would otherwise spend the whole budget and then report a healthy node
+        as down.
+
+        Always the internal port: a gateway answers from the leader, which is
+        the opposite of what this asks.
+        """
+        deadline = time.time() + timeout_sec
+        started = time.time()
+        probe = (
+            f"{container_exec_prefix(node.name)} "
+            f"pg_isready -U postgres -h localhost -p {fp.PG_INTERNAL_PORT} -d postgres"
+        )
+        last = "no attempt made"
+        while True:
+            try:
+                proc = self._run_shell(
+                    probe,
+                    step_log.with_suffix(".pg-ready-probe.log"),
+                    expect_exit=None,
+                    timeout_sec=PG_READY_PROBE_ATTEMPT_SEC,
+                    render=False,
+                )
+            except RunnerError as exc:
+                # A probe the runner had to kill is a container not answering,
+                # which is the condition being waited out rather than a failure.
+                last = str(exc).splitlines()[0]
+                if time.time() >= deadline:
+                    break
+                continue
+            last = (proc.stdout or proc.stderr).strip() or f"exit {proc.returncode}"
+            match postmaster_readiness(proc.returncode):
+                case PostmasterReadiness.ACCEPTING:
+                    return time.time() - started
+                case PostmasterReadiness.BAD_INVOCATION:
+                    raise RunnerError(
+                        f"pg_isready made no attempt against {node.name} "
+                        f"(exit {proc.returncode}): {last}"
+                    )
+                case PostmasterReadiness.NOT_YET:
+                    pass
+            if time.time() >= deadline:
+                break
+            time.sleep(1.0)
+        raise RunnerError(
+            f"{node.name}'s PostgreSQL did not accept connections within "
+            f"{timeout_sec}s; last pg_isready said: {last}"
+        )
+
     def _await_node_accepts_writes(
         self, node: ClusterNodeConfig, step_log: Path, budget_sec: int
     ) -> None:
@@ -3585,6 +3698,19 @@ class CIRunner:
                             f"after {timeout_sec}s: {last_status}"
                         )
                     time.sleep(1)
+
+            case StepType.WAIT_PG_READY:
+                node_id = int(step["node"])
+                node = self.node_map.get(node_id)
+                if not node:
+                    raise RunnerError(f"Unknown node {node_id} for wait_pg_ready.")
+                timeout_sec = int(step.get("timeout_sec", PG_READY_TIMEOUT_SEC))
+                elapsed = self._await_postmaster_accepting(node, step_log, timeout_sec)
+                self._write_text(
+                    step_log,
+                    f"{node.name} PostgreSQL accepting on port {fp.PG_INTERNAL_PORT}: "
+                    f"elapsed_sec={elapsed:.1f}, timeout_sec={timeout_sec}",
+                )
 
             case StepType.NETWORK_DELAY:
                 node_id = int(step["node"])

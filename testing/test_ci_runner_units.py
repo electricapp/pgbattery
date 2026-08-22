@@ -2018,6 +2018,29 @@ def test_two_leaders_still_fail_when_a_third_node_is_down() -> None:
         raise AssertionError("two leaders must fail regardless of a down node")
 
 
+def test_a_postmaster_answering_ends_the_wait() -> None:
+    assert ci_runner.postmaster_readiness(0) is ci_runner.PostmasterReadiness.ACCEPTING
+
+
+def test_a_postmaster_still_starting_is_waited_on() -> None:
+    """The case this was written for: the reconcile loop re-points a restored
+    standby onto the leader's timeline, which stops and restarts its PostgreSQL.
+    Rejecting (1) and silent (2) are both that window."""
+    assert ci_runner.postmaster_readiness(1) is ci_runner.PostmasterReadiness.NOT_YET
+    assert ci_runner.postmaster_readiness(2) is ci_runner.PostmasterReadiness.NOT_YET
+
+
+def test_a_probe_that_never_ran_fails_rather_than_waiting() -> None:
+    """Exit 3 is pg_isready declining to try — bad parameters, or missing from
+    the image. Waiting it out would report a healthy node as down a minute
+    later, which is the failure this whole step exists to stop happening."""
+    assert ci_runner.postmaster_readiness(3) is ci_runner.PostmasterReadiness.BAD_INVOCATION
+
+
+def test_an_unrecognised_exit_is_not_waited_on() -> None:
+    assert ci_runner.postmaster_readiness(127) is ci_runner.PostmasterReadiness.BAD_INVOCATION
+
+
 def test_a_follower_level_with_the_target_has_caught_up() -> None:
     lag = {"is_synced": True, "node_lsn": 5_000, "lag_bytes": 0}
     assert ci_runner.follower_has_caught_up(lag, 5_000)
