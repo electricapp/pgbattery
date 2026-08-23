@@ -12,10 +12,13 @@ Run with:
 
 from __future__ import annotations
 
+import dataclasses
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import fault_primitives as fp
 import lint_matrix as lm
 
 
@@ -241,6 +244,95 @@ class StateMachineDocTest(unittest.TestCase):
         ):
             lm.check_state_machine_foreign_names_are_still_needed()
         self.assertIn("StandbyAction", str(caught.exception))
+
+
+class SpecCodeReferenceTest(unittest.TestCase):
+    """A spec header names the Rust it models, and that mapping is the only
+    thing tying a machine-checked proof to the binary. A rename that leaves it
+    behind gives a passing model checker describing code that is gone."""
+
+    def test_the_specs_as_committed_map_onto_real_code(self) -> None:
+        lm.check_spec_code_references_resolve()
+
+    def test_a_prose_word_beside_a_path_is_not_read_as_a_symbol(self) -> None:
+        self.assertEqual(lm.code_identifiers_named("CODE: app.rs bootstrap path."), set())
+
+    def test_a_call_with_arguments_names_only_its_receiver(self) -> None:
+        # `get` is std's; `node_lsns` is the field the spec is mapping onto.
+        self.assertEqual(
+            lm.code_identifiers_named("lsn[n] -> state_machine.rs: node_lsns.get(&n)"),
+            {"node_lsns"},
+        )
+
+    def test_empty_parentheses_mark_a_name_with_no_underscore(self) -> None:
+        self.assertEqual(lm.code_identifiers_named("CODE: governor/lease.rs renew()."), {"renew"})
+
+    def test_a_reference_resolves_by_path_suffix_not_basename(self) -> None:
+        sources = lm.rust_sources()
+        resolved = lm.resolve_rust_path("gateway/handlers/mod.rs", sources)
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertTrue(str(resolved).endswith("src/gateway/handlers/mod.rs"), resolved)
+
+    def test_a_source_a_spec_names_that_is_gone_is_caught(self) -> None:
+        with (
+            self._spec("\\* CODE: governor/departed.rs still_here()\n"),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            lm.check_spec_code_references_resolve()
+        self.assertIn("departed.rs", str(caught.exception))
+
+    def test_a_function_renamed_out_from_under_a_spec_is_caught(self) -> None:
+        with (
+            self._spec("\\* CODE: governor/lease.rs renew_the_lease()\n"),
+            self.assertRaises(AssertionError) as caught,
+        ):
+            lm.check_spec_code_references_resolve()
+        self.assertIn("renew_the_lease", str(caught.exception))
+
+    def _spec(self, body: str) -> mock._patch[mock.MagicMock]:
+        """Point the check at one spec holding `body` and nothing else."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        spec = Path(directory.name) / "made_up.tla"
+        spec.write_text(body, encoding="utf-8")
+        return mock.patch.object(lm, "tla_specs", return_value=[spec])
+
+
+class LeaseFencingTimingTest(unittest.TestCase):
+    """TLC checks the model, not the deployment. The spec assumes only a ratio
+    between three constants, so a retuned millisecond in the binary leaves every
+    model passing about a system nobody runs."""
+
+    def test_the_models_as_committed_state_the_shipped_timings(self) -> None:
+        lm.check_lease_fencing_model_matches_the_shipped_timings()
+
+    def test_a_vote_delay_inside_the_safe_region_is_caught(self) -> None:
+        """One tick of flight where the timings admit two: the model then never
+        reaches the boundary its safety argument is sized against."""
+        timings = fp.read_system_timings()
+        problems = lm.lease_fencing_tick_problems(
+            {"QuorumTimeout": 2, "LeaseDuration": 4, "HoldDown": 4, "VoteDelay": 1}, timings
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("VoteDelay", problems[0])
+
+    def test_a_retuned_quorum_timeout_is_caught(self) -> None:
+        timings = dataclasses.replace(fp.read_system_timings(), quorum_timeout_ms=1_500)
+        problems = lm.lease_fencing_tick_problems(
+            {"QuorumTimeout": 2, "LeaseDuration": 4, "HoldDown": 4, "VoteDelay": 2}, timings
+        )
+        self.assertEqual(len(problems), 2, problems)
+        self.assertIn("QuorumTimeout", " ".join(problems))
+
+    def test_a_config_that_assigns_nothing_is_caught(self) -> None:
+        problems = lm.lease_fencing_tick_problems({}, fp.read_system_timings())
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("assigns no", problems[0])
+
+    def test_a_commented_ratio_is_not_read_as_an_assignment(self) -> None:
+        text = "\\* HoldDown = 99 is what the comment says\nHoldDown = 4\n"
+        self.assertEqual(lm.tla_config_constants(text), {"HoldDown": 4})
 
 
 if __name__ == "__main__":

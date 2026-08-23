@@ -1660,6 +1660,208 @@ def check_prose_exemptions_are_still_needed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# TLA+ specs: the mapping onto the binary they are a proof about
+# ---------------------------------------------------------------------------
+
+TLA_DIR: Final[Path] = PROJECT_ROOT / "tla"
+
+PATH_SUFFIXES: Final[tuple[str, ...]] = (
+    ".rs",
+    ".md",
+    ".tla",
+    ".cfg",
+    ".toml",
+    ".py",
+    ".yaml",
+    ".yml",
+    ".sh",
+)
+"""Extensions that make a token a path rather than a name to read out of it."""
+
+TOKEN_TRIM: Final[str] = ".,;:()[]<>`'\"—"
+"""Punctuation a spec's prose wraps a path or a name in."""
+
+
+def tla_specs() -> list[Path]:
+    """Every spec whose header claims to map onto this workspace."""
+    specs = sorted(TLA_DIR.glob("*.tla"))
+    if not specs:
+        raise AssertionError(f"{TLA_DIR} holds no specs — the directory or the suffix has moved")
+    return specs
+
+
+def rust_paths_named(line: str) -> list[str]:
+    """The `.rs` paths a line of spec prose names."""
+    return [token for raw in line.split() if (token := raw.strip(TOKEN_TRIM)).endswith(".rs")]
+
+
+def code_identifiers_named(line: str) -> set[str]:
+    """The Rust identifiers a line of spec prose cites.
+
+    An underscore or a pair of empty parentheses is what marks a citation; the
+    English around it has neither. So `node_lsns.get(&n)` yields `node_lsns`
+    alone, and `bootstrap path` yields nothing — which is what keeps this off
+    ordinary words that happen to sit next to a path.
+    """
+    scannable = " ".join(
+        " " if "/" in raw or raw.strip(TOKEN_TRIM).endswith(PATH_SUFFIXES) else raw
+        for raw in line.split()
+    )
+    found: set[str] = set()
+    run: list[str] = []
+    for index, char in enumerate(scannable + " "):
+        if char.isalnum() or char == "_":
+            run.append(char)
+            continue
+        token, run = "".join(run), []
+        called = scannable[index : index + 2] == "()"
+        if token and not token[:1].isdigit() and ("_" in token or called):
+            found.add(token)
+    return found
+
+
+def resolve_rust_path(reference: str, sources: Sequence[Path]) -> Path | None:
+    """The workspace file a `.rs` reference names, matched by path suffix.
+
+    Suffix rather than basename: the specs write `governor/lease.rs` and
+    `gateway/handlers/mod.rs`, and matching on the basename alone would let the
+    second resolve to any of the workspace's many `mod.rs`.
+    """
+    wanted = Path(reference).parts
+    for candidate in sources:
+        if candidate.relative_to(PROJECT_ROOT).parts[-len(wanted) :] == wanted:
+            return candidate
+    return None
+
+
+def check_spec_code_references_resolve() -> None:
+    """Every file and symbol the TLA+ specs map themselves onto must exist.
+
+    Each spec header names the Rust that implements the action it models, and
+    that mapping is the only thing connecting a machine-checked proof to the
+    binary it is a proof about. Nothing checked it, so a rename could leave the
+    specs describing a program that no longer exists — and a model checker
+    passing against code that moved is worse than none, because it reads as
+    assurance.
+
+    A line naming exactly one source is where a symbol can be attributed; zero
+    names nothing to look in, and more than one leaves the names on the line
+    unattributed.
+    """
+    sources = rust_sources()
+    texts: dict[Path, str] = {}
+    unresolved_files: list[str] = []
+    absent_symbols: list[str] = []
+    for spec in tla_specs():
+        for number, line in enumerate(spec.read_text(encoding="utf-8").splitlines(), start=1):
+            named = rust_paths_named(line)
+            resolved = [(ref, resolve_rust_path(ref, sources)) for ref in named]
+            if missing := [ref for ref, path in resolved if path is None]:
+                unresolved_files.append(f"{spec.name}:{number} -> {', '.join(missing)}")
+                continue
+            if len(resolved) != 1:
+                continue
+            reference, path = resolved[0]
+            if path is None:
+                continue
+            text = texts.setdefault(path, path.read_text(encoding="utf-8"))
+            if absent := sorted(n for n in code_identifiers_named(line) if n not in text):
+                absent_symbols.append(f"{spec.name}:{number} {reference} -> {', '.join(absent)}")
+    problems = []
+    if unresolved_files:
+        problems.append("sources that do not exist: " + " | ".join(unresolved_files))
+    if absent_symbols:
+        problems.append("names not found in the source cited: " + " | ".join(absent_symbols))
+    if problems:
+        raise AssertionError("TLA+ specs map onto code that has moved — " + " ; ".join(problems))
+
+
+def tla_config_constants(text: str) -> dict[str, int]:
+    """The integer constants a TLC config assigns.
+
+    Comment lines go first: a `\\*` line is prose, and these configs discuss
+    their own ratios in the same `Name = value` shape the assignments use.
+    """
+    found: dict[str, int] = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("\\*"):
+            continue
+        name, separator, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if separator and name.isidentifier() and value.isdigit():
+            found[name] = int(value)
+    return found
+
+
+def lease_fencing_tick_problems(
+    constants: Mapping[str, int], timings: fp.SystemTimings
+) -> list[str]:
+    """How a `lease_fencing` model's ticks disagree with the shipped timings.
+
+    One tick is `LeaseDuration` divided into the shipped lease, and on that
+    scale `QuorumTimeout` and `HoldDown` must be the milliseconds the binary
+    runs on — `SystemTimings.promotion_holddown_ms` is where the hold-down's
+    value comes from, so the model does not get to choose it either.
+
+    `VoteDelay` is held at the boundary those timings admit, `HoldDown -
+    QuorumTimeout`: the longest a candidacy may take to reach a majority before
+    a deposed leader's self-fence trails the winner's promotion. A shorter one
+    explores only the interior of the safe region, which is not where an
+    off-by-one in the argument would show.
+    """
+    missing = sorted({"QuorumTimeout", "LeaseDuration", "HoldDown", "VoteDelay"} - constants.keys())
+    if missing:
+        return [f"assigns no {', '.join(missing)}"]
+    lease_ticks = constants["LeaseDuration"]
+    lease_ms = timings.lease_duration_ms
+    if lease_ticks <= 0 or lease_ms % lease_ticks:
+        return [f"LeaseDuration={lease_ticks} does not divide the {lease_ms} ms lease into ticks"]
+    tick_ms = lease_ms // lease_ticks
+    holddown_ms = timings.promotion_holddown_ms
+    expected = {
+        "QuorumTimeout": timings.quorum_timeout_ms,
+        "HoldDown": holddown_ms,
+        "VoteDelay": holddown_ms - timings.quorum_timeout_ms,
+    }
+    return [
+        f"{name}={constants[name]} ticks is {constants[name] * tick_ms} ms, not {want} ms"
+        for name, want in expected.items()
+        if constants[name] * tick_ms != want
+    ]
+
+
+def check_lease_fencing_model_matches_the_shipped_timings() -> None:
+    """`lease_fencing`'s ticks must be the milliseconds the binary ships.
+
+    The spec's safety argument rests on three timing constants, and its models
+    state them in ticks. TLC checks the model, not the deployment: raise
+    `QUORUM_TIMEOUT_MS` and every spec still passes, because the config picked
+    its own numbers, and only the ratio between them is what the spec assumes.
+    Deriving the tick from the lease and requiring the rest to land on the
+    shipped milliseconds is what makes a green `make check` a statement about
+    this binary rather than about an arithmetic relationship.
+
+    Every `lease_fencing*.cfg` is held to it, the counterexample included: that
+    model differs by one flag and nothing else, and a second set of timings
+    hiding in it would make the counterexample a proof about a system nobody
+    runs.
+    """
+    timings = fp.read_system_timings()
+    configs = sorted(TLA_DIR.glob("lease_fencing*.cfg"))
+    if not configs:
+        raise AssertionError(f"no lease_fencing configs under {TLA_DIR} — this would check nothing")
+    problems = []
+    for path in configs:
+        constants = tla_config_constants(path.read_text(encoding="utf-8"))
+        if found := lease_fencing_tick_problems(constants, timings):
+            problems.append(f"{path.name}: {'; '.join(found)}")
+    if problems:
+        raise AssertionError(
+            "lease_fencing models no longer state the shipped timings — " + " | ".join(problems)
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1704,6 +1906,11 @@ def lint() -> None:
     check(
         "State machine foreign names still apply",
         check_state_machine_foreign_names_are_still_needed,
+    )
+    check("TLA specs name real code", check_spec_code_references_resolve)
+    check(
+        "TLA models state the shipped timings",
+        check_lease_fencing_model_matches_the_shipped_timings,
     )
 
     table = Table(title="Test Harness Lint", show_lines=False)

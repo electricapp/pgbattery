@@ -64,7 +64,7 @@ so the mechanism is disabled only where a counterexample is the expected result.
 
 ## Properties (checked by each `.cfg`)
 
-**`lease_fencing.tla`** — passes (492,689 distinct states)
+**`lease_fencing.tla`** — passes (533,517 distinct states)
 
 - `AtMostOneWriteAuthority` — at most one node has a valid lease **and** writable
   PG at any instant. **Non-vacuous, and not on the honour system**: leadership
@@ -82,7 +82,12 @@ so the mechanism is disabled only where a counterexample is the expected result.
   a deposed leader holding a quorum that excludes the winner — a reachable state,
   and what makes quorum intersection a consequence instead of a premise.
 - Time is modeled **relatively** (bounded countdowns advanced by one global tick),
-  not as an absolute clock, so the state space stays small and finite.
+  not as an absolute clock, so the state space stays small and finite. The tick's
+  length is the binary's, not the model's: `lint_matrix.py` derives it from
+  `DEFAULT_LEASE_DURATION` and requires `QuorumTimeout` and `HoldDown` to land on
+  the shipped milliseconds, and `VoteDelay` to sit at the boundary they admit
+  (`HoldDown - QuorumTimeout`). Without that, retuning a constant in Rust leaves
+  every model passing about a system nobody runs.
 - Scope: the Raft log is abstracted away (that is `raft_lsn.tla`), and message
   loss appears only as a candidacy that did not win in time. `VoteDelay` is the
   network bound the argument cannot escape — a vote slower than
@@ -129,3 +134,10 @@ Each spec's header maps its TLA+ variables and actions to the Rust that implemen
 them, by file and function (not line number, which rots). The supervisor lives in
 the `crates/pgbattery-supervisor/` workspace crate
 (`crates/pgbattery-supervisor/src/process.rs`), not `src/supervisor/` (a re-export shim).
+
+The mapping is a lint, not a comment. `lint_matrix.py`'s "TLA specs name real
+code" resolves every `.rs` path a spec names against the workspace, and on a line
+naming exactly one source it requires the identifiers cited there — anything with
+an underscore, or written with empty parentheses — to be in that file. A rename
+that leaves a spec behind fails the lint rather than leaving a passing model
+checker describing a program that is gone.

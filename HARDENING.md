@@ -477,8 +477,10 @@ The roadmap is done when:
    tracking task and all of them are checked; RW-5 is the one with no task,
    because it is an Accepted risk with its rationale there.
 5. The specs are checked against traces from the running binary. **Not met.**
-   The spec-to-code mapping is still comments, so nothing detects drift — H-34,
-   which H-33 unblocked by making the transitions observable.
+   The static half of the mapping is no longer comments: the code a spec names
+   and the milliseconds its ticks stand for are both lints (H-60). What no check
+   reaches is the shape of a run — a transition sequence the spec does not
+   permit — which is H-34, unblocked by H-33 making the transitions observable.
 
 So the distance to zero is criteria 3 and 5, and both are infrastructure rather
 than a missing assertion: a deterministic runtime, and a trace-checking harness.
@@ -2146,6 +2148,15 @@ nothing detects drift.
       the implementation anchors at local leader-loss observation.
       **Done when** a harness run's trace is checked against `lease_fencing` and
       `raft_lsn`, and an injected drift is caught.
+
+      Still open, and narrower than it was. H-60 took the static half of this
+      tier's complaint — the names and the numbers a spec maps itself onto are
+      now lints rather than comments. What no check reaches is the shape of a
+      run: a sequence of transitions the binary took that the spec's `Next`
+      does not permit. Note H-33's limit before building on its stream —
+      `watch` is lossy, so a transition superseded before the observer wakes is
+      not recorded, and a gap must be distinguishable from an illegal step or
+      the checker manufactures violations.
       _Closes_ exit criterion 5 · _Blocked by_ H-33 · _Effort_ L
 
 - [x] **H-35 — Partial-quorum dynamics are modeled, and the counterexample is
@@ -2294,6 +2305,50 @@ nothing detects drift.
       commits it, and `/cluster/nodes` returns to three after the case where it
       used to stay at four.
       _Effort_ M
+
+- [x] **H-60 — the specs proved things about numbers nobody runs.** Tier 5 opens
+      by saying the spec-to-code mapping is comments, so nothing detects drift.
+      That is the half of it a reader expects: a renamed function leaves a
+      spec's `CODE:` header describing a program that is gone. The other half is
+      worse and was invisible, because the mapping that rots quietly is the
+      numeric one.
+
+      `lease_fencing`'s safety argument rests on three timing constants, and its
+      models state them in ticks. TLC checks the model. The `ASSUME`s constrain
+      the ratio between the three, and the config picks values satisfying it —
+      so `QUORUM_TIMEOUT_MS` could be retuned in Rust and `make check` would
+      still pass, four specs green, about a system nobody was running. Nothing
+      anywhere tied `QuorumTimeout = 2` to the 1 s the binary ships. The `.cfg`
+      restated the real values in a comment, which is the failure mode rather
+      than a defence against it.
+
+      The tick's length now comes from the binary: `lint_matrix.py` divides
+      `DEFAULT_LEASE_DURATION` by `LeaseDuration` and requires `QuorumTimeout`
+      and `HoldDown` to land on the milliseconds pgbattery ships, across every
+      `lease_fencing*.cfg` including the counterexample — a second set of
+      timings hiding in that one would make the counterexample a proof about
+      the wrong system too.
+
+      Pinning the scale exposed a model that was checking the easy case.
+      `VoteDelay` — the flight a candidacy has to reach a majority — was one
+      tick, 500 ms, where the shipped timings admit `HoldDown - QuorumTimeout`,
+      a full second. The `ASSUME` therefore held with a tick to spare, and the
+      boundary where an off-by-one in the hold-down argument would surface had
+      never been explored. `VoteDelay` is now that boundary, and the lint
+      requires it: 533,517 distinct states against 492,689, still 2 s, and the
+      counterexample still produces its two writers.
+
+      The naming half is a lint as well. Every `.rs` path a spec names resolves
+      against the workspace by path suffix, and on a line naming exactly one
+      source, the identifiers cited there must be in that file. What separates a
+      citation from the English around it is an underscore or a pair of empty
+      parentheses, so `node_lsns.get(&n)` claims `node_lsns` and not `get`, and
+      `app.rs bootstrap path` claims nothing. Seventeen references across the
+      four specs resolve today; the check exists for the rename that would have
+      left them behind silently.
+
+      _Related_ H-34, which is the behavioural half of the same tier and is
+      still open · _Effort_ M
 
 - [x] **H-59 — the canonical doc was appended to rather than maintained.**
       Fifteen commits touched `docs/STATE_MACHINE.md` in eight days, nearly all
