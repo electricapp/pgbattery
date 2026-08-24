@@ -17,6 +17,9 @@ pub mod state_machine;
 pub mod storage;
 pub mod tls;
 
+#[cfg(test)]
+mod compat_fixtures;
+
 pub use lease::{
     DEFAULT_LEASE_DURATION, LEASE_CHECK_INTERVAL, SharedLeaseState, new_shared_lease,
     new_shared_lease_with_duration,

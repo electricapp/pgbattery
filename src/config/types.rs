@@ -62,9 +62,16 @@ pub struct Config {
     #[serde(default)]
     pub topology_mode: TopologyMode,
 
-    /// Path to `PostgreSQL` binaries
+    /// Path to `PostgreSQL` binaries (active major — the running pointer).
     #[serde(default)]
     pub pg_bin_dir: PathBuf,
+
+    /// Available `PostgreSQL` major → bindir map for Track B major upgrades.
+    /// Example: `{ "18" = "/usr/lib/postgresql/18/bin", "19" = "..." }`.
+    /// `pg_bin_dir` remains the active pointer; this map is consulted by
+    /// `pgbattery upgrade postgres --to <major>`.
+    #[serde(default)]
+    pub pg_bin_dirs: std::collections::BTreeMap<String, PathBuf>,
 
     /// Path to `PostgreSQL` data directory
     #[serde(default)]
@@ -139,6 +146,11 @@ pub struct Config {
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_ms: u64,
 
+    /// Hold client queries during Track B upgrade freeze before a clean error
+    /// (milliseconds). Default 60s — existing sessions stall, not disconnect.
+    #[serde(default = "default_upgrade_hold_timeout")]
+    pub upgrade_hold_timeout_ms: u64,
+
     /// Max concurrent client connections; excess are dropped until a slot
     /// frees, bounding memory/fd use under a connection storm.
     #[serde(default = "default_max_connections")]
@@ -189,6 +201,10 @@ const fn default_connection_timeout() -> u64 {
 
 const fn default_idle_timeout() -> u64 {
     crate::config::constants::DEFAULT_IDLE_TIMEOUT_MS
+}
+
+const fn default_upgrade_hold_timeout() -> u64 {
+    60_000
 }
 
 const fn default_max_connections() -> usize {
@@ -355,6 +371,7 @@ impl Config {
             ("heartbeat_interval_ms", self.heartbeat_interval_ms),
             ("connection_timeout_ms", self.connection_timeout_ms),
             ("idle_timeout_ms", self.idle_timeout_ms),
+            ("upgrade_hold_timeout_ms", self.upgrade_hold_timeout_ms),
             (
                 "replica_disconnect_timeout_ms",
                 self.replica_disconnect_timeout_ms,
@@ -555,6 +572,14 @@ impl Config {
         // Validate PostgreSQL configuration
         if self.pg_bin_dir.as_os_str().is_empty() {
             anyhow::bail!("pg_bin_dir is required");
+        }
+        for (major, path) in &self.pg_bin_dirs {
+            if major.parse::<u32>().is_err() {
+                anyhow::bail!("pg_bin_dirs key {major:?} must be a PostgreSQL major number");
+            }
+            if path.as_os_str().is_empty() {
+                anyhow::bail!("pg_bin_dirs[{major}] path is empty");
+            }
         }
         if self.pg_data_dir.as_os_str().is_empty() {
             anyhow::bail!("pg_data_dir is required");
@@ -762,8 +787,27 @@ impl Config {
             ssl_key_path: self.ssl_key_path.clone(),
             connection_timeout_ms: self.connection_timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
+            upgrade_hold_timeout_ms: self.upgrade_hold_timeout_ms,
             max_connections: self.max_connections,
         }
+    }
+
+    /// Bindir for a `PostgreSQL` major from `pg_bin_dirs`, or an error if missing.
+    ///
+    /// # Errors
+    /// When `pg_bin_dirs` has no entry for `major`.
+    pub fn pg_bin_dir_for_major(&self, major: u32) -> Result<&std::path::Path> {
+        let key = major.to_string();
+        self.pg_bin_dirs
+            .get(&key)
+            .map(PathBuf::as_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pg_bin_dirs has no entry for major {major}; configure \
+                 `pg_bin_dirs = {{ \"{major}\" = \"/path/to/{major}/bin\" }}` \
+                 (and keep pg_bin_dir as the active pointer)"
+                )
+            })
     }
 
     /// Create configuration for the Supervisor component.
@@ -777,6 +821,7 @@ impl Config {
             wal_level: self.wal_level,
             node_id: self.node_id,
             pg_auth_mode: self.pg_auth_mode,
+            wal_archive_dir: self.backup.wal_archive_dir.clone(),
         }
     }
 }

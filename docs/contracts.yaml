@@ -100,3 +100,37 @@ contracts:
     inversions:
       - testing/test_checker_sanity.py
       - assert_flagged
+
+  U1:
+    severity: FATAL
+    title: Cross-Cluster Single Write Authority
+    inversions:
+      - tla/cutover_authority.inv-green-self-elect.cfg
+      - cutover_transfer_advances_epoch_to_green
+
+  U2:
+    severity: FATAL
+    title: Cutover Drain Completeness
+    inversions:
+      - cutover_abort_unseal_returns_blue_new_epoch
+      - tla/cutover_authority.tla
+
+  U3:
+    severity: FATAL
+    title: Sequence Non-Collision
+    inversions:
+      - src/commands/upgrade/blue_green.rs
+      - cutover_seal_ignored_unless_armed
+
+  U4:
+    severity: FATAL
+    title: Fail-Closed Cutover
+    inversions:
+      - tla/cutover_authority.inv-green-self-elect.cfg
+
+  U5:
+    severity: FATAL
+    title: Reverse-Drain Completeness
+    inversions:
+      - tla/cutover_authority.tla
+      - cutover_transfer_advances_epoch_to_green

@@ -40,3 +40,23 @@
   "timeline_id",
   "verify_promotion_safe",
 ]
+
+[cutover_authority]
+"governor/state_machine.rs" = [
+  "CutoverArmed",
+  "CutoverSeal",
+  "CutoverDrainObserved",
+  "CutoverTransfer",
+  "CutoverAbortUnseal",
+  "CutoverAuthorityState",
+  "CutoverPhase",
+  "green_leader_pg_addr",
+]
+"commands/upgrade/blue_green.rs" = [
+  "run_blue_green_preflight",
+  "run_local_blue_green_preflight",
+]
+"commands/upgrade/client_fence.rs" = [
+  "apply_client_write_fence",
+  "lift_client_write_fence",
+]

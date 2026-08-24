@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::common::{
     colors, cprintln, hints, http_client, metric_to_u64, parse_prometheus_metric_line,
@@ -69,6 +69,40 @@ struct NodeProbe {
     result: Result<ProbeData, ProbeError>,
 }
 
+/// Collect the doctor report without printing or exiting.
+///
+/// Used by CLI `doctor` and by Track A cluster-upgrade preflight so both
+/// share one probe path. Callers that want the historical exit-1 behaviour
+/// use [`run_doctor`].
+///
+/// # Errors
+/// Returns an error if node discovery fails.
+pub(crate) async fn collect_doctor_report(
+    nodes: Option<String>,
+    discover: Option<String>,
+    skip_network: bool,
+    skip_disk: bool,
+    config_path: Option<String>,
+) -> Result<DoctorReport> {
+    let node_addrs = discover_nodes(nodes, discover, config_path).await?;
+    let probes = probe_nodes(&node_addrs).await;
+
+    let mut checks = Vec::new();
+    checks.extend(check_node_connectivity(&probes));
+    checks.extend(check_cluster_health(&probes));
+    checks.extend(check_replication(&probes));
+    if !skip_network && probes.len() > 1 {
+        checks.extend(check_network_latency(&probes));
+    }
+    if !skip_disk {
+        checks.push(disk_check_notice());
+    }
+    checks.extend(check_configuration(&probes));
+    checks.extend(check_pg_versions(&probes));
+
+    Ok(build_report(checks))
+}
+
 /// Run the doctor command.
 ///
 /// # Errors
@@ -83,38 +117,8 @@ pub async fn run_doctor(
     strict: bool,
     config_path: Option<String>,
 ) -> Result<()> {
-    // Discover nodes, then fetch every node's metrics once, concurrently.
-    let node_addrs = discover_nodes(nodes, discover, config_path).await?;
-    let probes = probe_nodes(&node_addrs).await;
-
-    let mut checks = Vec::new();
-
-    // 1. Node connectivity checks
-    checks.extend(check_node_connectivity(&probes));
-
-    // 2. Cluster health checks
-    checks.extend(check_cluster_health(&probes));
-
-    // 3. Replication checks
-    checks.extend(check_replication(&probes));
-
-    // 4. Network latency between operator and nodes (if not skipped)
-    if !skip_network && probes.len() > 1 {
-        checks.extend(check_network_latency(&probes));
-    }
-
-    // 5. Disk checks (if not skipped)
-    if !skip_disk {
-        checks.push(disk_check_notice());
-    }
-
-    // 6. Configuration checks
-    checks.extend(check_configuration(&probes));
-
-    // 7. PostgreSQL version window
-    checks.extend(check_pg_versions(&probes));
-
-    let report = build_report(checks);
+    let report =
+        collect_doctor_report(nodes, discover, skip_network, skip_disk, config_path).await?;
 
     // Output
     match format {
@@ -135,6 +139,56 @@ pub async fn run_doctor(
     }
 
     Ok(())
+}
+
+/// Fail closed when `doctor --strict` would exit non-zero.
+///
+/// Covers connectivity, quorum, SYNC replication (warn→fail under strict),
+/// and the other doctor gates. Used by `upgrade --cluster --check`.
+///
+/// # Errors
+/// Returns when discovery fails or any check is fail/warn.
+pub(crate) async fn require_doctor_strict(
+    discover: Option<String>,
+    config_path: Option<String>,
+) -> Result<()> {
+    let report = collect_doctor_report(None, discover, false, false, config_path).await?;
+    if report.fail_count == 0 && report.warn_count == 0 {
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    for c in &report.checks {
+        if matches!(c.status, CheckStatus::Fail | CheckStatus::Warn) {
+            // Ahead-of-parser is advisory (gateway may sever newer grammar on
+            // failover). It must not block Track A/B upgrade preflight when
+            // the fleet runs a newer major than the embedded libpg_query.
+            if c.name.starts_with("pg-version:")
+                && c.message.contains("ahead of the embedded SQL parser")
+            {
+                continue;
+            }
+            parts.push(format!(
+                "{}: {} ({})",
+                c.name,
+                c.message,
+                match c.status {
+                    CheckStatus::Fail => "fail",
+                    CheckStatus::Warn => "warn",
+                    _ => unreachable!(),
+                }
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Refusing cluster upgrade: doctor --strict is not green \
+         ({} fail, {} warn). {}",
+        report.fail_count,
+        report.warn_count,
+        parts.join("; ")
+    );
 }
 
 fn build_report(checks: Vec<CheckResult>) -> DoctorReport {

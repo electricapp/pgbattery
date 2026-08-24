@@ -20,6 +20,16 @@ const LOGS_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("raft_l
 const META_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("raft_meta");
 const SNAPSHOT_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("raft_snapshot");
 
+/// Meta key for the on-disk Raft store schema version.
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// On-disk Raft store schema version this binary writes and expects.
+///
+/// Missing key = schema 0 (every existing store adopts without a migrate).
+/// Older → forward migrate before Raft join; newer → refuse (no downgrade).
+/// See `UPGRADE_CHECKLIST.md` step 1.
+pub const STORE_SCHEMA_VERSION: u32 = 0;
+
 /// Entry payload type for storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogEntryPayload {
@@ -107,6 +117,16 @@ pub struct PurgedLogId {
     pub term: u64,
     pub leader_node_id: NodeId,
     pub index: u64,
+}
+
+fn decode_schema_version(bytes: &[u8]) -> Result<u32> {
+    let Ok(raw) = <[u8; 4]>::try_from(bytes) else {
+        return Err(Error::Storage(format!(
+            "invalid {SCHEMA_VERSION_KEY} value ({} bytes, expected 4)",
+            bytes.len()
+        )));
+    };
+    Ok(u32::from_le_bytes(raw))
 }
 
 /// Decode a postcard record, mapping failures to an actionable error.
@@ -226,7 +246,8 @@ impl RedbLogStorage {
         })
     }
 
-    /// Open the database and ensure every table exists.
+    /// Open the database and ensure every table exists, then check/migrate
+    /// the store schema version.
     ///
     /// Split out so a single `catch_unwind` covers both halves; it must not be
     /// called outside that guard.
@@ -259,6 +280,8 @@ impl RedbLogStorage {
                 .map_err(|e| Error::Storage(format!("Failed to open snapshot table: {e}")))?;
         }
 
+        Self::ensure_schema_version(&write_txn)?;
+
         write_txn
             .commit()
             .map_err(|e| Error::Storage(format!("Failed to commit: {e}")))?;
@@ -266,11 +289,58 @@ impl RedbLogStorage {
         Ok(db)
     }
 
+    /// Read or stamp `schema_version`; refuse newer stores; migrate older ones.
+    ///
+    /// Called inside the open write transaction, before Raft joins. Migrations
+    /// for versions below [`STORE_SCHEMA_VERSION`] must be idempotent.
+    fn ensure_schema_version(write_txn: &redb::WriteTransaction) -> Result<()> {
+        let mut meta = write_txn
+            .open_table(META_TABLE)
+            .map_err(|e| Error::Storage(format!("Failed to open meta table: {e}")))?;
+
+        let (on_disk, key_present) = match meta.get(SCHEMA_VERSION_KEY) {
+            Ok(Some(value)) => (decode_schema_version(value.value())?, true),
+            Ok(None) => (0, false), // pre-versioned stores adopt as schema 0
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to read {SCHEMA_VERSION_KEY}: {e}"
+                )));
+            }
+        };
+
+        if on_disk > STORE_SCHEMA_VERSION {
+            return Err(Error::Storage(format!(
+                "Raft store schema version {on_disk} is newer than this binary \
+                 (schema {STORE_SCHEMA_VERSION}). Downgrade is not supported — \
+                 install a matching or newer release."
+            )));
+        }
+
+        // Forward migrations for each step `(on_disk+1)..=STORE_SCHEMA_VERSION`
+        // go here when the constant is bumped. Schema 0 has nothing to migrate.
+
+        if !key_present || on_disk != STORE_SCHEMA_VERSION {
+            let bytes = STORE_SCHEMA_VERSION.to_le_bytes();
+            meta.insert(SCHEMA_VERSION_KEY, bytes.as_slice())
+                .map_err(|e| {
+                    Error::Storage(format!("Failed to write {SCHEMA_VERSION_KEY}: {e}"))
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Shared handle to the backing `raft.db` path, for error messages that
     /// must name it — a refcount, not a `PathBuf` copy, since `storage_io`
     /// takes one per operation.
     pub(crate) fn path_handle(&self) -> Arc<Path> {
         Arc::clone(&self.path)
+    }
+
+    /// Borrow the open redb handle (compat fixtures).
+    #[cfg(test)]
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
     }
 
     /// Build the fatal, operator-actionable error for a corrupted Raft DB.
@@ -1034,6 +1104,77 @@ mod tests {
         storage.delete_from(2).unwrap();
         assert!(storage.get_entry(2).unwrap().is_none());
         assert!(storage.get_entry(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn open_stamps_schema_version_and_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        {
+            let read = storage.db.begin_read().unwrap();
+            let meta = read.open_table(META_TABLE).unwrap();
+            let bytes = meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap();
+            assert_eq!(
+                decode_schema_version(bytes.value()).unwrap(),
+                STORE_SCHEMA_VERSION
+            );
+        }
+        drop(storage);
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        let read = reopened.db.begin_read().unwrap();
+        let meta = read.open_table(META_TABLE).unwrap();
+        let bytes = meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap();
+        assert_eq!(
+            decode_schema_version(bytes.value()).unwrap(),
+            STORE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn missing_schema_key_adopts_as_version_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        {
+            let write = storage.db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META_TABLE).unwrap();
+                assert!(meta.remove(SCHEMA_VERSION_KEY).unwrap().is_some());
+            }
+            write.commit().unwrap();
+        }
+        drop(storage);
+
+        let reopened = RedbLogStorage::new(&path).unwrap();
+        let read = reopened.db.begin_read().unwrap();
+        let meta = read.open_table(META_TABLE).unwrap();
+        let bytes = meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap();
+        assert_eq!(decode_schema_version(bytes.value()).unwrap(), 0);
+    }
+
+    #[test]
+    fn newer_schema_version_refuses_to_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        let storage = RedbLogStorage::new(&path).unwrap();
+        {
+            let write = storage.db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META_TABLE).unwrap();
+                let newer = (STORE_SCHEMA_VERSION + 1).to_le_bytes();
+                meta.insert(SCHEMA_VERSION_KEY, newer.as_slice()).unwrap();
+            }
+            write.commit().unwrap();
+        }
+        drop(storage);
+
+        let err = RedbLogStorage::new(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer than this binary") && msg.contains("Downgrade is not supported"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Build a real `raft.db` with `entries` log records and return its bytes.

@@ -100,10 +100,26 @@ asked the other two."""
 TOPOLOGIES: Final[dict[str, tuple[NodeTarget, ...]]] = {
     "three": NODES,
     "five": FIVE_NODES,
+    "bluegreen": _targets("docker-compose.bluegreen.yml"),
 }
+"""``bluegreen`` covers all six voters across two Raft groups (U1)."""
 
 PG_USER: Final[str] = "postgres"
 PG_DBNAME: Final[str] = "postgres"
+
+# Mutable for --user (client-vs-apply fence paths).
+_active_pg_user: str = PG_USER
+
+
+def set_pg_user(user: str) -> None:
+    """Probe as ``user`` (Track C app-role fence verification)."""
+    global _active_pg_user
+    _active_pg_user = user
+
+
+def active_pg_user() -> str:
+    return _active_pg_user
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Timing defaults
@@ -1138,7 +1154,7 @@ class _NodeWorker(threading.Thread):
             conn: psycopg.Connection[Any] = psycopg.connect(
                 host=host,
                 port=port,
-                user=PG_USER,
+                user=active_pg_user(),
                 dbname=PG_DBNAME,
                 connect_timeout=max(1, round(self._connect_timeout_s)),
                 autocommit=True,
@@ -1312,7 +1328,7 @@ class DualWritabilityProber:
             return psycopg.connect(
                 host=host,
                 port=port,
-                user=PG_USER,
+                user=active_pg_user(),
                 dbname=PG_DBNAME,
                 connect_timeout=5,
                 autocommit=True,
@@ -1716,10 +1732,14 @@ def run(
     topology: str = typer.Option(
         "three",
         "--topology",
-        help="three | five. Selects which cluster to probe: the default "
-        "docker-compose.yml (172.28.0.x) or docker-compose.5node.yml "
-        "(172.29.0.x). L1 is cluster-wide, so probing three ports of a "
-        "five-node cluster would leave two unobserved.",
+        help="three | five | bluegreen. Selects which cluster to probe. "
+        "bluegreen covers six ports across two Raft groups (contract U1).",
+    ),
+    user: str = typer.Option(
+        PG_USER,
+        "--user",
+        help="PostgreSQL role for probes. Use the Track C app role to verify "
+        "the client-vs-apply fence (U1 through that path).",
     ),
     json_out: str = typer.Option(
         "",
@@ -1736,6 +1756,7 @@ def run(
             f"[red]unknown --topology {topology!r}[/]; expected one of {sorted(TOPOLOGIES)}"
         )
         raise typer.Exit(code=2)
+    set_pg_user(user)
     config = ProberConfig(
         nodes=TOPOLOGIES[topology],
         round_period_s=round_ms / 1000.0,

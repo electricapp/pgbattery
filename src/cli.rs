@@ -17,14 +17,19 @@
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 /// Version string including the exact build timestamp, e.g.
+///
 /// `0.1.0 (built 2026-06-08T17:10:50Z)`. `PGBATTERY_BUILD_TIME` is stamped by
-/// `build.rs` at compile time.
-pub const LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (built ",
-    env!("PGBATTERY_BUILD_TIME"),
-    ")"
-);
+/// `build.rs` at compile time. Dual-binary CI images set
+/// `PGBATTERY_VERSION_OVERRIDE` and omit the build stamp (proof-only).
+pub const LONG_VERSION: &str = match option_env!("PGBATTERY_VERSION_OVERRIDE") {
+    Some(v) => v,
+    None => concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (built ",
+        env!("PGBATTERY_BUILD_TIME"),
+        ")"
+    ),
+};
 
 /// cloudflared-style help layout: uppercase labeled sections, version (with
 /// build time) shown inline. `{usage}`/`{version}`/`{subcommands}`/`{options}`/
@@ -265,15 +270,37 @@ pub enum Commands {
         strict: bool,
     },
 
-    /// Upgrade pgbattery to a newer version
+    /// Upgrade pgbattery to a newer version, or PostgreSQL majors via subcommand
     Upgrade {
+        #[command(subcommand)]
+        command: Option<UpgradeSubcommand>,
+
         /// Check for updates without installing
         ///
         /// Exit codes: 0 = already up to date; 10 = a newer version is
         /// available (distinct from generic failures so automation can
-        /// branch on it).
+        /// branch on it). With --cluster, exit 0 means version preflight
+        /// passed (mixed / out-of-window versions refuse with a non-zero exit).
         #[arg(long)]
         check: bool,
+
+        /// Rolling upgrade of every cluster node (Track A).
+        ///
+        /// With --check: preflight only (versions, doctor --strict / SYNC,
+        /// backup inventory). Without --check: preflight then apply —
+        /// lag-ordered follower self-upgrade, leadership transfer, former
+        /// leader, postflight.
+        #[arg(long)]
+        cluster: bool,
+
+        /// Cluster entry node for --cluster (management host:port, or node id
+        /// when a local config can resolve it).
+        #[arg(long)]
+        node: Option<String>,
+
+        /// With --cluster, proceed even when backup inventory is empty.
+        #[arg(long)]
+        allow_no_backup: bool,
 
         /// Specific version to install (default: latest)
         #[arg(long)]
@@ -325,6 +352,64 @@ pub enum Commands {
     ///
     /// Save with: pgbattery man > pgbattery.1
     Man,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UpgradeSubcommand {
+    /// PostgreSQL major upgrade via pg_upgrade (Track B)
+    Postgres {
+        /// Target PostgreSQL major (must be N+1 from the running data directory)
+        #[arg(long)]
+        to: u32,
+
+        /// Preflight only (doctor, bins, pg_upgrade --check, extensions, ...)
+        #[arg(long)]
+        check: bool,
+
+        /// Cluster entry node (management host:port, or node id)
+        #[arg(long)]
+        node: Option<String>,
+
+        /// Proceed without a restore-and-start backup proof
+        #[arg(long)]
+        allow_no_backup: bool,
+
+        /// Allow --link (no rollback after new postmaster starts)
+        #[arg(long)]
+        accept_no_rollback: bool,
+
+        /// Proceed when WAL archiving is off (abort RPO = last full backup)
+        #[arg(long)]
+        accept_write_loss: bool,
+
+        /// Transfer mode: clone (default), copy, or link
+        #[arg(long, value_name = "MODE")]
+        transfer_mode: Option<String>,
+
+        /// Enable full apply flow (step 5)
+        #[arg(long)]
+        experimental: bool,
+
+        /// Delete rollback anchor and old datadir after a successful apply (no timer)
+        #[arg(long)]
+        confirm: bool,
+
+        /// Roll back to the pre-upgrade datadir (requires --accept-write-loss)
+        #[arg(long)]
+        rollback: bool,
+
+        /// Track C: logical blue/green major upgrade (preflight with --check)
+        #[arg(long)]
+        blue_green: bool,
+
+        /// Application role for client-vs-apply fence feasibility (repeatable; required with --blue-green)
+        #[arg(long = "app-role", value_name = "ROLE")]
+        app_roles: Vec<String>,
+
+        /// Track C: allow unlogged tables (they arrive empty on green)
+        #[arg(long)]
+        accept_empty_unlogged: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

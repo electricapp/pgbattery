@@ -34,14 +34,14 @@ pub struct BackupCreateResponse {
 }
 
 /// Response for backup list operation
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BackupListResponse {
     pub backups: Vec<BackupItemResponse>,
     pub backup_dir: String,
     pub retention_count: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BackupItemResponse {
     pub path: String,
     pub timestamp: String,

@@ -112,6 +112,71 @@ pub struct ClusterState {
     /// only be stricter than necessary.
     #[serde(default)]
     pub sync_replication_active: Option<bool>,
+
+    /// Track C cutover authority — epoch + phase from blue's Raft log (U1/U4).
+    /// Default = blue holds epoch 0, idle (single-cluster operation).
+    #[serde(default)]
+    pub cutover: CutoverAuthorityState,
+}
+
+/// Track C write-authority identity projected from blue's committed log.
+///
+/// Not a leadership projection: Raft leadership stays `RaftMetrics::current_leader`.
+/// This is the `(epoch, cluster)` pair from `tla/cutover_authority.tla`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CutoverAuthorityState {
+    pub epoch: u64,
+    /// `"blue"` | `"green"` | `"none"` — cluster that holds client write authority.
+    pub authority_cluster: String,
+    pub phase: CutoverPhase,
+    /// Blue final flush LSN at SEAL (bytes), when sealed/draining/transferred.
+    #[serde(default)]
+    pub sealed_final_lsn: Option<u64>,
+    /// Green cluster id named in ARMED / TRANSFERRED.
+    #[serde(default)]
+    pub green_cluster_id: Option<String>,
+    /// Green primary PG address for blue gateway relay after TRANSFER.
+    #[serde(default)]
+    pub green_leader_pg_addr: Option<String>,
+}
+
+impl Default for CutoverAuthorityState {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            authority_cluster: "blue".into(),
+            phase: CutoverPhase::Idle,
+            sealed_final_lsn: None,
+            green_cluster_id: None,
+            green_leader_pg_addr: None,
+        }
+    }
+}
+
+/// Cutover protocol phase (blue log). Matches `tla/cutover_authority.tla` Phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CutoverPhase {
+    #[default]
+    Idle,
+    Armed,
+    Sealed,
+    Draining,
+    Transferred,
+    Aborted,
+}
+
+impl CutoverPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Armed => "armed",
+            Self::Sealed => "sealed",
+            Self::Draining => "draining",
+            Self::Transferred => "transferred",
+            Self::Aborted => "aborted",
+        }
+    }
 }
 
 /// Information about a cluster node.
@@ -194,6 +259,25 @@ pub enum ClusterCommand {
     /// election-time and promotion-time LSN catch-up gates consult to
     /// choose between tight and loose thresholds.
     SetSyncMode { active: bool },
+
+    /// Track C: `CUTOVER_ARMED{green}` — pending handoff; clients unchanged.
+    CutoverArmed { green_cluster_id: String },
+
+    /// Track C: `WRITE_AUTHORITY_SEALED{final_lsn}` — blue stops client writes.
+    CutoverSeal { final_lsn: u64 },
+
+    /// Track C: green drain observed (still read-only).
+    CutoverDrainObserved,
+
+    /// Track C: `AUTHORITY_TRANSFERRED{green, epoch+1}` after reverse slot ready.
+    CutoverTransfer {
+        green_cluster_id: String,
+        /// Green primary internal PG `host:port` for blue gateway relay.
+        green_leader_pg_addr: String,
+    },
+
+    /// Track C: green drain failed — unseal blue into a **new** epoch.
+    CutoverAbortUnseal,
 }
 
 impl ClusterState {
@@ -256,6 +340,55 @@ impl ClusterState {
             }
             ClusterCommand::SetSyncMode { active } => {
                 self.sync_replication_active = Some(active);
+            }
+            ClusterCommand::CutoverArmed { green_cluster_id } => {
+                if self.cutover.phase != CutoverPhase::Idle
+                    && self.cutover.phase != CutoverPhase::Aborted
+                {
+                    return;
+                }
+                self.cutover.phase = CutoverPhase::Armed;
+                self.cutover.green_cluster_id = Some(green_cluster_id);
+            }
+            ClusterCommand::CutoverSeal { final_lsn } => {
+                if self.cutover.phase != CutoverPhase::Armed {
+                    return;
+                }
+                self.cutover.phase = CutoverPhase::Sealed;
+                self.cutover.sealed_final_lsn = Some(final_lsn);
+            }
+            ClusterCommand::CutoverDrainObserved => {
+                if self.cutover.phase != CutoverPhase::Sealed {
+                    return;
+                }
+                self.cutover.phase = CutoverPhase::Draining;
+            }
+            ClusterCommand::CutoverTransfer {
+                green_cluster_id,
+                green_leader_pg_addr,
+            } => {
+                if self.cutover.phase != CutoverPhase::Draining {
+                    return;
+                }
+                self.cutover.epoch = self.cutover.epoch.saturating_add(1);
+                self.cutover.authority_cluster = "green".into();
+                self.cutover.phase = CutoverPhase::Transferred;
+                self.cutover.green_cluster_id = Some(green_cluster_id);
+                self.cutover.green_leader_pg_addr = Some(green_leader_pg_addr);
+            }
+            ClusterCommand::CutoverAbortUnseal => {
+                if !matches!(
+                    self.cutover.phase,
+                    CutoverPhase::Sealed | CutoverPhase::Draining
+                ) {
+                    return;
+                }
+                self.cutover.epoch = self.cutover.epoch.saturating_add(1);
+                self.cutover.authority_cluster = "blue".into();
+                self.cutover.phase = CutoverPhase::Aborted;
+                self.cutover.sealed_final_lsn = None;
+                self.cutover.green_cluster_id = None;
+                self.cutover.green_leader_pg_addr = None;
             }
         }
     }
@@ -556,6 +689,62 @@ mod tests {
             role: NodeRole::Follower,
             last_seen: 0,
         }));
+    }
+
+    /// Happy-path cutover matches `tla/cutover_authority.tla` Transfer sequence.
+    #[test]
+    fn cutover_transfer_advances_epoch_to_green() {
+        let mut state = ClusterState::new();
+        assert_eq!(state.cutover.phase, CutoverPhase::Idle);
+        assert_eq!(state.cutover.authority_cluster, "blue");
+        assert_eq!(state.cutover.epoch, 0);
+
+        state.apply(ClusterCommand::CutoverArmed {
+            green_cluster_id: "green-1".into(),
+        });
+        assert_eq!(state.cutover.phase, CutoverPhase::Armed);
+
+        state.apply(ClusterCommand::CutoverSeal { final_lsn: 100 });
+        assert_eq!(state.cutover.phase, CutoverPhase::Sealed);
+        assert_eq!(state.cutover.sealed_final_lsn, Some(100));
+
+        state.apply(ClusterCommand::CutoverDrainObserved);
+        assert_eq!(state.cutover.phase, CutoverPhase::Draining);
+
+        state.apply(ClusterCommand::CutoverTransfer {
+            green_cluster_id: "green-1".into(),
+            green_leader_pg_addr: "172.30.0.21:5434".into(),
+        });
+        assert_eq!(state.cutover.phase, CutoverPhase::Transferred);
+        assert_eq!(state.cutover.authority_cluster, "green");
+        assert_eq!(state.cutover.epoch, 1);
+        assert_eq!(
+            state.cutover.green_leader_pg_addr.as_deref(),
+            Some("172.30.0.21:5434")
+        );
+    }
+
+    /// Abort unseals blue into a new epoch; green never held authority.
+    #[test]
+    fn cutover_abort_unseal_returns_blue_new_epoch() {
+        let mut state = ClusterState::new();
+        state.apply(ClusterCommand::CutoverArmed {
+            green_cluster_id: "green-1".into(),
+        });
+        state.apply(ClusterCommand::CutoverSeal { final_lsn: 50 });
+        state.apply(ClusterCommand::CutoverAbortUnseal);
+        assert_eq!(state.cutover.phase, CutoverPhase::Aborted);
+        assert_eq!(state.cutover.authority_cluster, "blue");
+        assert_eq!(state.cutover.epoch, 1);
+        assert!(state.cutover.sealed_final_lsn.is_none());
+    }
+
+    /// Out-of-order seal is a no-op (idempotent refuse).
+    #[test]
+    fn cutover_seal_ignored_unless_armed() {
+        let mut state = ClusterState::new();
+        state.apply(ClusterCommand::CutoverSeal { final_lsn: 1 });
+        assert_eq!(state.cutover.phase, CutoverPhase::Idle);
     }
 
     /// `fresh_max_lsn` re-derives the cluster max from only non-stale entries,

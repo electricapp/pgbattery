@@ -24,7 +24,7 @@ services:
     # exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
-    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive /var/lib/postgresql/backups && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node1.toml:/app/pgbattery.toml:ro
@@ -64,7 +64,7 @@ services:
     # exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
-    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 2 --voter"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 2 --voter"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node2.toml:/app/pgbattery.toml:ro
@@ -102,7 +102,7 @@ services:
     # exceeded the budget. Verified by ci case
     # `restart-budget-sustained-pg-death`.
     restart: unless-stopped
-    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 3 --voter"]
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.28.0.11:9091 --node-id 3 --voter"]
     cap_add: [NET_ADMIN]
     volumes:
       - ./config/node3.toml:/app/pgbattery.toml:ro

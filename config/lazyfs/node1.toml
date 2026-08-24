@@ -9,6 +9,7 @@ listen_addr = "0.0.0.0:5432"
 raft_addr = "0.0.0.0:5433"
 metrics_addr = "0.0.0.0:9090"
 pg_bin_dir = "/usr/lib/postgresql/18/bin"
+pg_bin_dirs = { "17" = "/usr/lib/postgresql/17/bin", "18" = "/usr/lib/postgresql/18/bin" }
 pg_data_dir = "/var/lib/postgresql/data"
 pg_internal_port = 5434
 pg_auth_mode = "trust"
@@ -34,6 +35,7 @@ pg_addr = "172.30.0.13:5434"
 [backup]
 enabled = true
 backup_dir = "/var/lib/postgresql/backups"
+wal_archive_dir = "/var/lib/postgresql/wal_archive"
 retention_count = 3
 backup_type = "dump"  # "full" or "dump"
 compress = true

@@ -1,0 +1,147 @@
+# Six-node Track C topology: blue (ids 1–3) + green (ids 4–6) on one L2
+# network so logical replication can cross clusters, with two independent
+# Raft groups (peers only within blue / within green).
+#
+# Separate project name, subnet, and host ports from 3-node and 5-node.
+# Requires PGBATTERY_MANAGEMENT_API_TOKEN.
+#
+# Topology is derived by testing/topology.py (COMPOSE_FILE=…).
+name: pgbattery-bg
+
+x-node-env: &node-env
+  RUST_LOG: info
+  PGBATTERY_MANAGEMENT_API_TOKEN: ${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+  LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+  FAKETIME_NO_CACHE: "1"
+  FAKETIME_TIMESTAMP_FILE: /tmp/faketime
+  FAKETIME_DONT_FAKE_MONOTONIC: "1"
+
+services:
+  blue1:
+    build: { context: ., target: runtime }
+    hostname: blue1
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/bluegreen/blue1.toml:/app/pgbattery.toml:ro
+      - blue1_state:/var/lib/postgresql
+    ports: ["5452:5432", "9291:9090", "9281:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.30.0.11 }
+
+  blue2:
+    build: { context: ., target: runtime }
+    hostname: blue2
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.30.0.11:9091 --node-id 2 --voter",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/bluegreen/blue2.toml:/app/pgbattery.toml:ro
+      - blue2_state:/var/lib/postgresql
+    ports: ["5453:5432", "9292:9090", "9282:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.30.0.12 }
+
+  blue3:
+    build: { context: ., target: runtime }
+    hostname: blue3
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.30.0.11:9091 --node-id 3 --voter",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/bluegreen/blue3.toml:/app/pgbattery.toml:ro
+      - blue3_state:/var/lib/postgresql
+    ports: ["5454:5432", "9293:9090", "9283:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.30.0.13 }
+
+  green1:
+    build: { context: ., target: runtime }
+    hostname: green1
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/bluegreen/green1.toml:/app/pgbattery.toml:ro
+      - green1_state:/var/lib/postgresql
+    ports: ["5462:5432", "9301:9090", "9294:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.30.0.21 }
+
+  green2:
+    build: { context: ., target: runtime }
+    hostname: green2
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.30.0.21:9091 --node-id 5 --voter",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/bluegreen/green2.toml:/app/pgbattery.toml:ro
+      - green2_state:/var/lib/postgresql
+    ports: ["5463:5432", "9302:9090", "9295:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.30.0.22 }
+
+  green3:
+    build: { context: ., target: runtime }
+    hostname: green3
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.30.0.21:9091 --node-id 6 --voter",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/bluegreen/green3.toml:/app/pgbattery.toml:ro
+      - green3_state:/var/lib/postgresql
+    ports: ["5464:5432", "9303:9090", "9296:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.30.0.23 }
+
+volumes:
+  blue1_state:
+  blue2_state:
+  blue3_state:
+  green1_state:
+  green2_state:
+  green3_state:
+
+networks:
+  raft_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

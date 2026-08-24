@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::fs;
@@ -437,6 +437,9 @@ pub struct SupervisorConfig {
 
     /// Authentication mode for `pg_hba.conf`
     pub pg_auth_mode: PgAuthMode,
+
+    /// When set, `PostgreSQL` archives completed WAL segments here (`archive_mode=on`).
+    pub wal_archive_dir: Option<PathBuf>,
 }
 
 /// Outcome of a timeline comparison against the leader.
@@ -833,7 +836,7 @@ async fn relay_postgres_log(stderr: tokio::process::ChildStderr) {
 /// removing it would detach the mount. Async because a PGDATA can hold
 /// gigabytes and unlinking it on the runtime thread would stall every other
 /// task, including the lease tick.
-async fn clear_dir_contents(dir: &std::path::Path) -> Result<()> {
+async fn clear_dir_contents(dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
@@ -871,11 +874,7 @@ async fn clear_dir_contents(dir: &std::path::Path) -> Result<()> {
 ///   `configure_postgresql` regenerate identical config on every `start()`.
 ///
 /// `parent` is the directory whose entry must be durable (PGDATA).
-async fn write_file_durably_in(
-    parent: &std::path::Path,
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> Result<bool> {
+async fn write_file_durably_in(parent: &Path, path: &Path, bytes: &[u8]) -> Result<bool> {
     if let Ok(existing) = fs::read(path).await
         && existing == bytes
     {
@@ -944,10 +943,7 @@ const CONTROLDATA_SYSTEM_IDENTIFIER: &str = "Database system identifier";
 /// Returns an error only when `pg_controldata` ran and produced something this
 /// cannot read; an absent data directory is `Ok(None)`, since a node that has
 /// not been provisioned yet has no lineage rather than a broken one.
-pub async fn read_system_identifier(
-    pg_bin_dir: &std::path::Path,
-    pg_data_dir: &std::path::Path,
-) -> Result<Option<u64>> {
+pub async fn read_system_identifier(pg_bin_dir: &Path, pg_data_dir: &Path) -> Result<Option<u64>> {
     if !pg_data_dir.join("global/pg_control").exists() {
         return Ok(None);
     }
@@ -1014,6 +1010,27 @@ impl Supervisor {
             child: None,
             sql_client: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Retarget binary and data directories after a Track B `pg_upgrade` (runtime
+    /// pointer; durable config rewrite is the caller's job).
+    ///
+    /// Must be called while the postmaster is stopped.
+    pub fn retarget_paths(&mut self, bin_dir: PathBuf, data_dir: PathBuf) {
+        self.config.pg_bin_dir = bin_dir;
+        self.config.pg_data_dir = data_dir;
+    }
+
+    /// Current data directory (for upgrade orchestration probes).
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.config.pg_data_dir
+    }
+
+    /// Current binary directory.
+    #[must_use]
+    pub fn bin_dir(&self) -> &Path {
+        &self.config.pg_bin_dir
     }
 
     /// Connection parameters for spawning a one-shot psql against the
@@ -1369,6 +1386,10 @@ impl Supervisor {
     }
 
     /// Configure `PostgreSQL` for HA replication.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "managed conf block is the shipped postgresql.conf surface"
+    )]
     async fn configure_postgresql(&self) -> Result<()> {
         let conf_path = self.config.pg_data_dir.join("postgresql.conf");
         let hba_path = self.config.pg_data_dir.join("pg_hba.conf");
@@ -1378,6 +1399,33 @@ impl Supervisor {
             WalLevel::Replica => "replica",
             WalLevel::Logical => "logical",
         };
+
+        let (archive_mode, archive_lines) = match &self.config.wal_archive_dir {
+            Some(dir) => {
+                fs::create_dir_all(dir).await.map_err(|e| {
+                    Error::Postgres(format!(
+                        "Failed to create WAL archive dir {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                // Idempotent: succeed if the segment is already archived.
+                // `test ! -f && cp` exits 1 when the file exists, which makes
+                // shutdown hang retrying archive and stalls Track B rejoin.
+                let dir_disp = dir.display().to_string().replace('\'', "''");
+                (
+                    "on",
+                    format!(
+                        "archive_mode = on\n\
+                         archive_command = 'test -f {dir_disp}/%f || cp %p {dir_disp}/%f'\n\
+                         # Force a segment at least once a minute so PITR has recent WAL \
+                         # even under light write load.\n\
+                         archive_timeout = 60\n"
+                    ),
+                )
+            }
+            None => ("off", "archive_mode = off\n".to_string()),
+        };
+        let _ = archive_mode; // logged via archive_lines content
 
         let conf_block = format!(
             r"
@@ -1398,8 +1446,7 @@ wal_keep_size = '1GB'
 # the live leader).
 max_slot_wal_keep_size = '10GB'
 synchronous_commit = on
-archive_mode = off
-wal_log_hints = on  # Required for pg_rewind
+{}wal_log_hints = on  # Required for pg_rewind
 
 # Connection settings
 max_connections = 200
@@ -1409,7 +1456,7 @@ shared_buffers = '128MB'
 effective_cache_size = '512MB'
 # END pgbattery managed config
 ",
-            self.config.pg_port, wal_level_str
+            self.config.pg_port, wal_level_str, archive_lines
         );
 
         let conf_existing = fs::read_to_string(&conf_path)
@@ -3051,7 +3098,7 @@ host all all ::/0 {auth_method}
     }
 
     /// Durably install `bytes` at `path` (see [`write_file_durably_in`]).
-    async fn write_file_durably(&self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    async fn write_file_durably(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         write_file_durably_in(&self.config.pg_data_dir, path, bytes)
             .await
             .map(|_| ())
@@ -3147,7 +3194,7 @@ host all all ::/0 {auth_method}
     /// orphan that could race a later `start()` on the same data directory.
     async fn run_pg_rewind_attempt(
         &self,
-        pg_rewind: &std::path::Path,
+        pg_rewind: &Path,
         source_connstr: &str,
         budget_deadline: Instant,
     ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
@@ -5544,6 +5591,7 @@ mod tests {
             wal_level: WalLevel::Replica,
             node_id: 1,
             pg_auth_mode: PgAuthMode::Trust,
+            wal_archive_dir: None,
         });
         assert_eq!(
             supervisor.postmaster_state().unwrap(),

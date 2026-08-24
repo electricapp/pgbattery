@@ -7,9 +7,12 @@
 //!
 //! # Wire format and cancellation safety
 //!
-//! Every frame is `len(4, big-endian) + type(1) + corr_id(8, big-endian) +
+//! Every frame is `len(4, big-endian) + version(1) + type(1) + corr_id(8) +
 //! body`, where `len` counts everything after itself. A response echoes its
-//! request's `corr_id`.
+//! request's `corr_id`. [`RAFT_RPC_FRAME_VERSION`] is the version this binary
+//! emits; peers may send `N-1..=N` once `N > 0` (today `N = 0`, so only `0`).
+//! A version outside that window is a typed protocol error — see `UPGRADE.md`
+//! Track A / `UPGRADE_CHECKLIST.md` step 1.
 //!
 //! openraft cancels an RPC by dropping its future, and a drop can land at
 //! any await point — after half a frame was written, or with half a response
@@ -51,6 +54,15 @@ use crate::error::{Error, Result};
 /// Previously 64 MB, reduced to limit DoS-induced allocation.
 const MAX_RPC_FRAME_LEN: usize = 4 * 1024 * 1024;
 
+/// Raft RPC frame version this binary emits.
+///
+/// Accept window is `saturating_sub(1)..=RAFT_RPC_FRAME_VERSION`. Bump only
+/// with a rolling-upgrade plan (`UPGRADE_CHECKLIST.md` step 1).
+pub const RAFT_RPC_FRAME_VERSION: u8 = 0;
+
+/// Bytes after `len`: version (1) + type (1) + correlation ID (8).
+const FRAME_OVERHEAD_AFTER_LEN: usize = 1 + 1 + 8;
+
 /// Per-operation I/O budget for a single RPC: connect, TLS handshake, and
 /// each framed read/write on both client and server sides. The server uses
 /// the same value so a request that fits the client's budget is never cut
@@ -67,10 +79,6 @@ const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// bound instead of pinning their server task forever.
 const SERVER_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Bytes of a frame counted by its length prefix besides the body:
-/// type (1) + correlation ID (8).
-const FRAME_OVERHEAD_AFTER_LEN: usize = 1 + 8;
-
 fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
     if len < FRAME_OVERHEAD_AFTER_LEN {
         return Err(Error::Protocol(format!(
@@ -85,8 +93,20 @@ fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
     Ok(len - FRAME_OVERHEAD_AFTER_LEN)
 }
 
-/// Write a frame header (length placeholder, type byte, correlation ID);
-/// returns the length field's offset for [`finish_frame`].
+fn frame_version_accepted(version: u8) -> bool {
+    let min = RAFT_RPC_FRAME_VERSION.saturating_sub(1);
+    (min..=RAFT_RPC_FRAME_VERSION).contains(&version)
+}
+
+/// Whether `version` is in this binary's Raft RPC accept window (`N-1..=N`).
+#[doc(hidden)]
+#[must_use]
+pub fn raft_rpc_frame_version_accepted(version: u8) -> bool {
+    frame_version_accepted(version)
+}
+
+/// Write a frame header (length placeholder + version/type/corr); returns the
+/// length field's offset for [`finish_frame`].
 ///
 /// Together with `finish_frame` this is the wire format itself, written
 /// once: the byte-body path (`append_frame_bytes`, which the fuzz seam also
@@ -96,6 +116,7 @@ fn validate_rpc_frame_len(len: usize, context: &str) -> Result<usize> {
 fn start_frame(buf: &mut BytesMut, type_byte: u8, corr_id: u64) -> usize {
     let len_pos = buf.len();
     buf.put_u32(0);
+    buf.put_u8(RAFT_RPC_FRAME_VERSION);
     buf.put_u8(type_byte);
     buf.put_u64(corr_id);
     len_pos
@@ -156,6 +177,7 @@ fn shrink_frame_buf(buf: &mut BytesMut) {
 }
 
 /// One parsed inbound frame.
+#[derive(Debug)]
 struct Frame {
     type_byte: u8,
     corr_id: u64,
@@ -197,7 +219,8 @@ pub const RPC_FRAME_LEN_BOUNDS: (usize, usize) = (FRAME_OVERHEAD_AFTER_LEN, MAX_
 ///
 /// `Ok(None)` means more bytes are needed; the partial frame stays in `buf`
 /// untouched, which is what lets a cancelled read resume losslessly. A
-/// length prefix outside the valid range is a protocol violation.
+/// length prefix outside the valid range, or a frame version outside the
+/// accept window, is a protocol violation.
 fn take_frame(buf: &mut BytesMut, context: &str) -> Result<Option<Frame>> {
     let Some(len_bytes) = buf.get(..4) else {
         return Ok(None);
@@ -208,8 +231,25 @@ fn take_frame(buf: &mut BytesMut, context: &str) -> Result<Option<Frame>> {
     if buf.len() < total {
         return Ok(None);
     }
+    // Peek before consuming so a version refusal leaves `buf` untouched
+    // (same discipline as length validation — callers drop the connection
+    // either way, but the fuzzer asserts the property).
+    let version = buf
+        .get(4)
+        .copied()
+        .ok_or_else(|| Error::Protocol(format!("RPC {context} frame missing version byte")))?;
+    if !frame_version_accepted(version) {
+        return Err(Error::Protocol(format!(
+            "Raft RPC frame version {version} is not accepted (this node speaks \
+             {RAFT_RPC_FRAME_VERSION}, window \
+             {}..={RAFT_RPC_FRAME_VERSION})",
+            RAFT_RPC_FRAME_VERSION.saturating_sub(1)
+        )));
+    }
     let mut frame = buf.split_to(total);
     frame.advance(4);
+    let got_version = frame.get_u8();
+    debug_assert_eq!(got_version, version);
     let type_byte = frame.get_u8();
     let corr_id = frame.get_u64();
     debug_assert_eq!(frame.len(), body_len);
@@ -995,6 +1035,7 @@ impl Default for RaftRpcClient {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
     reason = "test code asserts on known-good values and panics are the failure signal"
@@ -1011,7 +1052,7 @@ mod tests {
 
     #[test]
     fn test_validate_rpc_frame_len_bounds() {
-        // Below the fixed overhead (type + correlation ID) is malformed.
+        // Below the fixed overhead (version + type + correlation ID) is malformed.
         assert!(validate_rpc_frame_len(0, "request").is_err());
         assert!(validate_rpc_frame_len(FRAME_OVERHEAD_AFTER_LEN - 1, "request").is_err());
         // Overhead-only = empty body, valid.
@@ -1021,6 +1062,42 @@ mod tests {
         );
         assert!(validate_rpc_frame_len(MAX_RPC_FRAME_LEN, "request").is_ok());
         assert!(validate_rpc_frame_len(MAX_RPC_FRAME_LEN + 1, "request").is_err());
+    }
+
+    #[test]
+    fn take_frame_accepts_current_version_and_refuses_newer() {
+        let mut ok = BytesMut::new();
+        append_frame_bytes(&mut ok, RpcType::Vote as u8, 7, b"ballot").unwrap();
+        let frame = take_frame(&mut ok, "test").unwrap().unwrap();
+        assert_eq!(frame.type_byte, RpcType::Vote as u8);
+        assert_eq!(frame.corr_id, 7);
+        assert_eq!(&frame.body[..], b"ballot");
+
+        let mut newer = BytesMut::new();
+        newer.put_u32(u32::try_from(FRAME_OVERHEAD_AFTER_LEN).expect("overhead fits u32"));
+        newer.put_u8(RAFT_RPC_FRAME_VERSION.saturating_add(1));
+        newer.put_u8(RpcType::Vote as u8);
+        newer.put_u64(1);
+        let before = newer.clone();
+        let err = take_frame(&mut newer, "test").unwrap_err();
+        assert!(
+            err.to_string().contains("not accepted"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            &newer[..],
+            &before[..],
+            "version refusal must not consume bytes"
+        );
+    }
+
+    #[test]
+    fn emit_includes_frame_version_byte() {
+        let mut buf = BytesMut::new();
+        append_frame_bytes(&mut buf, RpcType::AppendEntries as u8, 42, b"").unwrap();
+        assert_eq!(buf.len(), 4 + FRAME_OVERHEAD_AFTER_LEN);
+        assert_eq!(buf[4], RAFT_RPC_FRAME_VERSION);
+        assert_eq!(buf[5], RpcType::AppendEntries as u8);
     }
 
     /// Test-side framing over the shipping [`append_frame_bytes`].
@@ -1133,9 +1210,10 @@ mod tests {
         let len = u32::from_be_bytes(len_buf) as usize;
         let mut rest = vec![0u8; len];
         stream.read_exact(&mut rest).await.unwrap();
-        let type_byte = rest[0];
-        let corr_id = u64::from_be_bytes(<[u8; 8]>::try_from(&rest[1..9]).unwrap());
-        (type_byte, corr_id, rest[9..].to_vec())
+        assert_eq!(rest[0], RAFT_RPC_FRAME_VERSION);
+        let type_byte = rest[1];
+        let corr_id = u64::from_be_bytes(<[u8; 8]>::try_from(&rest[2..10]).unwrap());
+        (type_byte, corr_id, rest[10..].to_vec())
     }
 
     async fn write_frame_to<S: AsyncWrite + Unpin>(

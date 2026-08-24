@@ -2,7 +2,7 @@
 //! inter-node message rides on.
 //!
 //! Wire format (`src/governor/network.rs` module docs): `len(4, big-endian) |
-//! type(1) | corr_id(8, big-endian) | body`, where `len` counts everything
+//! version(1) | type(1) | corr_id(8) | body`, where `len` counts everything
 //! after itself. The codec's whole reason for existing is cancellation safety:
 //! openraft drops an RPC future at arbitrary await points, so a partially-read
 //! inbound frame must stay staged in the buffer and resume losslessly, and a
@@ -21,11 +21,13 @@
 //!     consume any, or a cancelled read loses the partial frame.
 //!   - `Ok(Some(frame))` consumed exactly `4 + len` bytes, left the remainder
 //!     untouched, produced a body of exactly `len - overhead` bytes, and
-//!     **re-encodes to precisely the prefix it consumed**. A decoder that
-//!     re-encodes to anything else has invented or dropped state.
-//!   - A declared length outside `RPC_FRAME_LEN_BOUNDS` **always** errors, and
-//!     an in-bounds length **never** errors. Boundary values are swept
-//!     exhaustively at the low end and at both sides of the 4 MiB cap.
+//!     **re-encodes to precisely the prefix it consumed** when the input
+//!     version equals the emit version (accepted `N-1` frames would re-encode
+//!     as `N` once that window exists).
+//!   - A declared length outside `RPC_FRAME_LEN_BOUNDS` **always** errors.
+//!     An in-bounds length errors only when the version byte is outside the
+//!     accept window. Boundary values are swept exhaustively at the low end
+//!     and at both sides of the 4 MiB cap.
 //!   - Feeding one well-formed stream a byte at a time, in data-derived
 //!     variable chunks, or in a single write yields the **identical frame
 //!     sequence** and the identical residual buffer. Desync is supposed to be
@@ -34,11 +36,11 @@
 //!     encoder wrote comes back out in order with nothing left over.
 //!
 //! Also asserted, as an observed design fact rather than a documented
-//! contract: an `Err` leaves the buffer byte-identical too. Length validation
-//! runs before any `split_to`, so a protocol violation is detected before a
-//! single byte is consumed. The caller drops the connection either way, so
-//! nothing depends on it today — but a refactor that started consuming the bad
-//! frame before erroring would be worth noticing.
+//! contract: an `Err` leaves the buffer byte-identical too. Length and
+//! version validation run before any `split_to`, so a protocol violation is
+//! detected before a single byte is consumed. The caller drops the connection
+//! either way, so nothing depends on it today — but a refactor that started
+//! consuming the bad frame before erroring would be worth noticing.
 //!
 //! Not asserted: anything above the codec. Correlation-ID matching, straggler
 //! skipping, the stale-frame cap, and response-type validation live in the
@@ -53,7 +55,8 @@
 use bytes::{BufMut, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use pgbattery::governor::network::{
-    RPC_FRAME_LEN_BOUNDS, decode_rpc_frame_for_fuzz, encode_rpc_frame_for_fuzz,
+    RAFT_RPC_FRAME_VERSION, RPC_FRAME_LEN_BOUNDS, decode_rpc_frame_for_fuzz,
+    encode_rpc_frame_for_fuzz,
 };
 
 type DecodedFrame = (u8, u64, Vec<u8>);
@@ -62,6 +65,11 @@ type DecodedFrame = (u8, u64, Vec<u8>);
 const MAX_SYNTHETIC_BODY: usize = 48;
 /// Cap on synthetic frames per input, for the same reason.
 const MAX_SYNTHETIC_FRAMES: usize = 32;
+
+fn version_accepted(version: u8) -> bool {
+    let min = RAFT_RPC_FRAME_VERSION.saturating_sub(1);
+    (min..=RAFT_RPC_FRAME_VERSION).contains(&version)
+}
 
 /// Read the frame's declared length prefix, if the buffer has one.
 fn declared_len(bytes: &[u8]) -> Option<usize> {
@@ -126,20 +134,27 @@ fn check_single_decode(input: &[u8]) {
                 "the remainder after a decoded frame was disturbed"
             );
 
-            let mut re = BytesMut::new();
-            encode_rpc_frame_for_fuzz(&mut re, type_byte, corr_id, &body)
-                .expect("a frame that decoded must re-encode");
-            assert_eq!(
-                &re[..],
-                &input[..consumed],
-                "frame does not re-encode to the bytes it consumed"
-            );
+            // Re-encode always writes `RAFT_RPC_FRAME_VERSION`; byte identity
+            // holds only when the input already used that version.
+            if input.get(4) == Some(&RAFT_RPC_FRAME_VERSION) {
+                let mut re = BytesMut::new();
+                encode_rpc_frame_for_fuzz(&mut re, type_byte, corr_id, &body)
+                    .expect("a frame that decoded must re-encode");
+                assert_eq!(
+                    &re[..],
+                    &input[..consumed],
+                    "frame does not re-encode to the bytes it consumed"
+                );
+            }
         }
         Err(_) => {
             let len = declared.expect("error raised without a length prefix");
+            let version_out = input
+                .get(4)
+                .is_some_and(|&v| !version_accepted(v) && input.len() >= 4 + len);
             assert!(
-                !(min_len..=max_len).contains(&len),
-                "in-bounds length {len} was rejected"
+                !(min_len..=max_len).contains(&len) || version_out,
+                "in-bounds length {len} was rejected without a version-window reason"
             );
             assert_eq!(
                 &buf[..],
@@ -155,11 +170,15 @@ fn check_single_decode(input: &[u8]) {
 fn check_length_bounds() {
     let (min_len, max_len) = RPC_FRAME_LEN_BOUNDS;
 
-    // Complete frames for every small length, straddling the minimum.
+    // Complete frames for every small length, straddling the minimum. Version
+    // byte is the current emit version so length is the only variable.
     for len in 0..=(min_len + 8) {
         let mut buf = BytesMut::with_capacity(4 + len);
         buf.put_u32(u32::try_from(len).expect("small length fits u32"));
-        buf.resize(4 + len, 0xAB);
+        if len > 0 {
+            buf.put_u8(RAFT_RPC_FRAME_VERSION);
+            buf.resize(4 + len, 0xAB);
+        }
         let result = decode_rpc_frame_for_fuzz(&mut buf);
         if len < min_len {
             assert!(result.is_err(), "undersized length {len} was accepted");

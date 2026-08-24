@@ -47,6 +47,8 @@
         "observability-sanity",
         "backup-corrupt-restore",
         "backup-restore-valid",
+        "pitr-restore-proof",
+        "pg-upgrade-hold-writes",
         "leaderless-wedge-recovery",
         "restart-budget-sustained-pg-death",
         "unopenable-standby-rebuilt",
@@ -116,6 +118,8 @@
         "network-latency-stability",
         "follower-one-peer-partition",
         "rolling-upgrade",
+        "mixed-version-orientation",
+        "pg-upgrade-hold-chaos-mid-freeze",
         "wal-hole-resync",
         "rogue-pg-promote",
         "correctness-lite-invariants",
@@ -136,6 +140,17 @@
         "disk-full-wal-pressure",
         "replication-severed-raft-healthy",
         "raft-severed-replication-healthy"
+      ]
+    },
+    "upgrade-proof": {
+      "description": "Track A/B/C upgrade proofs that own their compose topology (dual-binary image, PG 17→18, blue@17/green@18). Runner does not compose up/down.",
+      "reuse_cluster": false,
+      "manage_cluster": false,
+      "cases": [
+        "cluster-binary-upgrade-proof",
+        "pg-major-upgrade-proof",
+        "bluegreen-cutover",
+        "bluegreen-rollback-drill"
       ]
     }
   },
@@ -2534,6 +2549,146 @@
           "leaders": 1,
           "timeout_sec": 120
         }
+      ]
+    },
+    {
+      "id": "pitr-restore-proof",
+      "contracts": [
+        "V2"
+      ],
+      "description": "WAL-archive PITR restore-and-start proof (UPGRADE_CHECKLIST step 3). Writes a pre-backup marker, forces WAL archive, takes a full basebackup, writes a post-backup marker, restores into a scratch datadir with restore_command against the live archive, starts a throwaway postmaster, asserts both markers, and accepts a write. Fails if restore never runs or the archive does not apply. RPO without archive is last-full-backup only; with archive_timeout=60s it is bounded to about a minute plus apply lag.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pitr_restore_proof.py",
+          "comment": "In-container scratch restore; refuses green if post-backup marker is missing."
+        }
+      ]
+    },
+    {
+      "id": "pg-upgrade-hold-writes",
+      "contracts": ["W1", "V1"],
+      "description": "Track B gateway hold under continuous writes: freeze → hold window → unfreeze; writers resume with zero lost completed acks (UPGRADE_CHECKLIST steps 5–6).",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pg_upgrade_hold_chaos.py --hold-sec 4"
+        }
+      ]
+    },
+    {
+      "id": "mixed-version-orientation",
+      "contracts": ["W1", "V1"],
+      "description": "Track A mixed-orientation soak: leadership on node1 then node2 while followers restart (same binary in CI; procedure matches N/N-1 orientation swaps). Complements rolling-upgrade.",
+      "actions": [
+        {"type": "transfer_leadership", "target_node_id": 1},
+        {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 60},
+        {"type": "cmd", "cmd": "docker compose restart node3"},
+        {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 60},
+        {"type": "transfer_leadership", "target_node_id": 2},
+        {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 60},
+        {"type": "cmd", "cmd": "docker compose restart node1"},
+        {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 120}
+      ],
+      "assertions": [
+        {"type": "cluster_topology", "nodes": 3, "leaders": 1}
+      ]
+    },
+    {
+      "id": "pg-upgrade-hold-chaos-mid-freeze",
+      "contracts": ["L1", "V1"],
+      "description": "Track B chaos: kill leader while upgrade-frozen; cluster must not dual-accept.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pg_upgrade_hold_chaos.py --chaos mid-freeze"
+        },
+        {"type": "cmd", "cmd": "docker compose start node1", "expect_exit": null},
+        {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 120}
+      ]
+    },
+    {
+      "id": "cluster-binary-upgrade-proof",
+      "contracts": ["W1", "V1"],
+      "description": "Track A proof: rolling self-upgrade to a distinct package version shipped in the runtime image (not same-binary restart).",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/cluster_binary_upgrade_proof.py",
+          "timeout_sec": 600
+        }
+      ]
+    },
+    {
+      "id": "pg-major-upgrade-proof",
+      "contracts": ["W1", "V1", "L1"],
+      "description": "Track B proof: live pg_upgrade 17→18 on docker-compose.pgupgrade.yml with dual majors in the image.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pg_major_upgrade_proof.py",
+          "timeout_sec": 900
+        }
+      ]
+    },
+    {
+      "id": "bluegreen-cutover",
+      "contracts": ["U1", "U2", "U3", "U5", "W1"],
+      "description": "Track C full cutover under continuous writes with reverse replication (blue@17 / green@18).",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/bluegreen_cutover.py",
+          "timeout_sec": 900
+        }
+      ]
+    },
+    {
+      "id": "bluegreen-rollback-drill",
+      "contracts": ["U5", "U1"],
+      "description": "Track C post-cutover rollback drill (U5 window).",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/bluegreen_cutover.py --rollback-drill",
+          "timeout_sec": 900
+        }
+      ]
+    },
+    {
+      "id": "bluegreen-chaos-arm-seal",
+      "contracts": ["U4"],
+      "description": "Chaos: kill blue leader between ARMED and SEAL.",
+      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos arm-seal",
+      "actions": [
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos arm-seal", "expect_exit": null}
+      ]
+    },
+    {
+      "id": "bluegreen-chaos-seal-transfer",
+      "contracts": ["U4"],
+      "description": "Chaos: kill blue after SEAL before TRANSFER.",
+      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos seal-transfer",
+      "actions": [
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos seal-transfer", "expect_exit": null}
+      ]
+    },
+    {
+      "id": "bluegreen-chaos-mid-drain",
+      "contracts": ["U4", "U2"],
+      "description": "Chaos: kill green mid-drain; blue abort-unseal.",
+      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos mid-drain",
+      "actions": [
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos mid-drain"}
+      ]
+    },
+    {
+      "id": "bluegreen-chaos-blue-quorum",
+      "contracts": ["U4"],
+      "description": "Chaos: blue quorum loss after SEAL; force-transfer with accept_blue_write_loss.",
+      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos blue-quorum",
+      "actions": [
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos blue-quorum", "expect_exit": null}
       ]
     },
     {

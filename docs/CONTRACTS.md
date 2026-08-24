@@ -187,6 +187,50 @@ only in part.
 
 ---
 
+## Upgrade / cutover contracts (Track C)
+
+### U1 — Cross-Cluster Single Write Authority (FATAL)
+
+At most one `(epoch, cluster)` accepts client writes. Generalization of L1
+across blue and green. Epoch advances only through blue's Raft log.
+
+**Violation**: confirmed acceptances on both clusters for overlapping windows.
+
+**Tests / inversions**: `tla/cutover_authority.tla` (`AtMostOneWriteAuthority`);
+counterexample `cutover_authority.inv-green-self-elect.cfg`.
+
+### U2 — Cutover Drain Completeness (FATAL)
+
+Every write acked by blue before SEAL is present on green after TRANSFER.
+
+**Violation**: missing pre-seal ack on green.
+
+### U3 — Sequence Non-Collision (FATAL)
+
+After cutover, no sequence on green issues a value blue already issued.
+
+**Violation**: green sequences not advanced past blue.
+
+**Tests**: Track C catalog preflight names sequences (`src/commands/upgrade/blue_green.rs`).
+
+### U4 — Fail-Closed Cutover (FATAL)
+
+When the current epoch cannot be confirmed from a committed source (blue
+unreachable mid-cutover), no node takes authority. Green does not self-elect.
+
+**Violation**: green writable while blue unreachable before TRANSFER.
+
+**Inversion**: `tla/cutover_authority.inv-green-self-elect.cfg`.
+
+### U5 — Reverse-Drain Completeness (FATAL)
+
+While rollback is reported available, every write green has acked is on blue
+or captured in the reverse slot (slot must predate green's first accepted write).
+
+**Violation**: fence lifted before reverse slot exists, plus a write in the gap.
+
+---
+
 ## Contract-to-Test Index
 
 Human-readable summary. **Lint enforces inversions from `docs/contracts.yaml`**,

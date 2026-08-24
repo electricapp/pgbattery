@@ -56,6 +56,10 @@ pub struct GatewayConfig {
     /// Idle timeout in milliseconds
     pub idle_timeout_ms: u64,
 
+    /// Track B: how long to hold queries during `upgrade_frozen` before a clean
+    /// error (default 60s). Same stall-not-disconnect contract as fence wait.
+    pub upgrade_hold_timeout_ms: u64,
+
     /// Max concurrent client connections; excess are dropped until a slot frees.
     pub max_connections: usize,
 }
@@ -408,6 +412,7 @@ mod tests {
             ssl_key_path: None,
             connection_timeout_ms: 5000,
             idle_timeout_ms: 300_000,
+            upgrade_hold_timeout_ms: 60_000,
             max_connections: 5000,
         };
 
@@ -424,6 +429,7 @@ mod tests {
             ssl_key_path: None,
             connection_timeout_ms: 5000,
             idle_timeout_ms: 300_000,
+            upgrade_hold_timeout_ms: 60_000,
             max_connections: 5000,
         };
         let (_leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);

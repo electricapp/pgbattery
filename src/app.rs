@@ -155,6 +155,7 @@ struct DataNodeSpawnInputs {
     backup_manager: Option<Arc<BackupManager>>,
     leader_rx: watch::Receiver<Option<SocketAddr>>,
     fence_rx: watch::Receiver<FenceState>,
+    fence_tx: watch::Sender<FenceState>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     lease_state: crate::governor::SharedLeaseState,
@@ -223,6 +224,7 @@ impl App {
 
         let raft_tls_config = self.setup_raft_tls()?;
         let lease_state = Self::create_lease_state();
+        let fence_tx_for_mgmt = fence_tx.clone();
         let governor = self
             .create_governor(
                 storage.clone(),
@@ -250,6 +252,7 @@ impl App {
                 backup_manager: backup_manager.clone(),
                 leader_rx,
                 fence_rx,
+                fence_tx: fence_tx_for_mgmt,
                 shutdown_tx: shutdown_tx.clone(),
                 shutdown_rx: shutdown_rx.clone(),
                 lease_state,
@@ -540,6 +543,7 @@ impl App {
             backup_manager,
             leader_rx,
             fence_rx,
+            fence_tx,
             shutdown_tx,
             shutdown_rx,
             lease_state,
@@ -594,6 +598,8 @@ impl App {
             &postgres_manager,
             backup_manager,
             Arc::clone(&debug_events),
+            shutdown_tx.clone(),
+            fence_tx,
         );
         // Also clone the token into an owned String copy for the CLI-style
         // HTTP client used by the auto-promotion path, below.
@@ -738,6 +744,10 @@ impl App {
     /// constructed here: this struct is moved into `start_management_api`, so a
     /// buffer created inline would be reachable only by the handlers that read
     /// it, and every emitter would be uncallable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "management state wires many independent handles at once"
+    )]
     fn build_management_state(
         &self,
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
@@ -745,6 +755,8 @@ impl App {
         postgres_manager: &Arc<tokio::sync::Mutex<Supervisor>>,
         backup_manager: Option<Arc<BackupManager>>,
         debug_events: Arc<crate::observability::debug_events::DebugEventBuffer>,
+        shutdown_tx: watch::Sender<bool>,
+        fence_tx: watch::Sender<FenceState>,
     ) -> Arc<ManagementApiState> {
         Arc::new(ManagementApiState {
             node_id: self.config.node_id,
@@ -757,13 +769,20 @@ impl App {
             transfer_lock: tokio::sync::Mutex::new(()),
             membership_lock: tokio::sync::Mutex::new(()),
             backup_lock: tokio::sync::Mutex::new(()),
+            upgrade_lock: tokio::sync::Mutex::new(()),
+            shutdown_tx,
             // clock-lint: allow — brute-force rate-limit window, decides nothing
             // about write authority.
             auth_failures: parking_lot::Mutex::new((Instant::now(), 0)),
-            pg_paths: Some(crate::observability::management_api::PgPaths {
-                bin_dir: self.config.pg_bin_dir.clone(),
-                data_dir: self.config.pg_data_dir.clone(),
-            }),
+            pg_paths: parking_lot::Mutex::new(Some(
+                crate::observability::management_api::PgPaths {
+                    bin_dir: self.config.pg_bin_dir.clone(),
+                    data_dir: self.config.pg_data_dir.clone(),
+                    bin_dirs: self.config.pg_bin_dirs.clone(),
+                    wal_archive_dir: self.config.backup.wal_archive_dir.clone(),
+                },
+            )),
+            fence_tx,
         })
     }
 
@@ -827,12 +846,14 @@ impl App {
                     }
                     let new_fence = *fence_rx.borrow();
                     if new_fence != last_fence {
-                        let reason = if new_fence.has_quorum {
+                        let reason = if new_fence.upgrade_frozen {
+                            "upgrade-freeze"
+                        } else if new_fence.has_quorum {
                             "lease"
                         } else {
                             "quorum-loss"
                         };
-                        events.fence_change(node_id, new_fence.fenced, reason);
+                        events.fence_change(node_id, new_fence.fenced || new_fence.upgrade_frozen, reason);
                         last_fence = new_fence;
                     }
                 }
@@ -4239,6 +4260,9 @@ mod tests {
                 .send(FenceState {
                     fenced: true,
                     has_quorum: false,
+                    upgrade_frozen: false,
+                    cutover_client_hold: false,
+                    authority_pg_addr: None,
                 })
                 .unwrap();
             observe_until_event(&events, handle, &shutdown_tx).await;
@@ -4283,6 +4307,9 @@ mod tests {
                 .send(FenceState {
                     fenced: true,
                     has_quorum: true,
+                    upgrade_frozen: false,
+                    cutover_client_hold: false,
+                    authority_pg_addr: None,
                 })
                 .unwrap();
             observe_until_event(&events, handle, &shutdown_tx).await;

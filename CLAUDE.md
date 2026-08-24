@@ -62,6 +62,7 @@ Internal port 9091 (host 9081/9082/9083).
 
 **Discovery (no auth):**
 
+- `GET /api/v1/version` → `{version, raft_rpc_frame_version, store_schema_version, node_id}`
 - `GET /api/v1/cluster/leader` → `{leader_id, leader_addr, leader_pg_addr, leader_mgmt_addr}`
 - `GET /api/v1/cluster/nodes` → node states
 - `GET /api/v1/cluster/members` → Raft membership
@@ -69,6 +70,7 @@ Internal port 9091 (host 9081/9082/9083).
 
 **Token-required (`x-pgbattery-token`):**
 
+- `POST /api/v1/admin/self-upgrade` — download/verify/replace binary + graceful restart
 - `POST /api/v1/cluster/transfer-leadership/{target_id}`
 - `POST /api/v1/cluster/join`, `/promote/{id}`, `/remove/{id}`
 - `POST /api/v1/backup/create`, `/restore?filename=...`

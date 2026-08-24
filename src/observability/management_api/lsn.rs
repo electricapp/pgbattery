@@ -32,7 +32,7 @@ fn txid_status_limiter() -> &'static tokio::sync::Semaphore {
 use super::ManagementApiState;
 
 /// Response for replication lag query
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LagResponse {
     pub node_id: u64,
     pub lag_bytes: u64,

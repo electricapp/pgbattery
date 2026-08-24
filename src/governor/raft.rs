@@ -65,12 +65,28 @@ pub struct ClusterResponse {
 /// consumers can choose an appropriate response timeout without needing a
 /// separate channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "fence bits are independent SoT flags on one watch channel; packing obscures meaning"
+)]
 pub struct FenceState {
     /// True when this node must not accept writes.
     pub fenced: bool,
     /// True when a quorum of peers is reachable.
     /// False during quorum loss — no new leader is coming to lift the fence.
     pub has_quorum: bool,
+    /// Track B major-upgrade freeze: gateways **hold** idle queries (step 6)
+    /// up to `upgrade_hold_timeout_ms`, then clean error. In-progress
+    /// transactions error immediately. Raft fence updates preserve this flag.
+    pub upgrade_frozen: bool,
+    /// Track C: blue has sealed client write authority (ARMED→SEAL→DRAIN).
+    /// Derived from `ClusterState.cutover` — Sealed/Draining only. After
+    /// TRANSFER, blue gateways **route** to `authority_pg_addr` instead of holding.
+    pub cutover_client_hold: bool,
+    /// When set (post-TRANSFER to green), gateways proxy to this PG address
+    /// instead of the local Raft leader. Fail-closed: `None` after transfer
+    /// with authority≠blue means hold/refuse (never guess).
+    pub authority_pg_addr: Option<SocketAddr>,
 }
 
 impl FenceState {
@@ -79,6 +95,9 @@ impl FenceState {
         Self {
             fenced: false,
             has_quorum: true,
+            upgrade_frozen: false,
+            cutover_client_hold: false,
+            authority_pg_addr: None,
         }
     }
 }
@@ -599,11 +618,35 @@ impl Governor {
         // per heartbeat just to re-observe the same state. A late subscriber
         // still sees the current value: the stored state is always the latest
         // one, changed or not.
-        let new_fence = FenceState {
-            fenced: should_fence,
-            has_quorum,
-        };
         self.fence_tx.send_if_modified(|current| {
+            let cutover = self.state.read().cutover.clone();
+            let authority_pg_addr = if cutover.phase
+                == crate::governor::state_machine::CutoverPhase::Transferred
+                && cutover.authority_cluster != "blue"
+            {
+                cutover
+                    .green_leader_pg_addr
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+            } else {
+                None
+            };
+            // Fail closed (U4): transferred without a parseable green addr → hold.
+            let cutover_client_hold = matches!(
+                cutover.phase,
+                crate::governor::state_machine::CutoverPhase::Sealed
+                    | crate::governor::state_machine::CutoverPhase::Draining
+            ) || (cutover.phase
+                == crate::governor::state_machine::CutoverPhase::Transferred
+                && cutover.authority_cluster != "blue"
+                && authority_pg_addr.is_none());
+            let new_fence = FenceState {
+                fenced: should_fence,
+                has_quorum,
+                upgrade_frozen: current.upgrade_frozen,
+                cutover_client_hold,
+                authority_pg_addr,
+            };
             if *current == new_fence {
                 false
             } else {
@@ -757,9 +800,20 @@ impl Governor {
             "Raft metrics stalled while leader — triggering emergency fence"
         );
         self.lease.write().expire();
-        self.fence_tx.send_replace(FenceState {
-            fenced: true,
-            has_quorum: false,
+        self.fence_tx.send_if_modified(|current| {
+            let next = FenceState {
+                fenced: true,
+                has_quorum: false,
+                upgrade_frozen: current.upgrade_frozen,
+                cutover_client_hold: current.cutover_client_hold,
+                authority_pg_addr: current.authority_pg_addr,
+            };
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
         });
         runtime.last_metrics_update = self.lease.read().now();
     }
@@ -2434,6 +2488,9 @@ mod tests {
         let f = FenceState {
             fenced: true,
             has_quorum: false,
+            upgrade_frozen: false,
+            cutover_client_hold: false,
+            authority_pg_addr: None,
         };
         assert!(f.fenced);
         assert!(!f.has_quorum);
@@ -2466,7 +2523,10 @@ mod tests {
             FenceState::unfenced(),
             FenceState {
                 fenced: true,
-                has_quorum: false
+                has_quorum: false,
+                upgrade_frozen: false,
+                cutover_client_hold: false,
+                authority_pg_addr: None,
             }
         );
     }

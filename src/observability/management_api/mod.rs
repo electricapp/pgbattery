@@ -22,9 +22,11 @@
 
 mod backup;
 mod cluster;
+mod cutover;
 mod debug;
 mod discovery;
 mod lsn;
+mod upgrade;
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
@@ -58,9 +60,18 @@ pub use backup::{
 pub use cluster::{MemberInfo, MembershipResponse, TransferResponse};
 pub use discovery::{
     ClusterIdentityResponse, JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse,
-    PeerInfo,
+    PeerInfo, VersionResponse,
 };
 pub use lsn::{LagResponse, ReportLsnRequest, ReportLsnResponse, TxidStatusResponse};
+pub use upgrade::{
+    BlueGreenPreflightHttpResponse, BlueGreenPreflightReport, BlueGreenPreflightRequest,
+    PostgresBinDirInfo, PostgresBinsResponse, PostgresStatusResponse, PostgresUpgradeApplyRequest,
+    PostgresUpgradeApplyResponse, PostgresUpgradeConfirmRequest, PostgresUpgradeConfirmResponse,
+    PostgresUpgradePreflightRequest, PostgresUpgradePreflightResponse,
+    PostgresUpgradeRejoinRequest, PostgresUpgradeRejoinResponse, PostgresUpgradeRollbackRequest,
+    PostgresUpgradeRollbackResponse, SelfUpgradeHttpRequest, SelfUpgradeResponse,
+    UpgradeFreezeRequest, UpgradeFreezeResponse,
+};
 
 /// Re-export `JoinRequest` from cluster module
 pub use crate::cluster::JoinRequest;
@@ -102,6 +113,13 @@ pub struct ManagementApiState {
     /// create) on the same PGDATA corrupt it, and the supervisor lock doesn't
     /// cover dump restores or create. `try_lock` fast-fails the second request.
     pub backup_lock: tokio::sync::Mutex<()>,
+    /// Serializes self-upgrade: two concurrent replace-and-restart races would
+    /// leave the on-disk binary indeterminate.
+    pub upgrade_lock: tokio::sync::Mutex<()>,
+    /// Process-level shutdown sender — self-upgrade signals this after the
+    /// binary is replaced so the supervisor/container restarts into the new
+    /// binary (same channel lease-enforcement uses).
+    pub shutdown_tx: watch::Sender<bool>,
     /// Fixed 1s-window count of auth *failures*, to throttle brute force.
     /// Valid tokens bypass it, so a legitimate caller is never limited.
     pub auth_failures: Mutex<(std::time::Instant, u64)>,
@@ -110,14 +128,21 @@ pub struct ManagementApiState {
     /// Paths rather than the supervisor handle: reading the control file must
     /// not queue behind a demote holding the supervisor lock, which can run
     /// for minutes. `None` on a witness, which has no `PostgreSQL`.
-    pub pg_paths: Option<PgPaths>,
+    /// Interior mutability so Track B can retarget after `pg_upgrade`.
+    pub pg_paths: Mutex<Option<PgPaths>>,
+    /// Gateway/lease fence watch — Track B sets `upgrade_frozen` here so every
+    /// gateway connection refuses queries without a second channel.
+    pub fence_tx: watch::Sender<crate::governor::raft::FenceState>,
 }
 
-/// The two paths needed to read a data directory's control file.
+/// The two paths needed to read a data directory's control file, plus Track B
+/// dual-bin-dir map and optional WAL archive root.
 #[derive(Debug, Clone)]
 pub struct PgPaths {
     pub bin_dir: std::path::PathBuf,
     pub data_dir: std::path::PathBuf,
+    pub bin_dirs: std::collections::BTreeMap<String, std::path::PathBuf>,
+    pub wal_archive_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for ManagementApiState {
@@ -279,6 +304,7 @@ const _: () = assert!(
 /// # Errors
 /// Returns an error if the listener cannot bind to `addr` or the server exits
 /// with a fatal error.
+#[allow(clippy::too_many_lines, reason = "route table is one readable block")]
 pub async fn start_management_api(
     addr: SocketAddr,
     state: Arc<ManagementApiState>,
@@ -336,6 +362,53 @@ pub async fn start_management_api(
     let backup_routes = Router::new()
         .route("/api/v1/backup/create", post(backup::create_backup))
         .route("/api/v1/backup/restore", post(backup::restore_backup))
+        // Self-upgrade downloads a multi-hundred-MB binary under cosign verify;
+        // same timeout exemption as backup restore.
+        .route("/api/v1/admin/self-upgrade", post(upgrade::self_upgrade))
+        .route(
+            "/api/v1/admin/postgres-upgrade/preflight",
+            post(upgrade::postgres_upgrade_preflight),
+        )
+        .route(
+            "/api/v1/admin/postgres-upgrade/blue-green/preflight",
+            post(upgrade::blue_green_preflight),
+        )
+        .route("/api/v1/admin/cutover/arm", post(cutover::cutover_arm))
+        .route("/api/v1/admin/cutover/seal", post(cutover::cutover_seal))
+        .route(
+            "/api/v1/admin/cutover/drain-observed",
+            post(cutover::cutover_drain_observed),
+        )
+        .route(
+            "/api/v1/admin/cutover/transfer",
+            post(cutover::cutover_transfer),
+        )
+        .route("/api/v1/admin/cutover/abort", post(cutover::cutover_abort))
+        .route(
+            "/api/v1/admin/cutover/force-transfer",
+            post(cutover::cutover_force_transfer),
+        )
+        .route(
+            "/api/v1/admin/postgres-upgrade/freeze",
+            post(upgrade::set_upgrade_freeze),
+        )
+        .route("/api/v1/admin/postgres/stop", post(upgrade::stop_postgres))
+        .route(
+            "/api/v1/admin/postgres-upgrade/apply",
+            post(upgrade::postgres_upgrade_apply),
+        )
+        .route(
+            "/api/v1/admin/postgres-upgrade/rejoin",
+            post(upgrade::postgres_upgrade_rejoin),
+        )
+        .route(
+            "/api/v1/admin/postgres-upgrade/confirm",
+            post(upgrade::postgres_upgrade_confirm),
+        )
+        .route(
+            "/api/v1/admin/postgres-upgrade/rollback",
+            post(upgrade::postgres_upgrade_rollback),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_management_token,
@@ -347,6 +420,12 @@ pub async fn start_management_api(
     let timed_routes = Router::new()
         // Health check
         .route("/health", get(health_check))
+        // This node's binary + wire/store schema versions (Track A preflight SoT)
+        .route("/api/v1/version", get(discovery::get_version))
+        // Track B: dual-bin-dir inventory (paths + postgres --version probe)
+        .route("/api/v1/postgres/bins", get(upgrade::get_postgres_bins))
+        .route("/api/v1/postgres/status", get(upgrade::get_postgres_status))
+        .route("/api/v1/cutover/status", get(cutover::get_cutover_status))
         // Leader discovery
         .route("/api/v1/cluster/leader", get(discovery::get_leader))
         // Node discovery (for CLI auto-discovery)

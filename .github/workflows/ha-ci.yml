@@ -330,6 +330,57 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans || true
 
+  upgrade-proof:
+    name: Upgrade proofs (A/B/C)
+    needs: lint-test-harness
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - cluster-binary-upgrade-proof
+          - pg-major-upgrade-proof
+          - bluegreen-cutover
+          - bluegreen-rollback-drill
+    env:
+      COMPOSE_PROJECT_NAME: pgbha_upg_${{ matrix.case }}_${{ github.run_id }}_${{ github.run_attempt }}
+      PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Show Docker Compose version
+        run: docker compose version
+
+      - name: Run upgrade proof case
+        run: >
+          ./testing/ci_runner.py --suite upgrade-proof --case ${{ matrix.case }}
+          --artifact-dir testing/artifacts/upgrade-proof-${{ matrix.case }}
+
+      - name: Upload artifacts (failure only)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upgrade-proof-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: testing/artifacts/upgrade-proof-${{ matrix.case }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Force cleanup
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml down -v --remove-orphans || true
+          docker compose -f docker-compose.pgupgrade.yml down -v --remove-orphans || true
+          docker compose -f docker-compose.bluegreen.yml down -v --remove-orphans || true
+
   ha-controlplane-nightly:
     name: HA Control Plane Nightly
     runs-on: ubuntu-latest

@@ -34,7 +34,7 @@ TOOLS_DIR := .tools
 JAR       := $(TOOLS_DIR)/tla2tools.jar
 STATES    := $(TOOLS_DIR)/states
 
-SPECS := lease_fencing raft_lsn commit_probing timeline_verification
+SPECS := lease_fencing raft_lsn commit_probing timeline_verification cutover_authority
 
 # Models that MUST fail. Each `<spec>.inv-<name>.cfg` disables one mechanism the
 # spec's safety argument rests on and names, in an `EXPECT-VIOLATION:` header,

@@ -1,0 +1,82 @@
+# Track B major-upgrade proof: boots on PostgreSQL 17 with 18 binaries present
+# (`config/pgupgrade/`). Separate project/subnet/ports from the default 3-node
+# compose. Topology via COMPOSE_FILE + testing/topology.py.
+name: pgbattery-pgup
+
+x-node-env: &node-env
+  RUST_LOG: info
+  PGBATTERY_MANAGEMENT_API_TOKEN: ${PGBATTERY_MANAGEMENT_API_TOKEN:?set in .env or shell}
+  LD_PRELOAD: /usr/local/lib/libfaketime.so.1
+  FAKETIME_NO_CACHE: "1"
+  FAKETIME_TIMESTAMP_FILE: /tmp/faketime
+  FAKETIME_DONT_FAKE_MONOTONIC: "1"
+
+services:
+  node1:
+    build: { context: ., target: runtime }
+    hostname: node1
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive /var/lib/postgresql/backups && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/pgupgrade/node1.toml:/app/pgbattery.toml:ro
+      - node1_state:/var/lib/postgresql
+    ports: ["5482:5432", "9191:9090", "9181:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.31.0.11 }
+
+  node2:
+    build: { context: ., target: runtime }
+    hostname: node2
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.31.0.11:9091 --node-id 2 --voter",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/pgupgrade/node2.toml:/app/pgbattery.toml:ro
+      - node2_state:/var/lib/postgresql
+    ports: ["5483:5432", "9192:9090", "9182:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.31.0.12 }
+
+  node3:
+    build: { context: ., target: runtime }
+    hostname: node3
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.31.0.11:9091 --node-id 3 --voter",
+      ]
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./config/pgupgrade/node3.toml:/app/pgbattery.toml:ro
+      - node3_state:/var/lib/postgresql
+    ports: ["5484:5432", "9193:9090", "9183:9091"]
+    environment: *node-env
+    networks:
+      raft_net: { ipv4_address: 172.31.0.13 }
+
+networks:
+  raft_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16
+
+volumes:
+  node1_state:
+  node2_state:
+  node3_state:

@@ -44,6 +44,34 @@ pub struct NodeDiscoveryInfo {
     pub is_leader: bool,
 }
 
+/// This process's pgbattery / wire / store versions.
+///
+/// Truth source for Track A rolling-upgrade preflight: the operator probes
+/// every node's management address and compares. Not a cache of peer versions
+/// — peers are queried at their own `/api/v1/version`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionResponse {
+    /// `CARGO_PKG_VERSION` of the running binary.
+    pub version: String,
+    /// [`crate::governor::network::RAFT_RPC_FRAME_VERSION`] this process emits.
+    pub raft_rpc_frame_version: u8,
+    /// [`crate::governor::storage::STORE_SCHEMA_VERSION`] this process writes.
+    pub store_schema_version: u32,
+    pub node_id: u64,
+}
+
+/// Report this node's binary and compatibility versions.
+pub(super) async fn get_version(
+    State(state): State<Arc<ManagementApiState>>,
+) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: crate::version::PACKAGE_VERSION.to_string(),
+        raft_rpc_frame_version: crate::governor::network::RAFT_RPC_FRAME_VERSION,
+        store_schema_version: crate::governor::storage::STORE_SCHEMA_VERSION,
+        node_id: state.node_id,
+    })
+}
+
 /// Response for node discovery (used by CLI for auto-discovery)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodesResponse {
@@ -141,7 +169,8 @@ pub(super) async fn get_nodes(State(state): State<Arc<ManagementApiState>>) -> J
 pub(super) async fn get_cluster_identity(
     State(state): State<Arc<ManagementApiState>>,
 ) -> Json<ClusterIdentityResponse> {
-    let cluster_lineage = match &state.pg_paths {
+    let paths = state.pg_paths.lock().clone();
+    let cluster_lineage = match paths.as_ref() {
         Some(paths) => crate::supervisor::read_system_identifier(&paths.bin_dir, &paths.data_dir)
             .await
             .unwrap_or_else(|e| {
@@ -211,4 +240,31 @@ pub(super) async fn get_join_info(
         leader_mgmt_addr,
         peers,
     })
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code asserts on known-good values"
+)]
+mod tests {
+    use super::*;
+    use crate::governor::network::RAFT_RPC_FRAME_VERSION;
+    use crate::governor::storage::STORE_SCHEMA_VERSION;
+
+    #[test]
+    fn version_response_matches_binary_constants() {
+        let resp = VersionResponse {
+            version: crate::version::PACKAGE_VERSION.to_string(),
+            raft_rpc_frame_version: RAFT_RPC_FRAME_VERSION,
+            store_schema_version: STORE_SCHEMA_VERSION,
+            node_id: 7,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: VersionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, resp);
+        assert_eq!(back.raft_rpc_frame_version, 0);
+        assert_eq!(back.store_schema_version, 0);
+    }
 }

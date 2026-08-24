@@ -847,6 +847,11 @@ impl ConnectionHandler {
     }
 
     fn get_leader(&self) -> Result<SocketAddr> {
+        // Post-cutover: blue gateways relay to green from committed cutover SoT.
+        let relay = self.fence_rx.borrow().authority_pg_addr;
+        if let Some(addr) = relay {
+            return Ok(addr);
+        }
         self.leader_rx.borrow().ok_or(Error::NoLeader)
     }
 
@@ -878,6 +883,7 @@ impl ConnectionHandler {
         let mut last_activity = Instant::now();
 
         loop {
+            self.wait_for_upgrade_hold_if_needed().await?;
             self.wait_for_fence_if_needed().await?;
             let remaining = idle_timeout.saturating_sub(last_activity.elapsed());
             if remaining.is_zero() {
@@ -918,6 +924,54 @@ impl ConnectionHandler {
                 }
             }
         }
+    }
+
+    /// Hold idle queries during Track B upgrade freeze or Track C cutover seal.
+    async fn wait_for_upgrade_hold_if_needed(&mut self) -> Result<()> {
+        let fence = *self.fence_rx.borrow();
+        if !fence.upgrade_frozen && !fence.cutover_client_hold {
+            return Ok(());
+        }
+        let reason = if fence.upgrade_frozen {
+            "PostgreSQL major upgrade"
+        } else {
+            "blue/green cutover (write authority sealed)"
+        };
+        if self.state.read().tx_status != TransactionStatus::Idle {
+            self.send_failover_error_response(&format!(
+                "pgbattery: {reason} in progress; in-progress transaction cannot continue"
+            ))
+            .await;
+            return Err(Error::Fenced);
+        }
+
+        let timeout = Duration::from_millis(self.config.upgrade_hold_timeout_ms);
+        tracing::debug!(
+            conn_id = self.id,
+            timeout_ms = self.config.upgrade_hold_timeout_ms,
+            upgrade_frozen = fence.upgrade_frozen,
+            cutover_client_hold = fence.cutover_client_hold,
+            "Holding idle connection during upgrade/cutover hold"
+        );
+        metrics::counter!("pgbattery_connections_held_during_upgrade").increment(1);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while {
+            let f = self.fence_rx.borrow();
+            f.upgrade_frozen || f.cutover_client_hold
+        } {
+            if !matches!(
+                tokio::time::timeout_at(deadline, self.fence_rx.changed()).await,
+                Ok(Ok(()))
+            ) {
+                self.send_failover_error_response(&format!(
+                    "pgbattery: {reason} hold timed out; severing connection"
+                ))
+                .await;
+                return Err(Error::Fenced);
+            }
+        }
+        tracing::debug!(conn_id = self.id, "Upgrade/cutover hold lifted, resuming");
+        Ok(())
     }
 
     async fn wait_for_fence_if_needed(&mut self) -> Result<()> {
@@ -2312,6 +2366,7 @@ impl ConnectionHandler {
         // without a leader, wait via the same fence logic used by the proxy
         // loop top.  If we still have no leader after that, bail.
         if self.get_leader().is_err() && self.state.read().is_migratable() {
+            self.wait_for_upgrade_hold_if_needed().await?;
             self.wait_for_fence_if_needed().await?;
         }
 
@@ -3417,6 +3472,9 @@ mod tests {
         let (fence_tx, mut fence_rx) = watch::channel(FenceState {
             fenced: true,
             has_quorum: true,
+            upgrade_frozen: false,
+            cutover_client_hold: false,
+            authority_pg_addr: None,
         });
 
         // Lift the fence after 50ms
@@ -3444,6 +3502,9 @@ mod tests {
         let (_fence_tx, mut fence_rx) = watch::channel(FenceState {
             fenced: true,
             has_quorum: false,
+            upgrade_frozen: false,
+            cutover_client_hold: false,
+            authority_pg_addr: None,
         });
 
         // Short timeout - fence never lifts
@@ -4000,6 +4061,7 @@ mod tests {
             ssl_key_path: None,
             connection_timeout_ms: 5_000,
             idle_timeout_ms: 300_000,
+            upgrade_hold_timeout_ms: 60_000,
             max_connections: 5_000,
         };
         let handler = ConnectionHandler::new(

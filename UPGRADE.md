@@ -75,19 +75,14 @@ docs/STATE_MACHINE.md: derive, do not cache).
 Rolling upgrades mean mixed versions on the wire and on disk. Two contracts
 must become explicit and tested:
 
-1. Raft RPC framing. The correlation-ID framed transport gets a protocol
-   version byte in the frame header. Rule: version N speaks the frame format
-   of N and accepts N-1; a node receiving a newer major frame version replies
-   with a typed "version too new" error instead of a decode failure. This
-   bounds the supported window to adjacent releases and makes violations loud.
-   Introducing the byte is itself a wire change, so it has to bootstrap: the
-   release that adds it accepts today's unversioned frames as version 0 while
-   still emitting version 0, and the release after flips the emit default. If
-   the current header has a byte that is already always zero, the version
-   byte takes that position and the ratchet collapses to one release — worth
-   checking before writing any code. Without one of the two, the first
-   rolling upgrade under this scheme is exactly the incompatible jump the
-   scheme exists to prevent.
+1. Raft RPC framing. Every frame carries an explicit protocol version byte
+   (`version(1) + type(1) + corr_id(8)`). Rule: version N speaks the frame
+   format of N and accepts N-1; a node receiving a version outside that
+   window replies with a typed "version not accepted" error instead of a
+   decode failure. This bounds the supported window to adjacent releases
+   and makes violations loud. Greenfield: the byte is present from the first
+   release (`RAFT_RPC_FRAME_VERSION = 0`); there is no unversioned legacy
+   frame shape to bootstrap around.
 2. redb store schema. The store gets a schema-version key written at create
    time; a store with no key reads as schema 0, which is how every existing
    store adopts the scheme. On open: equal version proceeds; older version

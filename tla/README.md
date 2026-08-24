@@ -8,7 +8,7 @@
 
 # for humans.
 
-> **Validation.** `make check` (below) runs all four specs through TLC and fails
+> **Validation.** `make check` (below) runs all five specs through TLC and fails
 > on any violation, then runs the counterexample models and fails if any of them
 > _passes_. The model checker (`tla2tools.jar`) is pinned by version + SHA-256 in
 > the `Makefile`, so every run — local or CI — uses an identical, verified
@@ -58,12 +58,13 @@ nothing. All four specs have one, and `make check-counterexamples` fails when a
 spec does not — a target that silently checked three of four would read as
 coverage the next time somebody added a spec.
 
-| Spec                    | Mechanism disabled                                    | Invariant that must then break |
-| ----------------------- | ----------------------------------------------------- | ------------------------------ |
-| `lease_fencing`         | hold-down anchored at the campaign it wins            | `AtMostOneWriteAuthority`      |
-| `raft_lsn`              | one vote per term                                     | `ElectionSafety`               |
-| `commit_probing`        | LSN election gate (leader holds every replicated txn) | `AckedSuccessIsDurable`        |
-| `timeline_verification` | pg_rewind's divergence gate                           | `TimelineMonotonic`            |
+| Spec                    | Mechanism disabled                                    | Invariant that must then break  |
+| ----------------------- | ----------------------------------------------------- | ------------------------------- |
+| `lease_fencing`         | hold-down anchored at the campaign it wins            | `AtMostOneWriteAuthority`       |
+| `raft_lsn`              | one vote per term                                     | `ElectionSafety`                |
+| `commit_probing`        | LSN election gate (leader holds every replicated txn) | `AckedSuccessIsDurable`         |
+| `timeline_verification` | pg_rewind's divergence gate                           | `TimelineMonotonic`             |
+| `cutover_authority`     | green refuses to self-elect while blue unreachable    | `FailClosedWhenBlueUnreachable` |
 
 Each switch is a `CONSTANT` defaulting to the safe value in every other model,
 so the mechanism is disabled only where a counterexample is the expected result.
@@ -76,6 +77,7 @@ so the mechanism is disabled only where a counterexample is the expected result.
 | `raft_lsn.tla`              | Election safety + the LSN gate never deadlocks elections                  |
 | `commit_probing.tla`        | In-doubt COMMIT probing is correct; acknowledged commits survive failover |
 | `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions    |
+| `cutover_authority.tla`     | Track C: ≤1 `(epoch, cluster)` writable; green never self-elects (U1/U4)  |
 
 ## Properties (checked by each `.cfg`)
 

@@ -1,0 +1,34 @@
+# Blue cluster — node 3
+node_id = 3
+listen_addr = "0.0.0.0:5432"
+raft_addr = "0.0.0.0:5433"
+metrics_addr = "0.0.0.0:9090"
+pg_bin_dir = "/usr/lib/postgresql/17/bin"
+pg_bin_dirs = { "17" = "/usr/lib/postgresql/17/bin", "18" = "/usr/lib/postgresql/18/bin" }
+pg_data_dir = "/var/lib/postgresql/data"
+pg_internal_port = 5434
+pg_auth_mode = "trust"
+wal_level = "logical"
+
+advertise_raft_addr = "172.30.0.13:5433"
+advertise_mgmt_addr = "172.30.0.13:9091"
+
+election_timeout_ms = 1000
+heartbeat_interval_ms = 250
+
+[[peers]]
+id = 1
+raft_addr = "172.30.0.11:5433"
+pg_addr = "172.30.0.11:5434"
+
+[[peers]]
+id = 2
+raft_addr = "172.30.0.12:5433"
+pg_addr = "172.30.0.12:5434"
+
+[backup]
+enabled = true
+backup_dir = "/var/lib/postgresql/backups"
+retention_count = 3
+backup_type = "dump"
+compress = true

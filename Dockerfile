@@ -30,16 +30,35 @@ ENV RUSTFLAGS="--remap-path-prefix=/app=/src --remap-path-prefix=/usr/local/carg
 # Cargo writes a custom profile to target/<profile>/; only `dev` is spelled
 # differently. Naming the profile rather than branching on it means a new one
 # needs no change here.
+# Two package versions in one image so Track A can prove a real N→N+1 binary
+# roll (not same-binary restart). Running binary stays workspace version;
+# `pgbattery-next` is built with PGBATTERY_VERSION_OVERRIDE=workspace+patch.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --profile "$BUILD_PROFILE" --locked && \
     out=$([ "$BUILD_PROFILE" = "dev" ] && echo debug || echo "$BUILD_PROFILE") && \
-    cp "target/$out/pgbattery" /pgbattery
+    cargo build --profile "$BUILD_PROFILE" --locked && \
+    cp "target/$out/pgbattery" /pgbattery && \
+    cur=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1) && \
+    next=$(python3 -c "v='$cur'.split('.'); print(f'{v[0]}.{v[1]}.{int(v[2])+1}')") && \
+    touch src/version.rs && \
+    PGBATTERY_VERSION_OVERRIDE="$next" cargo build --profile "$BUILD_PROFILE" --locked && \
+    cp "target/$out/pgbattery" /pgbattery-next && \
+    test "$(/pgbattery --version | head -1)" != "$(/pgbattery-next --version | head -1)"
 
 FROM postgres:${PG_MAJOR} AS runtime-base
+ARG PG_MAJOR
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl && rm -rf /var/lib/apt/lists/*
+# postgresql-17 sits beside the image major (18) so Track B can prove a live
+# 17→18 `pg_upgrade` and Track C can run blue@17 / green@18. Refuse the
+# build if either postgres binary is missing — a single-major image makes
+# every major-upgrade case pass while blind.
+RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl \
+        python3 postgresql-17 && \
+    test -x /usr/lib/postgresql/17/bin/postgres && \
+    test -x /usr/lib/postgresql/${PG_MAJOR}/bin/postgres && \
+    command -v python3 && \
+    rm -rf /var/lib/apt/lists/*
 
 # Chaos faults need these in-container: iproute2 for `tc netem` (latency, loss),
 # iptables for asymmetric partitions (one-directional DROP). Absent, the fault
@@ -79,14 +98,35 @@ CMD ["pgbattery", "run"]
 # The binary is the only thing separating these two stages, and it is the last
 # layer, so both reuse every layer above and switching between them is a copy.
 FROM runtime-base AS runtime
-COPY --from=builder /pgbattery /usr/local/bin/pgbattery
+USER root
+COPY --from=builder /pgbattery /opt/pgbattery/bin/pgbattery
+COPY --from=builder /pgbattery-next /usr/local/share/pgbattery-releases/pgbattery-next
+# Self-upgrade replaces current_exe() via rename in its parent dir. Keep the
+# live binary under a postgres-owned directory *outside* the state volume
+# (`/var/lib/postgresql` is bind-mounted and would hide anything placed there).
+RUN mkdir -p /opt/pgbattery/bin \
+    && chown -R postgres:postgres /opt/pgbattery \
+        /usr/local/share/pgbattery-releases \
+    && ln -sfn /opt/pgbattery/bin/pgbattery /usr/local/bin/pgbattery \
+    && test -x /usr/local/bin/pgbattery \
+    && test -x /usr/local/share/pgbattery-releases/pgbattery-next \
+    && /usr/local/bin/pgbattery --version >/dev/null \
+    && /usr/local/share/pgbattery-releases/pgbattery-next --version >/dev/null
+USER postgres
 
 # Local iteration only (`scripts/dev-image.sh`), never CI. Every `COPY . .` in
 # the builder hands cargo fresh mtimes, so the in-VM build refingerprints and
 # rebuilds all three workspace crates for a one-line edit; a host cross-build
 # keeps its own fingerprints and does the same work in a third of the time.
+# Track A dual-binary proof needs the full `runtime` stage (or a host-built
+# `.devbin/pgbattery-next`); prebuilt alone is not a Track A proof image.
 FROM runtime-base AS runtime-prebuilt
-COPY .devbin/pgbattery /usr/local/bin/pgbattery
+USER root
+COPY .devbin/pgbattery /opt/pgbattery/bin/pgbattery
+RUN mkdir -p /opt/pgbattery/bin \
+    && chown -R postgres:postgres /opt/pgbattery \
+    && ln -sfn /opt/pgbattery/bin/pgbattery /usr/local/bin/pgbattery
+USER postgres
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LazyFS build — durability testing only, never in the default image.

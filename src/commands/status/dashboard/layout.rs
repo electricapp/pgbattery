@@ -44,7 +44,7 @@ pub(super) mod head {
     use super::char_width;
 
     pub(in super::super) const NAME: &str = "pgbattery";
-    pub(in super::super) const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+    pub(in super::super) const VERSION: &str = crate::version::PACKAGE_VERSION;
     pub(in super::super) const TERM: &str = "Term ";
     pub(in super::super) const TIER: &str = "COMMUNITY";
     /// Every health badge is padded to this width so the fields after it do

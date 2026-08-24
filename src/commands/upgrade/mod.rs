@@ -8,7 +8,14 @@ use tracing::{info, warn};
 
 use super::common::{confirm, fsync_dir, http_client};
 
+pub(crate) mod blue_green;
+pub(crate) mod client_fence;
+mod cluster;
 mod cosign;
+pub(crate) mod postgres;
+
+pub use postgres::{PostgresUpgradeParams, TransferMode, run_postgres_upgrade};
+
 use cosign::CosignVerifier;
 
 const DEFAULT_UPGRADE_URL: &str = "https://pgbattery.io/releases";
@@ -23,8 +30,98 @@ const MAX_UPGRADE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 /// can distinguish "update available" from "check failed".
 const UPDATE_AVAILABLE_EXIT_CODE: i32 = 10;
 
-/// Current version from Cargo.toml.
-pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Current version from Cargo.toml (or `PGBATTERY_VERSION_OVERRIDE` at build).
+pub(super) const VERSION: &str = crate::version::PACKAGE_VERSION;
+
+/// Parameters for [`perform_self_upgrade`] (CLI and management API).
+#[derive(Debug, Clone)]
+pub struct SelfUpgradeRequest {
+    pub version: String,
+    pub url: Option<String>,
+    pub allow_insecure_http: bool,
+    pub insecure_no_verify: bool,
+    pub allow_downgrade: bool,
+    pub identity: Option<String>,
+}
+
+/// Download, verify, and replace the running binary with `req.version`.
+///
+/// Does not restart the process — callers that need a restart (management API)
+/// signal shutdown themselves after this returns `Ok`.
+///
+/// # Errors
+/// Same failure modes as the CLI upgrade path (URL, checksum, cosign, perms).
+pub async fn perform_self_upgrade(req: SelfUpgradeRequest) -> Result<std::path::PathBuf> {
+    if cfg!(windows) {
+        anyhow::bail!("Self-upgrade is not supported on Windows");
+    }
+
+    let base_url = req.url.unwrap_or_else(|| DEFAULT_UPGRADE_URL.to_string());
+    let base_url = base_url.trim_end_matches('/');
+
+    if base_url.starts_with("http://") && !req.allow_insecure_http {
+        anyhow::bail!(
+            "Refusing to upgrade over plain HTTP ({base_url}): the response could be \
+             tampered with in transit. Use an https:// URL, or pass \
+             allow_insecure_http to override."
+        );
+    }
+
+    let target = req.version;
+    if target == VERSION {
+        anyhow::bail!("Already at version {VERSION}");
+    }
+
+    if !req.allow_downgrade {
+        ensure_not_downgrade(VERSION, &target)?;
+    }
+
+    let verifier = if req.insecure_no_verify {
+        None
+    } else {
+        Some(CosignVerifier::from_env(req.identity.as_deref(), &target)?)
+    };
+
+    if verifier.is_none() && !req.insecure_no_verify {
+        anyhow::bail!(
+            "Release signature verification is not configured: the new binary's authenticity \
+             cannot be cryptographically verified. Pass insecure_no_verify to upgrade anyway."
+        );
+    }
+
+    if verifier.is_none() {
+        warn!(
+            "insecure_no_verify: the new binary's authenticity is NOT cryptographically \
+             verified (integrity still enforced via SHA-256 over HTTPS)."
+        );
+    }
+
+    let exe_path = std::env::current_exe()?;
+    check_write_permissions(&exe_path)?;
+
+    let binary_name = platform_binary_name();
+    let download_url = format!("{base_url}/v{target}/{binary_name}");
+    let checksum_url = format!("{download_url}.sha256");
+    let bundle_url = format!("{download_url}.bundle");
+    let signature_url = format!("{download_url}.sig");
+    let certificate_url = format!("{download_url}.pem");
+
+    info!(url = %download_url, "Downloading");
+
+    let backup_path = download_verify_replace(
+        &download_url,
+        &checksum_url,
+        &bundle_url,
+        &signature_url,
+        &certificate_url,
+        verifier.as_ref(),
+        &exe_path,
+    )
+    .await?;
+
+    info!(version = %target, backup = %backup_path.display(), "Binary replaced");
+    Ok(backup_path)
+}
 
 /// Reject a target version older than the running one (anti-rollback).
 ///
@@ -63,8 +160,14 @@ fn ensure_not_downgrade(current: &str, target: &str) -> Result<()> {
     clippy::too_many_arguments,
     reason = "mirrors the CLI's Upgrade subcommand flags one-to-one"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-node download/verify/replace path stays in one function for auditability"
+)]
 pub async fn run_upgrade(
     check: bool,
+    cluster: bool,
+    node: Option<String>,
     version: Option<String>,
     url: Option<String>,
     yes: bool,
@@ -72,6 +175,8 @@ pub async fn run_upgrade(
     identity: Option<String>,
     insecure_no_verify: bool,
     allow_downgrade: bool,
+    allow_no_backup: bool,
+    config_path: Option<String>,
 ) -> Result<()> {
     // Initialize minimal logging for CLI
     tracing_subscriber::fmt()
@@ -109,6 +214,40 @@ pub async fn run_upgrade(
 
     info!(current = VERSION, latest = %latest, "Version check");
 
+    if cluster {
+        let target = version.unwrap_or_else(|| latest.clone());
+        if check {
+            let versions = cluster::run_cluster_version_preflight(
+                node,
+                &target,
+                config_path.as_deref(),
+                allow_no_backup,
+            )
+            .await?;
+            let need = cluster::nodes_needing_upgrade(&versions, &target);
+            if need.is_empty() {
+                info!("All nodes already report target version {target}.");
+            } else {
+                info!(count = need.len(), "Nodes would be upgraded on apply");
+            }
+            return Ok(());
+        }
+        cluster::run_cluster_upgrade(cluster::ClusterUpgradeParams {
+            node,
+            target,
+            config_path: config_path.as_deref(),
+            allow_no_backup,
+            url: Some(base_url.to_string()),
+            allow_insecure_http,
+            insecure_no_verify,
+            allow_downgrade,
+            identity,
+            yes,
+        })
+        .await?;
+        return Ok(());
+    }
+
     if check {
         if latest == VERSION {
             info!("Already running latest version.");
@@ -128,59 +267,12 @@ pub async fn run_upgrade(
         return Ok(());
     }
 
-    // Anti-rollback: refuse a target older than the running version unless the
-    // operator explicitly opts in. A compromised mirror can serve an older,
-    // genuinely-signed, vulnerable release at the requested tag — every
-    // signature/identity check would pass — so the version must be gated too.
-    if !allow_downgrade {
-        ensure_not_downgrade(VERSION, &target)?;
-    }
-
-    // Build the cosign keyless verifier now that the target version is known,
-    // pinning the accepted signer identity to the exact `v{target}` tag (so a
-    // mirror cannot substitute a different signed release). A malformed
-    // `--identity`/env override fails here, before any binary is downloaded.
-    // The Sigstore trust root (Fulcio CA certs + Rekor keys) is fetched lazily,
-    // only once we actually have a binary to verify.
-    //
-    // When --insecure-no-verify is set we skip the verifier entirely: the
-    // upgrade proceeds on SHA-256 integrity + HTTPS only (see the refusal
-    // below for the security trade-off).
-    let verifier = if insecure_no_verify {
-        None
-    } else {
-        Some(CosignVerifier::from_env(identity.as_deref(), &target)?)
-    };
-
-    // Safety warning
     warn!(
         "If this node is running in a cluster, drain it first: \
          pgbattery cluster remove --self"
     );
 
-    // Require either cosign keyless verification or an explicit insecure opt-in
-    // before installing. Without verification the binary's authenticity cannot
-    // be cryptographically established (only SHA-256 integrity over the
-    // transport), so refuse by default — symmetric with --allow-insecure-http.
-    if verifier.is_none() && !insecure_no_verify {
-        // Unreachable in practice (verifier is always Some unless
-        // insecure_no_verify), but kept as a defensive guard.
-        anyhow::bail!(
-            "Release signature verification is not configured: the new binary's authenticity \
-             cannot be cryptographically verified. Pass --insecure-no-verify to upgrade anyway \
-             (integrity is still checked via SHA-256 over HTTPS)."
-        );
-    }
-
-    // current_exe() resolves symlinks, so this is the real file replaced in
-    // place. For a symlinked or package-manager install the resolved (often
-    // versioned) target — not the symlink — is overwritten; the confirmation
-    // below shows that path. Upgrade through the package manager instead if that
-    // is how this node was installed.
     let exe_path = std::env::current_exe()?;
-
-    // Replacing the running binary is irreversible without the backup copy;
-    // confirm before touching it (or require --yes for non-interactive use).
     if !confirm(
         &format!(
             "Upgrade pgbattery {} -> {} and replace the binary at {}?",
@@ -194,36 +286,14 @@ pub async fn run_upgrade(
         return Ok(());
     }
 
-    if verifier.is_none() {
-        warn!(
-            "--insecure-no-verify: the new binary's authenticity is NOT cryptographically \
-             verified (integrity still enforced via SHA-256 over HTTPS). See docs/RELEASING.md."
-        );
-    }
-
-    // Download new binary
-    let binary_name = platform_binary_name();
-    let download_url = format!("{base_url}/v{target}/{binary_name}");
-    let checksum_url = format!("{download_url}.sha256");
-    let bundle_url = format!("{download_url}.bundle");
-    let signature_url = format!("{download_url}.sig");
-    let certificate_url = format!("{download_url}.pem");
-
-    info!(url = %download_url, "Downloading");
-
-    // Check write permissions before downloading
-    check_write_permissions(&exe_path)?;
-
-    // Download, verify, and replace
-    let backup_path = download_verify_replace(
-        &download_url,
-        &checksum_url,
-        &bundle_url,
-        &signature_url,
-        &certificate_url,
-        verifier.as_ref(),
-        &exe_path,
-    )
+    let backup_path = perform_self_upgrade(SelfUpgradeRequest {
+        version: target.clone(),
+        url: Some(base_url.to_string()),
+        allow_insecure_http,
+        insecure_no_verify,
+        allow_downgrade,
+        identity,
+    })
     .await?;
 
     info!(version = %target, "Upgrade complete");

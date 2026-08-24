@@ -143,7 +143,10 @@ async fn main() -> Result<()> {
             } => run_backup_restore(filename, node, database, yes, cli.config).await,
         },
         Commands::Upgrade {
+            command,
             check,
+            cluster,
+            node,
             version,
             url,
             yes,
@@ -151,18 +154,64 @@ async fn main() -> Result<()> {
             identity,
             insecure_no_verify,
             allow_downgrade,
+            allow_no_backup,
         } => {
-            run_upgrade(
-                check,
-                version,
-                url,
-                yes,
-                allow_insecure_http,
-                identity,
-                insecure_no_verify,
-                allow_downgrade,
-            )
-            .await
+            if let Some(pgbattery::cli::UpgradeSubcommand::Postgres {
+                to,
+                check: pg_check,
+                node: pg_node,
+                allow_no_backup: pg_allow_no_backup,
+                accept_no_rollback,
+                accept_write_loss,
+                transfer_mode,
+                experimental,
+                confirm,
+                rollback,
+                blue_green,
+                app_roles,
+                accept_empty_unlogged,
+            }) = command
+            {
+                let mode = match transfer_mode {
+                    Some(ref s) => Some(pgbattery::commands::TransferMode::parse(s)?),
+                    None => None,
+                };
+                pgbattery::commands::run_postgres_upgrade(
+                    pgbattery::commands::PostgresUpgradeParams {
+                        to_major: to,
+                        check_only: pg_check,
+                        experimental,
+                        confirm,
+                        rollback,
+                        node: pg_node.or(node),
+                        allow_no_backup: pg_allow_no_backup || allow_no_backup,
+                        accept_no_rollback,
+                        accept_write_loss,
+                        transfer_mode: mode,
+                        config_path: cli.config,
+                        blue_green,
+                        app_roles,
+                        accept_empty_unlogged,
+                    },
+                )
+                .await
+            } else {
+                run_upgrade(
+                    check,
+                    cluster,
+                    node,
+                    version,
+                    url,
+                    yes,
+                    allow_insecure_http,
+                    identity,
+                    insecure_no_verify,
+                    allow_downgrade,
+                    allow_no_backup,
+                    cli.config,
+                )
+                .await
+            }
         }
         Commands::Doctor {
             nodes,

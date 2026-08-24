@@ -529,12 +529,19 @@ class SuiteConfig(BaseModel):
             cases sequentially; otherwise stand up / tear down per case.
         max_wait_cluster_seconds: Optional convergence budget applied to every
             ``wait_cluster`` step in this suite.
+        compose_file: Optional override of the matrix-level compose file
+            (Track C blue/green six-node topology).
+        manage_cluster: If ``False``, the runner does not ``compose up/down``;
+            each case owns its topology (upgrade proof harnesses). Default
+            ``True`` preserves existing suite behaviour.
         cases: Ordered list of case IDs to execute.
     """
 
     description: str = ""
     reuse_cluster: bool = False
     max_wait_cluster_seconds: int | None = None
+    compose_file: str | None = None
+    manage_cluster: bool = True
     cases: list[str]
 
 
@@ -1382,7 +1389,8 @@ class CIRunner:
         # values authoritative.
         load_dotenv(self.project_root / ".env", override=False)
         self.env: dict[str, str] = os.environ.copy()
-        self.env["COMPOSE_FILE"] = str((self.project_root / self.matrix.compose_file).resolve())
+        compose = self.suite_config.compose_file or self.matrix.compose_file
+        self.env["COMPOSE_FILE"] = str((self.project_root / compose).resolve())
         self.mgmt_token: str = self.env.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
 
         self.system_dir: Path = self.artifact_dir / "system"
@@ -3898,8 +3906,13 @@ class CIRunner:
             0 if all cases passed, 1 if any failed.
         """
         reuse_cluster = self.suite_config.reuse_cluster
+        manage_cluster = self.suite_config.manage_cluster
 
-        if reuse_cluster:
+        if not manage_cluster:
+            # Cases own compose lifecycle (e.g. Track A/B/C upgrade proofs).
+            for case_id in self.selected_case_ids:
+                self._run_case(case_id)
+        elif reuse_cluster:
             cluster_started = False
             try:
                 self._start_cluster(self.suite_name)

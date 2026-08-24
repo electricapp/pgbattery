@@ -22,6 +22,7 @@ pub mod gateway;
 pub mod governor;
 pub mod observability;
 pub mod supervisor;
+pub mod version;
 
 pub use app::App;
 pub use config::Config;

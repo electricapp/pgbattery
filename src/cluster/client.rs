@@ -443,6 +443,519 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
+    /// Fetch one node's binary / frame / store versions (`GET /api/v1/version`).
+    ///
+    /// Probe each member's own management address — versions are not mirrored
+    /// through Raft, so a single `/nodes` call cannot answer uniformity.
+    ///
+    /// # Errors
+    /// Returns an error if the node is unreachable or returns a non-success status.
+    pub async fn get_version(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::VersionResponse> {
+        let url = format!("http://{addr}/api/v1/version");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "Version request",
+                status,
+                &body,
+                false
+            ));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// List backups on a node (`GET /api/v1/backup/list`, token required).
+    ///
+    /// # Errors
+    /// Returns an error if the node is unreachable, unauthorized, or non-success.
+    pub async fn list_backups(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::BackupListResponse> {
+        let url = format!("http://{addr}/api/v1/backup/list");
+        let resp = self
+            .add_management_token(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "Backup list request",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Dual-bin-dir inventory (`GET /api/v1/postgres/bins`).
+    ///
+    /// # Errors
+    /// Unreachable node or non-success status.
+    pub async fn get_postgres_bins(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::PostgresBinsResponse> {
+        let url = format!("http://{addr}/api/v1/postgres/bins");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL bins request",
+                status,
+                &body,
+                false
+            ));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Primary-side Track B preflight (`POST /api/v1/admin/postgres-upgrade/preflight`).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or preflight refusal.
+    pub async fn postgres_upgrade_preflight(
+        &self,
+        addr: &str,
+        body: &crate::observability::management_api::PostgresUpgradePreflightRequest,
+    ) -> Result<crate::observability::management_api::PostgresUpgradePreflightResponse> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/preflight");
+        let resp = self
+            .add_management_token(self.client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            // Prefer structured message when the body is our JSON response.
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::PostgresUpgradePreflightResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("PostgreSQL upgrade preflight at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL upgrade preflight",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Track C catalog preflight (`POST .../postgres-upgrade/blue-green/preflight`).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or catalog refusal.
+    pub async fn blue_green_preflight(
+        &self,
+        addr: &str,
+        body: &crate::observability::management_api::BlueGreenPreflightRequest,
+    ) -> Result<crate::observability::management_api::BlueGreenPreflightReport> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/blue-green/preflight");
+        let resp = self
+            .add_management_token(self.client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::BlueGreenPreflightHttpResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("blue/green preflight at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "blue/green preflight",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+
+        let parsed: crate::observability::management_api::BlueGreenPreflightHttpResponse =
+            resp.json().await?;
+        parsed.report.ok_or_else(|| {
+            anyhow::anyhow!("blue/green preflight at {addr}: success without report")
+        })
+    }
+
+    /// Track C cutover status (`GET /api/v1/cutover/status`).
+    ///
+    /// # Errors
+    /// Unreachable node.
+    pub async fn cutover_status(&self, addr: &str) -> Result<serde_json::Value> {
+        let url = format!("http://{addr}/api/v1/cutover/status");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "cutover status",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Commit a cutover log entry (`POST /api/v1/admin/cutover/{action}`).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or protocol refusal.
+    pub async fn cutover_action(
+        &self,
+        addr: &str,
+        action: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("http://{addr}/api/v1/admin/cutover/{action}");
+        let resp = self
+            .add_management_token(self.client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                &format!("cutover {action}"),
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Set or clear Track B upgrade freeze (`POST .../postgres-upgrade/freeze`).
+    ///
+    /// # Errors
+    /// Unreachable or unauthorized.
+    pub async fn set_upgrade_freeze(
+        &self,
+        addr: &str,
+        frozen: bool,
+    ) -> Result<crate::observability::management_api::UpgradeFreezeResponse> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/freeze");
+        let body = crate::observability::management_api::UpgradeFreezeRequest { frozen };
+        let resp = self
+            .add_management_token(self.client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "Upgrade freeze",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Stop `PostgreSQL` on a node (`POST /api/v1/admin/postgres/stop`).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or stop failure.
+    pub async fn stop_postgres(&self, addr: &str) -> Result<()> {
+        let url = format!("http://{addr}/api/v1/admin/postgres/stop");
+        let resp = self
+            .add_management_token(self.client.post(&url))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL stop",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Primary `pg_upgrade` apply (`POST .../postgres-upgrade/apply`).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or apply failure.
+    pub async fn postgres_upgrade_apply(
+        &self,
+        addr: &str,
+        body: &crate::observability::management_api::PostgresUpgradeApplyRequest,
+    ) -> Result<crate::observability::management_api::PostgresUpgradeApplyResponse> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/apply");
+        let resp = self
+            .add_management_token(self.client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::PostgresUpgradeApplyResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("PostgreSQL upgrade apply at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL upgrade apply",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Standby re-basebackup after primary major upgrade.
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or rejoin failure.
+    pub async fn postgres_upgrade_rejoin(
+        &self,
+        addr: &str,
+        body: &crate::observability::management_api::PostgresUpgradeRejoinRequest,
+    ) -> Result<crate::observability::management_api::PostgresUpgradeRejoinResponse> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/rejoin");
+        let resp = self
+            .add_management_token(self.client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::PostgresUpgradeRejoinResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("PostgreSQL upgrade rejoin at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL upgrade rejoin",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Active `PostgreSQL` major / paths (`GET /api/v1/postgres/status`).
+    ///
+    /// # Errors
+    /// Unreachable or non-success.
+    pub async fn get_postgres_status(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::PostgresStatusResponse> {
+        let url = format!("http://{addr}/api/v1/postgres/status");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL status",
+                status,
+                &body,
+                false
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Confirm upgrade — delete old datadir + anchor.
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or confirm failure.
+    pub async fn postgres_upgrade_confirm(
+        &self,
+        addr: &str,
+        to_major: u32,
+    ) -> Result<crate::observability::management_api::PostgresUpgradeConfirmResponse> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/confirm");
+        let body = crate::observability::management_api::PostgresUpgradeConfirmRequest { to_major };
+        let resp = self
+            .add_management_token(self.client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::PostgresUpgradeConfirmResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("PostgreSQL upgrade confirm at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL upgrade confirm",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Roll primary back to the pre-upgrade datadir.
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or rollback failure.
+    pub async fn postgres_upgrade_rollback(
+        &self,
+        addr: &str,
+        to_major: u32,
+        accept_write_loss: bool,
+    ) -> Result<crate::observability::management_api::PostgresUpgradeRollbackResponse> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/rollback");
+        let body = crate::observability::management_api::PostgresUpgradeRollbackRequest {
+            to_major,
+            accept_write_loss,
+        };
+        let resp = self
+            .add_management_token(self.client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::PostgresUpgradeRollbackResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("PostgreSQL upgrade rollback at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "PostgreSQL upgrade rollback",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Trigger a remote self-upgrade (`POST /api/v1/admin/self-upgrade`).
+    ///
+    /// The target node replaces its binary and shuts down; the caller must
+    /// wait for it to come back on the target version.
+    ///
+    /// # Errors
+    /// Returns when the request fails or the node reports unsuccessful upgrade.
+    pub async fn self_upgrade(
+        &self,
+        addr: &str,
+        body: &crate::observability::management_api::SelfUpgradeHttpRequest,
+    ) -> Result<crate::observability::management_api::SelfUpgradeResponse> {
+        let url = format!("http://{addr}/api/v1/admin/self-upgrade");
+        // Long timeout: download + cosign verify of a release binary.
+        let client = Client::builder().timeout(Duration::from_mins(10)).build()?;
+        let resp = self
+            .add_management_token(client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "Self-upgrade request",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Query replication lag for a node (`GET /api/v1/cluster/node/{id}/lag`).
+    ///
+    /// # Errors
+    /// Returns when the node is unreachable or returns a non-success status.
+    pub async fn get_node_lag(
+        &self,
+        addr: &str,
+        node_id: u64,
+    ) -> Result<crate::observability::management_api::LagResponse> {
+        let url = format!("http://{addr}/api/v1/cluster/node/{node_id}/lag");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure("Lag request", status, &body, false));
+        }
+
+        Ok(resp.json().await?)
+    }
+
     /// Get local management address if configured.
     #[must_use]
     pub const fn local_mgmt_addr(&self) -> Option<SocketAddr> {

@@ -221,6 +221,13 @@ pub struct BackupConfig {
     /// Compress backups.
     #[serde(default = "default_compress")]
     pub compress: bool,
+
+    /// Directory for archived WAL segments. When set, `archive_mode=on` and
+    /// `archive_command` copies completed segments here so PITR can reach past
+    /// the last full basebackup (Track B/C abort RPO). `None` keeps archiving
+    /// off (legacy).
+    #[serde(default)]
+    pub wal_archive_dir: Option<PathBuf>,
 }
 
 impl Default for BackupConfig {
@@ -231,6 +238,7 @@ impl Default for BackupConfig {
             retention_count: default_retention_count(),
             backup_type: BackupType::default(),
             compress: default_compress(),
+            wal_archive_dir: None,
         }
     }
 }

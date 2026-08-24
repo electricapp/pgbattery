@@ -172,6 +172,30 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 - **Fence escalation**: `default_transaction_read_only` alone is bypassable (`BEGIN READ WRITE`, existing sessions). After GUC apply, terminate client backends (`pg_terminate_backend`, `backend_type = 'client backend'`) — **only on verified fence**. `set_readonly` polls `pg_settings` up to `READONLY_RELOAD_SETTLE` (300 ms). Still-false after settle → real `FAILED TO FENCE`. Non-answering PG is not split-brain risk (`fence_failure_is_split_brain_risk`) → `Fence not applied`.
 - **Fail-closed**: every tick re-queries. After `FENCE_FAILURE_SHUTDOWN_THRESHOLD` (= 5) consecutive failures → process shutdown (`restart: on-failure`).
 
+### 8b. Track B upgrade freeze (gateway)
+
+- **States**: `thawed | frozen` on `FenceState.upgrade_frozen` (same watch as lease fence; not a `ClusterState` projection).
+- **Source of truth**: operator/API `POST /api/v1/admin/postgres-upgrade/freeze` — Raft metrics updates **preserve** this bit (never re-derive from heartbeats).
+- **Gateway behaviour**: when `upgrade_frozen` **or** `cutover_client_hold`, **hold** idle sessions up to `upgrade_hold_timeout_ms`; when `authority_pg_addr` is set (post-TRANSFER), **route** to that committed green PG address instead of the local Raft leader. Missing green addr after transfer → hold (fail closed).
+- **`cutover_client_hold`**: derived from `ClusterState.cutover` Sealed/Draining (or Transferred without parseable green addr).
+- **Active PG major pointer**: `pg_bin_dir` (config) + `PG_VERSION` / `postgres --version` probes; dual map in `pg_bin_dirs`. No leadership projection.
+- **Code**: `FenceState` in `governor/raft.rs`; hold/route in `gateway/handlers`; Track B freeze via management API; Track C seal via Raft apply → fence bit + optional role REVOKE (`client_fence.rs`).
+
+### 8c. Track C blue/green catalog preflight (no authority SoT)
+
+- **Purpose**: prove logical replication + client-vs-apply fence can cover this database before cutover exists.
+- **Source of truth**: live PG catalogs on blue primary (probed SQL); dual-bin map for green major extensions. No epoch, no second Raft group, no `ClusterState` projection.
+- **Code**: `commands/upgrade/blue_green.rs`; `POST /api/v1/admin/postgres-upgrade/blue-green/preflight`.
+- **Cutover authority / epoch SoT**: see §8d (`cutover_authority.tla`); Rust entries land after the TLA gate.
+
+### 8d. Track C cutover authority (epoch)
+
+- **Identity**: `(epoch, cluster_id, node_id)` — write authority for exactly one `(epoch, cluster)`.
+- **Source of truth**: **blue’s Raft log** only. Epoch advances via committed entries: `CUTOVER_ARMED` → `WRITE_AUTHORITY_SEALED` → (green drain, observed) → `AUTHORITY_TRANSFERRED` | `UNSEAL` (abort into new epoch).
+- **Green**: never elects itself into authority; receives it after `AUTHORITY_TRANSFERRED`. Fail closed if blue unreachable (`cutover_authority.tla` / U4).
+- **Invariant**: `AtMostOneWriteAuthority` across both clusters (U1). Model: `tla/cutover_authority.tla`.
+- **Code**: `ClusterCommand::{CutoverArmed,CutoverSeal,CutoverDrainObserved,CutoverTransfer,CutoverAbortUnseal}` → `ClusterState.cutover` (`state_machine.rs`). Gateway epoch routing + green drain orchestration: remaining step 8/9.
+
 ### 9. Leadership transfer — lame-duck window
 
 - **Purpose**: hand leadership to a chosen target without a third node winning the term.

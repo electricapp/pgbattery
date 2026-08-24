@@ -8,7 +8,19 @@
 
 enums.StandbyAction = ["NoOp", "Defer", "RestartOnly", "Rewind", "Reprovision"]
 enums.ReplicaHealth = ["Healthy", "Lagging", "Unhealthy"]
-enums.ClusterCommand = ["AddNode", "RemoveNode", "UpdateNode", "UpdateLsn", "SetSyncMode"]
+enums.ClusterCommand = [
+  "AddNode",
+  "RemoveNode",
+  "UpdateNode",
+  "UpdateLsn",
+  "SetSyncMode",
+  "CutoverArmed",
+  "CutoverSeal",
+  "CutoverDrainObserved",
+  "CutoverTransfer",
+  "CutoverAbortUnseal",
+]
+enums.CutoverPhase = ["Idle", "Armed", "Sealed", "Draining", "Transferred", "Aborted"]
 enums.PostmasterState = ["Running", "NotRunning", "Exited"]
 # Wire-compat labels on NodeInfo — not live Raft leadership (see STATE_MACHINE §5).
 enums.NodeRole = ["Leader", "Follower"]
@@ -28,6 +40,8 @@ enums.StatementClass = ["Modeled", "Unmodeled"]
 types = [
   "ClusterState",
   "ClusterCommand",
+  "CutoverAuthorityState",
+  "CutoverPhase",
   "ConnectionState",
   "HeartbeatGuard",
   "LeadershipObservation",
