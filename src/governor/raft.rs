@@ -302,11 +302,6 @@ impl Governor {
         let leader_id = metrics.current_leader;
         let leader_addr =
             leader_id.and_then(|id| self.state.read().nodes.get(&id).map(|n| n.pg_addr));
-        {
-            let mut state = self.state.write();
-            state.leader_id = leader_id;
-            state.leader_addr = leader_addr;
-        }
         // openraft emits a `RaftMetrics` update on every heartbeat and on
         // every match-index advance, so this code path runs many times per
         // second. `send_if_modified` only wakes subscribers when the leader
@@ -315,6 +310,10 @@ impl Governor {
         // spam and unnecessary psql round-trips. The stored value is
         // always brought up-to-date, so a late subscriber still observes
         // the current leader. See docs/STATE_MACHINE.md.
+        //
+        // Leadership decisions use `RaftMetrics::current_leader` directly;
+        // `leader_rx` is the derived address/wakeup channel for gateway and
+        // reconcile — not a second copy on `ClusterState`.
         self.leader_tx.send_if_modified(|current| {
             if *current == leader_addr {
                 false

@@ -1603,17 +1603,8 @@ impl App {
         }
     }
 
-    /// Live truth source per `docs/STATE_MACHINE.md` row "Who is Raft leader".
-    ///
-    /// Reads `RaftMetrics::current_leader` rather than `cluster_state.leader_id`
-    /// (the Raft-applied mirror), which can lag by one apply cycle on
-    /// transitions. The mgmt API endpoints (`get_leader`, `get_nodes`,
-    /// `get_join_info`) and the governor's metrics watchdog already use this
-    /// source — keeping the supervisor in alignment closes a paper-tiger
-    /// where the supervisor could briefly disagree with mgmt about who's
-    /// leader during failover. `STATE_MACHINE.md` §4 prohibits "ask our own
-    /// process for state we just wrote" (consulting the mirror we wrote in
-    /// `process_metrics_update`).
+    /// Live truth source per `docs/STATE_MACHINE.md` row "Who is Raft leader":
+    /// `RaftMetrics::current_leader`. Address fan-out uses `leader_rx`.
     fn is_local_leader(
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
         node_id: NodeId,
@@ -3303,14 +3294,9 @@ fn are_paths_on_same_mount(_path1: &PathBuf, _path2: &PathBuf) -> Result<bool> {
     Ok(true)
 }
 
-// The previous unit test for `is_local_leader` was tied to the
-// `cluster_state.leader_id` mirror. It became vacuous once the function
-// switched to `RaftMetrics::current_leader` as its truth source
-// (constructing a real `Raft` instance in a unit test is non-trivial and
-// the property under test — "node identity uses NodeId, not SocketAddr" —
-// is now true by construction since RaftMetrics has no SocketAddr field).
-// Live behavior is exercised by the chaos / failover suite in
-// `testing/ci_matrix.yaml`.
+// `is_local_leader` reads `RaftMetrics::current_leader` (docs/STATE_MACHINE.md).
+// Constructing a real `Raft` in a unit test is non-trivial; live behavior is
+// exercised by the chaos / failover suite in `testing/ci_matrix.yaml`.
 
 #[cfg(test)]
 #[allow(

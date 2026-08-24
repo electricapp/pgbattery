@@ -1,11 +1,6 @@
 #!/usr/bin/env -S uv run --project testing python
 """Self-tests for the harness lint's documentation checks.
 
-A check that cannot fail is worse than no check, because it reads as coverage.
-These drive each documentation gate to red on a case it is supposed to catch,
-so that a green lint means the gate looked and found nothing rather than that
-it never looked.
-
 Run with:
     uv run --project testing python testing/test_lint_matrix.py
 """
@@ -13,7 +8,6 @@ Run with:
 from __future__ import annotations
 
 import dataclasses
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,7 +17,7 @@ import lint_matrix as lm
 
 
 class ProseFileReferenceTest(unittest.TestCase):
-    """Paths in the documentation must name files that exist."""
+    """Markdown links in documentation must name files that exist."""
 
     def test_the_documents_as_committed_pass(self) -> None:
         lm.check_prose_file_references_resolve()
@@ -31,36 +25,34 @@ class ProseFileReferenceTest(unittest.TestCase):
     def test_a_path_naming_nothing_is_caught(self) -> None:
         with (
             mock.patch.object(lm, "PROSE_DOCS", ("CLAUDE.md",)),
-            mock.patch.object(Path, "read_text", return_value="see `docs/NO_SUCH_FILE.md`"),
+            mock.patch.object(Path, "read_text", return_value="see [gone](docs/NO_SUCH_FILE.md)"),
             self.assertRaises(AssertionError) as caught,
         ):
             lm.check_prose_file_references_resolve()
         self.assertIn("NO_SUCH_FILE.md", str(caught.exception))
 
-    def test_a_basename_is_enough_to_resolve(self) -> None:
-        # Documentation says `torn_raft.py`, not `testing/torn_raft.py`, and
-        # demanding the full path would push authors toward naming nothing.
+    def test_a_basename_link_is_enough_to_resolve(self) -> None:
         with (
             mock.patch.object(lm, "PROSE_DOCS", ("CLAUDE.md",)),
-            mock.patch.object(Path, "read_text", return_value="see `torn_raft.py`"),
+            mock.patch.object(Path, "read_text", return_value="see [x](torn_raft.py)"),
+        ):
+            lm.check_prose_file_references_resolve()
+
+    def test_a_backtick_path_is_not_scanned(self) -> None:
+        """Freeform backticks must not freeze essay wording."""
+        with (
+            mock.patch.object(lm, "PROSE_DOCS", ("CLAUDE.md",)),
+            mock.patch.object(Path, "read_text", return_value="see `docs/NO_SUCH_FILE.md`"),
         ):
             lm.check_prose_file_references_resolve()
 
 
 class DerivedConstantTest(unittest.TestCase):
-    """Fault timings are read from the Rust source rather than restated. A
-    renamed constant otherwise surfaces minutes into a docker run, as a
-    precondition failure that reads like a broken cluster."""
-
     def test_every_constant_the_harness_derives_is_found(self) -> None:
         lm.check_derived_rust_constants_resolve()
 
 
 class ClusterPortTest(unittest.TestCase):
-    """A harness that spells a published port itself reaches nothing when the
-    port moves, and an unreachable node is recorded `indeterminate` — which the
-    L1 verdict reads as no acceptance observed. It passes while blind."""
-
     PORTS = (5432, 5433, 5434)
 
     def test_the_harness_as_committed_derives_every_port(self) -> None:
@@ -75,15 +67,11 @@ class ClusterPortTest(unittest.TestCase):
         self.assertEqual(lm.restated_cluster_ports(source, self.PORTS), [])
 
     def test_a_literal_inside_a_function_is_left_alone(self) -> None:
-        # Fixture data in a test asserts a value rather than reaching a node,
-        # and flagging it is what a line-by-line scan does wrong.
         source = "def test_x():\n    assert node.addr == '172.28.0.12:5433'\n    return 5434\n"
         self.assertEqual(lm.restated_cluster_ports(source, self.PORTS), [])
 
 
 class ProseExemptionTest(unittest.TestCase):
-    """An exemption that has outlived its reason is a hole held open."""
-
     def test_the_exemptions_as_committed_still_apply(self) -> None:
         lm.check_prose_exemptions_are_still_needed()
 
@@ -109,14 +97,10 @@ class ProseExemptionTest(unittest.TestCase):
 
 
 class MembershipWaitTest(unittest.TestCase):
-    """A wait for fewer members than the cluster has can only time out."""
-
     def test_the_matrix_as_committed_passes(self) -> None:
         lm.check_waits_do_not_ask_membership_to_shrink()
 
     def test_a_wait_for_one_fewer_member_after_a_kill_is_caught(self) -> None:
-        """Two nightly cases were written this way and neither could ever
-        pass; both sat behind an earlier failure where nothing ran them."""
         cases = [
             {
                 "id": "kills-then-waits-for-two",
@@ -140,7 +124,6 @@ class MembershipWaitTest(unittest.TestCase):
         self.assertEqual(lm.waits_that_ask_membership_to_shrink(cases, 3), [])
 
     def test_a_topology_that_adds_a_member_is_left_alone(self) -> None:
-        """`witness-topology` joins a fourth node and waits for four."""
         cases = [
             {
                 "id": "adds-a-witness",
@@ -150,61 +133,49 @@ class MembershipWaitTest(unittest.TestCase):
         self.assertEqual(lm.waits_that_ask_membership_to_shrink(cases, 3), [])
 
 
-class StateMachineDocTest(unittest.TestCase):
-    """The canonical doc is pinned to the code it claims to describe.
+class StateMachineInventoryTest(unittest.TestCase):
+    """Inventory TOML is pinned to the code — not markdown backticks."""
 
-    The drift these catch is the one the maintenance rule alone did not: a
-    commit that touches the doc — satisfying the rule — by appending a prose
-    bullet, while the states and truth sources the doc leads with quietly stop
-    matching the code.
-    """
-
-    def test_the_doc_as_committed_passes(self) -> None:
+    def test_the_inventory_as_committed_passes(self) -> None:
         lm.check_state_machine_names_resolve()
         lm.check_state_machine_describes_whole_enums()
         lm.check_state_machine_foreign_names_are_still_needed()
+        lm.check_no_cluster_state_leader_projection()
 
     def test_a_type_the_workspace_no_longer_defines_is_caught(self) -> None:
-        doc = "- **States**: held in `TheRenamedThing`, which nothing defines.\n"
+        inv = {
+            "enums": {},
+            "types": ["TheRenamedThing"],
+            "foreign": {},
+        }
         with (
-            mock.patch.object(Path, "read_text", return_value=doc),
+            mock.patch.object(lm, "load_state_machine_inventory", return_value=inv),
             self.assertRaises(AssertionError) as caught,
         ):
             lm.check_state_machine_names_resolve()
         self.assertIn("TheRenamedThing", str(caught.exception))
 
     def test_an_acronym_is_not_mistaken_for_a_type(self) -> None:
-        """`WAL`, `GUC` and SQL keywords are all-caps; our types are not."""
         self.assertFalse(lm.is_rust_type_name("WAL"))
         self.assertFalse(lm.is_rust_type_name("WHERE"))
         self.assertTrue(lm.is_rust_type_name("StandbyAction"))
 
-    def test_a_variant_the_doc_never_describes_is_caught(self) -> None:
+    def test_a_variant_the_inventory_omits_is_caught(self) -> None:
+        inv = {
+            "enums": {"StandbyAction": ["NoOp", "Defer"]},
+            "types": [],
+            "foreign": {},
+        }
         index = {"StandbyAction": {"NoOp", "Defer", "TheNewOne"}}
-        doc = "- `StandbyAction` is `NoOp` or `Defer`.\n"
         with (
+            mock.patch.object(lm, "load_state_machine_inventory", return_value=inv),
             mock.patch.object(lm, "enum_variant_index", return_value=index),
-            mock.patch.object(Path, "read_text", return_value=doc),
             self.assertRaises(AssertionError) as caught,
         ):
             lm.check_state_machine_describes_whole_enums()
         self.assertIn("TheNewOne", str(caught.exception))
 
-    def test_citing_one_variant_does_not_claim_the_whole_enum(self) -> None:
-        """`Error::ForeignDataDirectory` is a citation, not a promise to
-        describe every error the workspace can return."""
-        index = {"Error": {"ForeignDataDirectory", "Io", "Tls"}}
-        doc = "- The rewind path returns `Error::ForeignDataDirectory`.\n"
-        with (
-            mock.patch.object(lm, "enum_variant_index", return_value=index),
-            mock.patch.object(Path, "read_text", return_value=doc),
-        ):
-            lm.check_state_machine_describes_whole_enums()
-
     def test_a_variant_after_an_attribute_holding_braces_is_still_seen(self) -> None:
-        """`#[error("... {field} ...")]` sits between an enum's variants, and
-        counting its braces closed the enum early — hiding every variant after
-        the first one that carried a format string."""
         source = (
             "pub enum Error {\n"
             '    #[error("Connection idle timeout (id={conn_id}, limit={idle_ms}ms)")]\n'
@@ -229,18 +200,15 @@ class StateMachineDocTest(unittest.TestCase):
 
 
 class SpecCodeReferenceTest(unittest.TestCase):
-    """A spec header names the Rust it models, and that mapping is the only
-    thing tying a machine-checked proof to the binary. A rename that leaves it
-    behind gives a passing model checker describing code that is gone."""
+    """tla/code_map.toml must resolve to real workspace code."""
 
-    def test_the_specs_as_committed_map_onto_real_code(self) -> None:
+    def test_the_map_as_committed_resolves(self) -> None:
         lm.check_spec_code_references_resolve()
 
     def test_a_prose_word_beside_a_path_is_not_read_as_a_symbol(self) -> None:
         self.assertEqual(lm.code_identifiers_named("CODE: app.rs bootstrap path."), set())
 
     def test_a_call_with_arguments_names_only_its_receiver(self) -> None:
-        # `get` is std's; `node_lsns` is the field the spec is mapping onto.
         self.assertEqual(
             lm.code_identifiers_named("lsn[n] -> state_machine.rs: node_lsns.get(&n)"),
             {"node_lsns"},
@@ -256,68 +224,38 @@ class SpecCodeReferenceTest(unittest.TestCase):
         assert resolved is not None
         self.assertTrue(str(resolved).endswith("src/gateway/handlers/mod.rs"), resolved)
 
-    def test_a_source_a_spec_names_that_is_gone_is_caught(self) -> None:
+    def test_a_source_the_map_names_that_is_gone_is_caught(self) -> None:
         with (
-            self._spec("\\* CODE: governor/departed.rs still_here()\n"),
+            mock.patch.object(
+                lm,
+                "load_tla_code_map",
+                return_value={"lease_fencing": {"governor/departed.rs": ["still_here"]}},
+            ),
+            mock.patch.object(lm, "tla_specs", return_value=[Path("tla/lease_fencing.tla")]),
             self.assertRaises(AssertionError) as caught,
         ):
             lm.check_spec_code_references_resolve()
         self.assertIn("departed.rs", str(caught.exception))
 
-    def test_a_function_renamed_out_from_under_a_spec_is_caught(self) -> None:
+    def test_a_function_renamed_out_from_under_the_map_is_caught(self) -> None:
         with (
-            self._spec("\\* CODE: governor/lease.rs renew_the_lease()\n"),
+            mock.patch.object(
+                lm,
+                "load_tla_code_map",
+                return_value={"lease_fencing": {"governor/lease.rs": ["renew_the_lease"]}},
+            ),
+            mock.patch.object(lm, "tla_specs", return_value=[Path("tla/lease_fencing.tla")]),
             self.assertRaises(AssertionError) as caught,
         ):
             lm.check_spec_code_references_resolve()
         self.assertIn("renew_the_lease", str(caught.exception))
 
-    def test_a_constant_on_a_continuation_line_is_read_against_the_source_above(self) -> None:
-        """A citation that wraps is still a claim about the file its entry
-        named, and a constant belonging to another module is the shape that
-        hides on the wrapped half."""
-        entry = (
-            " *    Reality: state_machine.rs lsn_catchup_threshold_bytes() picks by\n"
-            " *      mode between BELONGS_TO_NOBODY and another.\n"
-        )
-        with self._spec(entry), self.assertRaises(AssertionError) as caught:
-            lm.check_spec_code_references_resolve()
-        self.assertIn("BELONGS_TO_NOBODY", str(caught.exception))
-
-    def test_a_line_back_at_the_outer_indent_stops_inheriting(self) -> None:
-        """A `lease_fencing` entry's `Here:` half sits level with its `CODE:`
-        half and talks about the model, so it is not read against the file."""
-        lines = list(
-            lm.attributed_lines(
-                " *    CODE: governor/lease.rs renew()\n *    Here: a_tla_note follows\n"
-            )
-        )
-        self.assertEqual([source for _, _, source in lines], ["governor/lease.rs", ""])
-
-    def test_a_line_naming_two_sources_attributes_neither(self) -> None:
-        lines = list(lm.attributed_lines(" *    CODE: app.rs holddown(); governor/raft.rs\n"))
-        self.assertEqual(lines[0][2], "")
-
-    def _spec(self, body: str) -> mock._patch[mock.MagicMock]:
-        """Point the check at one spec holding `body` and nothing else."""
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        spec = Path(directory.name) / "made_up.tla"
-        spec.write_text(body, encoding="utf-8")
-        return mock.patch.object(lm, "tla_specs", return_value=[spec])
-
 
 class LeaseFencingTimingTest(unittest.TestCase):
-    """TLC checks the model, not the deployment. The spec assumes only a ratio
-    between three constants, so a retuned millisecond in the binary leaves every
-    model passing about a system nobody runs."""
-
     def test_the_models_as_committed_state_the_shipped_timings(self) -> None:
         lm.check_lease_fencing_model_matches_the_shipped_timings()
 
     def test_a_vote_delay_inside_the_safe_region_is_caught(self) -> None:
-        """One tick of flight where the timings admit two: the model then never
-        reaches the boundary its safety argument is sized against."""
         timings = fp.read_system_timings()
         problems = lm.lease_fencing_tick_problems(
             {"QuorumTimeout": 2, "LeaseDuration": 4, "HoldDown": 4, "VoteDelay": 1}, timings

@@ -28,6 +28,8 @@ def timings(*, lease_duration_ms: int = 2_000) -> fp.SystemTimings:
         lsn_staleness_threshold_ms=30_000,
         leadership_transfer_lease_safety_ms=500,
         slot_ensure_interval_ms=30_000,
+        replica_check_interval_ms=1_000,
+        replica_disconnect_timeout_ms=30_000,
         election_timeout_source="constants.rs",
     )
 

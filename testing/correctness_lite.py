@@ -1,156 +1,32 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Correctness Lite: history-based durability + split-brain checker for pgbattery.
+"""History-based durability + split-brain checker (not Jepsen / Elle).
 
-SCOPE — READ THIS FIRST
-This is **NOT** Jepsen. It does not run a linearizability checker, does not
-generate a concurrent operation DAG, and does not detect transactional
-anomalies (read-skew, write-skew, lost-update, phantom-read). It is a
-**custom-invariant durability and split-brain smoketest**. Real Jepsen-grade
-correctness verification needs Elle / Knossos / Porcupine plus an adversarial
-multi-object workload — see `testing/linearizability_register.py` for the
-single-register linearizability test we run separately, and the skeletons
-under `testing/{fault_primitives,five_node_suite}.py` for what's still missing.
+Does **not** check linearizability or multi-statement isolation — see
+`linearizability_register.py` for register linearizability.
 
-What this file DOES verify:
-- Acked writes survive every injected fault (durability — I1).
-- Writes during quorum-loss windows are properly fenced (no ghost writes — I5).
-- No two nodes claim leadership in the same 0.5 s poll round (no split-brain — I4).
-- A bank-transfer workload conserves total balance (B1/B2 — single-object
-  multi-write consistency under failover) and applies every uniquely-identified
-  transfer at most once, exactly once if acked (B3/B4).
-- Optional: concurrent same-row hammer (3 writers contending on 3 keys with a
-  blind read-modify-write `UPDATE counters SET val = val + 1 WHERE id = k`,
-  which PostgreSQL serialises per row; verifies "no lost update" — C1).
-- Optional: monotonic-read session test (a value visible from a session must
-  not regress after failover on that same logical session — M1).
+**Does check** (against a full attempt history + leader polls):
 
-What this file does NOT verify:
-- Linearizability of concurrent reads + writes (see linearizability_register.py).
-- Isolation across multi-statement transactions (serializable / snapshot).
-- 2PC (prepared transaction) fate after coordinator failover.
-- Causal+ consistency across sessions.
+- I1 acked writes survive faults
+- I2 no phantoms (db is a subset of acked plus indeterminate)
+- I3 no duplicate primary keys
+- I4 single leader per poll round (control-plane; not L1 — see
+  `dual_writability_prober.py`)
+- I5 no acks strictly inside a quorum-loss window (L2); overlaps give I5-WARN
+- I6 post-recovery snapshots retain prior acks
+- I7 causal monotonicity in `db_final`
+- Optional bank B1-B4, counter C1, monotonic-read M1
 
-Every write attempt is logged with monotonic timestamps.  A background thread
-continuously samples leader status across all three nodes in parallel.  Fault
-windows are recorded precisely (open/close).  After the fault schedule the
-invariants below are checked against the *complete* operation history — not
-just a single point-in-time snapshot.
+**Outcome taxonomy** (`classify_attempt`): acked = exit 0 only; known refusal =
+rejected; anything else = indeterminate (never map unknown → rejected).
 
-Outcome taxonomy (`classify_attempt`) is the foundation everything else rests
-on.  "acked" requires psql exit status 0 and nothing else; a *recognised*
-definite refusal is "rejected"; anything else — including an error string we
-have never seen before — is "indeterminate".  Falling back to "rejected" for an
-unrecognised error would let a write that really did commit be counted as a
-definite non-commit, which turns I2 / C1 / B3 into false-positive generators.
-Indeterminate merely widens the permitted bound, so unknown always maps there.
+**Log greps** (verbatim Rust substrings; pinned by unit tests):
 
-════════════════════════════════════════════════════════════════════════════════
-LAYER 1 — POLLING-BASED INVARIANTS  I1-I7  (all FATAL)
-Checked against the timestamped operation history and background leader polls.
-Coverage: ~0.5s granularity for leader state; exact for write timestamps.
-════════════════════════════════════════════════════════════════════════════════
+- L0 corpus must look like pgbattery (else L2/L3 are vacuous)
+- L2 no `"potential split-brain"` / `"FAILED TO FENCE"` / `"Promotion safety check failed"`
+- L3 `"EMERGENCY FENCE"` implies `"PostgreSQL fenced (read-only)"` (else WARN if
+  no fence after quorum-loss)
 
-I1  NO_LOST_ACKS
-    ∀ v ∈ acked_set  →  v ∈ db_final
-    An acknowledged write must survive every fault.  Violation = data loss.
-
-I2  NO_PHANTOM_WRITES
-    ∀ v ∈ db_final  →  v ∈ (acked_set | indeterminate_set)
-    No value may appear in the DB unless we either acked it or lost track of it.
-    Violation = split-brain ghost write or uncommitted-data replay.
-
-I3  NO_DUPLICATES
-    COUNT(*) = COUNT(DISTINCT id) in the jepsen table.
-    The PRIMARY KEY constraint must hold under all replication paths.
-
-I4  SINGLE_LEADER
-    In every concurrent leader-poll round, all responding management nodes
-    agree on a single leader (or all return "no leader").
-    Two distinct non-None leader IDs in the same round = split-brain.
-
-I5  NO_ACKS_DURING_QUORUM_LOSS
-    No write whose entire lifespan [start_ts, end_ts] is strictly inside a
-    recorded quorum-loss fault window was acked.
-    Violation = lease-fencing mechanism failed to block writes under majority loss.
-    This is the exact letter of contract L2 in docs/CONTRACTS.md, so strict
-    containment stays the FATAL case.  An acked write that *overlaps* a window
-    but crosses one of its boundaries cannot be judged against L2 — our fault
-    open/close timestamps are wall-clock-adjacent to the real outage, not
-    identical to it — so those are reported separately as I5-WARN observations
-    rather than dropped on the floor.
-
-I6  INTERMEDIATE_READ_CONSISTENCY
-    Each post-recovery snapshot must contain every value that was in acked_set
-    at the moment the snapshot was taken.
-    Violation = transient data loss (write survived until that point, then vanished).
-
-I7  CAUSAL_MONOTONICITY
-    In db_final: if value N is present (N ∈ acked_set) and value M was fully
-    acked *before* N was even attempted — ack_end_ts(M) < attempt_start_ts(N) —
-    then M must also be in db_final.
-    Violation = selective rollback: an older committed write was lost while a
-    strictly later write that had not yet started survived.
-
-════════════════════════════════════════════════════════════════════════════════
-LAYER 2 — LOG GREP CHECKS  L0, L2-L3  (FATAL, defense in depth)
-Checked against the collected container log file after the fault schedule.
-Simple substring presence — no regex parsing, no format fragility.  Every
-substring below is emitted verbatim by the Rust source (`src/app.rs`);
-`testing/test_correctness_lite_invariants.py` greps the tree to prove they
-still exist, so a reworded log line breaks the unit test instead of silently
-turning a grep into a no-op.
-════════════════════════════════════════════════════════════════════════════════
-
-L0  LOG_CORPUS_VALID
-    The collected log must be readable and must contain at least one known
-    pgbattery startup marker.  L2/L3 are absence/conditional greps: over a
-    missing, empty, or non-pgbattery log they match nothing and would read as
-    a pass.  L0 makes that vacuity a loud FATAL instead.
-
-L2  NO_EXPLICIT_SPLIT_BRAIN_SIGNALS
-    Zero occurrences of "potential split-brain", "FAILED TO FENCE", or
-    "Promotion safety check failed" in the collected log.
-    These strings are emitted only when the code itself detects an unsafe
-    state — their presence is an unconditional violation regardless of
-    whether data loss occurred.
-
-L3  FENCE_CONFIRMED_AFTER_EMERGENCY
-    If any "EMERGENCY FENCE" line exists in the log, at least one
-    "PostgreSQL fenced (read-only)" line must also exist.
-    A fence that fires without a subsequent confirmation means writes may
-    have been accepted on a node that had already lost quorum.
-    If a quorum-loss window was injected but the log carries no fence trace at
-    all, L3 had nothing to check: reported as an L3-WARN observation, because
-    the lease may legitimately have been surrendered through the ordinary
-    step-down path instead of the emergency fence.
-
-════════════════════════════════════════════════════════════════════════════════
-LAYER 3 — WORKLOAD INVARIANTS  B1-B4, C1, M1  (all FATAL)
-Checked against the workload tables plus the in-memory attempt records.
-════════════════════════════════════════════════════════════════════════════════
-
-B1  BANK_TOTAL_CONSERVED           SUM(balance) == BANK_TOTAL.
-B2  NO_NEGATIVE_BALANCE            MIN(balance) >= 0.
-B3  TRANSFER_APPLIED_AT_MOST_ONCE  Every attempted transfer id appears at most
-                                   once in the ledger, exactly once if acked,
-                                   and never if definitely rejected.
-B4  BANK_LEDGER_RECONCILED         Every balance equals the initial balance
-                                   plus the credits minus the debits recorded
-                                   in the ledger.  B1 is algebraically blind to
-                                   double application (applying a transfer
-                                   twice still conserves the sum); B4 is not.
-C1  NO_LOST_UPDATE                 acked <= db_val <= acked + indeterminate.
-M1  NO_READ_REGRESSION             observed MAX(val) never decreases.
-
-════════════════════════════════════════════════════════════════════════════════
-
-Findings are either FATAL (an invariant violation, drives the exit code) or
-WARN (a labelled observation that is reported but does not fail the run).
-
-Exit codes:
-    0 — all invariants hold (PASS)
-    1 — at least one invariant violated (FAIL)
-    2 — infrastructure error (cluster unreachable, table creation failed, etc.)
+Findings: FATAL (exit 1) or WARN. Exit 0 pass, 1 fail, 2 infrastructure.
 """
 
 from __future__ import annotations

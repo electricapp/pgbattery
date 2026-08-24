@@ -1,0 +1,102 @@
+# Machine registry for correctness contracts.
+# Narrative lives in docs/CONTRACTS.md; lint reads this file for IDs,
+# severities, and FATAL inversions — not markdown headings/tables.
+#
+# Every matrix case `contracts:` entry must name an `id` below.
+# FATAL rows must list at least one inversion that still exists as a
+# matrix case id, repo path, or Rust/Python function name.
+
+contracts:
+  W1:
+    severity: FATAL
+    title: ACKed Write Durability
+    inversions:
+      - assert-sanity-acked
+      - assert-sanity-acked-dup
+      - assert-sanity-chaos-oracle
+      - assert-sanity-chaos-oracle-post
+      - assert-sanity-chaos-oracle-full
+      - testing/durability_crash.py
+      - testing/torn_write.py
+      - testing/wal_enospc.py
+
+  W2:
+    severity: FATAL
+    title: At-Most-Once Write Delivery
+    inversions:
+      - assert-sanity-concurrent
+      - assert-sanity-cascade-atomicity
+      - test_duplicate_ledger_row_flags_b3
+
+  W3:
+    severity: FATAL
+    title: DDL Atomicity
+    inversions:
+      - assert-sanity-ddl
+
+  L1:
+    severity: FATAL
+    title: Single Writable Leader
+    inversions:
+      - test_two_confirmed_acceptances_is_a_fatal_violation
+      - test_split_brain_signal_flags_l2
+
+  L2:
+    severity: FATAL
+    title: Lease-Fenced Write Rejection
+    inversions:
+      - test_contained_ack_is_fatal_i5
+      - test_fence_failure_signal_flags_l2
+
+  L3:
+    severity: FATAL
+    title: LSN-Safe Election
+    inversions:
+      - test_emergency_fence_without_confirmation_flags_l3
+      - testing/torn_raft.py
+
+  V1:
+    severity: SLO
+    title: Failover Availability Window
+
+  V2:
+    severity: SLO
+    title: Diverged / WAL-hole Recovery
+    inversions:
+      - assert-sanity-diverged
+
+  S1:
+    severity: FATAL
+    title: Commit Visibility / Prepared Tx
+    inversions:
+      - assert-sanity-commit-boundary
+
+  S2:
+    severity: SLO
+    title: Gateway Session Continuity
+    inversions:
+      - assert-sanity-gateway-migration
+
+  R1:
+    severity: FATAL
+    title: No Replication Slot Leak
+    inversions:
+      - assert-sanity-slot-leak
+
+  R2:
+    severity: FATAL
+    title: Synchronous Replica Acknowledgment
+    inversions:
+      - assert-sanity-acked-dup
+      - testing/durability_crash.py
+      - testing/torn_write.py
+      - testing/torn_raft.py
+
+  # Covered by linearizability_register / Elle; no ### heading in CONTRACTS.md.
+  LIN:
+    severity: FATAL
+    title: Linearizability (single-register)
+    prose: false
+    inversions:
+      - testing/test_checker_sanity.py
+      - assert_flagged

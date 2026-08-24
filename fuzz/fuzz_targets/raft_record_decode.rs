@@ -100,19 +100,12 @@ fuzz_target!(|data: &[u8]| {
     };
 
     assert!(
-        state.leader_id.is_none(),
-        "a snapshot injected leader_id = {:?}",
-        state.leader_id
+        state.failover_started_at.is_none(),
+        "a snapshot injected failover_started_at = {:?}",
+        state.failover_started_at
     );
-    assert!(
-        state.leader_addr.is_none(),
-        "a snapshot injected leader_addr = {:?}",
-        state.leader_addr
-    );
-    // ClusterState carries a third `serde(skip)` local projection (the
-    // failover-start stamp). It is intentionally not named here: its type and
-    // name are being changed, and this target must not pin them. The same
-    // no-injection property applies to it and is worth adding once it settles.
+    // ClusterState local projections use serde(skip); an installed snapshot
+    // must not inject them.
 
     let fresh = state.fresh_max_lsn();
     let reported_max = state
@@ -146,6 +139,5 @@ fuzz_target!(|data: &[u8]| {
             !promotion_ok || election_ok,
             "promotion gate accepted node {candidate} that the election gate rejected"
         );
-        let _ = state.is_leader(candidate);
     }
 });

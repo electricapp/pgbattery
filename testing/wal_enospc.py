@@ -1,70 +1,17 @@
 #!/usr/bin/env -S uv run --project testing python
 """ENOSPC at WAL-segment allocation — contract W1.
 
-A blanket "fill the volume" test proves little: it exhausts the filesystem at
-whatever point the filler happens to reach, which is usually somewhere dull.
-The interesting failure is narrower — PostgreSQL rolling to a *new WAL
-segment* and finding no room for it. That is where a database either fences
-cleanly or starts acknowledging commits it cannot persist.
+Uses `fault_primitives.disk_full_during_wal` (free space < one segment; proves
+allocation fails). Asserts: every write acked before/during the window is
+readable after; the fault must have a visible effect (else fail, not pass);
+releasing the filler restores accepts without restart.
 
-`fault_primitives.disk_full_during_wal` aims there: it drives free space down
-to half a WAL segment, so ordinary small writes still succeed while segment
-allocation cannot, and it proves the aim by attempting a segment-sized
-allocation and requiring it to fail. This harness is what surrounds that fault
-with a claim.
+Not asserted: where leadership ends up. L1 comes from a concurrent
+`dual_writability_prober` (leader-name churn ≠ dual writers).
 
-WHAT IS ASSERTED
-
-    W1  Every write acknowledged before or during the full window is still
-        readable afterwards. This is the whole point: a full disk is allowed to
-        refuse writes, and is never allowed to lose one it accepted.
-
-    The fault must have a visible effect. If a leader whose filesystem cannot
-    allocate another WAL segment goes on acknowledging writes indefinitely with
-    leadership unmoved, this run measured nothing and says so rather than
-    passing. That is the difference between "the cluster tolerated the fault"
-    and "the fault never reached anything".
-
-    Recovery. Releasing the filler must return the cluster to accepting writes
-    without restarting anything.
-
-WHAT IS NOT ASSERTED
-
-    Where leadership ends up. Whether a disk-full leader sheds leadership or
-    holds it while refusing writes is recorded in the report, not required.
-    Both are defensible; asserting one before measuring which pgbattery does
-    would be writing the test around a guess.
-
-    L1 comes from `dual_writability_prober.py`, running concurrently across all
-    three internal PG ports for the whole fill-and-recovery window. Leader
-    observations are still collected but never asserted on: two distinct leader
-    names across the window are a leadership *transition*, not two leaders at
-    once, and Raft does not promise every node learns of a new leader at the
-    same instant. L1 is about two nodes being simultaneously *writable*, which
-    only concurrent real writes answer. A violation fails the run; an oracle
-    that saw too little to conclude leaves L1 out of the reported contracts
-    rather than claiming it.
-
-NO RESTARTS, DELIBERATELY
-
-    This suite needs the bounded volume variant, which is a tmpfs. Docker
-    instantiates a tmpfs volume's mount per container start, so restarting a
-    node brings it back with an EMPTY /var/lib/postgresql — node1 would
-    bootstrap a fresh cluster with a fresh Raft log and every assertion here
-    would pass against a database that had thrown away the evidence. So the
-    fault is released rather than crashed out of, and recovery is measured
-    without a restart. Run it against a cluster started with
-    PGBATTERY_STATE_SUFFIX=_bounded; the primitive refuses an unbounded
-    filesystem rather than filling a host disk.
-
-THE INVERSION
-
-    `--prove-oracle` runs the identical sequence with no fill and requires the
-    effect signal to be ABSENT. That is what makes the signal attributable: if
-    writes fail and leadership moves in a cluster nobody touched, then observing
-    the same thing under a full disk says nothing about disk exhaustion. A
-    suite that cannot tell its fault apart from its own workload is not
-    evidence, and this refuses to report green until it has shown it can.
+Requires `PGBATTERY_STATE_SUFFIX=_bounded` (tmpfs). No container restarts —
+restart empties the volume and vacates the evidence. `--prove-oracle` requires
+the effect signal absent without a fill.
 """
 
 from __future__ import annotations

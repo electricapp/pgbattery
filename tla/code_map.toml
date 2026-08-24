@@ -1,0 +1,42 @@
+# Spec → code map for TLA+ models.
+# lint_matrix resolves these paths/symbols against the workspace.
+# Spec header comments may still describe the mapping for humans;
+# this file is the machine registry.
+
+[commit_probing]
+"gateway/handlers/mod.rs" = ["probe_txid_status"]
+
+[lease_fencing]
+"app.rs" = ["promotion_lease_holddown"]
+"governor/lease.rs" = ["expires_at", "is_valid", "quorum_ack_age", "renew"]
+"governor/raft.rs" = [
+  "QUORUM_TIMEOUT_MS",
+  "has_quorum",
+  "millis_since_quorum_ack",
+  "should_anchor_coalesced_failover",
+  "should_anchor_term_advance",
+  "should_clear_stale_failover_anchor",
+]
+
+[raft_lsn]
+"app.rs" = []
+"config/constants.rs" = [
+  "LSN_CATCHUP_THRESHOLD_BYTES_ASYNC",
+  "LSN_CATCHUP_THRESHOLD_BYTES_SYNC",
+]
+"governor/network.rs" = ["vote_granted"]
+"state_machine.rs" = [
+  "is_lsn_acceptable_for_election",
+  "lsn_catchup_threshold_bytes",
+  "max_cluster_lsn",
+  "node_lsns",
+]
+
+[timeline_verification]
+"crates/pgbattery-supervisor/src/process.rs" = [
+  "pg_controldata",
+  "pg_rewind",
+  "receiver_info",
+  "timeline_id",
+  "verify_promotion_safe",
+]

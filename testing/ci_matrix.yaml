@@ -649,7 +649,7 @@
         "L1",
         "V1"
       ],
-      "description": "Kill PG on the leader; immediately query the leader's management API. The /cluster/leader endpoint must NOT continue to report this dead node as leader after RaftCore has shut down. The old implementation read `cluster_state.leader_id` (the Raft-log-applied mirror) which persists across RaftCore shutdown \u2014 fixed by reading `RaftMetrics::current_leader` (live truth source) instead. We poll the leader's own mgmt port immediately after the kill; if it lies, this assertion fails.",
+      "description": "Kill PG on the leader; immediately query the leader's management API. The /cluster/leader endpoint must NOT continue to report this dead node as leader after RaftCore has shut down. Leadership is read from RaftMetrics::current_leader (not a ClusterState field). We poll the leader's own mgmt port immediately after the kill; if it lies, this assertion fails.",
       "actions": [
         {
           "type": "record_leader",

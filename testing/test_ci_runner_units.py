@@ -1022,13 +1022,13 @@ Text.
 """
 
 
-def test_extract_contract_ids_reads_headings_only() -> None:
-    assert lint_matrix.extract_contract_ids(CONTRACTS_DOC_SAMPLE) == {"W1", "L2"}
+def test_extract_contract_ids_come_from_the_registry() -> None:
+    ids = lint_matrix.extract_contract_ids()
+    assert {"W1", "W2", "W3", "L1", "L2", "L3", "V1", "V2", "S1", "S2", "R1", "R2", "LIN"} <= ids
 
 
-def test_extract_contract_ids_from_the_real_doc() -> None:
-    ids = lint_matrix.extract_contract_ids(CONTRACTS_PATH.read_text(encoding="utf-8"))
-    assert {"W1", "W2", "W3", "L1", "L2", "L3", "V1", "V2", "S1", "S2", "R1", "R2"} <= ids
+def test_extract_contract_ids_from_prose_reads_headings_only() -> None:
+    assert lint_matrix.extract_contract_ids_from_prose(CONTRACTS_DOC_SAMPLE) == {"W1", "L2"}
 
 
 def test_implicit_build_target_is_flagged() -> None:
@@ -1297,45 +1297,55 @@ which is the point of the change — so the sample has to point at something tha
 exists. `test_the_sample_inversion_case_is_real` fails loudly if it is renamed,
 rather than letting this drift into an unresolvable token nobody notices."""
 
-CONTRACT_INDEX_SAMPLE = f"""
-## Contract-to-Test Index
-
-| Contract | Severity | Primary Tests | Inversion |
-| -------- | -------- | ------------- | --------- |
-| W1       | FATAL    | `a-case`      | `{SAMPLE_INVERSION_CASE}` |
-| V1       | SLO      | `b-case`      | —         |
+CONTRACT_REGISTRY_SAMPLE = f"""
+contracts:
+  W1:
+    severity: FATAL
+    title: ACKed write durability
+    inversions:
+      - {SAMPLE_INVERSION_CASE}
+  V1:
+    severity: SLO
+    title: Something measured, not gated
+    inversions: []
 """
 
 
-def test_contract_index_parses_only_the_index_table() -> None:
-    """A prose table elsewhere in the doc must not read as a coverage claim."""
-    noise = "| not | a | coverage | table |\n" + CONTRACT_INDEX_SAMPLE
-    rows = lint_matrix.parse_contract_index(noise)
-    assert [r[0] for r in rows] == ["W1", "V1"]
+def test_real_registry_defines_fatal_contracts() -> None:
+    """Guards the loader against silently reading nothing, which would make the
+    inversion check below pass against any file at all."""
+    registry = lint_matrix.load_contracts_registry()
+    fatal = [cid for cid, meta in registry.items() if meta["severity"] == "FATAL"]
+    assert len(fatal) >= 8, f"only {len(fatal)} FATAL contracts in the registry"
 
 
-def test_real_contracts_doc_has_fatal_rows() -> None:
-    """Guards the parser against silently matching nothing, which would make
-    the check below pass on any document at all."""
-    rows = lint_matrix.parse_contract_index(CONTRACTS_PATH.read_text(encoding="utf-8"))
-    fatal = [r for r in rows if len(r) > 1 and r[1] == "FATAL"]
-    assert len(fatal) >= 8, f"only {len(fatal)} FATAL rows parsed from the real doc"
+def test_registry_ids_match_the_prose_document() -> None:
+    """The YAML is the machine-readable half and `CONTRACTS.md` is the human
+    one. A contract in one and not the other sends a reader looking for an
+    argument that is not there, or gates on a contract nobody documented."""
+    registry = set(lint_matrix.load_contracts_registry())
+    prose = lint_matrix.extract_contract_ids_from_prose(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    documented = {
+        cid for cid, meta in lint_matrix.load_contracts_registry().items() if meta["prose"]
+    }
+    assert documented - prose == set(), f"in the registry, undocumented: {documented - prose}"
+    assert prose - registry == set(), f"documented, not in the registry: {prose - registry}"
 
 
-def _check_index(markdown: str, tmp: Path) -> None:
-    """Run the inversion check against `markdown` instead of the real doc."""
-    doc = tmp / "CONTRACTS.md"
-    doc.write_text(markdown, encoding="utf-8")
-    original = lint_matrix.CONTRACTS_PATH
-    lint_matrix.CONTRACTS_PATH = doc
+def _check_registry(yaml_text: str, tmp: Path) -> None:
+    """Run the inversion check against `yaml_text` instead of the real registry."""
+    doc = tmp / "contracts.yaml"
+    doc.write_text(yaml_text, encoding="utf-8")
+    original = lint_matrix.CONTRACTS_REGISTRY_PATH
+    lint_matrix.CONTRACTS_REGISTRY_PATH = doc
     try:
         lint_matrix.check_fatal_contracts_have_inversions()
     finally:
-        lint_matrix.CONTRACTS_PATH = original
+        lint_matrix.CONTRACTS_REGISTRY_PATH = original
 
 
-def test_inversion_check_accepts_a_complete_table() -> None:
-    _check_index(CONTRACT_INDEX_SAMPLE, Path(tempfile.mkdtemp(prefix="contracts-ok-")))
+def test_inversion_check_accepts_a_complete_registry() -> None:
+    _check_registry(CONTRACT_REGISTRY_SAMPLE, Path(tempfile.mkdtemp(prefix="contracts-ok-")))
 
 
 def test_the_sample_inversion_case_is_real() -> None:
@@ -1347,47 +1357,38 @@ def test_the_sample_inversion_case_is_real() -> None:
     )
 
 
-def test_inversion_check_rejects_a_fatal_row_without_one() -> None:
+def test_inversion_check_rejects_a_fatal_contract_without_one() -> None:
     """The check exists to catch exactly this, so it has to be seen catching it."""
-    stripped = CONTRACT_INDEX_SAMPLE.replace(f"`{SAMPLE_INVERSION_CASE}`", "—")
+    stripped = CONTRACT_REGISTRY_SAMPLE.replace(f"      - {SAMPLE_INVERSION_CASE}\n", "")
     assert_raises(
         AssertionError,
-        lambda: _check_index(stripped, Path(tempfile.mkdtemp(prefix="contracts-bad-"))),
+        lambda: _check_registry(stripped, Path(tempfile.mkdtemp(prefix="contracts-bad-"))),
         "W1 is FATAL with no inversion",
     )
 
 
 def test_inversion_check_rejects_a_dangling_reference() -> None:
-    """A non-empty cell was the whole bar until now, so a case that was renamed
-    or deleted left the contract still claiming a working oracle. The claim has
-    to resolve."""
-    renamed = CONTRACT_INDEX_SAMPLE.replace(SAMPLE_INVERSION_CASE, "assert-sanity-deleted")
+    """A non-empty entry was the whole bar until the names had to resolve, so a
+    case that was renamed or deleted left the contract still claiming a working
+    oracle. Prose in place of a name fails the same way, which is why it is not
+    a separate shape any more."""
+    renamed = CONTRACT_REGISTRY_SAMPLE.replace(SAMPLE_INVERSION_CASE, "assert-sanity-deleted")
     assert_raises(
         AssertionError,
-        lambda: _check_index(renamed, Path(tempfile.mkdtemp(prefix="contracts-dangling-"))),
+        lambda: _check_registry(renamed, Path(tempfile.mkdtemp(prefix="contracts-dangling-"))),
         "assert-sanity-deleted",
     )
 
 
-def test_inversion_check_rejects_prose_with_nothing_checkable() -> None:
-    """Prose is allowed alongside a name, never instead of one."""
-    vague = CONTRACT_INDEX_SAMPLE.replace(f"`{SAMPLE_INVERSION_CASE}`", "covered somewhere")
-    assert_raises(
-        AssertionError,
-        lambda: _check_index(vague, Path(tempfile.mkdtemp(prefix="contracts-vague-"))),
-        "names nothing checkable",
-    )
-
-
 def test_inversion_refs_resolve_by_case_file_or_function() -> None:
-    """The three shapes the real index uses, and one that resolves as none."""
-    known_cases = {"a-case"}
-    known_fns = {"test_something"}
-    resolve = lint_matrix.unresolved_inversion_refs
-    assert resolve("`a-case`", known_cases, known_fns) == []
-    assert resolve("unit: `test_something`", known_cases, known_fns) == []
-    assert resolve("`docs/CONTRACTS.md` — every case", known_cases, known_fns) == []
-    assert resolve("`no-such-thing`", known_cases, known_fns) == ["no-such-thing"]
+    """The three shapes the real registry uses, each accepted on its own."""
+    for name in (
+        SAMPLE_INVERSION_CASE,
+        "docs/CONTRACTS.md",
+        "test_real_registry_defines_fatal_contracts",
+    ):
+        sample = CONTRACT_REGISTRY_SAMPLE.replace(SAMPLE_INVERSION_CASE, name)
+        _check_registry(sample, Path(tempfile.mkdtemp(prefix="contracts-shape-")))
 
 
 def test_log_marker_check_catches_a_reworded_line() -> None:
@@ -1408,21 +1409,32 @@ def test_log_marker_check_reads_the_real_sources() -> None:
     assert lint_matrix.missing_log_markers(lint_matrix._harness_log_markers(), corpus) == []
 
 
-def test_inversion_refs_expand_brace_groups() -> None:
-    """`assert-sanity-chaos-oracle{,-post,-full}` is three case IDs, and each
-    must resolve; the real index writes them this way."""
-    known = {"c", "c-post"}
+def test_brace_groups_expand_to_one_id_each() -> None:
+    """`assert-sanity-chaos-oracle{,-post,-full}` is three case IDs."""
     assert lint_matrix.expand_braces("c{,-post,-full}") == ["c", "c-post", "c-full"]
-    assert lint_matrix.unresolved_inversion_refs("`c{,-post,-full}`", known, set()) == ["c-full"]
+    assert lint_matrix.expand_braces("plain") == ["plain"]
 
 
-def test_inversion_check_refuses_to_pass_on_an_unparseable_doc() -> None:
-    """Silence from the parser must be an error, not a pass: a table that moved
-    or got reformatted would otherwise retire the whole check."""
+def test_inversion_check_refuses_to_pass_on_a_registry_it_cannot_read() -> None:
+    """Silence from the loader must be an error, not a pass: a registry that
+    moved or got reshaped would otherwise retire the whole check."""
     assert_raises(
         AssertionError,
-        lambda: _check_index("# nothing here\n", Path(tempfile.mkdtemp(prefix="contracts-empty-"))),
-        "not found or unparseable",
+        lambda: _check_registry(
+            "# nothing here\n", Path(tempfile.mkdtemp(prefix="contracts-empty-"))
+        ),
+        "no contracts: map",
+    )
+
+
+def test_inversion_check_refuses_a_registry_with_no_fatal_contracts() -> None:
+    """A registry of SLOs alone would let every FATAL assertion pass by having
+    nothing to assert about."""
+    slo_only = CONTRACT_REGISTRY_SAMPLE.replace("severity: FATAL", "severity: SLO")
+    assert_raises(
+        AssertionError,
+        lambda: _check_registry(slo_only, Path(tempfile.mkdtemp(prefix="contracts-slo-"))),
+        "pass vacuously",
     )
 
 

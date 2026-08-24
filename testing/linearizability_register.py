@@ -1,93 +1,18 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Single-register linearizability checker for pgbattery.
+"""Per-key register linearizability (WGL) under failover via the gateway.
 
-Spawns K concurrent client threads that issue read / write / CAS operations
-against a small set of "register" rows (one row per key) through the
-pgbattery gateway. Each operation is recorded with monotonic
-invocation/response timestamps. The leader is killed mid-run to force a
-failover. After recovery, the recorded operation history is checked for
-linearizability per-key using the Wing-Gong-Lowe (WGL) search algorithm.
+Complements `correctness_lite.py` (durability / split-brain): this checks
+real-time ordering of concurrent read/write/CAS against a sequential register
+spec. Cross-key invariants are out of scope (use correctness_lite bank).
 
-═══════════════════════════════════════════════════════════════════════════
-WHY THIS FILE EXISTS ALONGSIDE correctness_lite.py
-═══════════════════════════════════════════════════════════════════════════
+WGL is exponential in overlap. `WGL_OPS_PER_KEY_CAP` windows long histories;
+`WGL_MAX_EXPLORED_STATES` bounds search. Budget exhaustion → `UNCHECKED`, exit
+2 (`INCONCLUSIVE`), never exit 0. Prefer `--check weak` or a smaller workload
+over widening past decidability.
 
-correctness_lite.py verifies durability of acked writes and absence of
-split-brain. It does NOT verify *ordering* of concurrent operations from a
-client's perspective. Two writers and a reader, all hitting the same key
-under a failover window, can produce a history where:
-
-  - All acked writes survive (durability holds — correctness_lite passes).
-  - The read returns a value that no linearization could possibly produce
-    (e.g. an older value after a newer one was already observed).
-
-That second class of bug — a stale-read, a lost-update, a write-skew — is
-what this file is for. It checks the *real-time* relationship between
-concurrent ops against the sequential specification of a register
-({read returns last write, write replaces, CAS commits iff witness matches}).
-
-═══════════════════════════════════════════════════════════════════════════
-SCOPE & LIMITATIONS
-═══════════════════════════════════════════════════════════════════════════
-
-  - **Per-key register model only.** Each key is treated as an independent
-    register; cross-key invariants (e.g. SUM(values) conservation) are
-    out of scope. Use correctness_lite's bank-transfer step for that.
-
-  - **WGL is exponential in concurrency, and two separate bounds apply.**
-    `WGL_OPS_PER_KEY_CAP` bounds the per-key op count: a longer history is
-    reduced to one contiguous window of that size centred near the median
-    return time, with the register's starting value inferred from the
-    discarded prefix, and ops outside the window are not checked. That caps
-    memory, not time — cost tracks how many ops overlap, not how many there
-    are. `WGL_MAX_EXPLORED_STATES` is the bound on the search itself.
-
-    A key that spends its state budget is reported `UNCHECKED` and the run
-    exits 2 (`INCONCLUSIVE`), never 0. Widening the workload past the point
-    WGL can decide it is a real risk: at 6 workers over 45 s, five of eight
-    keys were undecidable. Shrink the workload or use `--check weak`.
-
-    Real Jepsen uses Knossos/Elle which have better-than-WGL constants and
-    can also verify transactional histories. We do not.
-
-  - **Indeterminate operations are encoded as "pending"** (`return_ts is
-    None`, `result is None`) and both possible outcomes are considered: a
-    write that timed out could have committed or not. Distinct from a
-    **definite rejection** (`result is False` — PG refused the statement),
-    which provably never reached the register and is therefore modelled as
-    a no-op; a later read of its value is an anomaly, not a normal write.
-
-═══════════════════════════════════════════════════════════════════════════
-ALGORITHM (Wing-Gong-Lowe, register specialisation)
-═══════════════════════════════════════════════════════════════════════════
-
-A history H = [(op_i, invoke_i, return_i)] is linearizable iff there exists
-a total order < of the completed operations in H such that:
-
-  1. (REAL-TIME)  op_a returned before op_b invoked  ⇒  op_a < op_b.
-  2. (SEQUENTIAL) The total order produces a valid sequential register
-                  history when each op is applied to the register state.
-
-Search:
-
-  - Maintain `remaining` = set of ops not yet linearized.
-  - At each step, consider only ops whose invocation is at-or-before the
-    earliest return time in `remaining` (only these are eligible to be
-    linearized next under the real-time constraint).
-  - For each candidate, simulate the register transition; recurse with
-    the candidate removed and the register state updated.
-  - Memoize on (frozenset(remaining_ids), register_value) — a hash that
-    captures the entire search state.
-  - If recursion exhausts the frontier, history is linearizable.
-
-A pending op has no return time, so it is treated as returning at +inf: it
-stays eligible at every step and can always be deferred to the tail of the
-order, where nothing observes it. Applying it earlier is the "this op
-happened" branch; deferring it to the tail is "this op didn't happen". The
-search needs no separate branch for the two. A definitely-rejected op is an
-identity transition, so placing it is always legal and constrains nothing.
-
-═══════════════════════════════════════════════════════════════════════════
+Indeterminate ops are pending (both commit/not considered); definite rejection
+is a no-op. Algorithm: Wing-Gong-Lowe register specialisation (real-time plus
+sequential constraints, memoized on remaining ops by register value).
 """
 
 from __future__ import annotations

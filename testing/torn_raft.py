@@ -1,37 +1,12 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Torn-write oracle for the Raft store.
+"""Torn ``raft.db`` oracle (Raft LazyFS, separate from PGDATA).
 
-PROVES: that a write torn in half by a power loss cannot make a node serve
-Raft state it never committed. The property is sharper here than for a heap
-page. Lost data on a follower is recoverable from the leader; a corrupted
-*vote* or *log* is not, because a node that forgets it voted can vote again in
-the same term, and a node that forgets a committed entry can help elect a
-leader that never had it.
+``lazyfs::torn-op`` on the Raft store. Pass = tolerate (rollback to last
+committed) or refuse to start — never run voting on unvouched state.
 
-HOW: ``lazyfs::torn-op`` splits the next write to ``raft.db`` and crashes the
-Raft store's LazyFS instance, so the unwritten half dies in its userspace
-cache. The Raft store has its own instance, separate from PGDATA's, so this
-does not disturb PostgreSQL and the damage is attributable.
+``--prove-oracle`` mangling past repair must refuse start (most tears are
+uncommitted non-events, so green alone proves little).
 
-WHAT COUNTS AS PASSING: either outcome, provided it is not silent.
-
-  - tolerated: redb rolls back to its last committed state and the node
-    rejoins. Expected when the tear lands in an uncommitted page.
-  - detected:  redb reports the store unreadable and pgbattery refuses to
-    start rather than recreating it.
-
-The violation is a node that comes back believing something the cluster never
-committed, which shows up here as a lost acked write or a second leader.
-
-WHY THE INVERSION IS NOT OPTIONAL: most tears land in uncommitted pages and are
-correctly a non-event, so a green run is the *usual* result and says nothing by
-itself about whether damage would ever be noticed. ``--prove-oracle`` therefore
-mangles ``raft.db`` past repair first and requires the node to refuse to start,
-which establishes that the observable a green is measured on is reachable at
-all. Without it this suite would pass just as happily against a fault that
-injected nothing.
-
-Run:
     COMPOSE_FILE=docker-compose.lazyfs.yml docker compose up -d node1 node2 node3
     COMPOSE_FILE=docker-compose.lazyfs.yml uv run --project testing \
         python testing/torn_raft.py --prove-oracle

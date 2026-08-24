@@ -1,6 +1,12 @@
-# TLA+ Specifications
+# Formal models of pgbattery's core safety properties, **machine-checked** with TLC.
 
-Formal models of pgbattery's core safety properties, **machine-checked** with TLC.
+#
+
+# Spec → code mapping for lint lives in [`code_map.toml`](code_map.toml)
+
+# (not header-comment scraping). Spec comments may still describe the mapping
+
+# for humans.
 
 > **Validation.** `make check` (below) runs all four specs through TLC and fails
 > on any violation, then runs the counterexample models and fails if any of them

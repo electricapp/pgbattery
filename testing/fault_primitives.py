@@ -1,157 +1,34 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Fault-injection primitives — the shared fault vocabulary for pgbattery harnesses.
+"""Shared fault-injection primitives for pgbattery harnesses.
 
-Every primitive here does three things, in this order, and none of them are
-optional:
+Every primitive: (1) inject, (2) verify the effect from outside or raise
+:class:`FaultEffectNotObserved`, (3) heal idempotently and verify removal.
+See ``HARDENING.md`` for why step 2 is mandatory.
 
-  1. **Inject** the fault.
-  2. **Verify the effect landed**, positively and from outside: an iptables/tc
-     rule that is present *and* counting packets, a process actually in state
-     ``T``, a qdisc that reports the delay/loss we asked for, a clock offset
-     observable via ``date`` in the container, a filesystem that genuinely
-     cannot allocate another WAL segment. If the effect cannot be observed the
-     primitive raises :class:`FaultEffectNotObserved`.
-  3. **Heal idempotently and verify the removal.**
+Primitives (short):
 
-The reason step 2 exists is `disk_full`: the pre-existing attack allocated a
-500 MB filler inside an *unbounded* named volume, so on any host with GBs free
-it could never produce ENOSPC. It passed while testing nothing, which is worse
-than not existing because it reads as coverage. A fault that cannot fail is
-worse than no test — so a primitive that cannot verify its own effect raises a
-loud, actionable error instead of proceeding.
+- ``partition_lossy`` — degraded egress (loss+latency); not asymmetric.
+- ``partition_asymmetric`` — one-direction packet drop (tc counters both ways).
+  App-layer request/response still breaks both ways.
+- ``fsync_stall`` — node alive but WAL durability stalls. Not a real hung
+  ``fsync()`` syscall; use ``crash_losing_unsynced_writes`` / LazyFS for that.
+- ``clock_skew_at_lease_boundary`` — wall-clock skew inside the promotion
+  hold-down window (raises if the skew misses the window).
+- ``sigstop_checkpointer`` — checkpoints stop; commits may still complete.
+- ``disk_full_during_wal`` — ENOSPC at next WAL segment; requires
+  ``PGBATTERY_STATE_SUFFIX=_bounded``.
 
-═══════════════════════════════════════════════════════════════════════════
-WHAT EACH PRIMITIVE PROVES
-═══════════════════════════════════════════════════════════════════════════
+Timings that must straddle a system boundary come from
+:func:`read_system_timings` / :func:`sweep_around` (Rust constants + node1.toml),
+not hand-tuned sleeps.
 
-``partition_lossy(container, drop_pct, latency_ms)``
-    PROVES: Raft heartbeat / lease-renewal behaviour on a link that is
-    degraded rather than cut. Some RPCs arrive late, some never — this is the
-    regime that exposes resend, idempotency and duplicate-handling bugs that a
-    clean disconnect cannot, and it is the regime that decides whether a leader
-    with a slow-but-alive link gets deposed.
-    DOES NOT PROVE: anything about asymmetric reachability (use
-    ``partition_asymmetric``); netem is applied to egress only, so the peer's
-    view of *its own* send path is unchanged.
+Substrate: no ``iptables`` or ``ping`` in the image — use ``tc`` (as ``--user
+root``) and ``curl`` to mgmt ports. libfaketime offsets are fractional seconds
+only (``+250ms`` is parsed as minutes).
 
-``partition_asymmetric(from_container, to_container, direction)``
-    PROVES: behaviour when reachability is one-directional — the classic
-    "leader still believes it holds quorum while followers see no leader"
-    split. Packets in one direction are destroyed while packets in the other
-    direction are delivered, and both halves of that claim are verified with
-    tc packet counters.
-    DOES NOT PROVE: that a *connection* survives in the surviving direction.
-    Destroying one direction breaks request/response both ways at the
-    application layer, because responses carry the blocked address as their
-    source. The asymmetry is at the packet layer, which is where Raft's
-    reachability assumptions live.
-
-``fsync_stall(container, duration_s)``
-    PROVES: behaviour when a node cannot advance its durable WAL position while
-    its process supervisor, Raft loop and lease tick all keep running — the
-    "PG is alive but cannot make progress durable" branch. On a sync standby it
-    additionally blocks the leader's commit path, because commits wait for the
-    standby's ack; that is the closest signal-only analogue of a hung fsync().
-    DOES NOT PROVE: that a hung ``fsync()`` *syscall* is handled. Commit-time
-    fsyncs happen inside the backend process, which is deliberately left
-    running (stopping backends would hang the client, not the durability path).
-    No kernel or disk-controller path is exercised, fsync error (EIO) handling
-    is untested, and this cannot produce the "fsync returned success without
-    flushing" durability violation. :func:`crash_losing_unsynced_writes` can,
-    and does — run it from ``durability_crash.py`` against
-    ``docker-compose.lazyfs.yml``.
-
-``clock_skew_at_lease_boundary(container, skew_ms, window_ms)``
-    PROVES: whether any decision that a lease guards is actually taken on the
-    monotonic clock. The audited hazard is concrete: ``App::promote_local_postgres``
-    gates promotion behind ``promotion_lease_holddown(failover_started_ms,
-    unix_now_ms(), lease_ms)`` (``src/app.rs:1051``, ``src/app.rs:2341``), which
-    compares *wall clock* — ``unix_now_ms()`` is ``SystemTime::now()``
-    (``src/app.rs:2354``), and ``LD_PRELOAD``ed libfaketime intercepts it. The
-    lease it stands in for is monotonic (``LeaseState`` reads
-    ``pgbattery_core::Clock``, ``src/governor/lease.rs:106``). So a forward step
-    of at least one lease duration, applied to the election winner *inside* the
-    hold-down window, releases the hold-down while the deposed leader's lease is
-    still valid — two writable primaries. This primitive aims the skew at that
-    live window instead of at an arbitrary offset.
-    DOES NOT PROVE: anything about skew between *nodes* at rest (that is the
-    existing ``clock_skew`` step), and nothing at all if the skew lands outside
-    the window — which is why landing outside it raises rather than passes.
-
-``sigstop_checkpointer(container, duration_s)``
-    PROVES: the "PG accepts writes but cannot checkpoint" branch. Checkpoints
-    stop, ``pg_wal`` grows without recycling, and the lease tick must classify
-    the node as alive-but-unhealthy rather than dead.
-    DOES NOT PROVE: that commits stall. With ``synchronous_commit=on`` a backend
-    fsyncs WAL itself, so commits keep completing with the checkpointer stopped.
-    Use ``fsync_stall`` for the durability-path stall.
-
-``disk_full_during_wal(container)``
-    PROVES: the ENOSPC class specifically at WAL segment allocation. The
-    filesystem holding ``pg_wal`` is filled until strictly less than one WAL
-    segment of space remains, and the primitive proves it by *failing* to
-    allocate one more segment. PG can still write catalog/stat pages; what it
-    cannot do is roll to the next WAL file.
-    DOES NOT PROVE: anything unless the node state volume is size-bounded.
-    Requires ``PGBATTERY_STATE_SUFFIX=_bounded`` (see ``docker-compose.yml``);
-    against the unbounded default it refuses to run rather than fill a host
-    disk.
-
-═══════════════════════════════════════════════════════════════════════════
-DERIVED TIMINGS, NOT HAND-TUNED SLEEPS
-═══════════════════════════════════════════════════════════════════════════
-
-Fault durations that need to straddle a system boundary read that boundary from
-the Rust source instead of hard-coding it: :func:`read_system_timings` parses
-``src/config/constants.rs`` and ``src/governor/lease.rs`` (and lets
-``config/node1.toml`` override the Raft knobs it pins, because that is what the
-running cluster uses). :func:`sweep_around` turns a boundary into a set of
-durations either side of it, so a caller sweeps 0.5x / 0.9x / 1.0x / 1.1x / 2.0x
-of the lease rather than guessing. A rename in the Rust source makes
-:func:`read_system_timings` raise, so the harness cannot silently keep using a
-stale constant.
-
-═══════════════════════════════════════════════════════════════════════════
-SUBSTRATE FACTS THIS MODULE RELIES ON
-═══════════════════════════════════════════════════════════════════════════
-
-  - **``iptables`` is not installed in the image.** The Dockerfile installs
-    ``tini libfaketime iproute2 procps curl`` on top of ``postgres:18``; there
-    is no iptables binary. Directional drops here are built from ``tc``, which
-    is present: an ``ingress`` qdisc plus a ``u32``/``gact`` filter is the exact
-    equivalent of ``iptables -I INPUT -s <ip> -j DROP``, and a ``prio`` band fed
-    by ``netem loss 100%`` is the egress equivalent.
-  - **``tc`` needs ``--user root``.** ``cap_add: [NET_ADMIN]`` grants the
-    capability to the container, but the image runs as ``postgres``; a non-root
-    exec has no effective NET_ADMIN.
-  - **libfaketime offsets must be written in fractional seconds.** ``+250ms`` is
-    parsed as *250 minutes* (``m`` is the minute suffix, the trailing ``s`` is
-    ignored). :func:`faketime_offset_literal` only ever emits seconds with a
-    decimal fraction, and refuses to emit ``ms``.
-  - **``ping`` is not installed either.** Reachability probes use ``curl``
-    against a peer's management port: exit 7 means the SYN reached a closed or
-    refused socket, exit 28 means it was blackholed.
-
-═══════════════════════════════════════════════════════════════════════════
-RELATIONSHIP TO THE OTHER TWO FAULT VOCABULARIES
-═══════════════════════════════════════════════════════════════════════════
-
-Three fault vocabularies exist in this tree and they have drifted apart:
-
-  - ``ci_runner.py``'s ``StepType`` enum — 24 step types, of which
-    ``asymmetric_partition`` / ``asymmetric_heal`` / ``clock_skew`` /
-    ``clock_heal`` / ``network_delay`` / ``network_heal`` are faults.
-  - ``linearizability_register.py``'s ``ATTACK_DISPATCH`` — 16 live attacks plus
-    2 scaffolds (``fsync_drop``, ``bit_flip``).
-  - this module.
-
-They overlap but do not agree: the CI runner's ``network_delay`` has delay and
-jitter but no loss at all, its fault steps exec without ``--user root``, both of
-the others build asymmetric partitions from an ``iptables`` binary the image
-does not contain, and ``ATTACK_DISPATCH``'s cleanup never SIGCONTs a process
-that a crashed test left stopped. This module is the vocabulary intended to be
-shared; :func:`scrub` deliberately cleans up residue from all three (including
-the legacy ``_chaos_fill.bin`` filler path) so nothing leaks between runs.
+Also overlaps ``ci_runner`` ``StepType`` and ``linearizability_register``
+``ATTACK_DISPATCH``; prefer this module. :func:`scrub` cleans residue from all
+three.
 """
 
 from __future__ import annotations
@@ -802,13 +679,14 @@ class PinnedTimings(pydantic.BaseModel):
     """The timing keys a node config may override.
 
     Everything else in the file is ignored on purpose — this model exists to
-    give the two values that matter a declared type at the point they are read.
+    give the values that matter a declared type at the point they are read.
     """
 
     model_config = pydantic.ConfigDict(extra="ignore")
 
     election_timeout_ms: int | None = None
     heartbeat_interval_ms: int | None = None
+    replica_disconnect_timeout_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -829,6 +707,17 @@ class SystemTimings:
     lsn_staleness_threshold_ms: int
     leadership_transfer_lease_safety_ms: int
     slot_ensure_interval_ms: int
+    replica_check_interval_ms: int
+    """How often the replication manager reconciles the sync list. Also the
+    period in which it re-commits `SetSyncMode` after a leadership change or a
+    mode transition, so it bounds how long the replicated flag may trail the
+    live GUC."""
+
+    replica_disconnect_timeout_ms: int
+    """How long the leader tolerates no healthy standby before falling back to
+    asynchronous replication, which is what makes the replicated flag go
+    `false` in the first place."""
+
     election_timeout_source: str
     """``constants.rs`` or the config file that overrides it."""
 
@@ -963,6 +852,7 @@ def read_system_timings(repo_root: Path | None = None) -> SystemTimings:
 
     election_ms = parse_rust_u64_const(constants, "DEFAULT_ELECTION_TIMEOUT_MS")
     heartbeat_ms = parse_rust_u64_const(constants, "DEFAULT_HEARTBEAT_INTERVAL_MS")
+    disconnect_ms = parse_rust_u64_const(constants, "REPLICA_DISCONNECT_TIMEOUT_MS")
     election_source = "src/config/constants.rs"
 
     node_config = root / "config" / "node1.toml"
@@ -978,6 +868,8 @@ def read_system_timings(repo_root: Path | None = None) -> SystemTimings:
             election_source = "config/node1.toml"
         if pinned.heartbeat_interval_ms is not None:
             heartbeat_ms = pinned.heartbeat_interval_ms
+        if pinned.replica_disconnect_timeout_ms is not None:
+            disconnect_ms = pinned.replica_disconnect_timeout_ms
 
     return SystemTimings(
         lease_duration_ms=parse_rust_duration_const_ms(lease, "DEFAULT_LEASE_DURATION"),
@@ -995,6 +887,8 @@ def read_system_timings(repo_root: Path | None = None) -> SystemTimings:
             constants, "REPLICATION_SLOT_ENSURE_INTERVAL_SECS"
         )
         * 1_000,
+        replica_check_interval_ms=parse_rust_u64_const(constants, "REPLICA_CHECK_INTERVAL_MS"),
+        replica_disconnect_timeout_ms=disconnect_ms,
         election_timeout_source=election_source,
     )
 

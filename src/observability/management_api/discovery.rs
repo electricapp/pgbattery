@@ -75,14 +75,8 @@ pub struct PeerInfo {
 
 /// Get current leader.
 ///
-/// Truth source: `openraft::RaftMetrics::current_leader`. The
-/// `cluster_state.leader_id` field is the Raft-log-applied mirror and
-/// lags `RaftMetrics` during transitions; it also keeps its last value
-/// after `RaftCore` shuts down, which can produce stale "I am leader"
-/// responses from a node whose Raft is no longer running.
-///
-/// We only use `cluster_state` here for the `id → addresses` lookup —
-/// the node metadata map. The *who* answer comes from openraft.
+/// Truth source: `openraft::RaftMetrics::current_leader`. `cluster_state` is
+/// used only for the `id → addresses` lookup on the membership map.
 pub(super) async fn get_leader(
     State(state): State<Arc<ManagementApiState>>,
 ) -> Json<LeaderResponse> {
@@ -114,33 +108,7 @@ pub(super) async fn get_leader(
 
 /// Get all nodes with their management addresses (for CLI auto-discovery).
 ///
-/// Same truth-source discipline as [`get_leader`]: `leader_id` is read
-/// from `RaftMetrics::current_leader` (live), never from
-/// `cluster_state.leader_id` (the Raft-log-applied mirror — lags during
-/// transitions and persists after `RaftCore` shutdown).
-/// Report which cluster this node's data belongs to.
-///
-/// Read from the control file rather than from a running `PostgreSQL`: the
-/// caller that needs this is deciding, at startup, whether the cluster
-/// answering it is its own, and neither end is necessarily serving yet.
-pub(super) async fn get_cluster_identity(
-    State(state): State<Arc<ManagementApiState>>,
-) -> Json<ClusterIdentityResponse> {
-    let cluster_lineage = match &state.pg_paths {
-        Some(paths) => crate::supervisor::read_system_identifier(&paths.bin_dir, &paths.data_dir)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Could not read this node's cluster lineage");
-                None
-            }),
-        None => None,
-    };
-    Json(ClusterIdentityResponse {
-        node_id: state.node_id,
-        cluster_lineage,
-    })
-}
-
+/// Same truth-source discipline as [`get_leader`]: `RaftMetrics::current_leader`.
 pub(super) async fn get_nodes(State(state): State<Arc<ManagementApiState>>) -> Json<NodesResponse> {
     let leader_id = state.raft.metrics().borrow().current_leader;
     let cluster_state = state.cluster_state.read();
@@ -165,10 +133,32 @@ pub(super) async fn get_nodes(State(state): State<Arc<ManagementApiState>>) -> J
     Json(NodesResponse { nodes })
 }
 
+/// Report which cluster this node's data belongs to.
+///
+/// Read from the control file rather than from a running `PostgreSQL`: the
+/// caller that needs this is deciding, at startup, whether the cluster
+/// answering it is its own, and neither end is necessarily serving yet.
+pub(super) async fn get_cluster_identity(
+    State(state): State<Arc<ManagementApiState>>,
+) -> Json<ClusterIdentityResponse> {
+    let cluster_lineage = match &state.pg_paths {
+        Some(paths) => crate::supervisor::read_system_identifier(&paths.bin_dir, &paths.data_dir)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Could not read this node's cluster lineage");
+                None
+            }),
+        None => None,
+    };
+    Json(ClusterIdentityResponse {
+        node_id: state.node_id,
+        cluster_lineage,
+    })
+}
+
 /// Get join info for simplified cluster joining.
 ///
-/// Same truth-source discipline as [`get_leader`]: live `RaftMetrics`,
-/// not the cached `cluster_state.leader_id`.
+/// Same truth-source discipline as [`get_leader`]: live `RaftMetrics`.
 pub(super) async fn get_join_info(
     State(state): State<Arc<ManagementApiState>>,
 ) -> Json<JoinInfoResponse> {

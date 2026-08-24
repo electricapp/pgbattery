@@ -27,10 +27,9 @@ Checks:
     5. Every case ID referenced by a suite exists in the ``cases`` list.
     6. All ``.sql`` files are non-empty valid UTF-8.
     7. No duplicate case IDs in the matrix.
-    8. ``docs/CONTRACTS.md`` still defines parseable contract IDs.
-    9. Every case declares at least one contract ID, and every declared ID is
-       defined in ``docs/CONTRACTS.md`` — the policy that doc states but that
-       nothing enforced while ``contracts`` was an undeclared field.
+    8. ``docs/contracts.yaml`` defines contract IDs / severities / inversions;
+       ``docs/CONTRACTS.md`` headings stay in sync for prose contracts.
+    9. Every case declares at least one contract ID from the registry.
 
 Exit codes:
     0: All checks passed.
@@ -40,8 +39,10 @@ Exit codes:
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import re
+import tomllib
 from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
@@ -66,6 +67,9 @@ LINEARIZABILITY_PATH = TESTING_DIR / "linearizability_register.py"
 ELLE_MATRIX_PATH = TESTING_DIR / "run_elle_matrix.sh"
 UNIT_TEST_PATH = TESTING_DIR / "test_ci_runner_units.py"
 CONTRACTS_PATH = PROJECT_ROOT / "docs" / "CONTRACTS.md"
+CONTRACTS_REGISTRY_PATH = PROJECT_ROOT / "docs" / "contracts.yaml"
+STATE_MACHINE_INVENTORY_PATH = PROJECT_ROOT / "docs" / "state_machine_inventory.toml"
+TLA_CODE_MAP_PATH = PROJECT_ROOT / "tla" / "code_map.toml"
 
 DEFAULT_TRANSFER_RETRY_SEC = 60
 """`ci_runner.py`'s default `retry_sec` for a transfer_leadership step."""
@@ -238,20 +242,41 @@ def check_no_duplicate_case_ids() -> None:
 # ---------------------------------------------------------------------------
 
 
-def extract_contract_ids(markdown: str) -> set[str]:
-    """Collect the contract IDs defined by ``docs/CONTRACTS.md``.
+def load_contracts_registry() -> dict[str, dict[str, Any]]:
+    """Contract id → {severity, title, inversions, prose?} from contracts.yaml."""
+    if not CONTRACTS_REGISTRY_PATH.exists():
+        raise AssertionError(f"{CONTRACTS_REGISTRY_PATH} not found")
+    raw = yaml.safe_load(CONTRACTS_REGISTRY_PATH.read_text(encoding="utf-8"))
+    contracts = raw.get("contracts") if isinstance(raw, dict) else None
+    if not isinstance(contracts, dict) or not contracts:
+        raise AssertionError(f"{CONTRACTS_REGISTRY_PATH} has no contracts: map")
+    out: dict[str, dict[str, Any]] = {}
+    for cid, body in contracts.items():
+        if not isinstance(cid, str) or not isinstance(body, dict):
+            raise AssertionError(f"bad contract entry {cid!r}")
+        severity = body.get("severity")
+        if severity not in {"FATAL", "SLO"}:
+            raise AssertionError(f"{cid}: severity must be FATAL or SLO, got {severity!r}")
+        inversions = body.get("inversions") or []
+        if not isinstance(inversions, list) or not all(isinstance(x, str) for x in inversions):
+            raise AssertionError(f"{cid}: inversions must be a list of strings")
+        out[cid] = {
+            "severity": severity,
+            "title": body.get("title", cid),
+            "inversions": inversions,
+            "prose": body.get("prose", True),
+        }
+    return out
 
-    A contract is defined by an ``### <ID> — <title>`` heading; the
-    contract-to-test index table at the bottom of the doc is derived from those
-    headings and is deliberately not treated as a definition site.
 
-    Args:
-        markdown: Contents of ``docs/CONTRACTS.md``.
-
-    Returns:
-        Set of contract IDs (e.g. ``{"W1", "L2", "R1"}``).
-    """
+def extract_contract_ids_from_prose(markdown: str) -> set[str]:
+    """`### <ID>` headings in CONTRACTS.md (human prose, synced to the registry)."""
     return set(CONTRACT_HEADING_PATTERN.findall(markdown))
+
+
+def extract_contract_ids(_markdown: str | None = None) -> set[str]:
+    """Contract IDs the matrix may cite — from the YAML registry."""
+    return set(load_contracts_registry())
 
 
 def _format_case_list(case_ids: list[str]) -> str:
@@ -263,19 +288,7 @@ def _format_case_list(case_ids: list[str]) -> str:
 
 
 def collect_contract_violations(cases: list[dict[str, Any]], known_ids: set[str]) -> list[str]:
-    """Check every case against the contract-reference policy.
-
-    Policy (stated by ``docs/CONTRACTS.md``): every CI test case must reference
-    at least one contract ID, and every referenced ID must be a contract the doc
-    actually defines.
-
-    Args:
-        cases: Raw case dicts from the matrix.
-        known_ids: Contract IDs defined in ``docs/CONTRACTS.md``.
-
-    Returns:
-        Actionable violation messages (empty when the policy holds).
-    """
+    """Check every case against the contract-reference policy."""
     missing: list[str] = []
     malformed: list[str] = []
     unknown: list[str] = []
@@ -297,8 +310,8 @@ def collect_contract_violations(cases: list[dict[str, Any]], known_ids: set[str]
         violations.append(
             f"{len(missing)} case(s) declare no contracts. Add "
             f'"contracts": ["W1", ...] to each case in testing/ci_matrix.yaml '
-            f"(docs/CONTRACTS.md: every CI test case must reference at least one "
-            f"contract ID). Cases: {_format_case_list(missing)}"
+            f"({CONTRACTS_REGISTRY_PATH.name}: every CI test case must reference "
+            f"at least one contract ID). Cases: {_format_case_list(missing)}"
         )
     if malformed:
         violations.append(
@@ -307,28 +320,41 @@ def collect_contract_violations(cases: list[dict[str, Any]], known_ids: set[str]
         )
     if unknown:
         violations.append(
-            f"{len(unknown)} case(s) reference contract IDs that docs/CONTRACTS.md does not "
-            f"define: {_format_case_list(unknown)}. Defined IDs: {sorted(known_ids)}"
+            f"{len(unknown)} case(s) reference contract IDs that "
+            f"{CONTRACTS_REGISTRY_PATH.name} does not define: "
+            f"{_format_case_list(unknown)}. Defined IDs: {sorted(known_ids)}"
         )
     return violations
 
 
 def check_contracts_doc() -> None:
-    """Verify docs/CONTRACTS.md exists and still yields parseable contract IDs."""
+    """Registry exists, yields IDs, and prose headings stay in sync."""
+    registry = load_contracts_registry()
+    if not registry:
+        raise AssertionError(f"no contracts in {CONTRACTS_REGISTRY_PATH}")
     if not CONTRACTS_PATH.exists():
         raise AssertionError(f"{CONTRACTS_PATH} not found")
-    ids = extract_contract_ids(CONTRACTS_PATH.read_text(encoding="utf-8"))
-    if not ids:
-        raise AssertionError(
-            f"no '### <ID> — <title>' contract headings found in {CONTRACTS_PATH}; "
-            f"the contract-reference lint cannot run against an empty contract set"
+    prose_ids = extract_contract_ids_from_prose(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    expected_prose = {cid for cid, meta in registry.items() if meta.get("prose", True)}
+    missing_headings = sorted(expected_prose - prose_ids)
+    extra_headings = sorted(prose_ids - set(registry))
+    problems: list[str] = []
+    if missing_headings:
+        problems.append(
+            f"{CONTRACTS_PATH.name} missing ### headings for registry IDs: {missing_headings}"
         )
+    if extra_headings:
+        problems.append(
+            f"{CONTRACTS_PATH.name} has ### headings not in the registry: {extra_headings}"
+        )
+    if problems:
+        raise AssertionError(" | ".join(problems))
 
 
 def check_case_contract_refs() -> None:
     """Enforce the contract-reference policy on every case in the matrix."""
     data = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
-    known_ids = extract_contract_ids(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    known_ids = extract_contract_ids()
     violations = collect_contract_violations(data["cases"], known_ids)
     if violations:
         raise AssertionError(" | ".join(violations))
@@ -410,42 +436,45 @@ def count_raw_fault_verbs(source: str) -> list[int]:
     )
 
 
-CONTRACT_INDEX_ROW: Final[re.Pattern[str]] = re.compile(r"^\|(?P<cells>.+)\|\s*$")
-
-
-def parse_contract_index(markdown: str) -> list[list[str]]:
-    """Rows of the Contract-to-Test Index, cells stripped.
-
-    Header and separator rows are dropped, as is anything before the index
-    heading, so prose tables elsewhere in the document cannot be mistaken for
-    coverage declarations.
-    """
-    rows: list[list[str]] = []
-    _, _, tail = markdown.partition("## Contract-to-Test Index")
-    for line in tail.splitlines():
-        match = CONTRACT_INDEX_ROW.match(line.strip())
-        if match is None:
-            if rows:
-                break  # table ended
+def check_fatal_contracts_have_inversions() -> None:
+    """Every FATAL contract in the registry must name resolvable inversions."""
+    registry = load_contracts_registry()
+    case_ids = {str(case.get("id", "")) for case in json.loads(MATRIX_PATH.read_text())["cases"]}
+    fn_names = _known_test_function_names()
+    problems: list[str] = []
+    fatal_seen = 0
+    resolved_any = False
+    for cid, meta in sorted(registry.items()):
+        if meta["severity"] != "FATAL":
             continue
-        cells = [cell.strip() for cell in match.group("cells").split("|")]
-        if all(set(cell) <= {"-", ":"} for cell in cells if cell):
-            continue  # separator
-        rows.append(cells)
-    return rows[1:] if rows else []
+        fatal_seen += 1
+        inversions: list[str] = meta["inversions"]
+        if not inversions:
+            problems.append(f"{cid} is FATAL with no inversion")
+            continue
+        dangling = [
+            name
+            for name in inversions
+            if name not in case_ids and name not in fn_names and not (PROJECT_ROOT / name).exists()
+        ]
+        if dangling:
+            problems.append(
+                f"{cid}'s inversion points at {dangling}, which no longer exist "
+                f"as matrix cases, files, or functions"
+            )
+        else:
+            resolved_any = True
+    if fatal_seen == 0:
+        raise AssertionError("no FATAL contracts in the registry; the check would pass vacuously")
+    if not resolved_any and not problems:
+        raise AssertionError("no inversion reference resolved; the resolver is not working")
+    if problems:
+        raise AssertionError("; ".join(problems))
 
 
+# Kept for unit tests / callers that still expand brace groups in strings.
 BACKTICKED: Final[re.Pattern[str]] = re.compile(r"`([^`]+)`")
-"""Identifiers in the index are backticked; surrounding prose is not.
-
-Only backticked tokens are resolved. Prose like "LSN-gate proptest" is a
-pointer for a human and is not claimed to be a name, so demanding it resolve
-would push authors into deleting the context instead of writing it.
-"""
-
 BRACE_GROUP: Final[re.Pattern[str]] = re.compile(r"^(.*)\{([^}]*)\}(.*)$")
-"""`assert-sanity-chaos-oracle{,-post,-full}` names three cases."""
-
 TEST_FN: Final[re.Pattern[str]] = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?(?:fn|def)\s+(\w+)")
 
 
@@ -459,11 +488,7 @@ def expand_braces(token: str) -> list[str]:
 
 
 def _known_test_function_names() -> set[str]:
-    """Every Rust and Python function name in the tree.
-
-    Broader than "test functions" on purpose: an inversion may point at a
-    helper, and the question being asked is only whether the name still exists.
-    """
+    """Every Rust and Python function name in the tree."""
     names: set[str] = set()
     roots = (PROJECT_ROOT / "src", PROJECT_ROOT / "crates", TESTING_DIR)
     for root in roots:
@@ -477,82 +502,6 @@ def _known_test_function_names() -> set[str]:
                 if found:
                     names.add(found.group(1))
     return names
-
-
-def unresolved_inversion_refs(inversion: str, case_ids: set[str], fn_names: set[str]) -> list[str]:
-    """Backticked names in an inversion cell that resolve to nothing.
-
-    A name resolves as a matrix case ID, a path that exists, or a function
-    defined somewhere in the tree. Anything else is a dangling pointer: the
-    case was renamed or deleted and the contract's claim to have a working
-    oracle went stale without anything noticing.
-    """
-    dangling: list[str] = []
-    for quoted in BACKTICKED.findall(inversion):
-        for token in expand_braces(quoted.strip()):
-            name = token.strip()
-            if not name:
-                continue
-            if name in case_ids or name in fn_names or (PROJECT_ROOT / name).exists():
-                continue
-            dangling.append(name)
-    return dangling
-
-
-def check_fatal_contracts_have_inversions() -> None:
-    """Every FATAL contract must name a case proving its oracle can fail, and
-    that case must still exist.
-
-    A test that has only ever passed cannot be told apart from one that cannot
-    fail, and a suite of those reports PASS on a broken cluster. Checking only
-    that the cell is non-empty made this table a promise nothing kept: a
-    renamed or deleted inversion left the contract still claiming coverage.
-    Every backticked name here is resolved against the matrix, the filesystem,
-    and the function names in the tree.
-    """
-    rows = parse_contract_index(CONTRACTS_PATH.read_text(encoding="utf-8"))
-    if not rows:
-        raise AssertionError("Contract-to-Test Index not found or unparseable")
-
-    case_ids = {str(case.get("id", "")) for case in json.loads(MATRIX_PATH.read_text())["cases"]}
-    fn_names = _known_test_function_names()
-
-    problems: list[str] = []
-    fatal_seen = 0
-    resolved_any = False
-    for cells in rows:
-        if len(cells) < 4:
-            problems.append(f"row has {len(cells)} columns, expected 4: {cells[:1]}")
-            continue
-        contract, severity, _tests, inversion = cells[0], cells[1], cells[2], cells[3]
-        if severity != "FATAL":
-            continue
-        fatal_seen += 1
-        if not inversion or inversion == "—":
-            problems.append(f"{contract} is FATAL with no inversion")
-            continue
-        if not BACKTICKED.findall(inversion):
-            problems.append(
-                f"{contract}'s inversion names nothing checkable: {inversion!r}. "
-                f"Backtick the case ID, test function, or file that proves the "
-                f"oracle can fail."
-            )
-            continue
-        dangling = unresolved_inversion_refs(inversion, case_ids, fn_names)
-        if dangling:
-            problems.append(
-                f"{contract}'s inversion points at {dangling}, which no longer exist "
-                f"as matrix cases, files, or functions"
-            )
-        else:
-            resolved_any = True
-
-    if fatal_seen == 0:
-        raise AssertionError("no FATAL rows parsed; the check would pass vacuously")
-    if not resolved_any and not problems:
-        raise AssertionError("no inversion reference resolved; the resolver is not working")
-    if problems:
-        raise AssertionError("; ".join(problems))
 
 
 def cluster_topology_mismatches(cluster: dict[str, Any], derived: topology.Topology) -> list[str]:
@@ -1040,6 +989,11 @@ def check_fault_injection_confined() -> None:
         raise AssertionError(" | ".join(problems))
 
 
+MARKDOWN_LINK_PATH = re.compile(
+    r"\[[^\]]*\]\(([^)\s]+\.(?:md|py|rs|sql|tla|toml|ya?ml|sh))(?:#[^)]*)?\)"
+)
+"""Explicit markdown links in prose docs — not freeform path tokens."""
+
 FILE_REFERENCE = re.compile(
     r"(?<![\w./-])((?:[\w.-]+/)*[\w.-]+\.(?:md|py|rs|sql|tla|toml|ya?ml|sh))(?![\w/])"
 )
@@ -1357,115 +1311,60 @@ def check_harness_derives_cluster_ports() -> None:
 
 
 def check_prose_file_references_resolve() -> None:
-    """Verify every file the prose docs name is in the repository.
+    """Markdown links in selected docs must name files that exist.
 
-    Documentation only ever appended to accumulates paths for files that have
-    since moved or gone, and a re-read finds them once. This finds them on every
-    push, which is the difference between an audit and a property.
+    Freeform `foo.md` tokens are not scanned — that froze essay wording.
+    Case text still uses FILE_REFERENCE via check_case_cross_references_resolve.
     """
     rel_paths, basenames = repo_file_index()
-    problems = []
+    problems: list[str] = []
     for doc in PROSE_DOCS:
-        text = (PROJECT_ROOT / doc).read_text(encoding="utf-8")
-        refs = file_references(text) - set(PROSE_REFERENCE_EXEMPT)
-        if unresolved := unresolved_file_references(refs, rel_paths, basenames):
-            problems.append(f"{doc}: {', '.join(unresolved)}")
+        content = (PROJECT_ROOT / doc).read_text(encoding="utf-8")
+        refs = set(MARKDOWN_LINK_PATH.findall(content))
+        dangling = unresolved_file_references(refs, rel_paths, basenames)
+        # Apply exemptions
+        dangling = [
+            r
+            for r in dangling
+            if r not in PROSE_REFERENCE_EXEMPT and Path(r).name not in PROSE_REFERENCE_EXEMPT
+        ]
+        if dangling:
+            problems.append(f"{doc}: {dangling}")
     if problems:
-        raise AssertionError(
-            "documentation names files that are not in the repository — " + " | ".join(problems)
-        )
+        raise AssertionError("prose docs link to missing files — " + " | ".join(problems))
 
 
-STATE_MACHINE_DOC: Final[str] = "docs/STATE_MACHINE.md"
-
-RUST_SOURCE_DIRS: Final[tuple[str, ...]] = ("src", "crates")
-
-STATE_MACHINE_FOREIGN_TYPES: Final[dict[str, str]] = {
-    "RaftMetrics": "openraft",
-    "Instant": "std::time",
-    "Child": "tokio::process",
-    "SocketAddr": "std::net",
-    "Drop": "std::ops",
-    "None": "the Option variant, not a type of ours",
-    "Some": "the same",
-    "SelectStmt": "a libpg_query parse node",
-    "ExplainStmt": "the same",
-    "PostgreSQL": "the database, written as a name rather than a type",
-    "Database": "from the `Database system identifier` field of pg_controldata",
-    "Fence": "from the `Fence not applied` log line",
-    "RestampAnchorOnCampaign": "an action in tla/lease_fencing.tla, not Rust",
-    "Stopped": "section 3's PostgreSQL role is a model, not an enum: it is derived "
-    "from pg_is_in_recovery() and PostmasterState, and no type spells it",
-    "Starting": "the same",
-    "Primary": "the same",
-    "Standby": "the same",
-    "Recovering": "the same",
-}
-"""CamelCase names the state-machine doc uses that are not our types.
-
-Each is written down rather than filtered by shape, so the check can say which
-of our types has gone missing instead of quietly widening to cover it.
-"""
+def load_state_machine_inventory() -> dict[str, Any]:
+    """Owned types/enums/foreign names from state_machine_inventory.toml."""
+    if not STATE_MACHINE_INVENTORY_PATH.exists():
+        raise AssertionError(f"{STATE_MACHINE_INVENTORY_PATH} not found")
+    data = tomllib.loads(STATE_MACHINE_INVENTORY_PATH.read_text(encoding="utf-8"))
+    enums = data.get("enums") or {}
+    types = data.get("types") or []
+    foreign = data.get("foreign") or {}
+    if not isinstance(enums, dict) or not isinstance(types, list) or not isinstance(foreign, dict):
+        raise AssertionError(f"{STATE_MACHINE_INVENTORY_PATH}: bad shape")
+    return {"enums": enums, "types": types, "foreign": foreign}
 
 
+# Retained for unit tests that exercise CamelCase detection.
 def is_rust_type_name(token: str) -> bool:
-    """Whether a token from the doc is shaped like one of our type names.
-
-    CamelCase and nothing else. An all-caps token is an acronym the prose uses
-    (`WAL`, `GUC`, `RPO`) or a SQL keyword from a quoted query, and neither is
-    a type this document could have renamed.
-    """
     return token.isidentifier() and token[:1].isupper() and not token.isupper()
 
 
 def without_string_literals(line: str) -> str:
-    """A Rust line with its double-quoted spans removed.
-
-    Brace counting has to skip them: `#[error("... {conn_id} ...")]` sits
-    between an enum's variants and would otherwise close the enum early,
-    hiding every variant after it.
-    """
     pieces = line.split('"')
     return "".join(piece for index, piece in enumerate(pieces) if index % 2 == 0)
 
 
-def doc_tokens(spans: Iterable[str]) -> set[str]:
-    """The identifiers a set of markdown code spans names.
-
-    Paths and call syntax are separators, so `Error::RewindFailed` and
-    `Some(true)` each yield the names inside them rather than themselves.
-    """
-    tokens: set[str] = set()
-    for span in spans:
-        for raw in span.replace("::", " ").replace("(", " ").replace(")", " ").split():
-            tokens.add(raw.strip(".,;:*_`'\"!?"))
-    return tokens
-
-
 def rust_sources() -> list[Path]:
-    """Every Rust file in the workspace, tests included."""
     files: list[Path] = []
-    for directory in RUST_SOURCE_DIRS:
+    for directory in ("src", "crates"):
         files.extend(sorted((PROJECT_ROOT / directory).rglob("*.rs")))
     return files
 
 
-def code_spans(markdown: str) -> list[str]:
-    """The backtick-delimited spans of a markdown document.
-
-    Split on backticks and take the odd pieces: the doc uses single backticks
-    throughout, and a span never crosses a blank line, so this is the whole of
-    its inline-code grammar.
-    """
-    spans: list[str] = []
-    for block in markdown.split("\n\n"):
-        pieces = block.split("`")
-        spans.extend(piece for index, piece in enumerate(pieces) if index % 2 == 1)
-    return spans
-
-
 def declared_types(sources: Iterable[Path]) -> dict[str, Path]:
-    """Every `enum`, `struct` and `trait` the workspace defines, to its file."""
     keywords = ("enum ", "struct ", "trait ", "type ")
     found: dict[str, Path] = {}
     for path in sources:
@@ -1483,16 +1382,10 @@ def declared_types(sources: Iterable[Path]) -> dict[str, Path]:
 
 
 def enum_variant_index(sources: Iterable[Path]) -> dict[str, set[str]]:
-    """Every enum the workspace defines, mapped to its variant names.
-
-    Scanned by brace depth from each `enum` line: a variant is an identifier at
-    depth one that starts a line, which covers the fieldless, tuple and struct
-    forms alike without needing to understand any of their bodies.
-    """
     index: dict[str, set[str]] = {}
     for path in sources:
         lines = path.read_text(encoding="utf-8").splitlines()
-        for start, line in enumerate(lines):
+        for start_i, line in enumerate(lines):
             stripped = line.strip().removeprefix("pub(crate) ").removeprefix("pub ")
             if not stripped.startswith("enum "):
                 continue
@@ -1502,7 +1395,7 @@ def enum_variant_index(sources: Iterable[Path]) -> dict[str, set[str]]:
             variants: set[str] = set()
             depth = 0
             opened = False
-            for body_line in lines[start:]:
+            for body_line in lines[start_i:]:
                 if depth == 1:
                     head = body_line.strip().split("(")[0].split("{")[0].split(",")[0].strip()
                     if head[:1].isupper() and head.isidentifier():
@@ -1517,94 +1410,84 @@ def enum_variant_index(sources: Iterable[Path]) -> dict[str, set[str]]:
 
 
 def check_state_machine_names_resolve() -> None:
-    """Every type the canonical state-machine doc names must still exist.
-
-    The doc is the reference a reader consults when the code and their
-    expectation disagree, so a type it describes that no longer exists is a
-    wrong answer given with confidence — and the way that happens is a rename
-    landing in the code alone.
-    """
+    """Every type in the inventory must still exist in the workspace."""
+    inv = load_state_machine_inventory()
     sources = rust_sources()
     variants = enum_variant_index(sources)
     known = declared_types(sources).keys() | set().union(*variants.values(), set())
-    text = (PROJECT_ROOT / STATE_MACHINE_DOC).read_text(encoding="utf-8")
-    missing = {
+    foreign = set(inv["foreign"])
+    missing = sorted(
         token
-        for token in doc_tokens(code_spans(text))
-        if is_rust_type_name(token)
-        and token not in known
-        and token not in STATE_MACHINE_FOREIGN_TYPES
-    }
+        for token in inv["types"]
+        if is_rust_type_name(token) and token not in known and token not in foreign
+    )
     if missing:
         raise AssertionError(
-            f"{STATE_MACHINE_DOC} names types the workspace does not define: "
-            f"{', '.join(sorted(missing))} — rename them in the doc, or add a foreign "
-            "name to STATE_MACHINE_FOREIGN_TYPES with its origin"
+            f"{STATE_MACHINE_INVENTORY_PATH.name} names types the workspace does not define: "
+            f"{', '.join(missing)}"
         )
 
 
 def check_state_machine_describes_whole_enums() -> None:
-    """An enum the canonical doc discusses must have all its variants described.
-
-    This is the drift the maintenance rule alone did not stop: a new variant
-    lands in the code, the commit adds a prose bullet about the behaviour, and
-    the state list the doc leads with silently stops being the set of states.
-
-    The claim is made by naming the enum **on its own** — a bare `StandbyAction`
-    says "this document describes that state machine", and every state it has
-    has to appear. A qualified mention (`Error::ForeignDataDirectory`) is a
-    citation of one variant and claims nothing about the rest, which is what
-    keeps this off the wide enums the doc only ever cites into.
-    """
+    """Inventory enums must list every Rust variant."""
+    inv = load_state_machine_inventory()
     index = enum_variant_index(rust_sources())
-    text = (PROJECT_ROOT / STATE_MACHINE_DOC).read_text(encoding="utf-8")
-    spans = code_spans(text)
-    named = {span.strip() for span in spans if is_rust_type_name(span.strip())}
-    mentioned = doc_tokens(spans)
     problems = []
-    for name in sorted(named & index.keys()):
-        if undescribed := sorted(index[name] - mentioned):
-            problems.append(f"{name}: {', '.join(undescribed)}")
+    for name, listed in sorted(inv["enums"].items()):
+        listed_set = set(listed)
+        if name not in index:
+            problems.append(f"{name}: not an enum in the workspace")
+            continue
+        if undescribed := sorted(index[name] - listed_set):
+            problems.append(f"{name}: missing variants {', '.join(undescribed)}")
+        if extra := sorted(listed_set - index[name]):
+            problems.append(f"{name}: inventory lists unknown variants {', '.join(extra)}")
     if problems:
         raise AssertionError(
-            f"{STATE_MACHINE_DOC} discusses these state machines without describing "
-            "every state they have — " + " | ".join(problems)
+            f"{STATE_MACHINE_INVENTORY_PATH.name} enum inventory drift — " + " | ".join(problems)
         )
 
 
 def check_state_machine_foreign_names_are_still_needed() -> None:
-    """No exemption may name a type the workspace now defines, or nothing cites.
-
-    An exemption that has outlived its reason is a hole in the two checks
-    above, which is the same failure they exist to catch, one level up.
-    """
+    """Foreign exemptions must not name a type the workspace now defines."""
+    # Unit tests may patch STATE_MACHINE_FOREIGN_TYPES; otherwise read inventory.
+    foreign = STATE_MACHINE_FOREIGN_TYPES or load_state_machine_inventory()["foreign"]
     known = declared_types(rust_sources())
-    text = (PROJECT_ROOT / STATE_MACHINE_DOC).read_text(encoding="utf-8")
-    cited = doc_tokens(code_spans(text))
-    stale = sorted(name for name in STATE_MACHINE_FOREIGN_TYPES if name in known)
-    uncited = sorted(name for name in STATE_MACHINE_FOREIGN_TYPES if name not in cited)
-    problems = []
+    stale = sorted(name for name in foreign if name in known)
     if stale:
-        problems.append(f"now defined in the workspace: {', '.join(stale)}")
-    if uncited:
-        problems.append(f"no longer named by the doc: {', '.join(uncited)}")
-    if problems:
         raise AssertionError(
-            "STATE_MACHINE_FOREIGN_TYPES entries have outlived their reason — "
-            + " | ".join(problems)
+            "foreign type exemptions now defined in the workspace: " + ", ".join(stale)
         )
 
 
-def check_prose_exemptions_are_still_needed() -> None:
-    """Verify no exemption names a file that now exists, or that nothing cites.
+# Patched by unit tests; populated from inventory at import when available.
+# Only a missing file is tolerated: an inventory that exists and cannot be read
+# must raise, because an empty exemption set makes the staleness check below
+# pass having nothing to check.
+STATE_MACHINE_FOREIGN_TYPES: dict[str, str] = {}
+with contextlib.suppress(FileNotFoundError):
+    STATE_MACHINE_FOREIGN_TYPES = dict(load_state_machine_inventory()["foreign"])
 
-    An exemption that has outlived its reason is a hole in the check above,
-    kept open by a line nobody reads.
-    """
+
+def check_no_cluster_state_leader_projection() -> None:
+    """ClusterState must not grow local leader_id/leader_addr projections again."""
+    sm = (PROJECT_ROOT / "src/governor/state_machine.rs").read_text(encoding="utf-8")
+    if "pub leader_id:" in sm or "pub leader_addr:" in sm:
+        raise AssertionError(
+            "ClusterState must not carry leader_id/leader_addr projections; "
+            "use RaftMetrics::current_leader and leader_rx (docs/STATE_MACHINE.md)"
+        )
+    raft = (PROJECT_ROOT / "src/governor/raft.rs").read_text(encoding="utf-8")
+    if "state.leader_id" in raft or "state.leader_addr" in raft:
+        raise AssertionError("governor/raft.rs must not write ClusterState leader projections")
+
+
+def check_prose_exemptions_are_still_needed() -> None:
+    """Verify no exemption names a file that now exists, or that nothing cites."""
     rel_paths, basenames = repo_file_index()
     cited: set[str] = set()
     for doc in PROSE_DOCS:
-        cited |= file_references((PROJECT_ROOT / doc).read_text(encoding="utf-8"))
+        cited |= set(MARKDOWN_LINK_PATH.findall((PROJECT_ROOT / doc).read_text(encoding="utf-8")))
     stale = sorted(
         ref
         for ref in PROSE_REFERENCE_EXEMPT
@@ -1727,42 +1610,56 @@ def attributed_lines(text: str) -> Iterable[tuple[int, str, str]]:
         yield number, line, source
 
 
+def load_tla_code_map() -> dict[str, dict[str, list[str]]]:
+    """spec stem → {rust path suffix → symbols} from tla/code_map.toml."""
+    if not TLA_CODE_MAP_PATH.exists():
+        raise AssertionError(f"{TLA_CODE_MAP_PATH} not found")
+    raw = tomllib.loads(TLA_CODE_MAP_PATH.read_text(encoding="utf-8"))
+    out: dict[str, dict[str, list[str]]] = {}
+    for spec, mapping in raw.items():
+        if not isinstance(mapping, dict):
+            raise AssertionError(f"{TLA_CODE_MAP_PATH}: [{spec}] must be a table")
+        out[spec] = {
+            str(path): list(syms) if isinstance(syms, list) else []
+            for path, syms in mapping.items()
+        }
+    return out
+
+
 def check_spec_code_references_resolve() -> None:
-    """Every file and symbol the TLA+ specs map themselves onto must exist.
+    """Every file and symbol in tla/code_map.toml must exist.
 
-    Each spec header names the Rust that implements the action it models, and
-    that mapping is the only thing connecting a machine-checked proof to the
-    binary it is a proof about. Left to prose, a rename leaves the specs
-    describing a program that no longer exists — and a model checker passing
-    against code that moved is worse than none, because it reads as assurance.
-
-    Attribution follows `attributed_lines`, so an entry that wraps is still
-    read against the source it named.
+    Spec header comments may still describe the mapping for humans; the TOML
+    registry is what lint resolves.
     """
     sources = rust_sources()
-    texts: dict[Path, str] = {}
+    code_map = load_tla_code_map()
+    spec_stems = {p.stem for p in tla_specs()}
     unresolved_files: list[str] = []
     absent_symbols: list[str] = []
-    for spec in tla_specs():
-        for number, line, reference in attributed_lines(spec.read_text(encoding="utf-8")):
-            if missing := [
-                ref for ref in rust_paths_named(line) if resolve_rust_path(ref, sources) is None
-            ]:
-                unresolved_files.append(f"{spec.name}:{number} -> {', '.join(missing)}")
-                continue
-            path = resolve_rust_path(reference, sources) if reference else None
+    unknown_specs = sorted(set(code_map) - spec_stems)
+    unmapped_specs = sorted(spec_stems - set(code_map))
+    texts: dict[Path, str] = {}
+    for spec, mapping in sorted(code_map.items()):
+        for reference, symbols in sorted(mapping.items()):
+            path = resolve_rust_path(reference, sources)
             if path is None:
+                unresolved_files.append(f"{spec} -> {reference}")
                 continue
-            text = texts.setdefault(path, path.read_text(encoding="utf-8"))
-            if absent := sorted(n for n in code_identifiers_named(line) if n not in text):
-                absent_symbols.append(f"{spec.name}:{number} {reference} -> {', '.join(absent)}")
+            text_body = texts.setdefault(path, path.read_text(encoding="utf-8"))
+            if absent := sorted(n for n in symbols if n not in text_body):
+                absent_symbols.append(f"{spec} {reference} -> {', '.join(absent)}")
     problems = []
+    if unknown_specs:
+        problems.append(f"code_map names unknown specs: {unknown_specs}")
+    if unmapped_specs:
+        problems.append(f"specs missing from code_map: {unmapped_specs}")
     if unresolved_files:
         problems.append("sources that do not exist: " + " | ".join(unresolved_files))
     if absent_symbols:
         problems.append("names not found in the source cited: " + " | ".join(absent_symbols))
     if problems:
-        raise AssertionError("TLA+ specs map onto code that has moved — " + " ; ".join(problems))
+        raise AssertionError("TLA+ code_map drift — " + " ; ".join(problems))
 
 
 def tla_config_constants(text: str) -> dict[str, int]:
@@ -1870,7 +1767,7 @@ def lint() -> None:
     check("Suite case refs exist", check_suite_case_refs)
     check("SQL files are non-empty UTF-8", check_sql_files_valid)
     check("No duplicate case IDs", check_no_duplicate_case_ids)
-    check("CONTRACTS.md defines contract IDs", check_contracts_doc)
+    check("contracts.yaml registry is valid", check_contracts_doc)
     check("Cases reference real contract IDs", check_case_contract_refs)
     check("Fault injection confined to tracked modules", check_fault_injection_confined)
     check("FATAL contracts declare an inversion", check_fatal_contracts_have_inversions)
@@ -1894,6 +1791,10 @@ def lint() -> None:
     check(
         "State machine foreign names still apply",
         check_state_machine_foreign_names_are_still_needed,
+    )
+    check(
+        "ClusterState has no leader projections",
+        check_no_cluster_state_leader_projection,
     )
     check("TLA specs name real code", check_spec_code_references_resolve)
     check(

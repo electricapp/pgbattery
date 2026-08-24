@@ -1,25 +1,9 @@
-"""Cluster topology, read from the compose file that defines it.
+"""Cluster topology derived from the active compose file.
 
-Service names, static `raft_net` addresses, and published host ports were
-written out independently in `fault_primitives.py`, `linreg/cluster.py`,
-`correctness_lite.py`, and `dual_writability_prober.py` — four copies of a fact
-that `docker-compose.yml` already states, and that a fifth file (the 5-node
-compose) states differently. A harness addressing a docker object that is not
-there is the failure mode this repo has been bitten by repeatedly: nothing
-raises, the fault lands nowhere, and the run reads as coverage.
-
-So nothing declares the topology. It is derived from the compose file, which is
-what actually creates the containers, and a mismatch is impossible rather than
-linted. Reading it costs a few milliseconds at import.
-
-Which file is read follows `COMPOSE_FILE`, the same variable `docker compose`
-itself honours, so a 5-node run gets the 5-node topology without a flag. Only
-the first entry is read: these harnesses drive one cluster definition, and an
-override file would name the same services.
-
-Anything malformed raises at import. There is no fallback to a hardcoded
-default — that would be the duplication this module exists to remove, and it
-would be reached exactly when the real answer had become unavailable.
+Service names, `raft_net` addresses, and published ports come from
+`COMPOSE_FILE` (same variable `docker compose` uses; first entry only) — not
+from hardcoded copies in harnesses. Malformed compose raises at import; there
+is no hardcoded fallback.
 """
 
 from __future__ import annotations

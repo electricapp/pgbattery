@@ -1,41 +1,16 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Dirty-crash durability oracle — contracts W1 and R2.
+"""Dirty-crash durability — W1 and R2 on LazyFS.
 
-Every other fault in this repo is a *clean* crash. ``docker kill`` sends
-SIGKILL, the container dies, and every byte PostgreSQL wrote but never flushed
-is still sitting in the *host* page cache, which nothing here discards. Restart
-the node and the data is all there — whatever its durability settings were. So
-the existing suites cannot distinguish a cluster that honours fsync from one
-that lies about it, and W1 ("an acknowledged write survives every supported
-fault") and R2 ("no ack before the write is flushed to the standby's WAL") have
-rested on how the code is built rather than on evidence.
+Clean faults (`docker kill`) leave unflushed bytes in the host page cache, so
+they cannot distinguish honoured fsync from lying. Against
+`docker-compose.lazyfs.yml`, `lazyfs::clear-cache` + SIGKILL discard the
+userspace cache for real.
 
-This harness closes that. It runs against ``docker-compose.lazyfs.yml``, where
-PGDATA is a LazyFS mount: un-fsynced writes live in LazyFS's own userspace
-cache, and both ``lazyfs::clear-cache`` and the SIGKILL that follows destroy
-them for real. What survives in the backing store is exactly what PostgreSQL
-flushed before it acknowledged.
+- ``leader-crash`` — W1 under dirty crash (standby may cover a lying leader).
+- ``cluster-crash`` — all three at once; the R2 test (standby flush lies show).
 
-Two modes, because they prove different contracts:
-
-``leader-crash``
-    Crash the leader alone. The cluster must not lose an acked write, because
-    sync replication should have put it on a standby's disk before the ack.
-    This is W1 under a dirty crash. It does not isolate the leader's own fsync
-    behaviour: a surviving standby can cover for a leader that lied.
-
-``cluster-crash``
-    Crash all three nodes at once. Nothing can cover for anything. This is the
-    only configuration in the repo where a *standby* that acknowledges a flush
-    it did not perform becomes observable, which makes it the R2 test. It is
-    also the harsher W1 test, and the one a Jepsen analysis would reach for.
-
-The oracle is proven able to fail before it is trusted. ``--weaken-durability``
-runs the writer with ``synchronous_commit = off``, which acknowledges commits
-before flushing anything; under ``cluster-crash`` that must lose acked writes.
-A run of this harness that cannot produce that red result is not evidence of
-durability, it is evidence the fault stopped injecting — so the inversion is
-not an optional extra mode, it is the thing that licenses the green result.
+``--weaken-durability`` (`synchronous_commit=off`) must lose acked writes under
+``cluster-crash`` before a green run is trusted.
 """
 
 from __future__ import annotations

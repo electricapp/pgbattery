@@ -1,0 +1,66 @@
+# Types and enums owned by docs/STATE_MACHINE.md.
+# lint_matrix reads this file — not markdown backticks — so the prose
+# doc can be rephrased without fighting extractors.
+#
+# `enums`: naming an enum here requires every variant to still exist in Rust.
+# `types`: every name must resolve to an enum/struct/trait/type or enum variant
+#          in src/ or crates/, unless listed under [foreign].
+
+enums.StandbyAction = ["NoOp", "Defer", "RestartOnly", "Rewind", "Reprovision"]
+enums.ReplicaHealth = ["Healthy", "Lagging", "Unhealthy"]
+enums.ClusterCommand = ["AddNode", "RemoveNode", "UpdateNode", "UpdateLsn", "SetSyncMode"]
+enums.PostmasterState = ["Running", "NotRunning", "Exited"]
+# Wire-compat labels on NodeInfo — not live Raft leadership (see STATE_MACHINE §5).
+enums.NodeRole = ["Leader", "Follower"]
+enums.TimelineCheck = ["Match", "Mismatch", "Unknown"]
+enums.SessionChange = [
+  "Deallocate",
+  "DeallocateAll",
+  "DiscardAll",
+  "Listen",
+  "NonMigratable",
+  "SetSessionVar",
+  "Unlisten",
+  "UnlistenAll",
+]
+enums.StatementClass = ["Modeled", "Unmodeled"]
+
+types = [
+  "ClusterState",
+  "ClusterCommand",
+  "ConnectionState",
+  "HeartbeatGuard",
+  "LeadershipObservation",
+  "LeaseState",
+  "NodeInfo",
+  "NodeRole",
+  "PostmasterState",
+  "PromotionWatchdog",
+  "ReplicaHealth",
+  "ReplicaStatus",
+  "SharedLeaseState",
+  "StandbyAction",
+  "TimelineCheck",
+  "SessionChange",
+  "StatementClass",
+]
+
+[foreign]
+RaftMetrics = "openraft"
+Instant = "std::time"
+Child = "tokio::process"
+SocketAddr = "std::net"
+Drop = "std::ops"
+None = "the Option variant, not a type of ours"
+Some = "the same"
+SelectStmt = "a libpg_query parse node"
+ExplainStmt = "the same"
+PostgreSQL = "the database, written as a name rather than a type"
+Database = "from the Database system identifier field of pg_controldata"
+Fence = "from the Fence not applied log line"
+RestampAnchorOnCampaign = "an action in tla/lease_fencing.tla, not Rust"
+Stopped = "section 3 PG role model, not a Rust enum"
+Starting = "the same"
+Primary = "the same"
+Standby = "the same"
+Recovering = "the same"

@@ -302,11 +302,8 @@ pub struct ReplicationManager<P: crate::governor::pg_control::PgControl> {
     node_id: NodeId,
     postgres: Arc<tokio::sync::Mutex<P>>,
     cluster_state: Arc<RwLock<ClusterState>>,
-    /// Live truth source for "am I leader" per `docs/STATE_MACHINE.md`.
-    /// Reading `cluster_state.leader_id` would consult the Raft-applied
-    /// mirror (one apply cycle behind on transitions); the manager
-    /// reconfigures sync replication, which is safety-relevant, so it
-    /// must use the same source `get_leader`/`get_nodes` use.
+    /// Live truth source for "am I leader" per `docs/STATE_MACHINE.md`:
+    /// `RaftMetrics::current_leader`.
     raft: Arc<openraft::Raft<TypeConfig>>,
     replica_status: Arc<RwLock<HashMap<NodeId, ReplicaStatus>>>,
     /// See [`ReplicaGauges`]: interned metric handles, populated on first
@@ -440,13 +437,9 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
                 }
 
                 _ = check_interval.tick() => {
-                    // Read leadership from `RaftMetrics::current_leader` — the
-                    // canonical truth source per `docs/STATE_MACHINE.md` row
-                    // "Who is Raft leader". The `cluster_state.leader_id`
-                    // mirror lags by one apply cycle during transitions and
-                    // can briefly point at a demoted leader; reconfiguring
-                    // `synchronous_standby_names` from there would let two
-                    // leaders issue overlapping ALTER SYSTEM in the gap.
+                    // `RaftMetrics::current_leader` — canonical SoT per
+                    // docs/STATE_MACHINE.md. Reconfiguring sync replication
+                    // from anything else would be a second leadership belief.
                     let is_leader = {
                         let metrics = self.raft.metrics();
                         let m = metrics.borrow();

@@ -80,12 +80,22 @@ must become explicit and tested:
    of N and accepts N-1; a node receiving a newer major frame version replies
    with a typed "version too new" error instead of a decode failure. This
    bounds the supported window to adjacent releases and makes violations loud.
+   Introducing the byte is itself a wire change, so it has to bootstrap: the
+   release that adds it accepts today's unversioned frames as version 0 while
+   still emitting version 0, and the release after flips the emit default. If
+   the current header has a byte that is already always zero, the version
+   byte takes that position and the ratchet collapses to one release — worth
+   checking before writing any code. Without one of the two, the first
+   rolling upgrade under this scheme is exactly the incompatible jump the
+   scheme exists to prevent.
 2. redb store schema. The store gets a schema-version key written at create
-   time. On open: equal version proceeds; older version runs forward
-   migrations (idempotent, applied before the node joins Raft); newer version
-   refuses to start with an explicit "downgrade not supported" error. The
-   binary's semver anti-rollback already refuses downgrades at install time;
-   the store check is defense in depth for hand-copied binaries.
+   time; a store with no key reads as schema 0, which is how every existing
+   store adopts the scheme. On open: equal version proceeds; older version
+   runs forward migrations (idempotent, applied before the node joins Raft);
+   newer version refuses to start with an explicit "downgrade not supported"
+   error. The binary's semver anti-rollback already refuses downgrades at
+   install time; the store check is defense in depth for hand-copied
+   binaries.
 
 Policy: patch/minor releases must not change frame format or store schema
 (CI-enforced by a compat test that runs current HEAD against the previous
@@ -100,16 +110,25 @@ either, with migrations, and support exactly the N-1 to N window.
   cluster keeps quorum with the remaining two nodes.
 - The loop never proceeds past a node whose standby has not re-attained
   streaming replication.
-- Rollback of a follower = install previous release (allowed while store
-  schema is unchanged, i.e. always within a minor line; documented as
-  unsupported across majors — restore from backup instead).
+- The loop never restarts a follower that is currently the only synchronous
+  candidate: it waits for the other standby to rejoin the sync set first,
+  because bouncing the sole sync standby stalls every leader write for the
+  duration of the restart.
+- Rollback of a follower = install the previous release with an explicit
+  `--force-downgrade`. The semver anti-rollback refuses the install
+  otherwise, and without the override this rollback path would not exist.
+  Allowed while store schema is unchanged, i.e. always within a minor line;
+  documented as unsupported across majors — restore from backup instead.
 
 ### Testing
 
 - ci_matrix case: rolling upgrade under continuous writes; assert zero lost
   acked writes and exactly one leadership transfer.
-- Mixed-version soak: leader on N-1, followers on N, run the parallel HA
-  suite unchanged.
+- Mixed-version soak in both orientations, because every rollout passes
+  through both: leader on N-1 with followers on N (during the follower
+  upgrades), and leader on N with a follower on N-1 (between
+  transfer-leadership and the last node's upgrade). The parallel HA suite
+  runs unchanged in each.
 - Frame/store compat fixtures generated at release-tag time and checked
   against HEAD in CI.
 
@@ -199,6 +218,16 @@ transfer, which is strictly worse than link mode for this flow's purposes.
      control file proves the extension was packaged for the new major, not
      that its `.so` is ABI-compatible, so the audit is a floor and the
      post-upgrade verification gate re-checks that each extension loads.
+   - Collation audit: the collation versions recorded in the catalogs
+     (`datcollversion`, `pg_collation.collversion`) checked against what the
+     new binaries report. `pg_upgrade` does not rebuild indexes, so a libc or
+     ICU change underneath a text collation corrupts every affected index
+     silently. Shipping both majors in one image pins one libc and usually
+     makes this pass — but the check is the guarantee, not the packaging.
+   - initdb parameters for the new datadir resolved from the old cluster —
+     checksum mode and WAL segment size from `pg_controldata`, encoding,
+     locale and locale provider from the catalogs — so a mismatch aborts
+     here, not out of `pg_upgrade` after the freeze has already begun.
    - Transfer mode resolved and probed: reflink support confirmed by an actual
      clone attempt in the target directory, not by filesystem type.
    - Fresh backup, restored into a scratch cluster and started, unless
@@ -239,9 +268,12 @@ transfer, which is strictly worse than link mode for this flow's purposes.
    ASYNC and the status output says so).
 6. Verification gate: replication SYNC on both standbys, doctor green,
    `SELECT version()` agreement, analyze-in-stages complete.
-7. `--confirm` (explicit operator action, or `--auto-confirm-after <dur>`):
-   deletes the old data dirs and flips `pg_bin_dir` permanently. Until then,
-   rollback is available.
+7. `--confirm`, an explicit operator action — deliberately with no timed
+   variant. A timer whose action is deleting the rollback anchor is the
+   anti-pattern docs/STATE_MACHINE.md refuses for state transitions, applied
+   to the one step here that cannot be undone, and the same reasoning Track C
+   uses to refuse a cutover timeout. Confirm deletes the old data dirs and
+   flips `pg_bin_dir` permanently. Until then, rollback is available.
 
 ### Gateway hold mode
 
@@ -342,6 +374,9 @@ pgbattery cluster at the new major, streams the live database into it by
 logical replication, and cuts write authority over in a window measured in
 seconds regardless of database size — with the old cluster left running, fully
 caught up in reverse, and available as a rollback target after the cutover.
+Connection strings survive the whole flow: blue's gateways route by epoch
+after cutover, and retiring them is a separate final step that refuses while
+clients still use them.
 
 ### Why this is the differentiator
 
@@ -422,9 +457,16 @@ Concretely, the authority identity widens from `node_id` to
    current values, then runs the equality checks. Green is still read-only.
    Drain progress is polled from green's catalogs — observed, never assumed.
 4. `AUTHORITY_TRANSFERRED{green_cluster_id, epoch+1}` — committed in blue's log
-   on green's proof of drain. Only now does green's supervisor lift its fence.
-   From here green's own Raft group owns the lease for the new epoch, and
-   blue's log holds the immutable record that it relinquished the old one.
+   on green's proof of drain. Green's supervisor then creates the reverse
+   publication and its replication slot, and only once the slot exists does
+   it lift the fence. The ordering is load-bearing: a slot pins WAL from the
+   moment of its creation, so a slot that predates the first client write
+   guarantees the reverse stream carries every write green ever accepts. A
+   slot created after the fence lifts leaves a gap of writes that can never
+   reach blue and a rollback that silently loses them — the same
+   passes-while-blind shape as the sequence problem. From here green's own
+   Raft group owns the lease for the new epoch, and blue's log holds the
+   immutable record that it relinquished the old one.
 
 Gateways on both sides route to the highest epoch they can confirm from a
 committed source. The invariant generalizes cleanly: **write authority exists
@@ -460,9 +502,20 @@ project's own standard: `dual_writability_prober.py` writes directly to the
 internal PG ports, and it is right to. The mechanism should be role-based —
 revoke write privileges from application roles, leave them with the
 subscription owner — because it is durable across restarts, independent of the
-gateway, and draws the line exactly where it needs to be drawn. It is a new
-fencing primitive with its own verification burden, and the prober has to be
-extended to prove it holds.
+gateway, and draws the line exactly where it needs to be drawn. Revocation
+alone is more porous than it looks, though: `REVOKE` does not bind table
+owners, whose privileges are implicit and re-grantable; it does not bind
+superusers; and it does not reach writes routed through `SECURITY DEFINER`
+functions owned by roles outside the revocation. In a schema where the
+application role owns its own tables — which is a lot of real schemas — the
+fence as stated holds nothing. So the preflight has to prove the fence can
+cover this database before the migration starts: application roles own no
+tables they write, no application connection runs as superuser, and every
+`SECURITY DEFINER` function reachable from an application role is enumerated
+and either fenced or accepted by name. It is a new fencing primitive with its
+own verification burden, and the prober has to be extended to prove it holds
+— connected as an application role, through those paths, not just a plain
+`INSERT`.
 
 ### Prerequisites and the restrictions that decide feasibility
 
@@ -501,6 +554,11 @@ FULL` or a suitable unique index, and even with FULL, `UPDATE` and `DELETE`
   and check constraints are enforced against arriving rows and can stall the
   subscription; row triggers do not fire unless `ENABLE REPLICA`. Both
   directions of that are surprises, so preflight reports them.
+- **Fence coverage.** The client-write fence is role-based, so its
+  preconditions are themselves preflight checks: an application role that
+  owns the tables it writes, a superuser application connection, or an
+  unvetted `SECURITY DEFINER` path aborts by name (see the fence discussion
+  above). A fence with a hole in it reports U1 held while blind.
 - **WAL retention on blue.** A stalled subscriber holds blue's slot back and
   can fill its disk. The supervisor monitors slot lag as a first-class health
   signal and aborts the migration long before blue is at risk, rather than
@@ -533,10 +591,19 @@ initial copy; the flow supports that path and says which one it took.
    replication metrics, and the schema freeze is enforced. This state is
    indefinitely holdable; the operator picks the cutover moment.
 5. Cutover: the four-step protocol above.
-6. Reverse: green becomes publisher, blue becomes subscriber, immediately on
-   transfer. Blue stays a live PG N cluster tracking green.
-7. `--confirm`: tears down reverse replication and decommissions blue. Until
-   then, rollback is the same protocol with green's log as the ordering point.
+6. Reverse: blue subscribes to the reverse publication whose slot cutover
+   step 4 created before green's fence lifted, so the stream starts at
+   green's first accepted write. Blue stays a live PG N cluster tracking
+   green.
+7. `--confirm`: tears down reverse replication and blue's PG cluster — but
+   not blue's gateways. Clients still hold connection strings that point at
+   blue's nodes, so those nodes drop to a gateway-only relay routing by epoch
+   to green: the endpoint outlives the database behind it. Until confirm,
+   rollback is the same protocol with green's log as the ordering point.
+8. `--retire-endpoints`: the step that actually decommissions blue's nodes.
+   Moving the connection string (DNS, VIP, client config) is the operator's
+   job; this step's job is to refuse while blue's gateways still carry client
+   connections, printing the count, rather than stranding them silently.
 
 ### Rollback
 
@@ -544,8 +611,9 @@ Before cutover, rollback is free — green has never held authority, so tearing
 it down changes nothing about blue.
 
 After cutover it is the differentiating capability, and it works because of
-step 6: blue is not frozen at the cutover LSN, it is a live cluster continuously
-receiving green's writes. Rolling back runs the same four steps with the roles
+step 6: blue is not frozen at the cutover LSN, it is a live cluster
+continuously receiving green's writes from the first one green accepted (the
+slot-before-fence ordering in cutover step 4). Rolling back runs the same four steps with the roles
 exchanged and green's log as the ordering point. The window is bounded by
 honesty about what reverse replication cannot carry: the moment green's schema
 diverges from blue's — a new-major-only type, an index blue cannot express, any
@@ -589,6 +657,11 @@ inversion that `lint_matrix.py` requires for FATAL rows:
 - **U4 — Fail-Closed Cutover (FATAL).** When the current epoch cannot be
   confirmed from a committed source, no node accepts writes. Inversion: an
   unreachable blue with a green that took authority anyway.
+- **U5 — Reverse-Drain Completeness (FATAL).** U2 with the roles exchanged:
+  while rollback is reported available, every write green has acked is on
+  blue or captured in the reverse slot — which requires the slot to predate
+  green's first accepted write. Inversion: a green whose fence lifted before
+  the reverse slot existed, plus one write landed in the gap.
 
 ### Testing
 
@@ -608,7 +681,9 @@ inversion that `lint_matrix.py` requires for FATAL rows:
   clusters between SEALED and TRANSFERRED; kill green's primary mid-drain;
   lose blue's quorum after SEAL and assert green stays read-only until the
   explicit break-glass.
-- Post-cutover rollback drill as a first-class case, and a forfeited-rollback
+- Post-cutover rollback drill as a first-class case: it writes to green in
+  the first moments after transfer, asserts those exact writes arrive on blue
+  (the U5 window), then runs the reverse protocol. Plus a forfeited-rollback
   case where DDL on green must flip the reported status.
 - Preflight abort cases, one per restriction: a table with no replica identity,
   a non-empty `pg_largeobject`, an unlogged table, a DDL attempt during the

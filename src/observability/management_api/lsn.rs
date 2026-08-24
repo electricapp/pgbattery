@@ -107,11 +107,7 @@ async fn leader_current_write_lsn(state: &ManagementApiState) -> Option<u64> {
 
 /// Get replication lag for a specific node (used for health-based promotion).
 ///
-/// Reads the live leader id from `RaftMetrics::current_leader` per
-/// `docs/STATE_MACHINE.md` — `cluster_state.leader_id` is the Raft-applied
-/// mirror and lags by one apply cycle on transitions. `wait_for_replication_to_sync`
-/// during cluster joins consumes this endpoint; a stale mirror could compare
-/// against a just-demoted leader's LSN and misjudge readiness.
+/// Leader id from `RaftMetrics::current_leader` per `docs/STATE_MACHINE.md`.
 pub(super) async fn get_node_lag(
     State(state): State<Arc<ManagementApiState>>,
     Path(node_id): Path<u64>,

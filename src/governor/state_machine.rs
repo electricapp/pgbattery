@@ -47,20 +47,6 @@ fn unix_now_secs() -> u64 {
 /// Cluster state managed by Raft.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClusterState {
-    /// Current leader node ID.
-    ///
-    /// Local projection of `RaftMetrics::current_leader`, re-derived on every
-    /// metrics tick — NOT replicated through the Raft log. `serde(skip)` keeps
-    /// it out of snapshots so an installed snapshot can't inject a stale leader
-    /// value; the receiver repopulates it from its own metrics within a tick.
-    #[serde(skip)]
-    pub leader_id: Option<NodeId>,
-
-    /// Current leader address. Local projection alongside `leader_id`; see its
-    /// docs for why it is `serde(skip)`.
-    #[serde(skip)]
-    pub leader_addr: Option<SocketAddr>,
-
     /// All known nodes in the cluster
     pub nodes: HashMap<NodeId, NodeInfo>,
 
@@ -77,9 +63,12 @@ pub struct ClusterState {
     /// `max_cluster_lsn` calculation to prevent dead nodes from blocking elections.
     pub node_lsns: HashMap<NodeId, (u64, u64)>,
 
-    /// Maximum observed LSN across active cluster members.
-    /// Only includes LSN entries updated within the staleness threshold.
-    /// Used as advisory input for leader election decisions.
+    /// Advisory cached max of fresh `node_lsns` entries (staleness-filtered).
+    ///
+    /// Safety gates must not trust this field alone: it only refreshes on Raft
+    /// apply, so it can freeze while reports age. Prefer
+    /// [`ClusterState::fresh_max_lsn`] / [`ClusterState::is_lsn_acceptable_for_election`]
+    /// which recompute from `node_lsns`.
     pub max_cluster_lsn: u64,
 
     /// Monotonic instant at which *this node* last observed the cluster losing
@@ -143,19 +132,27 @@ pub struct NodeInfo {
     /// Metrics/Prometheus endpoint address
     pub metrics_addr: SocketAddr,
 
-    /// Current role
+    /// Dead replicated label — **not** live Raft leadership.
+    ///
+    /// Kept for postcard layout compatibility with existing `raft.db` /
+    /// snapshots. Production always writes [`NodeRole::Follower`] on add;
+    /// [`ClusterCommand::UpdateNode`] is never issued outside tests/fuzz.
+    /// Write authority is `RaftMetrics::current_leader`, never this field.
     pub role: NodeRole,
 
     /// Last seen timestamp (Unix timestamp)
     pub last_seen: u64,
 }
 
-/// Node role in the cluster.
+/// Historical per-node label on [`NodeInfo`] — not Raft leadership.
+///
+/// Discriminant order is load-bearing for postcard. Do not reorder or remove
+/// variants without a store-format bump. Live leadership: `RaftMetrics`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeRole {
-    /// Primary/leader node
+    /// Unused leadership label (wire compat only).
     Leader,
-    /// Standby/follower node
+    /// Default label written on [`ClusterCommand::AddNode`].
     Follower,
 }
 
@@ -215,12 +212,10 @@ impl ClusterState {
             ClusterCommand::RemoveNode(id) => {
                 self.nodes.remove(&id);
                 self.node_lsns.remove(&id);
-                if self.leader_id == Some(id) {
-                    self.leader_id = None;
-                    self.leader_addr = None;
-                }
                 self.recalculate_max_cluster_lsn();
             }
+            // Wire-compat only: never issued in production. Does not affect
+            // Raft leadership (`RaftMetrics::current_leader`).
             ClusterCommand::UpdateNode { id, role } => {
                 if let Some(node) = self.nodes.get_mut(&id) {
                     node.role = role;
@@ -529,12 +524,6 @@ impl ClusterState {
     pub fn lsn_catchup_threshold_bytes(&self) -> u64 {
         let use_tight = self.sync_replication_active != Some(false);
         crate::config::constants::lsn_catchup_threshold_for(use_tight)
-    }
-
-    /// Check if a node is the current leader.
-    #[must_use]
-    pub fn is_leader(&self, id: NodeId) -> bool {
-        self.leader_id == Some(id)
     }
 }
 
@@ -1035,13 +1024,7 @@ mod tests {
 
         assert_eq!(state.nodes.len(), 2);
 
-        // `leader_id` is a local projection of RaftMetrics (not set via the
-        // log); `is_leader` reads it.
-        state.leader_id = Some(1);
-        assert!(state.is_leader(1));
-        assert!(!state.is_leader(2));
-
-        // Roles are carried per-node and updated via UpdateNode.
+        // Roles are dead replicated metadata (UpdateNode never issued in prod).
         state.apply(ClusterCommand::UpdateNode {
             id: 1,
             role: NodeRole::Leader,
@@ -1237,22 +1220,14 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_leader_clears_leader_id() {
+    fn test_remove_node_drops_membership_and_lsn() {
         let mut state = ClusterState::new();
         add_test_node(&mut state, 1);
         add_test_node(&mut state, 2);
 
-        // `leader_id`/`leader_addr` are the local RaftMetrics projection.
-        state.leader_id = Some(1);
-        state.leader_addr = Some("10.0.0.1:5432".parse().unwrap());
-        assert!(state.is_leader(1));
-
-        // Removing the current leader must clear leader_id and leader_addr.
         state.apply(ClusterCommand::RemoveNode(1));
-        assert!(state.leader_id.is_none());
-        assert!(state.leader_addr.is_none());
         assert!(!state.nodes.contains_key(&1));
-        // Remaining node is unaffected.
+        assert!(!state.node_lsns.contains_key(&1));
         assert!(state.nodes.contains_key(&2));
     }
 

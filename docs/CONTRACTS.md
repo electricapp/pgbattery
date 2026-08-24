@@ -1,7 +1,10 @@
 # pgbattery Correctness Contracts
 
-This document formally defines the correctness contracts for pgbattery. Every
-CI test case must reference at least one contract ID. A violation of any
+This document formally defines the correctness contracts for pgbattery. The
+**machine registry** is [`docs/contracts.yaml`](contracts.yaml) (IDs, severities,
+FATAL inversions). Narrative lives here; `lint_matrix.py` reads the YAML.
+
+Every CI test case must reference at least one contract ID. A violation of any
 FATAL contract is a release-blocking bug.
 
 ---
@@ -186,11 +189,11 @@ only in part.
 
 ## Contract-to-Test Index
 
+Human-readable summary. **Lint enforces inversions from `docs/contracts.yaml`**,
+not this table. Keep the two aligned when editing.
+
 Every FATAL contract carries an **inversion**: a case or test that feeds the
-oracle data it must reject, proving the oracle can fail. An oracle never
-observed failing is indistinguishable from one that cannot, and a suite full of
-those reports PASS on a broken cluster. `lint_matrix.py` enforces that this
-column is non-empty for every FATAL row.
+oracle data it must reject, proving the oracle can fail.
 
 | Contract                          | Severity | Primary Tests                                                                                                                                                                            | Inversion (proves the oracle can fail)                                                                                                                                                                                                                  |
 | --------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

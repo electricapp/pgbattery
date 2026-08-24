@@ -1,32 +1,12 @@
 #!/usr/bin/env -S uv run --project testing python
-"""The join and rejoin edges, and what they leave behind.
+"""Join / rejoin edges outside the happy path.
 
-Five cases, each an edge the happy path never visits:
-
-  deposed-mid-copy    the source a joining node is cloning from is deposed
-                      while `pg_basebackup` is running. The node must not end
-                      up running on a half-copied data directory.
-  clone-interrupted   the replication slot a clone streams through is taken
-                      away, so `pg_basebackup` fails for a reason that is the
-                      leader's. The node must finish its join without its
-                      container restarting: a transient clone failure is the
-                      join's to retry, not the container runtime's.
-  orphan-slot         a replication slot nobody consumes pins WAL forever.
-                      The reconciler is supposed to drop it; "supposed to" is
-                      the part this measures.
-  learner-crash       a node registers as a learner and dies before finishing.
-                      Membership must not keep a phantom voter.
-  bootstrap-wiped     the node that starts with `--bootstrap` loses its state
-                      directory. It re-runs initdb, so it holds a data lineage
-                      the cluster never wrote to, under an id the cluster still
-                      lists — and it is the peer the others are configured to
-                      join through. It must end up back on the cluster's
-                      lineage, and no peer may discard its own Raft state on
-                      what it said in the meantime.
-
-Orphan-slot pinning is asserted *bounded*: the slot is dropped, and the WAL it
-held is released, within a multiple of the reconciler's own interval. An
-unbounded slot is an outage on a real disk, and nothing had ever watched one.
+- ``deposed-mid-copy`` — clone source deposed mid-`pg_basebackup`; no half-copied datadir.
+- ``clone-interrupted`` — slot taken mid-clone; join retries in-process (not container restart).
+- ``orphan-slot`` — unused slot dropped and WAL released within a bound of the reconciler interval.
+- ``learner-crash`` — learner dies mid-join; no phantom voter.
+- ``bootstrap-wiped`` — wiped bootstrap node returns on the cluster lineage;
+  peers must not wipe Raft on its interim answers.
 """
 
 from __future__ import annotations

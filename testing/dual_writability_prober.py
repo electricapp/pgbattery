@@ -1,159 +1,25 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Dual-writability prober: a direct measurement of contract L1.
+"""Direct measurement of contract L1: at most one write-accepting node.
 
-`docs/CONTRACTS.md` L1 (FATAL) states: "At most one node may be in
-write-accepting state at any point in time."  This module measures exactly
-that proposition and nothing else.
+Concurrent real writes to every node's **internal** PG port (not gateway).
+`correctness_lite` I4 only checks management-API leader agreement and can miss
+a short dual-write window; matrix one-shot writability probes can miss windows
+between steps.
 
-WHY THIS EXISTS — WHAT THE REST OF THE HARNESS ACTUALLY MEASURES
-────────────────────────────────────────────────────────────────
-`correctness_lite.py` invariant I4 samples the three management APIs every
-0.5 s and asserts they agree on a single Raft leader id.  That is a
-*control-plane agreement* check, not an L1 check.  The two propositions come
-apart in the case that matters most:
+Fence is read-only GUC + backend terminate — not demotion — so recovery-state
+oracles are wrong. Probe is an autocommit UPSERT into `pgb_dual_write_probe`
+(one row per node); `RETURNING` matching the round seq = `ACCEPTED`. Known
+SQLSTATE refusals = rejected; everything else = `INDETERMINATE` (never count as
+acceptance). Do not `SET … read_only = off` / `BEGIN READ WRITE`.
 
-  - A deposed leader whose fence has not landed yet is simultaneously
-    Raft-consistent (everyone agrees node B is leader) and still
-    PostgreSQL-writable (node A's `default_transaction_read_only` is still
-    `off`).  I4 sees nothing.
-  - The lease/fence enforcement loop in `src/app.rs` ticks at 100 ms with a
-    1 s SQL budget, so a dual-write window can easily be shorter than I4's
-    500 ms sampling period.  Such a window is *structurally* unobservable to
-    I4 — it is not a matter of luck.
+Two confirmed acceptances in one round is FATAL (lease handoff cannot
+legitimately accept 50 ms apart). Low observability → exit 3 (`INCONCLUSIVE`),
+not a clean pass (`--max-indeterminate-rate`).
 
-`ci_matrix.yaml`'s `stale-leader-fencing` case does probe writability
-directly, but exactly once, at one point in time.  A window that opens and
-closes between two matrix steps is invisible to it.
+Transport: `direct` to compose bridge IPs, or `docker-exec` relay (Docker
+Desktop); `auto` tries direct then falls back.
 
-This prober closes that hole: it attempts a genuine write against all three
-nodes' internal PostgreSQL ports *concurrently*, at a high fixed cadence
-(50 ms by default), for the whole duration of a fault schedule, and asserts
-that at most one attempt is ever confirmed accepted.
-
-WHY THE PROBE MUST BE A REAL WRITE
-──────────────────────────────────
-pgbattery's fence is `ALTER SYSTEM SET default_transaction_read_only = 'on'`
-plus `pg_terminate_backend` over client backends (see
-`crates/pgbattery-supervisor/src/process.rs` and
-`App::terminate_client_backends` in `src/app.rs`).  It does **not** demote the
-postmaster, so a correctly fenced ex-primary still reports
-`pg_is_in_recovery() = false`.  Any oracle keyed on recovery state would
-report false positives forever.  The only sound signal is whether a normal
-client's write is accepted.
-
-For the same reason the probe never issues `SET transaction_read_only = off`,
-`SET default_transaction_read_only = off`, or `BEGIN READ WRITE`: those are
-precisely the overrides the fence deliberately tolerates for superuser
-sessions, and using them would measure "can a privileged session bypass the
-fence" instead of "is this node write-accepting".
-
-THE PROBE WRITE
-───────────────
-A single autocommit UPSERT into a dedicated table:
-
-    INSERT INTO pgb_dual_write_probe (node_id, round_seq, probe_ns)
-    VALUES (n, seq, ns)
-    ON CONFLICT (node_id) DO UPDATE SET round_seq = ..., probe_ns = ...
-    RETURNING round_seq;
-
-  - *Cannot corrupt the workload*: its own table, touched by nothing else.
-    Not `jepsen`, `linreg`, `linappend`, `accounts`, or `pgbench_*`.
-  - *Cannot grow unboundedly*: one row per node id, three rows forever.
-  - *Independently attributable*: each node only ever writes the row keyed by
-    its own node id, so three concurrent probes never contend on a row, never
-    block on each other's locks, and never turn a real acceptance into a
-    unique-violation rejection.
-  - *Positively confirmed*: `RETURNING round_seq` must come back equal to the
-    round sequence.  A returned row is proof the statement executed; in
-    autocommit mode the server commits before it sends the result, so a
-    returned row is proof of a committed write.
-  - *Refused by a fenced node*: a read-only default turns the implicit
-    transaction read-only, so the INSERT fails with SQLSTATE 25006
-    (`read_only_sql_transaction`).  A hot standby refuses with the same code.
-
-SOUNDNESS: ONLY CONFIRMED ACCEPTANCES COUNT
-───────────────────────────────────────────
-An indeterminate outcome is never acceptance.  Probes get killed *precisely*
-during failover — that is when `pg_terminate_backend` fires — so counting a
-dropped connection as a write would manufacture FATAL violations out of
-correct behaviour.  Rules:
-
-  - `ACCEPTED` requires a returned row matching the round sequence.  Nothing
-    else can produce it.
-  - A server-issued SQLSTATE on the definite-rejection list means the node
-    provably did not take the write.
-  - Everything else — connection refused, connect timeout, backend
-    termination (57P01), statement cancellation (57014),
-    `transaction_resolution_unknown` (08007), an unrecognised SQLSTATE, an
-    unparseable client-side error string — is `INDETERMINATE`, and its
-    verbatim error text is recorded.
-
-Indeterminates are safe for the violation verdict but corrosive to the
-*claim* a clean run makes, so they are counted and reported:
-
-  - A round where fewer than three nodes answered is `reduced observability`.
-  - A round where two or more nodes were indeterminate is
-    `observability lost`: dual writability could not be excluded for that
-    instant.  It is not a violation, and it is not a clean pass either.
-  - `--max-indeterminate-rate` turns an unobservant run into exit code 3
-    (INCONCLUSIVE) so it cannot masquerade as a pass.
-
-WHY TWO ACCEPTANCES IN ONE ROUND IS FATAL EVEN IF THEY DID NOT OVERLAP
-──────────────────────────────────────────────────────────────────────
-`DEFAULT_LEASE_DURATION` is 2 s (`src/governor/lease.rs`).  A correct handover
-requires the outgoing primary's lease to expire before the incoming primary
-accepts writes, so two nodes cannot legitimately accept writes 50 ms apart in
-any ordering.  The verdict therefore keys on "two confirmed acceptances in one
-round", and per-node send/complete monotonic timestamps are reported alongside
-so the overlap can be audited independently.
-
-TRANSPORT
-─────────
-Probes must hit the *internal* PostgreSQL port (5434 inside each container),
-never the published 5432/5433/5434 host ports — those are gateway ports that
-proxy to whoever the gateway believes the leader is, which would collapse
-three distinct nodes into one and make the whole measurement vacuous.
-
-`docker-compose.yml` publishes only gateway, metrics, and management ports, so
-there are two ways to reach internal PG from the host:
-
-  - `direct`: connect to `172.28.0.1{1,2,3}:5434`.  Works wherever the compose
-    bridge network is routable from the host, which includes Linux and the
-    GitHub Actions runners.  Preferred: lowest latency, no helper processes.
-  - `docker-exec`: a local TCP listener per node that relays bytes over
-    `docker compose exec -T <svc> perl -e <relay>` into the container's
-    127.0.0.1:5434.  Needed on Docker Desktop for macOS/Windows, where the
-    bridge subnet is not routable from the host.  Measured overhead is
-    ~0.4 ms per round trip, and psycopg speaks the real wire protocol through
-    it, so classification logic is byte-for-byte the same on both transports.
-
-`auto` (the default) tries `direct` and falls back to `docker-exec`.
-
-USAGE
-─────
-Standalone, against a running compose cluster:
-
-    ./testing/dual_writability_prober.py --duration 60
-    ./testing/dual_writability_prober.py --duration 60 --round-ms 50 \
-        --json testing/artifacts/dual-writability/result.json
-    ./testing/dual_writability_prober.py --until-stopped     # Ctrl-C to finish
-
-As a background oracle around an injected fault schedule:
-
-    from dual_writability_prober import DualWritabilityProber
-
-    with DualWritabilityProber() as prober:
-        prober.start()
-        inject_faults()
-        report = prober.stop()
-    if report.violations:
-        ...
-
-Exit codes:
-    0 — PASS: no confirmed dual-writability window, observability adequate.
-    1 — FAIL: at least one round with two or more confirmed acceptances (L1).
-    2 — infrastructure error (cluster unreachable, probe table unusable).
-    3 — INCONCLUSIVE: no violation found, but observability below threshold.
+Exit: 0 pass, 1 L1 fail, 2 infra, 3 inconclusive.
 """
 
 from __future__ import annotations

@@ -76,6 +76,11 @@ class DebugState(BaseModel):
     learners: list[int] = []
     node_count: int = 0
     failover_anchor_age_ms: int | None = None
+    sync_replication_active: bool | None = None
+    """Replicated `SetSyncMode` state. `None` is a real value — no transition
+    observed, which selects the tight LSN threshold — and it is also what an
+    absent field parses to, so a caller that decides on it checks the key is
+    there first (`SYNC_FIELD`)."""
 
 
 class TxidStatus(BaseModel):

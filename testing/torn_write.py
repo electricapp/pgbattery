@@ -1,33 +1,15 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Torn-write oracle.
+"""Torn heap-page oracle (PGDATA LazyFS).
 
-PROVES: that a write torn in half by a power loss is either repaired or
-detected, never silently accepted as valid data. A torn page keeps its length,
-so nothing about the file's metadata gives it away; if PostgreSQL served the
-mixed page as though it were whole, every layer above it would read consistent
-data that never existed.
+``lazyfs::torn-op`` persists only the first half of the next write, then
+crashes LazyFS. Assert: tear is repaired (full-page image) or rejected
+(checksums) — never served silently.
 
-HOW: ``lazyfs::torn-op`` splits the next write to one file into two halves,
-writes only the first straight to the backing store, and crashes LazyFS so the
-second half dies in its userspace cache. A one-row table is the instrument: heap
-tuples fill a page from the end downward, so both tuple versions sit in the
-second half while the page header and line pointers sit in the first. Persisting
-only the first half therefore leaves a NEW header over a STALE tuple area, which
-is a genuinely torn page rather than a truncated one.
+``--prove-oracle`` tears with ``full_page_writes=off`` and requires a red
+checksum rejection first (silent non-injection looks like successful recovery).
 
-WHY THE INVERSION IS NOT OPTIONAL: ``full_page_writes`` is what repairs the
-page -- it puts a full-page image in WAL at the first modification after a
-checkpoint, and redo overwrites the page with it. A run where the tear silently
-failed to inject looks exactly like a run where recovery worked. So
-``--prove-oracle`` first runs the same tear with ``full_page_writes=off``, where
-the damage must survive and PostgreSQL's data checksums must reject the page,
-and refuses to report on the real assertion unless that went red.
+Does not cover redb, torn WAL, or torn ``pg_control``.
 
-DOES NOT PROVE: anything about redb. The Raft store lives outside the LazyFS
-mount, so no tear here can reach it. Nor torn WAL records or a torn pg_control,
-which have their own CRCs and are not exercised.
-
-Run:
     COMPOSE_FILE=docker-compose.lazyfs.yml docker compose --profile tornwrite up -d --build pg
     COMPOSE_FILE=docker-compose.lazyfs.yml uv run --project testing \
         python testing/torn_write.py --prove-oracle

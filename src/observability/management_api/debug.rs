@@ -83,6 +83,15 @@ pub(super) struct StateResponse {
     /// promotion through immediately. Exposed so the lifecycle can be asserted
     /// rather than inferred from whether a hold-down happened to fire.
     pub failover_anchor_age_ms: Option<u64>,
+    /// Replicated `ClusterState::sync_replication_active` — the flag every
+    /// voter's election gate reads to pick the LSN catch-up threshold. `None`
+    /// means no `SetSyncMode` has been observed, which selects the tight one.
+    ///
+    /// Exposed because the disagreement that matters is with the leader's live
+    /// `synchronous_standby_names`, and only one side of it was readable from
+    /// outside. `false` here alongside a non-empty GUC on the leader is the
+    /// loose threshold being applied while sync replication is in force.
+    pub sync_replication_active: Option<bool>,
 }
 
 /// Get current cluster state (debug snapshot).
@@ -105,12 +114,12 @@ pub(super) async fn get_state(State(state): State<Arc<ManagementApiState>>) -> J
         let learners: Vec<u64> = membership.learner_ids().collect();
         (m.current_leader, voters, learners)
     };
-    let (node_count, failover_anchor_age_ms) = {
+    let (node_count, failover_anchor_age_ms, sync_replication_active) = {
         let cluster = state.cluster_state.read();
         let age = cluster
             .failover_started_at
             .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
-        (cluster.nodes.len(), age)
+        (cluster.nodes.len(), age, cluster.sync_replication_active)
     };
 
     Json(StateResponse {
@@ -121,5 +130,6 @@ pub(super) async fn get_state(State(state): State<Arc<ManagementApiState>>) -> J
         learners,
         node_count,
         failover_anchor_age_ms,
+        sync_replication_active,
     })
 }

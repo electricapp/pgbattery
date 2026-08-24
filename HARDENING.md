@@ -125,6 +125,17 @@ not the control plane, which node accepted. Its own floor is that round period �
 a dual-write window shorter than 50 ms is still invisible — and it measures one
 property, so **every other contract remains control-plane-observed.**
 
+A sampler has two ways to report nothing, and they look identical. It can watch
+a healthy system, or it can fail to watch: sample too coarsely to resolve the
+window it is measuring, or run over a stretch in which the transition never
+happened at all. Both give a clean zero. **A sampling harness has to assert its
+own resolution and its own preconditions** — the series must be fine-grained
+enough to fit inside the budget it judges against, and must contain the
+transition it exists to observe — or a green from it says only that it looked
+away. The corollary is that a window seen in a single sample spans zero seconds
+by construction, so the verdict belongs on the upper bound rather than the
+measured span.
+
 What remains here is timing: fault timing in the older suites is hand-tuned
 sleeps rather than values derived from the lease and election constants, so the
 boundary regime where openraft-0.9-without-pre-vote pathologies live is never
@@ -149,24 +160,24 @@ code and the harnesses by their `RW-N` id, so this is the definition list for
 those names rather than a record of work — a row leaves only when the window
 itself stops existing.
 
-| #     | Window                                                                                                                                                                 | Contract   | Watched by                                                                                                                                 |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| RW-1  | Deposed leader retains a quorum excluding the election winner, so its last ack can be later than the winner's first sight of leaderlessness                            | L1         | `lease_fencing.tla` with explicit quorum sets, and its counterexample model; live in `five_node_suite.py` Phase 2d with the prober running |
-| RW-2  | Post-promotion window: a freshly promoted primary acknowledging commits with zero standby acks                                                                         | W1, R2     | `post_promotion_sync_gap.py`, which enters the window on protocol state rather than a sleep; the commit is refused                         |
-| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL                                                                                                         | W1         | `rewind_loss.py` forces the fallback and counts the survivors. The loss is real and accepted — see Accepted risks                          |
-| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                              | L1, L2     | `fencing_tail.py` wedges PostgreSQL, costs the node quorum, and races the prober across the whole window                                   |
-| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely                                                                            | L1         | `dual_writability_prober.py` writes every internal port at 50 ms resolution. The `trust` perimeter itself is an accepted risk              |
-| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                    | W1         | **Nothing.** Cases drive a follower gateway across a leadership change but assert connection migration, not the routing decision           |
-| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold, and a node restored from an old backup can win                                      | L3         | The aged-LSN tiebreak in `evaluate_lsn_acceptable`, and `test_stale_restored_node_loses_a_leaderless_election`                             |
-| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1         | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`                                         |
-| RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1         | The mutex is no longer held across those; `app.rs` has the regression test                                                                 |
-| RW-10 | Join and rejoin edges: a clone source deposed mid-copy, orphan slots pinning WAL, a learner dying mid-join, a wiped bootstrap node impersonating the cluster           | R1, V2     | `join_edges.py`, five cases, run in CI                                                                                                     |
-| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active | W1, L3     | **Nothing.** `replication-only-partition` produces the shape and asserts write availability returns, not that the two views agree          |
-| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                         | W1, W2, S1 | `commit_probe_sweep.py` sweeps offsets across the commit record and checks each answer against the row                                     |
+| #     | Window                                                                                                                                                                 | Contract   | Watched by                                                                                                                                                        |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RW-1  | Deposed leader retains a quorum excluding the election winner, so its last ack can be later than the winner's first sight of leaderlessness                            | L1         | `lease_fencing.tla` with explicit quorum sets, and its counterexample model; live in `five_node_suite.py` Phase 2d with the prober running                        |
+| RW-2  | Post-promotion window: a freshly promoted primary acknowledging commits with zero standby acks                                                                         | W1, R2     | `post_promotion_sync_gap.py`, which enters the window on protocol state rather than a sleep; the commit is refused                                                |
+| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL                                                                                                         | W1         | `rewind_loss.py` forces the fallback and counts the survivors. The loss is real and accepted — see Accepted risks                                                 |
+| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                              | L1, L2     | `fencing_tail.py` wedges PostgreSQL, costs the node quorum, and races the prober across the whole window                                                          |
+| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely                                                                            | L1         | `dual_writability_prober.py` writes every internal port at 50 ms resolution. The `trust` perimeter itself is an accepted risk                                     |
+| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                    | W1         | **Nothing.** Cases drive a follower gateway across a leadership change but assert connection migration, not the routing decision                                  |
+| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold, and a node restored from an old backup can win                                      | L3         | The aged-LSN tiebreak in `evaluate_lsn_acceptable`, and `test_stale_restored_node_loses_a_leaderless_election`                                                    |
+| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1         | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`                                                                |
+| RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1         | The mutex is no longer held across those; `app.rs` has the regression test                                                                                        |
+| RW-10 | Join and rejoin edges: a clone source deposed mid-copy, orphan slots pinning WAL, a learner dying mid-join, a wiped bootstrap node impersonating the cluster           | R1, V2     | `join_edges.py`, five cases, run in CI                                                                                                                            |
+| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active | W1, L3     | `sync_mode_agreement.py` measures how long the replicated flag runs looser than the leader's live GUC, against a budget derived from the reconcile that closes it |
+| RW-12 | Commit-probe correctness at every byte offset around COMMIT: a wrong answer manufactures a phantom commit or a duplicate retry                                         | W1, W2, S1 | `commit_probe_sweep.py` sweeps offsets across the commit record and checks each answer against the row                                                            |
 
-Two rows are unwatched, and they are the same shape: the conditions are
-producible and the specific disagreement is not asserted. Neither is a missing
-fault; both are a missing oracle.
+One row is unwatched. RW-6's conditions are producible and the specific
+decision is not asserted, which is a missing oracle rather than a missing
+fault — the same shape RW-11 was in.
 
 ## Tier 4 — Deterministic simulation
 
@@ -268,8 +279,8 @@ The roadmap is done when:
    the same faults against a system that may schedule them differently. Closing
    it outright needs a deterministic runtime.
 4. Every risk window is either covered by a test, closed by design, or listed in
-   Accepted risks with a rationale. **Not met**, by two rows: RW-6 and RW-11 are
-   both reachable with no oracle asserting the property.
+   Accepted risks with a rationale. **Not met**, by one row: RW-6 is reachable
+   with no oracle asserting the property.
 5. The specs are checked against traces from the running binary. **Not met.** The
    static half of the mapping is enforced; the shape of a run is not.
 
@@ -308,16 +319,6 @@ multi-week.
       primary it points at is deposed, and the write is refused or re-routed
       rather than landing on the deposed node.
       _Closes_ RW-6 · _Effort_ M
-
-- [ ] **Assert RW-11: replicated sync-mode state and the live GUC must agree.**
-      `replication-only-partition` produces the divergence window and asserts
-      write availability returns. Nothing asserts that `SetSyncMode`'s replicated
-      view and `synchronous_standby_names` say the same thing across the
-      leadership change, which is what decides whether the election gate uses the
-      tight or the loose LSN threshold.
-      **Done when** a case reads both across the window and fails when they
-      disagree.
-      _Closes_ RW-11 · _Effort_ M
 
 - [ ] **Validate real traces against the specs.** A harness run's transitions,
       checked against `lease_fencing` and `raft_lsn`, with an injected drift
