@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the H-14 RPO measurement.
+"""Self-tests for the RPO measurement.
 
 `rewind_loss.py` reports a number — how many acknowledged writes the async
 fallback destroyed — and a number is only worth reporting if the harness

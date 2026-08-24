@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Torn-write oracle for the Raft store (H-25).
+"""Torn-write oracle for the Raft store.
 
 PROVES: that a write torn in half by a power loss cannot make a node serve
 Raft state it never committed. The property is sharper here than for a heap
@@ -1095,7 +1095,7 @@ def main() -> int:
         "fires on the next write and so always lands on the 320-byte commit "
         "header. `page` bakes the fault into LazyFS's config at an occurrence "
         "past the node's own restart, which is the only way to reach a btree "
-        "page — see HARDENING H-48.",
+        "page.",
     )
     parser.add_argument(
         "--occurrence",

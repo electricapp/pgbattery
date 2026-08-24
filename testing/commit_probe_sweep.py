@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-17: is the commit probe right at every offset around COMMIT?
+"""Is the commit probe right at every offset around COMMIT?
 
 A client whose connection dies mid-COMMIT asks the probe whether its
 transaction landed. A wrong answer is not a wrong status line — it manufactures
@@ -324,7 +324,7 @@ def run(
         console.print("[red]no leader[/]")
         raise typer.Exit(code=2)
     node_index = int(leader.removeprefix("node"))
-    console.print(f"[bold]H-17 commit-probe sweep[/] — leader {leader}")
+    console.print(f"[bold]commit-probe sweep[/] — leader {leader}")
     setup(leader)
 
     results: list[Trial] = []
@@ -332,7 +332,7 @@ def run(
         for offset in DEFAULT_OFFSETS_MS:
             results.append(run_trial(leader, node_index, offset, repeat))
 
-    table = Table(title="Commit probe around COMMIT (H-17)")
+    table = Table(title="Commit probe around COMMIT")
     table.add_column("Offset", justify="right")
     table.add_column("Probe")
     table.add_column("Row")

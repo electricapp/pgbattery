@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Dirty-crash durability oracle — H-24, contracts W1 and R2.
+"""Dirty-crash durability oracle — contracts W1 and R2.
 
 Every other fault in this repo is a *clean* crash. ``docker kill`` sends
 SIGKILL, the container dies, and every byte PostgreSQL wrote but never flushed

@@ -285,11 +285,11 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans || true
 
-  # H-16's cases had self-tests in CI and no runner: `join_edges.py` was driven
-  # by hand and nothing else, so a regression in a join edge could only be found
-  # by someone going looking for it.
+  # `join_edges.py` needs a runner, not just its self-tests: a harness driven by
+  # hand and nothing else leaves a regression in a join edge findable only by
+  # someone going looking for it.
   join-edges:
-    name: Join and rejoin edges (H-16)
+    name: Join and rejoin edges
     needs: lint-test-harness
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'

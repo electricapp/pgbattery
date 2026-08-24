@@ -103,7 +103,7 @@ services:
       raft_net:
         ipv4_address: 172.30.0.13
 
-  # One bare PostgreSQL on LazyFS, for the torn-write suite (H-25). Inert
+  # One bare PostgreSQL on LazyFS, for the torn-write suite. Inert
   # unless started explicitly:
   #
   #   docker compose -f docker-compose.lazyfs.yml --profile tornwrite up -d pg

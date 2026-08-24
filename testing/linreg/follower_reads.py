@@ -1,4 +1,4 @@
-"""H-10: follower reads and predicate reads, and the properties they can break.
+"""Follower reads and predicate reads, and the properties they can break.
 
 A read served by a standby is not the same read the gateway serves. It can lag,
 it can disagree with another standby, and — if replication or visibility is

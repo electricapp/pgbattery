@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-08: clock steps across the failover boundary, in both directions.
+"""Clock steps across the failover boundary, in both directions.
 
 The skew this repo shipped with was forward-only and coarse (+30 s / +300 s),
 so it never landed near a boundary and never went backwards — the harder
@@ -266,7 +266,7 @@ def run(
     timings = fp.read_system_timings()
     plan = skew_plan(timings, quick=quick)
     console.print(
-        f"[bold]H-08 clock-skew sweep[/] — lease {timings.lease_duration_ms} ms, "
+        f"[bold]clock-skew sweep[/] — lease {timings.lease_duration_ms} ms, "
         f"election {timings.election_timeout_ms} ms, {len(plan)} steps, aim={target_aim.value}"
     )
 
@@ -278,7 +278,7 @@ def run(
             console.print(f"[red]{results[-1].verdict}[/]")
             break
 
-    table = Table(title="Clock steps across the failover boundary (H-08)")
+    table = Table(title="Clock steps across the failover boundary")
     table.add_column("Skew", justify="right")
     table.add_column("Observed", justify="right")
     table.add_column("Into window", justify="right")

@@ -279,7 +279,7 @@ pub const LEADERSHIP_TRANSFER_CATCHUP_TOLERANCE: u64 = 5;
 /// promoted by any means — the probe fails, `pg_ctl promote` refuses, and
 /// nothing readable on the node distinguishes it from a healthy primary — so
 /// yielding is the only recovery that does not touch data. See
-/// [`crate::governor::promotion_watchdog`] and `HARDENING.md` H-53.
+/// [`crate::governor::promotion_watchdog`].
 ///
 /// Well past any legitimate promotion, which is a `pg_controldata` read, an LSN
 /// probe and a `pg_ctl promote`, and past a cold start with `pg_rewind`'s

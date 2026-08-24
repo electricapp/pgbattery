@@ -465,7 +465,7 @@ pub(crate) enum FormerPrimaryAction {
 /// Whether a former primary may stop its `PostgreSQL` to rewind onto the leader.
 ///
 /// Defers on an unreachable leader, as the standby path already does: stopping
-/// a node that holds WAL the leader is waiting for leaves both stuck (H-53).
+/// a node that holds WAL the leader is waiting for leaves both stuck.
 /// The caller has already fenced this node, so what stays up cannot write.
 const fn former_primary_action(timeline: TimelineCheck) -> FormerPrimaryAction {
     match timeline {

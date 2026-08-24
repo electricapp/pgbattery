@@ -47,24 +47,6 @@ class ProseFileReferenceTest(unittest.TestCase):
             lm.check_prose_file_references_resolve()
 
 
-class HardeningCitationTest(unittest.TestCase):
-    """The register is cited as the place the reasoning lives. A citation of an
-    item that was renumbered sends a reader looking for an argument that is not
-    there, in a document long enough that nobody would notice."""
-
-    def test_the_repository_as_committed_cites_only_real_items(self) -> None:
-        lm.check_hardening_citations_resolve()
-
-    def test_a_citation_of_a_missing_item_is_caught(self) -> None:
-        self.assertEqual(
-            lm.unresolved_hardening_citations("see H-99 for the argument", {"H-01"}),
-            {"H-99"},
-        )
-
-    def test_a_citation_of_a_real_item_is_not(self) -> None:
-        self.assertEqual(lm.unresolved_hardening_citations("see H-01", {"H-01"}), set())
-
-
 class DerivedConstantTest(unittest.TestCase):
     """Fault timings are read from the Rust source rather than restated. A
     renamed constant otherwise surfaces minutes into a docker run, as a
@@ -289,6 +271,32 @@ class SpecCodeReferenceTest(unittest.TestCase):
         ):
             lm.check_spec_code_references_resolve()
         self.assertIn("renew_the_lease", str(caught.exception))
+
+    def test_a_constant_on_a_continuation_line_is_read_against_the_source_above(self) -> None:
+        """A citation that wraps is still a claim about the file its entry
+        named, and a constant belonging to another module is the shape that
+        hides on the wrapped half."""
+        entry = (
+            " *    Reality: state_machine.rs lsn_catchup_threshold_bytes() picks by\n"
+            " *      mode between BELONGS_TO_NOBODY and another.\n"
+        )
+        with self._spec(entry), self.assertRaises(AssertionError) as caught:
+            lm.check_spec_code_references_resolve()
+        self.assertIn("BELONGS_TO_NOBODY", str(caught.exception))
+
+    def test_a_line_back_at_the_outer_indent_stops_inheriting(self) -> None:
+        """A `lease_fencing` entry's `Here:` half sits level with its `CODE:`
+        half and talks about the model, so it is not read against the file."""
+        lines = list(
+            lm.attributed_lines(
+                " *    CODE: governor/lease.rs renew()\n *    Here: a_tla_note follows\n"
+            )
+        )
+        self.assertEqual([source for _, _, source in lines], ["governor/lease.rs", ""])
+
+    def test_a_line_naming_two_sources_attributes_neither(self) -> None:
+        lines = list(lm.attributed_lines(" *    CODE: app.rs holddown(); governor/raft.rs\n"))
+        self.assertEqual(lines[0][2], "")
 
     def _spec(self, body: str) -> mock._patch[mock.MagicMock]:
         """Point the check at one spec holding `body` and nothing else."""

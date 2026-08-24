@@ -1,6 +1,6 @@
 name: Durability
 
-# The dirty-crash suite (H-24, contracts W1 and R2). Runs against
+# The dirty-crash suite (contracts W1 and R2). Runs against
 # docker-compose.lazyfs.yml, where PGDATA is a LazyFS mount and an un-fsynced
 # write can actually be lost.
 #
@@ -249,7 +249,7 @@ jobs:
       # selection, which only a config-baked injection honours, so this pays a
       # restart to aim past the writes the victim makes rejoining. It asserts
       # the tear landed off offset 0 and refuses to report the header case as
-      # this one. See HARDENING H-48.
+      # this one.
       - name: Tear a committed btree page
         run: |
           uv run --project testing python testing/torn_raft.py \

@@ -239,7 +239,7 @@ pub enum ModelOp {
     Demote,
     SetReadonly,
     /// The probe itself refusing, which is what a standby that has not reached
-    /// a consistent recovery state does to every connection (H-53).
+    /// a consistent recovery state does to every connection.
     IsInRecovery,
 }
 

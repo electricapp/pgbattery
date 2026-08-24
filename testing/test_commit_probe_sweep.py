@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the H-17 commit-probe verdict.
+"""Self-tests for the commit-probe verdict.
 
 Both wrong answers have to be rejected. `committed` with no row is a phantom
 commit — the client believes a write that never happened. `aborted` with the row

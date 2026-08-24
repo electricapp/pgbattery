@@ -1439,7 +1439,7 @@ impl App {
     ) -> Option<bool> {
         let mut pg = postgres.lock().await;
         // One probe, reported to the caller whatever it said — see
-        // `observe_pg_primary` for why `None` is load-bearing (H-53).
+        // `observe_pg_primary` for why `None` is load-bearing.
         let observed = Self::observe_pg_primary(&*pg).await;
         // Fast-path idempotency: if PG is already primary we have nothing to
         // do. Skips the expensive verify_promotion_safe (which shells out to
@@ -3697,7 +3697,7 @@ mod tests {
             );
         }
 
-        // ── what the promotion watchdog is told (H-53) ──────────────────────
+        // ── what the promotion watchdog is told ─────────────────────────────
 
         #[tokio::test]
         async fn a_primary_reports_itself_as_serving() {
@@ -3735,7 +3735,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_unprobeable_postgres_is_reported_as_unknown_not_as_a_standby() {
-            // The whole of H-53. A standby that has not reached a consistent
+            // A standby that has not reached a consistent
             // recovery state refuses connections, so the probe cannot answer —
             // and if that collapsed into `Some(false)` the watchdog would see
             // an ordinary un-promoted standby, which is the state it must not

@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the H-09 wiped-rejoin checker.
+"""Self-tests for the wiped-rejoin checker.
 
 The safety question is decided by two pure functions: `find_dual_leadership`,
 which reads a sampled history, and `VariantResult.verdict`, which turns one

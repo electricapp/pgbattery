@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the follower-read and predicate-read checkers (H-10).
+"""Self-tests for the follower-read and predicate-read checkers.
 
 Each checker gets a history that violates it and must reject; a checker that
 only ever passes is worse than none, because it reads as coverage.

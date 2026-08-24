@@ -11,8 +11,8 @@
 //! Nothing the node can read locally names the cause. `pg_controldata` reports
 //! `in production` for a stuck standby, and the connection error is the same
 //! one `PostgreSQL` gives for the second or two of any normal start, so a guard
-//! keyed on either would either lie or fire on every restart (`HARDENING.md`
-//! H-53 records both experiments). What is left is the weaker statement that
+//! keyed on either would either lie or fire on every restart. What is left is
+//! the weaker statement that
 //! does not need a cause: **this node has led for longer than any legitimate
 //! promotion could take and its `PostgreSQL` is still not primary.** A wedged
 //! recovery, a crashed postmaster and a hung start all want the same remedy,

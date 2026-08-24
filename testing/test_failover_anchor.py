@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the H-18 anchor checker."""
+"""Self-tests for the anchor checker."""
 
 from __future__ import annotations
 

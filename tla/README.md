@@ -33,6 +33,15 @@ measurement behind the choice. Node count is not always the right axis —
 where a wider `MaxLSN` buys more. `check-large` fails rather than skips when a
 spec has no large config.
 
+`<spec>.alt-<name>.cfg` is a third kind, and the distinction from `large` is the
+point: it is the same spec at another setting **the binary can be running**, not
+a wider bound on the same one. `raft_lsn.alt-loose-lsn-gate.cfg` exists because
+`lsn_catchup_threshold_bytes()` picks between two thresholds by replication mode
+and a single `LSNLagThreshold` stands for whichever is active, so one model
+checks one of the two gates that ship. These run in `check-specs` beside
+`<spec>.cfg`, so a PR passes both; they are optional, because most specs have a
+single interesting point in their constant space.
+
 A third kind of model is a **counterexample**: `<spec>.inv-<name>.cfg` disables
 one mechanism the safety argument rests on and names, in an `EXPECT-VIOLATION:`
 header, the invariant TLC then has to report. A run that succeeds is the failure,
@@ -94,13 +103,18 @@ so the mechanism is disabled only where a counterexample is the expected result.
   `LeaseDuration - QuorumTimeout` breaks the inequality, and no lease scheme
   bounds that without assuming it.
 
-**`raft_lsn.tla`** — passes (33,957 distinct states)
+**`raft_lsn.tla`** — passes (33,957 distinct states tight, 112,053 loose)
 
 - `ElectionSafety` (≤1 leader), `NoLSNDeadlock` / `SomeNodeCanWin` (the LSN gate
   never wedges elections), `TypeOK`. `raft_lsn.inv-double-vote-per-term.cfg` is
   the checked config in which `ElectionSafety` breaks, which matters here more
   than elsewhere: the gate below is advisory, so this is the property safety
   actually rests on.
+- Checked at **both** ends of the gate. `raft_lsn.cfg` is the tight threshold,
+  where `NoLSNDeadlock` and `SomeNodeCanWin` bite because a narrow gate admits
+  fewer candidates; `raft_lsn.alt-loose-lsn-gate.cfg` is the loose one, which
+  reaches leaders further behind than the tight gate would ever have admitted
+  and where `ElectionSafety` still has to hold.
 - **TLC actively DISPROVES** `LeaderHasAcceptableLSN` and `LeaderLSNNotBelowVoters`
   (defined in the spec, deliberately not in the cfg): a candidate self-votes past
   the gate — the self-vote is not LSN-checked — and reaches quorum via an
@@ -136,8 +150,11 @@ the `crates/pgbattery-supervisor/` workspace crate
 (`crates/pgbattery-supervisor/src/process.rs`), not `src/supervisor/` (a re-export shim).
 
 The mapping is a lint, not a comment. `lint_matrix.py`'s "TLA specs name real
-code" resolves every `.rs` path a spec names against the workspace, and on a line
-naming exactly one source it requires the identifiers cited there — anything with
-an underscore, or written with empty parentheses — to be in that file. A rename
-that leaves a spec behind fails the lint rather than leaving a passing model
-checker describing a program that is gone.
+code" resolves every `.rs` path a spec names against the workspace, and requires
+the identifiers cited alongside it — anything with an underscore, or written with
+empty parentheses — to be in that file. An entry naming one source claims every
+line indented past it, so a citation that wraps is still read against the file it
+named. A line naming several sources claims nothing, since there is no saying
+which of them a name on it belongs to. A rename that leaves a spec behind fails
+the lint rather than leaving a passing model checker describing a program that is
+gone.

@@ -1263,16 +1263,12 @@ with confidence.
 
 PROSE_DOCS_PATHS: Final[tuple[Path, ...]] = tuple(PROJECT_ROOT / doc for doc in PROSE_DOCS)
 
-PROSE_REFERENCE_EXEMPT: Final[dict[str, str]] = {
-    "docs/TESTS.md": "H-51 quotes it as a document that was never in the repository",
-    "BUGS.md": "the same",
-    "file_backend/optimized.rs": "a path inside the redb crate, not this repository",
-}
+PROSE_REFERENCE_EXEMPT: Final[dict[str, str]] = {}
 """References that name no file here on purpose, and why.
 
-An exemption is a claim about a specific string, so it has to be written down
-next to the check rather than smuggled in as a pattern that would also hide the
-next stale path.
+Empty, and the mechanism stays: an exemption is a claim about a specific string,
+so it has to be written down next to the check rather than smuggled in as a
+pattern that would also hide the next stale path.
 """
 
 
@@ -1330,45 +1326,6 @@ class _PortLiterals(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Same, and a class body is where a test's expected values live."""
-
-
-HARDENING_PATH = PROJECT_ROOT / "HARDENING.md"
-
-HARDENING_ITEM = re.compile(r"^- \[[ x]\] \*\*(H-\d+)", re.MULTILINE)
-"""An item's own heading in `HARDENING.md`."""
-
-HARDENING_CITATION = re.compile(r"\b(H-\d+)\b")
-"""A reference to one from anywhere — code, matrix, docs, another item."""
-
-
-def unresolved_hardening_citations(text: str, defined: Container[str]) -> set[str]:
-    """Item IDs cited by `text` that `HARDENING.md` does not define."""
-    return {cited for cited in HARDENING_CITATION.findall(text) if cited not in defined}
-
-
-def check_hardening_citations_resolve() -> None:
-    """Every H-NN cited anywhere must be an item that exists.
-
-    The register is cited from the matrix, the harnesses and the state-machine
-    doc as the place the reasoning lives, and a citation of an item that was
-    renumbered or never written sends a reader looking for an argument that is
-    not there. The document is long enough that nobody would notice.
-    """
-    defined = set(HARDENING_ITEM.findall(HARDENING_PATH.read_text(encoding="utf-8")))
-    if not defined:
-        raise AssertionError("HARDENING.md defines no items; the heading shape must have changed")
-    problems = []
-    for path in [*sorted(TESTING_DIR.glob("*.py")), *PROSE_DOCS_PATHS, MATRIX_PATH]:
-        # This file and its test name item IDs to look for them, not to cite
-        # them — the same self-reference `check_sql_references` skips.
-        if path.name in {"lint_matrix.py", "test_lint_matrix.py"}:
-            continue
-        if unresolved := unresolved_hardening_citations(path.read_text(encoding="utf-8"), defined):
-            problems.append(f"{path.name}: {', '.join(sorted(unresolved))}")
-    if problems:
-        raise AssertionError(
-            "citations of HARDENING items that do not exist — " + " | ".join(problems)
-        )
 
 
 def check_derived_rust_constants_resolve() -> None:
@@ -1734,34 +1691,66 @@ def resolve_rust_path(reference: str, sources: Sequence[Path]) -> Path | None:
     return None
 
 
+def prose_indent(line: str) -> int:
+    """How far a spec's comment line is indented past its comment marker.
+
+    `\\*`, `(*` and the ` *` of a block are the markers; what follows them is
+    the prose, and its indentation is what says whether a line continues the
+    one above or starts something new.
+    """
+    stripped = line.lstrip()
+    for marker in ("\\*", "(*", "*)", "*"):
+        if stripped.startswith(marker):
+            stripped = stripped[len(marker) :]
+            break
+    return len(stripped) - len(stripped.lstrip())
+
+
+def attributed_lines(text: str) -> Iterable[tuple[int, str, str]]:
+    """Each line of a spec paired with the source it names or continues.
+
+    A line naming exactly one `.rs` attributes itself and every line indented
+    past it: a `CODE:` or `Reality:` entry that wraps onto three more lines is
+    still describing that one file, and a name on a continuation is as much a
+    claim about it as one on the first line. A line naming several sources
+    attributes nothing, because there is no saying which of them a name on it
+    belongs to.
+    """
+    source = ""
+    indent = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        named = rust_paths_named(line)
+        if len(named) == 1:
+            source, indent = named[0], prose_indent(line)
+        elif named or prose_indent(line) <= indent:
+            source = ""
+        yield number, line, source
+
+
 def check_spec_code_references_resolve() -> None:
     """Every file and symbol the TLA+ specs map themselves onto must exist.
 
     Each spec header names the Rust that implements the action it models, and
     that mapping is the only thing connecting a machine-checked proof to the
-    binary it is a proof about. Nothing checked it, so a rename could leave the
-    specs describing a program that no longer exists — and a model checker
-    passing against code that moved is worse than none, because it reads as
-    assurance.
+    binary it is a proof about. Left to prose, a rename leaves the specs
+    describing a program that no longer exists — and a model checker passing
+    against code that moved is worse than none, because it reads as assurance.
 
-    A line naming exactly one source is where a symbol can be attributed; zero
-    names nothing to look in, and more than one leaves the names on the line
-    unattributed.
+    Attribution follows `attributed_lines`, so an entry that wraps is still
+    read against the source it named.
     """
     sources = rust_sources()
     texts: dict[Path, str] = {}
     unresolved_files: list[str] = []
     absent_symbols: list[str] = []
     for spec in tla_specs():
-        for number, line in enumerate(spec.read_text(encoding="utf-8").splitlines(), start=1):
-            named = rust_paths_named(line)
-            resolved = [(ref, resolve_rust_path(ref, sources)) for ref in named]
-            if missing := [ref for ref, path in resolved if path is None]:
+        for number, line, reference in attributed_lines(spec.read_text(encoding="utf-8")):
+            if missing := [
+                ref for ref in rust_paths_named(line) if resolve_rust_path(ref, sources) is None
+            ]:
                 unresolved_files.append(f"{spec.name}:{number} -> {', '.join(missing)}")
                 continue
-            if len(resolved) != 1:
-                continue
-            reference, path = resolved[0]
+            path = resolve_rust_path(reference, sources) if reference else None
             if path is None:
                 continue
             text = texts.setdefault(path, path.read_text(encoding="utf-8"))
@@ -1898,7 +1887,6 @@ def lint() -> None:
     check("preflight.sh mirrors the CI gates", check_preflight_mirrors_ci)
     check("Harness derives cluster ports", check_harness_derives_cluster_ports)
     check("Derived Rust constants resolve", check_derived_rust_constants_resolve)
-    check("HARDENING citations resolve", check_hardening_citations_resolve)
     check("Docs name real files", check_prose_file_references_resolve)
     check("Doc reference exemptions still apply", check_prose_exemptions_are_still_needed)
     check("State machine doc names real types", check_state_machine_names_resolve)

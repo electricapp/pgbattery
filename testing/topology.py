@@ -98,8 +98,7 @@ class Node:
     """Whether this node starts with `--bootstrap`, which means "initdb a new
     cluster if there is no data here". Wiping such a node does not exercise a
     rejoin: it mints a fresh PostgreSQL lineage under an id the cluster still
-    lists — see H-16 in HARDENING.md — so a harness testing joins must target a
-    node that actually joins."""
+    lists, so a harness testing joins must target a node that actually joins."""
 
 
 @dataclass(frozen=True)

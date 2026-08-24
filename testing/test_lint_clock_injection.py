@@ -8,9 +8,9 @@ indistinguishable from one that cannot fail — the same argument the contract
 inversions rest on, applied to the lint itself.
 
 Two things need proving. First that the scan catches each shape it claims to:
-`Instant::now()`, `SystemTime::now()`, and `.elapsed()`, which is the one that
-actually got past the first pass of H-30 because it is implicitly
-`Instant::now() - self` and does not name a clock at all. Second that the
+`Instant::now()`, `SystemTime::now()`, and `.elapsed()`, which is the one a
+scan for clock names misses entirely because it is implicitly
+`Instant::now() - self`. Second that the
 `mod tests` cutoff cannot silently swallow the file: the scan treats everything
 after the boundary as test code, so a second `#[cfg(test)]` earlier in the file
 would un-guard the lines between them while the lint went on reporting PASS.
@@ -51,9 +51,9 @@ class CatchesEveryClockShape(unittest.TestCase):
         self.assertTrue(lines_of("let t = SystemTime::now();"))
 
     def test_elapsed_is_a_violation(self) -> None:
-        """The shape that survived the first pass of H-30. It reads the process
-        clock without naming it, so converting every `Instant::now()` looked
-        like a complete migration while five gates still could not be driven."""
+        """The shape a name-based scan misses. It reads the process clock
+        without naming it, so converting every `Instant::now()` can look like a
+        complete migration while gates remain undrivable."""
         self.assertTrue(lines_of("if self.anchor.elapsed() < timeout {"))
 
     def test_the_injected_clock_is_not_a_violation(self) -> None:

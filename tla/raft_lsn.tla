@@ -45,11 +45,17 @@
  * 3. LSN LAG THRESHOLD (single, abstracted):
  *    Spec: one LSNLagThreshold constant.
  *    Reality: state_machine.rs lsn_catchup_threshold_bytes() picks a DUAL
- *      threshold by replication mode — tight SYNC_LAG_THRESHOLD_BYTES (1 MB,
- *      also the fail-safe default for unknown mode) vs loose
- *      MAX_REPLICATION_LAG_BYTES (16 MB) only when async is positively known.
- *    Run this model twice — a tight and a loose LSNLagThreshold — to cover
- *      both; the single constant abstracts whichever mode is active.
+ *      threshold by replication mode, taking the tight branch whenever sync is
+ *      active OR the mode is unknown, so an unknown mode fails safe.
+ *    The two it picks between live in config/constants.rs:
+ *      LSN_CATCHUP_THRESHOLD_BYTES_SYNC, one WAL block, against
+ *      LSN_CATCHUP_THRESHOLD_BYTES_ASYNC, the published async RPO. They are
+ *      orders of magnitude apart, which is why one model cannot stand in for
+ *      both — an abstraction that collapses them hides the distance.
+ *    One constant abstracts whichever mode is active, so the model is checked
+ *      at both ends: raft_lsn.cfg is the tight one and
+ *      raft_lsn.alt-loose-lsn-gate.cfg the loose one, and `make check` runs
+ *      both.
  *
  * 4. VOTING LOGIC (core comparison only):
  *    Spec: candidateLSN + threshold >= voterMaxLSN  (i.e. max - candidate <=

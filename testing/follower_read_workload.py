@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-10: drive follower reads and predicate reads against a live cluster.
+"""Drive follower reads and predicate reads against a live cluster.
 
 Writes go through the gateway to the leader and record their commit LSN. Reads
 are served by each standby and record that standby's replay position, which is
@@ -199,7 +199,7 @@ def run(
         console.print("[red]no leader[/]")
         raise typer.Exit(code=2)
     standbys = [n for n in fp.NODES if n != leader]
-    console.print(f"[bold]H-10 follower reads[/] — leader {leader}, standbys {', '.join(standbys)}")
+    console.print(f"[bold]follower reads[/] — leader {leader}, standbys {', '.join(standbys)}")
 
     setup(leader)
     recorded = run_workload(leader, standbys, rounds)
@@ -222,7 +222,7 @@ def run(
         ),
     ]
 
-    table = Table(title="Follower and predicate reads (H-10)")
+    table = Table(title="Follower and predicate reads")
     table.add_column("Property", style="bold")
     table.add_column("Result")
     table.add_column("Detail")

@@ -1906,7 +1906,7 @@ class LazyfsFaultChannelTests(RunnerFixture):
 
 
 class TornWriteTests(RunnerFixture):
-    """Torn-write injection (H-25). Every guard here encodes something read out
+    """Torn-write injection. Every guard here encodes something read out
     of the LazyFS source, because each one fails silently rather than loudly:
     a torn-op that does not match reports "configured successfully" and tears
     nothing."""

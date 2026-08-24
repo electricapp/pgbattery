@@ -3867,8 +3867,8 @@ mod tests {
         ));
     }
 
-    /// H-23 decided not to flip the `_ => Unmodeled` fallback, and the argument
-    /// rests entirely on this: a plain `SELECT` is classified by its own arm, so
+    /// The `_ => Unmodeled` fallback stays migratable, and the argument rests
+    /// entirely on this: a plain `SELECT` is classified by its own arm, so
     /// `SELECT my_func()` never reaches the fallback and flipping it could not
     /// close the function-body hole. If a refactor ever routes `SelectStmt`
     /// through the fallback, that argument silently stops holding.
@@ -3892,7 +3892,7 @@ mod tests {
                     ConnectionHandler::classify_statement(node),
                     StatementClass::Unmodeled
                 ),
-                "{query:?} reached the Unmodeled fallback; H-23's reasoning no longer holds"
+                "{query:?} reached the Unmodeled fallback; the fallback's reasoning no longer holds"
             );
         }
     }
@@ -4748,7 +4748,7 @@ mod tests {
     }
 }
 
-/// H-19: the differential classifier oracle.
+/// The differential classifier oracle.
 ///
 /// The classifier is a deny-list over a language with roughly two hundred
 /// statement types, so its correctness cannot be argued from its own arms. It
@@ -4878,9 +4878,10 @@ mod session_state_oracle {
     /// this oracle disagree with the running gateway: `analyze_query` runs only
     /// when a prefilter recognises the statement, and function-call state
     /// (`set_config`, the advisory-lock family) never reaches it because that
-    /// flag is authoritative on its own. H-20 is the precedent — an arm sat
-    /// unreachable in production while its own test passed, because the test
-    /// called the analyzer directly and could not see a missing gate keyword.
+    /// flag is authoritative on its own. Going through the gateway is what
+    /// catches an arm sitting unreachable in production while its own test
+    /// passes, the test having called the analyzer directly and so been unable
+    /// to see a missing gate keyword.
     fn gateway_verdict(query: &str) -> Verdict {
         let flags = ConnectionHandler::query_keyword_flags(query);
         if flags.function_state {

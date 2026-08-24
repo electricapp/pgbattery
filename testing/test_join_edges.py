@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the H-16 join-edge harness.
+"""Self-tests for the join-edge harness.
 
 The live cases each drive one edge and read one observable back. What is tested
 here is the reading: the target choice that keeps a case pointed at the edge it

@@ -196,7 +196,7 @@ counting one as a voter makes every quorum assertion vacuous."""
 JOINING_NODES: Final[tuple[str, ...]] = topology.JOINING_NODES
 """Voters that reach the cluster by joining it — the only valid targets for a
 wipe-and-rejoin. Wiping the bootstrap node makes it `initdb` a new lineage
-under an id the cluster still lists — see H-16 in HARDENING.md."""
+under an id the cluster still lists."""
 
 NODE_IPS: Final[dict[str, str]] = topology.NODE_IPS
 """Static addresses on the cluster network, for peer-level faults."""
@@ -3344,7 +3344,7 @@ def crash_losing_unsynced_writes(
     pins alone.
 
     DOES NOT PROVE: torn-write handling. Pages here are lost whole, never
-    half-written. That is :func:`arm_torn_write`'s job, and H-25's.
+    half-written. That is :func:`arm_torn_write`'s job.
 
     Every named container is discarded before any is killed. Killing them one
     at a time would let the survivors keep accepting writes and re-replicating

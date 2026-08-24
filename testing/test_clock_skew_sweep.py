@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Self-tests for the H-08 clock-skew sweep.
+"""Self-tests for the clock-skew sweep.
 
 The sweep's own logic is the plan: which steps get applied. Everything else is
 the fault primitive and the prober, both tested elsewhere. What matters here is

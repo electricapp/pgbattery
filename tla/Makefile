@@ -1,7 +1,8 @@
 # TLA+ model checking — reproducible, scripted.
 #
-#   make check          # download (if needed) + check ALL specs AND the
-#                       # counterexample models; fails on violation
+#   make check          # download (if needed) + check ALL specs, their alt
+#                       # models, AND the counterexample models; fails on
+#                       # violation
 #   make check-large    # the nightly models: more nodes, wider bounds
 #   make check-counterexamples  # the models that MUST fail (see below)
 #   make check-lease_fencing   # check one spec (full TLC output)
@@ -42,6 +43,12 @@ SPECS := lease_fencing raft_lsn commit_probing timeline_verification
 # whose passing means nothing.
 INV_CFGS := $(wildcard *.inv-*.cfg)
 
+# A `<spec>.alt-<name>.cfg` is the same spec at another point in its constant
+# space — a second setting the binary can be running, not a wider bound. Each
+# says in its own header which setting and why. Optional, and checked beside
+# `<spec>.cfg` in `check-specs`, so a PR has to pass both.
+ALT_CFGS := $(wildcard *.alt-*.cfg)
+
 # Prefer a `java` that actually runs (the macOS /usr/bin/java stub fails
 # `java -version`), else Homebrew openjdk@21, else bare `java` for a clear error.
 JAVA ?= $(shell \
@@ -74,12 +81,13 @@ check: check-specs check-counterexamples
 
 check-specs: tools
 	@mkdir -p $(STATES)
-	@fail=0; for s in $(SPECS); do \
-	  echo "=== $$s ==="; \
-	  if $(TLC) -config $$s.cfg -workers auto -metadir $(STATES)/$$s $$s.tla > $(STATES)/$$s.log 2>&1; then \
-	    grep -E "Model checking completed|distinct states found" $(STATES)/$$s.log | sed 's/^/  /'; \
+	@fail=0; for cfg in $(addsuffix .cfg,$(SPECS)) $(ALT_CFGS); do \
+	  spec=$${cfg%%.*}; name=$${cfg%.cfg}; \
+	  echo "=== $$name ==="; \
+	  if $(TLC) -config $$cfg -workers auto -metadir $(STATES)/$$name $$spec.tla > $(STATES)/$$name.log 2>&1; then \
+	    grep -E "Model checking completed|distinct states found" $(STATES)/$$name.log | sed 's/^/  /'; \
 	  else \
-	    echo "  FAILED — invariant violated or error:"; tail -40 $(STATES)/$$s.log | sed 's/^/  /'; fail=1; \
+	    echo "  FAILED — invariant violated or error:"; tail -40 $(STATES)/$$name.log | sed 's/^/  /'; fail=1; \
 	  fi; \
 	done; \
 	if [ $$fail -ne 0 ]; then echo "TLA validation FAILED"; exit 1; fi; \

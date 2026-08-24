@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-18: the failover anchor's lifecycle under coalesced watch transitions.
+"""The failover anchor's lifecycle under coalesced watch transitions.
 
 `promote_local_postgres` withholds promotion for one lease duration measured
 from `failover_started_at`. The governor stamps that anchor on the leader-loss
@@ -22,7 +22,7 @@ Three properties:
   bounded   an anchor observed during a failover is younger than the failover
             it belongs to, never inherited from an earlier one
   restamped a node whose election keeps failing re-anchors on every new term
-            (H-35, `restamp` below), because the instant the hold-down has to
+            (`restamp` below), because the instant the hold-down has to
             bound is when a majority moved past the deposed leader's term, not
             when this node first saw the leader go
 """
@@ -242,8 +242,8 @@ def anchor_resets(ages: Sequence[int | None]) -> int:
     An anchor stamped once grows monotonically for the whole leaderless window.
     Each decrease is a re-stamp, and a re-stamp is the observable that says the
     hold-down measures the newest term rather than the first sight of
-    leaderlessness — the H-35 defect, whose signature is an anchor that only
-    ever ages.
+    leaderlessness. The defect this catches has the opposite signature: an
+    anchor that only ever ages.
 
     A gap (the node did not answer) breaks the chain rather than counting as a
     decrease, and so does a clear: those are `should_clear_stale_failover_anchor`,
@@ -332,7 +332,7 @@ def run(
 ) -> None:
     """Force leadership churn and assert the anchor lifecycle, not its arithmetic."""
     timings = fp.read_system_timings()
-    console.print(f"[bold]H-18 failover anchor[/] — lease {timings.lease_duration_ms} ms")
+    console.print(f"[bold]failover anchor[/] — lease {timings.lease_duration_ms} ms")
 
     results: list[Round] = []
     for index in range(rounds):
@@ -342,7 +342,7 @@ def run(
             console.print(f"[red]round {index}: {exc}[/]")
             raise typer.Exit(code=1) from None
 
-    table = Table(title="Failover anchor lifecycle (H-18)")
+    table = Table(title="Failover anchor lifecycle")
     table.add_column("Round", justify="right")
     table.add_column("Deposed")
     table.add_column("Samples", justify="right")
@@ -375,10 +375,10 @@ def restamp(
     window_s: float = typer.Option(45.0, "--window", help="Seconds to keep the follower stranded."),
     token: str = typer.Option("local-ci-token", "--token", help="Management API token."),
 ) -> None:
-    """H-35: an election that keeps failing must re-anchor on every new term."""
+    """An election that keeps failing must re-anchor on every new term."""
     timings = fp.read_system_timings()
     console.print(
-        f"[bold]H-35 hold-down anchor per term[/] — lease {timings.lease_duration_ms} ms, "
+        f"[bold]hold-down anchor per term[/] — lease {timings.lease_duration_ms} ms, "
         f"{window_s:.0f} s stranded"
     )
 
@@ -388,7 +388,7 @@ def restamp(
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from None
 
-    table = Table(title="Hold-down anchor across failed elections (H-35)")
+    table = Table(title="Hold-down anchor across failed elections")
     table.add_column("Stranded")
     table.add_column("Samples", justify="right")
     table.add_column("Anchors seen", justify="right")

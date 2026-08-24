@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Torn-write oracle (H-25).
+"""Torn-write oracle.
 
 PROVES: that a write torn in half by a power loss is either repaired or
 detected, never silently accepted as valid data. A torn page keeps its length,

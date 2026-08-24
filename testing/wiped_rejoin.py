@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-09: destroy a node's state, rejoin it under the same id, assert nobody voted twice.
+"""Destroy a node's state, rejoin it under the same id, assert nobody voted twice.
 
 A voter's persisted vote is what stops it voting twice in one term. Wipe the
 store, bring the node back under the same id, and it has no memory of the vote
@@ -346,7 +346,7 @@ def run(
             break
         restore_cluster(results[-1])
 
-    table = Table(title="Wiped-node rejoin (H-09)")
+    table = Table(title="Wiped-node rejoin")
     table.add_column("Variant", style="bold")
     table.add_column("Node")
     table.add_column("Rejoined")

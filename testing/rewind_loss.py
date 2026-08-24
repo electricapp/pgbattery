@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-14: how much acknowledged WAL does pg_rewind actually destroy?
+"""How much acknowledged WAL does pg_rewind actually destroy?
 
 The rewind gate tolerates divergence up to `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`
 (16 MiB) and its justification is that synchronous replication is holding the
@@ -170,7 +170,7 @@ def run(
     """Force the async fallback, depose the leader, and count what rewind ate."""
     leader = await_healthy(RECOVERY_TIMEOUT_S)
     standbys = [n for n in fp.NODES if n != leader]
-    console.print(f"[bold]H-14 rewind loss[/] — leader {leader}, standbys {', '.join(standbys)}")
+    console.print(f"[bold]rewind loss[/] — leader {leader}, standbys {', '.join(standbys)}")
 
     rc, out = _psql(
         leader,
@@ -251,7 +251,7 @@ def run(
         new_leader=new_leader,
     )
 
-    table = Table(title="What pg_rewind discarded (H-14)")
+    table = Table(title="What pg_rewind discarded")
     table.add_column("Acked in fallback", justify="right")
     table.add_column("Survived", justify="right")
     table.add_column("Destroyed", justify="right")

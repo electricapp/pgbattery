@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""H-16: the join and rejoin edges, and what they leave behind.
+"""The join and rejoin edges, and what they leave behind.
 
 Five cases, each an edge the happy path never visits:
 
@@ -536,7 +536,7 @@ def run(
         except EdgeError as exc:
             console.print(f"[yellow]cluster did not fully recover after {chosen}: {exc}[/]")
 
-    table = Table(title="Join and rejoin edges (H-16)")
+    table = Table(title="Join and rejoin edges")
     table.add_column("Case", style="bold")
     table.add_column("Result")
     table.add_column("Detail")

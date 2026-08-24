@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""ENOSPC at WAL-segment allocation — H-26, contract W1.
+"""ENOSPC at WAL-segment allocation — contract W1.
 
 A blanket "fill the volume" test proves little: it exhausts the filesystem at
 whatever point the filler happens to reach, which is usually somewhere dull.
