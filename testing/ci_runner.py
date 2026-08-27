@@ -1583,6 +1583,12 @@ class CIRunner:
                 self._write_text(log_path, message)
                 self.log(f"    {message.splitlines()[0]}")
                 raise RunnerError(message) from exc
+            except BaseException:
+                # The step has its own process group, so Ctrl-C no longer
+                # reaches it. Without this, interrupting a local run leaves
+                # docker compose and the harness orphaned.
+                kill_process_group(handle)
+                raise
             returncode = handle.returncode
 
         proc = subprocess.CompletedProcess(

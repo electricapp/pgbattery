@@ -453,6 +453,48 @@ def test_run_shell_does_not_lose_buffered_output_from_a_python_child() -> None:
     assert "printed-before-the-hang" in partial
 
 
+def test_interrupting_a_step_kills_its_process_group() -> None:
+    """Ctrl-C reaches the runner, not the step's own group.
+
+    Steps run in a new session so a timeout can kill the whole tree; the cost
+    is that an interrupt no longer propagates, and the runner has to pass it on
+    or leave docker compose orphaned.
+    """
+    runner = make_runner()
+    killed: list[object] = []
+
+    class InterruptingPopen:
+        pid = 4242
+        returncode = 0
+
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def __enter__(self) -> InterruptingPopen:
+            return self
+
+        def __exit__(self, *_a: Any) -> None:
+            return None
+
+        def communicate(self, *_a: Any, **_kw: Any) -> tuple[str, str]:
+            raise KeyboardInterrupt
+
+        def kill(self) -> None:
+            return None
+
+    with (
+        mock.patch.object(subprocess, "Popen", InterruptingPopen),
+        mock.patch.object(ci_runner, "kill_process_group", killed.append),
+    ):
+        try:
+            runner._run_shell("true", runner.artifact_dir / "interrupt.log", timeout_sec=5)
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("the interrupt must propagate to the caller")
+    assert killed, "the step's process group must be killed on interrupt"
+
+
 def test_diagnostics_do_not_use_compose_when_the_case_owns_the_topology() -> None:
     """`docker compose` names the runner's project, not the case's.
 
