@@ -198,7 +198,9 @@ rm -f {scratch_in}/data/standby.signal
     )
 
     # Start throwaway postmaster; wait for ready; assert markers; write; stop.
-    compose_exec(
+    # `pg_ctl -l` sends the reason it refused to start to pg.log, so a failure
+    # here must report that file rather than "could not start server".
+    start = compose_exec(
         node,
         "sh",
         "-c",
@@ -211,7 +213,15 @@ for i in $(seq 1 60); do
 done
 {pg_bin}/pg_isready -h 127.0.0.1 -p {SCRATCH_PORT} -U {PG_USER}
 """,
+        check=False,
     )
+    if start.returncode != 0:
+        log = compose_exec(node, "cat", f"{scratch_in}/pg.log", check=False).stdout
+        die(
+            f"restored cluster did not start under {pg_bin} "
+            f"(rc={start.returncode}): {start.stderr or start.stdout}\n"
+            f"--- pg.log ---\n{log}"
+        )
 
     def scratch_psql(sql: str) -> str:
         r = compose_exec(

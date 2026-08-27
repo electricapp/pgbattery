@@ -946,6 +946,23 @@ pub fn data_dir_major(data_dir: &Path) -> Result<u32> {
     Ok(major)
 }
 
+/// The bin dir matching the major that is actually on disk.
+///
+/// `pg_bin_dir` is the configured default and outlives the data directory it
+/// was written for: after an upgrade, or before one, it can name a different
+/// major than `PG_VERSION` does. Anything that runs a binary against the live
+/// data directory has to resolve through `pg_bin_dirs` instead.
+#[must_use]
+pub fn bin_dir_for_major<'a>(
+    major: Option<u32>,
+    bin_dirs: &'a BTreeMap<String, PathBuf>,
+    configured: &'a Path,
+) -> &'a Path {
+    major
+        .and_then(|m| bin_dirs.get(&m.to_string()))
+        .map_or(configured, PathBuf::as_path)
+}
+
 /// Whether two paths share a filesystem (required for clone/link).
 ///
 /// # Errors
@@ -2365,6 +2382,35 @@ mod tests {
             fs::write(dir.join("global/pg_control"), b"x").unwrap();
         }
         dir
+    }
+
+    fn dual_bin_dirs() -> BTreeMap<String, PathBuf> {
+        BTreeMap::from([
+            ("17".into(), PathBuf::from("/usr/lib/postgresql/17/bin")),
+            ("18".into(), PathBuf::from("/usr/lib/postgresql/18/bin")),
+        ])
+    }
+
+    /// The shipped config points `pg_bin_dir` at the newer major while the
+    /// data directory is still on the older one. Running the configured
+    /// binaries against that data directory fails to start the server.
+    #[test]
+    fn the_active_bin_dir_follows_the_data_directory_not_the_config() {
+        let dirs = dual_bin_dirs();
+        let configured = Path::new("/usr/lib/postgresql/18/bin");
+        assert_eq!(
+            bin_dir_for_major(Some(17), &dirs, configured),
+            Path::new("/usr/lib/postgresql/17/bin")
+        );
+    }
+
+    /// A major with no mapping falls back rather than inventing a path.
+    #[test]
+    fn an_unmapped_major_falls_back_to_the_configured_bin_dir() {
+        let dirs = dual_bin_dirs();
+        let configured = Path::new("/usr/lib/postgresql/18/bin");
+        assert_eq!(bin_dir_for_major(Some(16), &dirs, configured), configured);
+        assert_eq!(bin_dir_for_major(None, &dirs, configured), configured);
     }
 
     /// The upgrade's position is read off disk, not from a marker it wrote.

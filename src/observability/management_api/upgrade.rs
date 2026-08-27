@@ -678,7 +678,7 @@ pub struct PostgresStatusResponse {
     pub active_major: Option<u32>,
     pub active_bin_dir: String,
     pub active_data_dir: String,
-    pub has_upgrade_anchor: bool,
+    pub rollback_available: bool,
 }
 
 /// Probe active `PG_VERSION` / paths on this node.
@@ -694,12 +694,12 @@ pub(super) async fn get_postgres_status(
                 active_major: None,
                 active_bin_dir: String::new(),
                 active_data_dir: String::new(),
-                has_upgrade_anchor: false,
+                rollback_available: false,
             }),
         );
     };
     let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
-    let has_anchor = match (major, paths.data_dir.parent()) {
+    let rollback_available = match (major, paths.data_dir.parent()) {
         (Some(m), Some(parent)) => {
             crate::commands::upgrade::postgres::UpgradeSite::probe(parent, m)
                 .is_ok_and(|s| s.rollback_available())
@@ -711,9 +711,15 @@ pub(super) async fn get_postgres_status(
         Json(PostgresStatusResponse {
             node_id: state.node_id,
             active_major: major,
-            active_bin_dir: paths.bin_dir.display().to_string(),
+            active_bin_dir: crate::commands::upgrade::postgres::bin_dir_for_major(
+                major,
+                &paths.bin_dirs,
+                &paths.bin_dir,
+            )
+            .display()
+            .to_string(),
             active_data_dir: paths.data_dir.display().to_string(),
-            has_upgrade_anchor: has_anchor,
+            rollback_available,
         }),
     )
 }
