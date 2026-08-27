@@ -6,6 +6,7 @@
 )]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,13 @@ use super::ManagementApiState;
 use crate::commands::upgrade::client_fence::apply_client_write_fence;
 use crate::governor::raft::ClusterRequest;
 use crate::governor::state_machine::{ClusterCommand, CommandOutcome, CutoverPhase};
+
+/// Per-request budget for reading one donor node's status.
+const DONOR_CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the recipient waits for a donor majority before refusing.
+const DONOR_QUORUM_BUDGET: Duration = Duration::from_secs(30);
+/// Gap between polling rounds while the donor's followers catch up.
+const DONOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutoverStatusResponse {
@@ -105,6 +113,39 @@ pub fn donor_quorum_confirms(claims: &[DonorClaim], donor_node_count: usize) -> 
         .filter(|c| **c == DonorClaim::Confirms)
         .count();
     confirming * 2 > donor_node_count
+}
+
+/// What to do after one round of polling the donor's nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DonorPollVerdict {
+    /// A majority confirms; the recipient may take authority.
+    Confirmed,
+    /// No majority yet, and there is budget left to keep asking.
+    Retry,
+    /// No majority within the budget. Refuse.
+    Expired,
+}
+
+/// Decide whether to accept, keep polling, or refuse the handoff.
+///
+/// A donor follower applies the transfer after its leader does, so the first
+/// round routinely finds the leader alone confirming. Refusing on that is a
+/// race, not a safety property: waiting only ever withholds authority longer,
+/// and a majority is still required before any fence lifts.
+#[must_use]
+pub fn donor_poll_verdict(
+    claims: &[DonorClaim],
+    donor_node_count: usize,
+    elapsed: Duration,
+    budget: Duration,
+) -> DonorPollVerdict {
+    if donor_quorum_confirms(claims, donor_node_count) {
+        return DonorPollVerdict::Confirmed;
+    }
+    if elapsed >= budget {
+        return DonorPollVerdict::Expired;
+    }
+    DonorPollVerdict::Retry
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +554,64 @@ async fn donor_claim(
     }
 }
 
+/// Poll the donor's nodes until a majority confirms, or the budget runs out.
+///
+/// Returns the confirming count, or the refusal to send.
+async fn await_donor_quorum(
+    state: &ManagementApiState,
+    body: &CutoverReceiveAuthorityRequest,
+) -> Result<usize, (StatusCode, Json<CutoverActionResponse>)> {
+    let client = reqwest::Client::builder()
+        .timeout(DONOR_CLAIM_TIMEOUT)
+        .build()
+        .unwrap_or_default();
+    let started = Instant::now();
+    loop {
+        let mut claims = Vec::with_capacity(body.donor_mgmt_addrs.len());
+        for addr in &body.donor_mgmt_addrs {
+            claims.push(
+                donor_claim(
+                    &client,
+                    addr,
+                    body.epoch,
+                    &body.from_cluster_id,
+                    &state.cluster_id,
+                )
+                .await,
+            );
+        }
+        let confirming = claims
+            .iter()
+            .filter(|c| **c == DonorClaim::Confirms)
+            .count();
+        match donor_poll_verdict(
+            &claims,
+            body.donor_mgmt_addrs.len(),
+            started.elapsed(),
+            DONOR_QUORUM_BUDGET,
+        ) {
+            DonorPollVerdict::Confirmed => return Ok(confirming),
+            DonorPollVerdict::Retry => tokio::time::sleep(DONOR_POLL_INTERVAL).await,
+            DonorPollVerdict::Expired => {
+                return Err(refuse(
+                    state,
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Refusing: only {confirming} of {} donor nodes confirm \
+                         TRANSFERRED to {} at epoch {} after {}s. A majority \
+                         must, or this cluster would lift its fence on a \
+                         minority's word.",
+                        body.donor_mgmt_addrs.len(),
+                        state.cluster_id,
+                        body.epoch,
+                        DONOR_QUORUM_BUDGET.as_secs(),
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// Recipient side: take write authority the donor committed to relinquish.
 ///
 /// The two Raft groups share no log, so the recipient confirms the donor's
@@ -556,47 +655,16 @@ pub(super) async fn cutover_receive_authority(
                  unreachable donor and cannot be combined with donor_mgmt_addrs",
             );
         }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        let mut claims = Vec::with_capacity(body.donor_mgmt_addrs.len());
-        for addr in &body.donor_mgmt_addrs {
-            claims.push(
-                donor_claim(
-                    &client,
-                    addr,
-                    body.epoch,
-                    &body.from_cluster_id,
-                    &state.cluster_id,
-                )
-                .await,
-            );
+        match await_donor_quorum(&state, &body).await {
+            Ok(confirming) => info!(
+                confirming,
+                epoch = body.epoch,
+                from = %body.from_cluster_id,
+                donor_nodes = body.donor_mgmt_addrs.len(),
+                "Donor quorum confirms the handoff"
+            ),
+            Err(refusal) => return refusal,
         }
-        if !donor_quorum_confirms(&claims, body.donor_mgmt_addrs.len()) {
-            let confirming = claims
-                .iter()
-                .filter(|c| **c == DonorClaim::Confirms)
-                .count();
-            return refuse(
-                &state,
-                StatusCode::CONFLICT,
-                format!(
-                    "Refusing: only {confirming} of {} donor nodes confirm \
-                     TRANSFERRED to {} at epoch {}. A majority must, or this \
-                     cluster would lift its fence on a minority's word.",
-                    body.donor_mgmt_addrs.len(),
-                    state.cluster_id,
-                    body.epoch
-                ),
-            );
-        }
-        info!(
-            epoch = body.epoch,
-            from = %body.from_cluster_id,
-            donor_nodes = body.donor_mgmt_addrs.len(),
-            "Donor quorum confirms the handoff"
-        );
     }
 
     apply_cutover(
@@ -661,5 +729,64 @@ mod tests {
         assert!(!donor_quorum_confirms(&two_of_five, 5));
         let three_of_five = [DonorClaim::Confirms; 3];
         assert!(donor_quorum_confirms(&three_of_five, 5));
+    }
+
+    /// The donor's followers apply after its leader, so the first round finds
+    /// the leader alone. Refusing there is a race, not a safety property.
+    #[test]
+    fn a_lagging_donor_follower_is_waited_for_not_refused() {
+        let leader_only = [
+            DonorClaim::Confirms,
+            DonorClaim::Contradicts,
+            DonorClaim::Contradicts,
+        ];
+        assert_eq!(
+            donor_poll_verdict(
+                &leader_only,
+                3,
+                Duration::from_millis(50),
+                Duration::from_secs(30)
+            ),
+            DonorPollVerdict::Retry
+        );
+    }
+
+    /// Waiting is bounded: a donor that never reaches a majority is refused.
+    #[test]
+    fn a_quorum_that_never_arrives_expires_rather_than_waiting_forever() {
+        let never = [DonorClaim::Silent; 3];
+        assert_eq!(
+            donor_poll_verdict(&never, 3, Duration::from_secs(30), Duration::from_secs(30)),
+            DonorPollVerdict::Expired
+        );
+    }
+
+    /// Budget left over never turns a real majority into more waiting.
+    #[test]
+    fn a_confirmed_quorum_stops_the_poll_immediately() {
+        let two_of_three = [
+            DonorClaim::Confirms,
+            DonorClaim::Confirms,
+            DonorClaim::Silent,
+        ];
+        assert_eq!(
+            donor_poll_verdict(&two_of_three, 3, Duration::ZERO, Duration::from_secs(30)),
+            DonorPollVerdict::Confirmed
+        );
+    }
+
+    /// Expiry must not be reachable by a minority: waiting cannot lower the bar.
+    #[test]
+    fn an_expired_budget_still_refuses_a_minority() {
+        let minority = [DonorClaim::Confirms, DonorClaim::Silent, DonorClaim::Silent];
+        assert_eq!(
+            donor_poll_verdict(
+                &minority,
+                3,
+                Duration::from_secs(99),
+                Duration::from_secs(30)
+            ),
+            DonorPollVerdict::Expired
+        );
     }
 }

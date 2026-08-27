@@ -15,10 +15,12 @@ Exit codes:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import time
 import traceback
@@ -451,6 +453,53 @@ def tail_text(text: str | None, limit: int = TIMEOUT_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return f"...<truncated {len(text) - limit} chars>...{text[-limit:]}"
+
+
+def kill_process_group(handle: subprocess.Popen[str]) -> None:
+    """Kill the whole process group of a spawned step, then the child itself.
+
+    Only the group kill closes the pipe a surviving grandchild still holds, so
+    the partial output can be drained.
+
+    Args:
+        handle: Popen started with ``start_new_session=True``.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(os.getpgid(handle.pid), signal.SIGKILL)
+    handle.kill()
+
+
+def format_exit_failure(
+    command: str,
+    returncode: int,
+    expected: Sequence[int],
+    stdout: str | None,
+    stderr: str | None,
+) -> str:
+    """Build the failure message for a command that exited unexpectedly.
+
+    CI logs show only the raised message, so the output belongs in it: without
+    that, diagnosing any failure means downloading the run's artifacts.
+
+    Args:
+        command: The command that ran.
+        returncode: Exit code it produced.
+        expected: Exit codes that would have been accepted.
+        stdout: Captured stdout, if any.
+        stderr: Captured stderr, if any.
+
+    Returns:
+        Multi-line message naming the exit code and carrying the output tails.
+    """
+    return "\n".join(
+        [
+            f"Command failed with exit code {returncode}, expected {list(expected)}: {command}",
+            "--- stdout ---",
+            tail_text(stdout),
+            "--- stderr ---",
+            tail_text(stderr),
+        ]
+    )
 
 
 def format_timeout_failure(
@@ -1389,6 +1438,9 @@ class CIRunner:
         # values authoritative.
         load_dotenv(self.project_root / ".env", override=False)
         self.env: dict[str, str] = os.environ.copy()
+        # Steps are Python harnesses, which block-buffer stdout to a pipe. A
+        # killed harness would otherwise report nothing about where it hung.
+        self.env["PYTHONUNBUFFERED"] = "1"
         compose = self.suite_config.compose_file or self.matrix.compose_file
         self.env["COMPOSE_FILE"] = str((self.project_root / compose).resolve())
         self.mgmt_token: str = self.env.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
@@ -1512,11 +1564,14 @@ class CIRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # Own process group: a step is a tree (uv -> python -> docker), and
+            # killing only the shell leaves grandchildren holding the pipe.
+            start_new_session=True,
         ) as handle:
             try:
                 stdout, stderr = handle.communicate(input=stdin_text, timeout=timeout_sec)
             except subprocess.TimeoutExpired as exc:
-                handle.kill()
+                kill_process_group(handle)
                 try:
                     # Drain whatever the killed command already wrote.  A
                     # grandchild that inherited the pipe can hold it open, so
@@ -1552,7 +1607,7 @@ class CIRunner:
 
         if proc.returncode not in expected:
             raise RunnerError(
-                f"Command failed with exit code {proc.returncode}, expected {expected}: {rendered}"
+                format_exit_failure(rendered, proc.returncode, expected, proc.stdout, proc.stderr)
             )
         return proc
 
@@ -2151,9 +2206,10 @@ class CIRunner:
         # Snapshots are diagnostics, not assertions: a docker daemon that is too
         # wedged to answer must not abort the case (or mask the real failure),
         # so a timeout here is recorded and swallowed.
+        ps_cmd = "docker compose ps" if self.owns_cluster_topology() else "docker ps -a"
         try:
             compose_ps = self._run_shell(
-                "docker compose ps",
+                ps_cmd,
                 snap / "compose-ps.txt",
                 expect_exit=None,
                 timeout_sec=DIAGNOSTIC_TIMEOUT_SEC,
@@ -2161,11 +2217,22 @@ class CIRunner:
             if compose_ps.returncode != 0:
                 self._write_text(
                     snap / "compose-ps.error.txt",
-                    f"docker compose ps failed with {compose_ps.returncode}",
+                    f"{ps_cmd} failed with {compose_ps.returncode}",
                 )
         except RunnerError as exc:
             self._write_text(snap / "compose-ps.error.txt", str(exc))
-            self.log(f"    [warn] snapshot 'docker compose ps' did not complete: {exc}")
+            self.log(f"    [warn] snapshot '{ps_cmd}' did not complete: {exc}")
+
+        if not self.owns_cluster_topology():
+            # Probing the runner's node map here would write a directory of
+            # connection errors describing a cluster that never ran.
+            self._write_text(
+                snap / "node-probes-skipped.txt",
+                "Suite sets manage_cluster: false; the case owns its compose "
+                "topology and ports, so the runner's node map does not "
+                "describe it. Container state and logs are collected instead.",
+            )
+            return
 
         for node_id in sorted(self.node_map):
             node = self.node_map[node_id]
@@ -2189,18 +2256,45 @@ class CIRunner:
             except RunnerError as exc:
                 self._write_text(path.with_suffix(".error.txt"), str(exc))
 
+    def owns_cluster_topology(self) -> bool:
+        """Whether the runner, rather than the case, brought the cluster up.
+
+        Suites with ``manage_cluster: false`` let the harness choose its own
+        compose file and ports, so the runner's compose file and node map
+        describe a cluster that is not the one under test.
+        """
+        return self.suite_config.manage_cluster
+
+    def _diagnostic_commands(self) -> list[tuple[str, str]]:
+        """Commands whose output describes the cluster that actually ran.
+
+        ``docker compose`` is scoped to the runner's own compose file, which is
+        the wrong project when the case owns its topology; ``docker ps`` is not.
+        """
+        if self.owns_cluster_topology():
+            return [
+                ("docker compose logs --no-color", "docker-compose.logs.txt"),
+                ("docker compose ps -a", "docker-compose.ps-a.txt"),
+            ]
+        return [
+            ("docker ps -a", "docker-ps-a.txt"),
+            (
+                "for c in $(docker ps -aq); do "
+                'echo "===== $(docker inspect -f \'{{.Name}}\' "$c") ====="; '
+                'docker logs --tail 400 "$c" 2>&1; done',
+                "container-logs.txt",
+            ),
+        ]
+
     def _collect_failure_logs(self, case_id: str) -> None:
-        """Dump full Docker Compose logs and container state on case failure.
+        """Dump container state and logs on case failure.
 
         Args:
             case_id: Failed case identifier (used for directory naming).
         """
         failure_dir = self._case_dir(case_id) / "failure-logs"
         failure_dir.mkdir(parents=True, exist_ok=True)
-        for command, filename in [
-            ("docker compose logs --no-color", "docker-compose.logs.txt"),
-            ("docker compose ps -a", "docker-compose.ps-a.txt"),
-        ]:
+        for command, filename in self._diagnostic_commands():
             # Best-effort: never let log collection replace the failure that
             # triggered it.
             try:

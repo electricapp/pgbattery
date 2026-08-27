@@ -17,6 +17,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -380,6 +381,96 @@ def test_run_shell_timeout_reports_partial_output() -> None:
     message = str(exc)
     partial_section = message.split("--- partial stdout ---", 1)[1]
     assert "wrote-this-before-hanging" in partial_section
+
+
+def test_run_shell_failure_message_carries_the_output() -> None:
+    """A non-zero exit must report what the command said, not just its code.
+
+    The artifact file has it, but CI logs show only the raised message; without
+    the output there, every failure costs an artifact download to diagnose.
+    """
+    runner = make_runner()
+    # The needles are computed by the command, not spelled in it: the failure
+    # message echoes the command, so a literal needle would match that instead
+    # and pass whether or not the output was ever captured.
+    exc = assert_raises(
+        ci_runner.RunnerError,
+        lambda: runner._run_shell(
+            "printf 'out%s\\n' \"$(expr 40 + 2)\"; "
+            "printf 'err%s\\n' \"$(expr 40 + 3)\" >&2; exit 3",
+            runner.artifact_dir / "exit-output.log",
+            expect_exit=0,
+            timeout_sec=30,
+        ),
+        "exit code 3",
+    )
+    message = str(exc)
+    assert "out42" in message, message
+    assert "err43" in message, message
+
+
+def test_run_shell_timeout_drains_output_a_grandchild_is_holding() -> None:
+    """A hung grandchild must not take the partial output down with it.
+
+    Every real step is a process tree (uv -> python -> docker).  Killing only
+    the direct child leaves the pipe open in the grandchild, and the drain
+    times out with the evidence still in it.
+    """
+    runner = make_runner()
+    exc = assert_raises(
+        ci_runner.RunnerError,
+        lambda: runner._run_shell(
+            "printf 'wrote-this-before-hanging\\n'; sleep 30 & sleep 30",
+            runner.artifact_dir / "timeout-grandchild.log",
+            expect_exit=None,
+            timeout_sec=1,
+        ),
+        "STEP TIMEOUT",
+    )
+    partial = str(exc).split("--- partial stdout ---", 1)[1]
+    assert "wrote-this-before-hanging" in partial
+
+
+def test_run_shell_does_not_lose_buffered_output_from_a_python_child() -> None:
+    """Python block-buffers stdout to a pipe; a killed child loses the buffer.
+
+    The harnesses are Python, so without unbuffered output a timeout reports
+    nothing at all about where the harness got to.
+    """
+    runner = make_runner()
+    script = "print('printed-before-the-hang'); import time; time.sleep(30)"
+    exc = assert_raises(
+        ci_runner.RunnerError,
+        lambda: runner._run_shell(
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+            runner.artifact_dir / "timeout-buffered.log",
+            expect_exit=None,
+            timeout_sec=1,
+        ),
+        "STEP TIMEOUT",
+    )
+    partial = str(exc).split("--- partial stdout ---", 1)[1]
+    assert "printed-before-the-hang" in partial
+
+
+def test_diagnostics_do_not_use_compose_when_the_case_owns_the_topology() -> None:
+    """`docker compose` names the runner's project, not the case's.
+
+    Upgrade-proof cases bring up their own compose file, so compose-scoped
+    diagnostics collect an empty log for the wrong project.
+    """
+    runner = make_runner()
+    runner.suite_config.manage_cluster = False
+    commands = [cmd for cmd, _ in runner._diagnostic_commands()]
+    assert not any(c.startswith("docker compose") for c in commands), commands
+    assert any("docker ps" in c for c in commands), commands
+
+
+def test_diagnostics_use_compose_when_the_runner_owns_the_topology() -> None:
+    runner = make_runner()
+    runner.suite_config.manage_cluster = True
+    commands = [cmd for cmd, _ in runner._diagnostic_commands()]
+    assert any(c.startswith("docker compose logs") for c in commands), commands
 
 
 def test_run_shell_still_returns_normally_within_budget() -> None:
