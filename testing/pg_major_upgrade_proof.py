@@ -34,6 +34,8 @@ from topology import Node, load
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 COMPOSE_FILE: Final[str] = "docker-compose.pgupgrade.yml"
+# Bounds any single docker call; the image is built by the job beforehand.
+COMPOSE_TIMEOUT_SEC: Final[float] = 300.0
 TOKEN_ENV: Final[str] = "PGBATTERY_MANAGEMENT_API_TOKEN"
 FROM_MAJOR: Final[int] = 17
 TO_MAJOR: Final[int] = 18
@@ -54,15 +56,23 @@ def _token() -> str:
     return t
 
 
-def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=PROJECT_ROOT,
-        check=check,
-        text=True,
-        capture_output=True,
-        env={**os.environ, "COMPOSE_FILE": COMPOSE_FILE},
-    )
+def _compose(
+    *args: str, check: bool = True, timeout: float = COMPOSE_TIMEOUT_SEC
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["docker", "compose", *args],
+            cwd=PROJECT_ROOT,
+            check=check,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "COMPOSE_FILE": COMPOSE_FILE},
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Naming the wedged command beats letting the step budget kill the
+        # harness with nothing said about which docker call hung.
+        raise SystemExit(f"docker compose {' '.join(args)} hung for {timeout:g}s") from exc
 
 
 def _exec(service: str, *cmd: str) -> str:

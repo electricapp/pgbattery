@@ -365,6 +365,15 @@ jobs:
       - name: Show Docker Compose version
         run: docker compose version
 
+      # These cases own their compose topology, so `up` would otherwise build
+      # the image inside the case's own step budget. All three files build the
+      # same runtime target, so only the first pays for it.
+      - name: Build the runtime image
+        run: |
+          docker compose -f docker-compose.yml build node1 node2 node3
+          docker compose -f docker-compose.pgupgrade.yml build
+          docker compose -f docker-compose.bluegreen.yml build
+
       - name: Run upgrade proof case
         run: >
           ./testing/ci_runner.py --suite upgrade-proof --case ${{ matrix.case }}

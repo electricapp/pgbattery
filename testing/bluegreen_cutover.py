@@ -39,6 +39,8 @@ from topology import Node, Topology, load
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 APP_ROLE: Final[str] = "bg_app"
+# Bounds any single docker call; the image is built by the job beforehand.
+COMPOSE_TIMEOUT_SEC: Final[float] = 300.0
 SUB_OWNER: Final[str] = "postgres"
 TOKEN_ENV: Final[str] = "PGBATTERY_MANAGEMENT_API_TOKEN"
 BLUE_CLUSTER: Final[str] = "blue"
@@ -74,15 +76,23 @@ def _pg_addr(node: Node) -> str:
     return f"{node.ip}:{topology.PG_INTERNAL_PORT}"
 
 
-def _compose(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=PROJECT_ROOT,
-        check=check,
-        text=True,
-        capture_output=True,
-        env={**os.environ},
-    )
+def _compose(
+    *args: str, check: bool = False, timeout: float = COMPOSE_TIMEOUT_SEC
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["docker", "compose", *args],
+            cwd=PROJECT_ROOT,
+            check=check,
+            text=True,
+            capture_output=True,
+            env={**os.environ},
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Naming the wedged command beats letting the step budget kill the
+        # harness with nothing said about which docker call hung.
+        raise SystemExit(f"docker compose {' '.join(args)} hung for {timeout:g}s") from exc
 
 
 def _wait_leader(node: Node, timeout: float = 120.0) -> dict[str, Any]:
