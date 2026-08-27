@@ -20,7 +20,15 @@ use crate::governor::state_machine::{ClusterCommand, CommandOutcome, CutoverPhas
 /// Per-request budget for reading one donor node's status.
 const DONOR_CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the recipient waits for a donor majority before refusing.
-const DONOR_QUORUM_BUDGET: Duration = Duration::from_secs(30);
+const DONOR_QUORUM_BUDGET: Duration = Duration::from_secs(20);
+
+/// The refusal explains which donors did not confirm. If the request timeout
+/// fires first the caller gets a bare 408 instead, and an operator debugging a
+/// stuck cutover learns nothing.
+const _: () = assert!(
+    DONOR_QUORUM_BUDGET.as_secs() < super::MGMT_API_REQUEST_TIMEOUT_SECS,
+    "the donor quorum poll must refuse before the management API times it out"
+);
 /// Gap between polling rounds while the donor's followers catch up.
 const DONOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 

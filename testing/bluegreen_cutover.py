@@ -442,7 +442,11 @@ def _receive_authority(recipient: Node, epoch: int, donor_cluster: str, donors: 
 
 
 def _assert_minority_cannot_hand_over(recipient: Node, epoch: int, donors: list[Node]) -> None:
-    """U4: one donor node's word is not a committed handoff."""
+    """U4: one donor node's word is not a committed handoff.
+
+    Takes the server's full donor-quorum budget: a minority now is not proof
+    that a majority will not arrive, so the recipient waits before refusing.
+    """
     r = _post(
         recipient,
         "receive-authority",
