@@ -161,13 +161,15 @@ class Writer(threading.Thread):
     def __init__(self, gateway_port: int) -> None:
         super().__init__(name="pg-upgrade-writer", daemon=True)
         self._port = gateway_port
-        self._stop = threading.Event()
+        # Not `_stop`: that is a Thread internal on CPython 3.12, and
+        # rebinding it makes join() raise at teardown.
+        self._stop_event = threading.Event()
         self.acked: list[str] = []
         self.errors: list[str] = []
 
     def run(self) -> None:
         i = 0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 with psycopg.connect(
                     host="127.0.0.1",
@@ -178,7 +180,7 @@ class Writer(threading.Thread):
                 ) as conn:
                     conn.autocommit = True
                     with conn.cursor() as cur:
-                        while not self._stop.is_set():
+                        while not self._stop_event.is_set():
                             key = f"w-{i}"
                             cur.execute(
                                 "INSERT INTO major_upgrade_probe VALUES (%s, %s) "
@@ -193,7 +195,7 @@ class Writer(threading.Thread):
                 time.sleep(0.5)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=15)
 
 

@@ -314,11 +314,15 @@ def _advance_sequences(green_leader: Node, blue_leader: Node) -> int:
 
 def _assert_no_sequence_collision(green_leader: Node, blue_max: int) -> None:
     """U3: green must not issue a sequence value blue already used."""
+    # Wrapped in a CTE so the result is a row set: a bare INSERT ... RETURNING
+    # makes psql print the `INSERT 0 1` command tag alongside the value.
     issued = int(
         _psql(
             green_leader,
-            "INSERT INTO bg_kv(k, v) VALUES ('u3-probe', 'x') "
-            "ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING seq;",
+            "WITH probe AS ("
+            "  INSERT INTO bg_kv(k, v) VALUES ('u3-probe', 'x') "
+            "  ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING seq"
+            ") SELECT seq FROM probe;",
         )
     )
     if issued <= blue_max:
@@ -596,12 +600,32 @@ def _chaos_mid_drain(blue_leader: Node, green_leader: Node) -> None:
     raise ContractFailure("abort reported success but blue never accepted a write again")
 
 
+def _await_quorum_loss(node: Node, timeout: float = 90.0) -> None:
+    """Block until `node` no longer reports a leader.
+
+    Stopping two of three containers is the request; losing quorum is the
+    effect, and openraft only notices once its heartbeats time out. Asserting
+    fail-closed before then tests how long `docker stop` took.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(f"{_mgmt(node)}/api/v1/cluster/leader", timeout=2.0)
+            if r.status_code != 200 or r.json().get("leader_id") is None:
+                return
+        except httpx.HTTPError:
+            return
+        time.sleep(1.0)
+    raise ContractFailure(f"{node.service} still reports a leader with two of three nodes stopped")
+
+
 def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
     followers = [n for n in blue if n.service != blue_leader.service]
     for f in followers[:2]:
-        _compose("stop", f.service)
+        _compose("stop", f.service, check=True)
+    _await_quorum_loss(blue_leader)
 
     body = {
         "target_cluster_id": GREEN_CLUSTER,

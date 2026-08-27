@@ -129,12 +129,14 @@ class Writer(threading.Thread):
     def __init__(self, gateway_port: int) -> None:
         super().__init__(name="hold-writer", daemon=True)
         self._port = gateway_port
-        self._stop = threading.Event()
+        # Not `_stop`: that is a Thread internal on CPython 3.12, and
+        # rebinding it makes join() raise at teardown.
+        self._stop_event = threading.Event()
         self.acked = 0
         self.errors = 0
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 with psycopg.connect(
                     host="127.0.0.1",
@@ -149,7 +151,7 @@ class Writer(threading.Thread):
                             "CREATE TABLE IF NOT EXISTS hold_probe("
                             "id bigserial PRIMARY KEY, t timestamptz default now())"
                         )
-                        while not self._stop.is_set():
+                        while not self._stop_event.is_set():
                             cur.execute("INSERT INTO hold_probe DEFAULT VALUES")
                             self.acked += 1
                             time.sleep(0.05)
@@ -158,7 +160,7 @@ class Writer(threading.Thread):
                 time.sleep(0.2)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=10)
 
 

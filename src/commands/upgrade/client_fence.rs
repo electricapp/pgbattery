@@ -144,6 +144,67 @@ pub async fn lift_client_write_fence(
     Ok(())
 }
 
+/// What the reconciler must do to make `PostgreSQL` match the committed log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceAction {
+    Apply,
+    Lift,
+    None,
+}
+
+/// Reconcile the observed fence against the wanted one.
+///
+/// Both inputs are observed — one from the committed log, one from
+/// `PostgreSQL`. Deriving `is_fenced` from what this process last did instead
+/// would miss the fence the seal handler applies directly, and an abort would
+/// then leave the application locked out of an unsealed cluster.
+#[must_use]
+pub const fn fence_action(want_fenced: bool, is_fenced: bool) -> FenceAction {
+    match (want_fenced, is_fenced) {
+        (true, false) => FenceAction::Apply,
+        (false, true) => FenceAction::Lift,
+        _ => FenceAction::None,
+    }
+}
+
+/// Whether the fence is currently applied to any of `app_roles`.
+///
+/// Read from the snapshot table rather than remembered: the seal handler
+/// applies the fence itself, so a reconciler that trusted its own history
+/// would believe an unfenced cluster was fenced (and, worse, never lift).
+///
+/// # Errors
+/// SQL failure, or a reply that is not a boolean.
+pub async fn fence_is_applied(
+    supervisor: &crate::supervisor::Supervisor,
+    app_roles: &[String],
+) -> Result<bool> {
+    if app_roles.is_empty() {
+        return Ok(false);
+    }
+    let mut quoted = Vec::with_capacity(app_roles.len());
+    for role in app_roles {
+        validate_role_ident(role)?;
+        quoted.push(format!("'{}'", role.replace('\'', "''")));
+    }
+    // to_regclass is NULL before the first seal ever ran, which is not an
+    // error: it means nothing is fenced.
+    let sql = format!(
+        "SELECT CASE WHEN to_regclass('{FENCE_TABLE}') IS NULL THEN false \
+         ELSE EXISTS(SELECT 1 FROM {FENCE_TABLE} WHERE role_name IN ({})) END;",
+        quoted.join(",")
+    );
+    let raw = supervisor
+        .execute_sql(&sql)
+        .await
+        .context("reading client-fence snapshot state")?;
+    match raw.trim() {
+        "t" | "true" => Ok(true),
+        "f" | "false" => Ok(false),
+        other => bail!("client-fence probe returned {other:?}, expected a boolean"),
+    }
+}
+
 /// Current flush LSN in bytes, read after the fence is in place.
 ///
 /// # Errors
@@ -203,6 +264,26 @@ fn validate_role_ident(role: &str) -> Result<()> {
 #[allow(clippy::unwrap_used, reason = "test assertions on known-good values")]
 mod tests {
     use super::*;
+
+    /// The seal handler fences directly, so the reconciler never applied it.
+    /// A reconciler tracking its own history sees "I applied nothing" and
+    /// leaves the application locked out of a cluster that has unsealed.
+    #[test]
+    fn a_fence_this_process_did_not_apply_is_still_lifted() {
+        assert_eq!(fence_action(false, true), FenceAction::Lift);
+    }
+
+    #[test]
+    fn a_wanted_fence_that_is_not_in_place_is_applied() {
+        assert_eq!(fence_action(true, false), FenceAction::Apply);
+    }
+
+    /// Reconciling an already-correct fence must not churn REVOKEs.
+    #[test]
+    fn a_fence_already_matching_the_log_is_left_alone() {
+        assert_eq!(fence_action(true, true), FenceAction::None);
+        assert_eq!(fence_action(false, false), FenceAction::None);
+    }
 
     #[test]
     fn rejects_unsafe_role() {

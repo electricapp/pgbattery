@@ -715,6 +715,8 @@ impl App {
     }
 
     fn spawn_client_fence_reconciler(input: ClientFenceReconcilerInputs) -> JoinHandle<()> {
+        use crate::commands::upgrade::client_fence;
+
         let ClientFenceReconcilerInputs {
             mut fence_rx,
             cluster_state,
@@ -723,7 +725,6 @@ impl App {
             configured_roles,
         } = input;
         tokio::spawn(async move {
-            let mut applied = false;
             loop {
                 let want_fenced = fence_rx.borrow().local_client_writes_fenced();
                 // A recipient fenced before any cutover entry has only its
@@ -734,25 +735,26 @@ impl App {
                 } else {
                     committed
                 };
-                if !roles.is_empty() && want_fenced != applied {
+                if !roles.is_empty() {
                     let guard = postgres.lock().await;
-                    let result = if want_fenced {
-                        crate::commands::upgrade::client_fence::apply_client_write_fence(
-                            &guard, &roles,
-                        )
-                        .await
-                    } else {
-                        crate::commands::upgrade::client_fence::lift_client_write_fence(
-                            &guard, &roles,
-                        )
-                        .await
+                    // Probed, never remembered: the seal handler fences
+                    // directly, so a cached "what I applied" would be false
+                    // exactly when the abort needs to lift.
+                    let result = match client_fence::fence_is_applied(&guard, &roles).await {
+                        Ok(is_fenced) => match client_fence::fence_action(want_fenced, is_fenced) {
+                            client_fence::FenceAction::Apply => {
+                                client_fence::apply_client_write_fence(&guard, &roles).await
+                            }
+                            client_fence::FenceAction::Lift => {
+                                client_fence::lift_client_write_fence(&guard, &roles).await
+                            }
+                            client_fence::FenceAction::None => Ok(()),
+                        },
+                        Err(e) => Err(e),
                     };
                     drop(guard);
-                    match result {
-                        Ok(()) => applied = want_fenced,
-                        Err(e) => {
-                            warn!(error = %e, want_fenced, "Client-write fence reconcile failed");
-                        }
+                    if let Err(e) = result {
+                        warn!(error = %e, want_fenced, "Client-write fence reconcile failed");
                     }
                 }
                 tokio::select! {
