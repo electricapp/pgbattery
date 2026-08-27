@@ -133,6 +133,8 @@ contracts:
     inversions:
       - tla/cutover_authority.inv-green-self-elect.cfg
       - test_an_unconfirmable_authority_holds_rather_than_guessing
+      - a_minority_of_donor_nodes_cannot_confirm_a_handoff
+      - silence_counts_against_the_handoff
 
   U5:
     severity: FATAL

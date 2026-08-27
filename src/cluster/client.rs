@@ -819,6 +819,102 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
+    /// Committed cutover authority on one node (`GET /api/v1/cutover/status`).
+    ///
+    /// # Errors
+    /// Unreachable or non-success.
+    pub async fn get_cutover_status(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::CutoverStatusResponse> {
+        let url = format!("http://{addr}/api/v1/cutover/status");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "cutover status",
+                status,
+                &body,
+                false
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Lowest applied origin LSN across `addr`'s logical subscriptions.
+    ///
+    /// # Errors
+    /// Unreachable, non-success, or a node with no subscriptions — draining
+    /// against a cluster that is not subscribed would wait out the budget and
+    /// report a failure that names the wrong cause.
+    pub async fn get_subscription_progress(&self, addr: &str) -> Result<u64> {
+        let url = format!("http://{addr}/api/v1/cutover/subscription-progress");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "subscription progress",
+                status,
+                &body,
+                false
+            ));
+        }
+        let body: crate::observability::management_api::SubscriptionProgressResponse =
+            resp.json().await?;
+        if body.subscription_count == 0 {
+            anyhow::bail!(
+                "{addr} has no logical subscriptions: the recipient must already be \
+                 streaming from the donor before a cutover can drain it"
+            );
+        }
+        Ok(body.applied_lsn)
+    }
+
+    /// Drive one step of the cutover protocol on `addr`.
+    ///
+    /// `step` is the path segment under `/api/v1/admin/cutover/`. A 409 means
+    /// the entry committed but no phase accepted it, which is never success.
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or a refused step.
+    pub async fn cutover_step<B: Serialize + Sync>(
+        &self,
+        addr: &str,
+        step: &str,
+        body: &B,
+    ) -> Result<crate::observability::management_api::CutoverActionResponse> {
+        let url = format!("http://{addr}/api/v1/admin/cutover/{step}");
+        let resp = self
+            .add_management_token(self.client.post(&url))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let detail = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                &format!("cutover {step}"),
+                status,
+                &detail,
+                true
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Confirm upgrade — delete old datadir + anchor.
     ///
     /// # Errors

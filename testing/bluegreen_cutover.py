@@ -402,22 +402,49 @@ def _cutover(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
     ).raise_for_status()
 
     epoch = int(_cutover_status(blue_leader)["epoch"])
-    _receive_authority(green_leader, epoch)
+    _receive_authority(green_leader, epoch, BLUE_CLUSTER, blue)
+    _assert_minority_cannot_hand_over(green_leader, epoch, blue)
     _assert_authority_is_green_only(blue, green_leader, epoch)
     _assert_no_sequence_collision(green_leader, blue_max)
 
 
-def _receive_authority(green_leader: Node, epoch: int) -> None:
+def _mgmt_addrs(nodes: list[Node]) -> list[str]:
+    return [f"{n.ip}:{topology.MGMT_CONTAINER_PORT}" for n in nodes]
+
+
+def _receive_authority(recipient: Node, epoch: int, donor_cluster: str, donors: list[Node]) -> None:
+    """The recipient confirms the handoff against a majority of donor nodes.
+
+    Not `accept_unverified_provenance`: that is the break-glass for an
+    unreachable donor, and using it here would leave the verification path
+    untested in the only case that runs it.
+    """
     r = _post(
-        green_leader,
+        recipient,
         "receive-authority",
         {
             "epoch": epoch,
-            "from_cluster_id": BLUE_CLUSTER,
-            "accept_unverified_provenance": True,
+            "from_cluster_id": donor_cluster,
+            "donor_mgmt_addrs": _mgmt_addrs(donors),
         },
     )
     r.raise_for_status()
+
+
+def _assert_minority_cannot_hand_over(recipient: Node, epoch: int, donors: list[Node]) -> None:
+    """U4: one donor node's word is not a committed handoff."""
+    r = _post(
+        recipient,
+        "receive-authority",
+        {
+            "epoch": epoch + 1,
+            "from_cluster_id": BLUE_CLUSTER,
+            "donor_mgmt_addrs": _mgmt_addrs(donors[:1]),
+        },
+    )
+    if r.status_code == 200:
+        raise ContractFailure("U4 violated: the recipient took authority on one donor node's word")
+    console.print(f"U4 OK: a single donor node cannot hand over ({r.status_code})")
 
 
 def _assert_authority_is_green_only(blue: list[Node], green_leader: Node, epoch: int) -> None:
@@ -601,7 +628,9 @@ CHAOS: Final[dict[str, Any]] = {
 }
 
 
-def _rollback_drill(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
+def _rollback_drill(
+    blue_leader: Node, green_leader: Node, blue: list[Node], green: list[Node]
+) -> None:
     """U5: reverse the protocol, green -> blue, and prove the window held."""
     green_acked = _write_burst(green_leader.gateway_port, 5, "rb")
 
@@ -624,7 +653,7 @@ def _rollback_drill(blue_leader: Node, green_leader: Node, blue: list[Node]) -> 
         },
     ).raise_for_status()
     epoch = int(_cutover_status(green_leader)["epoch"])
-    _receive_authority(blue_leader, epoch)
+    _receive_authority(blue_leader, epoch, GREEN_CLUSTER, green)
 
     present = set(
         _psql(
@@ -733,7 +762,7 @@ def main(
     console.print(f"relay OK: {on_green} writes through blue's gateway landed on green")
 
     if rollback_drill:
-        _rollback_drill(blue_leader, green_leader, blue)
+        _rollback_drill(blue_leader, green_leader, blue, green)
 
     _run_prober()
     console.print("bluegreen cutover e2e OK")

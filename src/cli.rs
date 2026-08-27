@@ -398,7 +398,9 @@ pub enum UpgradeSubcommand {
         #[arg(long)]
         rollback: bool,
 
-        /// Track C: logical blue/green major upgrade (preflight with --check)
+        /// Track C: logical blue/green major upgrade. --check runs catalog
+        /// preflight; --experimental runs the cutover against an already
+        /// seeded green cluster (provisioning and seeding are not implemented)
         #[arg(long)]
         blue_green: bool,
 
@@ -409,6 +411,14 @@ pub enum UpgradeSubcommand {
         /// Track C: allow unlogged tables (they arrive empty on green)
         #[arg(long)]
         accept_empty_unlogged: bool,
+
+        /// Track C: management host:port on the green cluster
+        #[arg(long)]
+        green_node: Option<String>,
+
+        /// Track C: green's cluster_id, checked against what green reports
+        #[arg(long)]
+        green_cluster_id: Option<String>,
     },
 }
 

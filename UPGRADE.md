@@ -1,10 +1,11 @@
 # UPGRADE.md — Upgrade Design Spec
 
 Status: design. This document is the target, not a status report —
-`UPGRADE_CHECKLIST.md` tracks what has landed. Tracks A and B are implemented;
-Track C's authority protocol, fences, and proofs are in, while its
-operator-facing orchestration is not (`--blue-green` still refuses apply).
-Three tracks, independently shippable:
+`UPGRADE_CHECKLIST.md` tracks what has landed. Tracks A and B are implemented.
+Track C's authority protocol, both fences, verified provenance, and the
+cutover command are in; green provisioning, logical seeding, and the DDL
+freeze are not, so the cutover requires a green cluster that is already
+streaming. Three tracks, independently shippable:
 
 - Track A: rolling pgbattery self-upgrades (minor and major) with no cluster
   downtime.
@@ -471,12 +472,15 @@ committed source. The invariant generalizes cleanly: **write authority exists
 for exactly one `(epoch, cluster)` pair, and epochs advance only through blue's
 log.**
 
-One honest gap in the shipped version of this: green cannot read blue's log,
-so it cannot verify that `AUTHORITY_TRANSFERRED` was committed. It records the
-handoff in its own log and enforces the half it can check without blue — the
-epoch strictly increases — while the orchestrator attests the rest. The
-endpoint names that (`accept_unverified_provenance`), and closing it needs a
-signed entry or a shared witness, neither of which exists yet.
+Green cannot read blue's log, so it confirms the commit the way anything
+outside a Raft group does: it reads `/api/v1/cutover/status` from a **strict
+majority of blue's own nodes** and requires every one of them to report
+TRANSFERRED, to green, at exactly this epoch, with blue no longer holding
+authority. Silence counts against, so a partitioned green talking to one stale
+blue node stays fenced — a minority cannot hold a commit, so a minority cannot
+prove one. `accept_unverified_provenance` remains only as the break-glass for
+a blue that is wholly unreachable, and it cannot be combined with the node
+list.
 
 The failure cases are where this earns its keep, and all of them fail closed:
 

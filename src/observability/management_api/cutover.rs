@@ -62,12 +62,49 @@ pub struct CutoverForceTransferRequest {
     pub accept_write_loss: bool,
 }
 
-/// Recipient side: accept authority attested by the orchestrator.
+/// Recipient side: take write authority the donor committed to relinquish.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutoverReceiveAuthorityRequest {
     pub epoch: u64,
     pub from_cluster_id: String,
+    /// Management addresses of the donor's nodes. The recipient reads the
+    /// donor's committed state from a majority of them before lifting its
+    /// fence, so a stale or lying minority cannot fabricate a handoff.
+    #[serde(default)]
+    pub donor_mgmt_addrs: Vec<String>,
+    /// Break glass when the donor is unreachable. Requires an empty
+    /// `donor_mgmt_addrs`, and records the epoch on trust alone.
+    #[serde(default)]
     pub accept_unverified_provenance: bool,
+}
+
+/// What one donor node said about the handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DonorClaim {
+    /// Reports TRANSFERRED to this recipient at exactly this epoch.
+    Confirms,
+    /// Answered, but does not describe this handoff.
+    Contradicts,
+    /// Did not answer. Neither evidence for nor against.
+    Silent,
+}
+
+/// Whether the donor's own nodes confirm the handoff.
+///
+/// A strict majority of the donor's *configured* nodes must confirm — silence
+/// counts against, so a partitioned recipient talking to one stale donor node
+/// cannot lift its fence. This is how a commit is confirmed from outside a
+/// Raft group: a minority cannot hold one.
+#[must_use]
+pub fn donor_quorum_confirms(claims: &[DonorClaim], donor_node_count: usize) -> bool {
+    if donor_node_count == 0 {
+        return false;
+    }
+    let confirming = claims
+        .iter()
+        .filter(|c| **c == DonorClaim::Confirms)
+        .count();
+    confirming * 2 > donor_node_count
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,24 +431,99 @@ pub(super) async fn cutover_force_transfer(
     .await
 }
 
-/// Recipient side: record that this cluster now holds authority for `epoch`.
+/// How far this cluster's logical subscriptions have applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionProgressResponse {
+    /// Lowest applied origin LSN across every subscription, in bytes. The
+    /// minimum, not the maximum: a drain is complete only when the furthest
+    /// *behind* subscription has caught up.
+    pub applied_lsn: u64,
+    pub subscription_count: usize,
+}
+
+/// Applied origin LSN, probed from the catalogs (`GET`, no auth: read-only).
+pub(super) async fn get_subscription_progress(
+    State(state): State<Arc<ManagementApiState>>,
+) -> impl IntoResponse {
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(SubscriptionProgressResponse {
+                applied_lsn: 0,
+                subscription_count: 0,
+            }),
+        );
+    };
+    let guard = pg.lock().await;
+    // `pg_replication_origin_progress` is the applied position, unlike
+    // `pg_stat_subscription.received_lsn`, which is only what arrived.
+    let sql = "SELECT count(*)::text || '|' || COALESCE(min(\
+               pg_replication_origin_progress('pg_' || s.oid::text, true))::text, '0/0') \
+               FROM pg_subscription s;";
+    let raw = guard.execute_sql(sql).await.unwrap_or_default();
+    drop(guard);
+    let (count, lsn) = raw
+        .trim()
+        .split_once('|')
+        .map_or((0, 0), |(c, l)| (c.parse().unwrap_or(0), parse_lsn(l)));
+    (
+        StatusCode::OK,
+        Json(SubscriptionProgressResponse {
+            applied_lsn: lsn,
+            subscription_count: count,
+        }),
+    )
+}
+
+fn parse_lsn(text: &str) -> u64 {
+    text.trim().split_once('/').map_or(0, |(hi, lo)| {
+        let hi = u64::from_str_radix(hi.trim(), 16).unwrap_or(0);
+        let lo = u64::from_str_radix(lo.trim(), 16).unwrap_or(0);
+        (hi << 32) | lo
+    })
+}
+
+/// Ask one donor node what it has committed about this handoff.
+async fn donor_claim(
+    client: &reqwest::Client,
+    addr: &str,
+    epoch: u64,
+    donor_cluster_id: &str,
+    recipient_cluster_id: &str,
+) -> DonorClaim {
+    let url = format!("http://{addr}/api/v1/cutover/status");
+    let Ok(resp) = client.get(&url).send().await else {
+        return DonorClaim::Silent;
+    };
+    if !resp.status().is_success() {
+        return DonorClaim::Silent;
+    }
+    let Ok(status) = resp.json::<CutoverStatusResponse>().await else {
+        return DonorClaim::Silent;
+    };
+    let confirms = status.cluster_id == donor_cluster_id
+        && status.phase == CutoverPhase::Transferred.as_str()
+        && status.epoch == epoch
+        && status.authority_cluster_id.as_deref() == Some(recipient_cluster_id)
+        && !status.holds_client_write_authority;
+    if confirms {
+        DonorClaim::Confirms
+    } else {
+        DonorClaim::Contradicts
+    }
+}
+
+/// Recipient side: take write authority the donor committed to relinquish.
 ///
-/// The recipient's Raft group cannot read the donor's log, so provenance is
-/// attested rather than proven and the caller must say so. What is enforced
-/// here is monotonicity: a replayed or stale attestation cannot lift the
-/// fence twice.
+/// The two Raft groups share no log, so the recipient confirms the donor's
+/// commit the way anything outside a Raft group does: by reading it from a
+/// strict majority of the donor's own nodes. Silence counts against, so a
+/// partitioned recipient talking to one stale node cannot lift its fence.
+/// Monotonicity is enforced underneath regardless.
 pub(super) async fn cutover_receive_authority(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<CutoverReceiveAuthorityRequest>,
 ) -> impl IntoResponse {
-    if !body.accept_unverified_provenance {
-        return refuse(
-            &state,
-            StatusCode::BAD_REQUEST,
-            "Refusing without accept_unverified_provenance=true: this cluster \
-             cannot read the donor's log and is taking the handoff on trust",
-        );
-    }
     if body.from_cluster_id.trim().is_empty() || body.from_cluster_id == *state.cluster_id {
         return refuse(
             &state,
@@ -419,11 +531,74 @@ pub(super) async fn cutover_receive_authority(
             "from_cluster_id must name a different cluster",
         );
     }
-    info!(
-        epoch = body.epoch,
-        from = %body.from_cluster_id,
-        "Accepting write authority"
-    );
+
+    if body.donor_mgmt_addrs.is_empty() {
+        if !body.accept_unverified_provenance {
+            return refuse(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "Refusing: give donor_mgmt_addrs so this cluster can confirm the \
+                 handoff from a majority of the donor's nodes, or pass \
+                 accept_unverified_provenance=true to take it on trust",
+            );
+        }
+        warn!(
+            epoch = body.epoch,
+            from = %body.from_cluster_id,
+            "Taking write authority on trust: donor unreachable, provenance unverified"
+        );
+    } else {
+        if body.accept_unverified_provenance {
+            return refuse(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "Refusing: accept_unverified_provenance is the break-glass for an \
+                 unreachable donor and cannot be combined with donor_mgmt_addrs",
+            );
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let mut claims = Vec::with_capacity(body.donor_mgmt_addrs.len());
+        for addr in &body.donor_mgmt_addrs {
+            claims.push(
+                donor_claim(
+                    &client,
+                    addr,
+                    body.epoch,
+                    &body.from_cluster_id,
+                    &state.cluster_id,
+                )
+                .await,
+            );
+        }
+        if !donor_quorum_confirms(&claims, body.donor_mgmt_addrs.len()) {
+            let confirming = claims
+                .iter()
+                .filter(|c| **c == DonorClaim::Confirms)
+                .count();
+            return refuse(
+                &state,
+                StatusCode::CONFLICT,
+                format!(
+                    "Refusing: only {confirming} of {} donor nodes confirm \
+                     TRANSFERRED to {} at epoch {}. A majority must, or this \
+                     cluster would lift its fence on a minority's word.",
+                    body.donor_mgmt_addrs.len(),
+                    state.cluster_id,
+                    body.epoch
+                ),
+            );
+        }
+        info!(
+            epoch = body.epoch,
+            from = %body.from_cluster_id,
+            donor_nodes = body.donor_mgmt_addrs.len(),
+            "Donor quorum confirms the handoff"
+        );
+    }
+
     apply_cutover(
         &state,
         ClusterCommand::CutoverAuthorityReceived {
@@ -433,4 +608,58 @@ pub(super) async fn cutover_receive_authority(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minority cannot hold a Raft commit, so a minority cannot prove one.
+    #[test]
+    fn a_minority_of_donor_nodes_cannot_confirm_a_handoff() {
+        let one = [DonorClaim::Confirms, DonorClaim::Silent, DonorClaim::Silent];
+        assert!(!donor_quorum_confirms(&one, 3));
+
+        let two = [
+            DonorClaim::Confirms,
+            DonorClaim::Confirms,
+            DonorClaim::Silent,
+        ];
+        assert!(donor_quorum_confirms(&two, 3));
+    }
+
+    /// Silence is not agreement: an unreachable donor leaves the recipient
+    /// fenced rather than letting it decide the donor must have transferred.
+    #[test]
+    fn silence_counts_against_the_handoff() {
+        let all_silent = [DonorClaim::Silent; 3];
+        assert!(!donor_quorum_confirms(&all_silent, 3));
+        assert!(!donor_quorum_confirms(&[], 3));
+    }
+
+    /// A donor node describing a different handoff is evidence against.
+    #[test]
+    fn a_contradicting_node_does_not_count_toward_quorum() {
+        let mixed = [
+            DonorClaim::Confirms,
+            DonorClaim::Contradicts,
+            DonorClaim::Contradicts,
+        ];
+        assert!(!donor_quorum_confirms(&mixed, 3));
+    }
+
+    /// Guard against the empty-set case reading as unanimous consent.
+    #[test]
+    fn no_donor_nodes_is_never_a_quorum() {
+        assert!(!donor_quorum_confirms(&[DonorClaim::Confirms], 0));
+    }
+
+    /// Five nodes need three, not two.
+    #[test]
+    fn quorum_scales_with_the_donor_node_count() {
+        let two_of_five = [DonorClaim::Confirms, DonorClaim::Confirms];
+        assert!(!donor_quorum_confirms(&two_of_five, 5));
+        let three_of_five = [DonorClaim::Confirms; 3];
+        assert!(donor_quorum_confirms(&three_of_five, 5));
+    }
 }

@@ -58,6 +58,7 @@ pub use backup::{
     BackupCreateResponse, BackupItemResponse, BackupListResponse, BackupRestoreResponse,
 };
 pub use cluster::{MemberInfo, MembershipResponse, TransferResponse};
+pub use cutover::{CutoverActionResponse, CutoverStatusResponse, SubscriptionProgressResponse};
 pub use discovery::{
     ClusterIdentityResponse, JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse,
     PeerInfo, VersionResponse,
@@ -393,6 +394,10 @@ pub async fn start_management_api(
         .route(
             "/api/v1/admin/cutover/receive-authority",
             post(cutover::cutover_receive_authority),
+        )
+        .route(
+            "/api/v1/cutover/subscription-progress",
+            get(cutover::get_subscription_progress),
         )
         .route(
             "/api/v1/admin/postgres-upgrade/freeze",

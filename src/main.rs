@@ -170,6 +170,8 @@ async fn main() -> Result<()> {
                 blue_green,
                 app_roles,
                 accept_empty_unlogged,
+                green_node,
+                green_cluster_id,
             }) = command
             {
                 let mode = match transfer_mode {
@@ -192,6 +194,8 @@ async fn main() -> Result<()> {
                         blue_green,
                         app_roles,
                         accept_empty_unlogged,
+                        green_node,
+                        green_cluster_id,
                     },
                 )
                 .await

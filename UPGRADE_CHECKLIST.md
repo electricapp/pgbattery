@@ -30,11 +30,10 @@ Shared spine before Track B/C is honest:
 | 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [~]    |
 
 Step 9 is `[~]`, not `[x]`. The cutover protocol, both fences, the epoch
-projection, and the proofs are in. What is missing is the operator-facing
-half: `pgbattery upgrade postgres --to N --blue-green` still refuses apply,
-green is provisioned and seeded by `testing/bluegreen_cutover.py` rather than
-by the product, and the DDL freeze and schema digest are unimplemented. See
-"Not implemented" under Track C.
+projection, provenance verification, the operator command, and the proofs are
+in. What is missing is everything _before_ the handoff: green provisioning and
+logical seeding, the DDL freeze, and the schema digest. See "Not implemented"
+under Track C.
 
 Do **not** parallelize 5, 6, and 8–9 in one branch. Do **not** ship wire-format
 and PG-major upgrade in the same release if avoidable.
@@ -173,20 +172,32 @@ and PG-major upgrade in the same release if avoidable.
 - [x] Six-node compose via `topology.py` — `docker-compose.bluegreen.yml`
 - [x] Chaos: arm-seal, seal-transfer, mid-drain, blue-quorum — each asserts an outcome, none use `expect_exit: null`, all four run in CI
 
+### Orchestration command (step 9)
+
+- [x] `pgbattery upgrade postgres --to N --blue-green --experimental --green-node <addr> --green-cluster-id <id> --app-role <role>` runs the handoff
+- [x] Refuses a recipient that already claims authority, or whose `cluster_id` is not the one named
+- [x] Drain waits on the recipient's applied origin LSN vs the donor's sealed LSN, and refuses a recipient with no subscriptions
+- [x] Postflight refuses unless exactly the recipient's nodes claim authority (U1)
+
+### Verified provenance (step 8)
+
+- [x] The recipient confirms the handoff by reading the donor's committed state from a **strict majority of the donor's own nodes** — silence counts against
+- [x] `accept_unverified_provenance` narrowed to the unreachable-donor break-glass; it cannot be combined with `donor_mgmt_addrs`
+- [x] Unit inversions: minority, all-silent, contradicting, empty-set, and 5-node quorum
+- [x] Live inversion: `bluegreen-cutover` asserts a single donor node cannot hand over
+
 ### Not implemented (Track C)
 
-- [ ] `pgbattery upgrade postgres --to N --blue-green` apply. The command still
-      refuses; `testing/bluegreen_cutover.py` drives the endpoints by hand.
 - [ ] Product-side green provisioning and logical seeding (`pg_createsubscriber`
-      or dump + `CREATE SUBSCRIPTION`).
+      or dump + `CREATE SUBSCRIPTION`). The cutover command requires green to be
+      already streaming and says so rather than pretending; the e2e harness does
+      the seeding.
 - [ ] DDL freeze event trigger and schema digest. `UPGRADE.md` calls these
       "enforced, not requested"; preflight only reports the gap.
 - [ ] WAL-retention / slot-lag monitor that aborts before the donor is at risk.
-- [ ] Reverse-cutover state machine as a first-class flow. The drill runs the
-      forward protocol with the roles exchanged, which works, but there is no
-      `--rollback` command for it.
-- [ ] Verified provenance for the recipient's attestation. It checks epoch
-      monotonicity; it cannot read the donor's log.
+- [ ] Reverse-cutover as its own command. The protocol is symmetric and the
+      drill runs it with the roles exchanged, but there is no `--rollback` flag
+      that drives it.
 
 Matrix case IDs: `bluegreen-cutover`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`.
 

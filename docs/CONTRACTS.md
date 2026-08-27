@@ -240,11 +240,19 @@ takes authority. A recipient never lifts its own fence on a timeout, and a
 gateway with no confirmed relay address holds rather than falling back to its
 local Raft leader.
 
-**Violation**: green writable while blue unreachable before TRANSFER.
+"Confirmed from a committed source" is literal across clusters: the recipient
+reads the donor's status from a strict majority of the donor's own nodes and
+requires all of them to describe this exact handoff. Silence counts against —
+a minority cannot hold a Raft commit, so a minority cannot prove one.
+
+**Violation**: green writable while blue unreachable before TRANSFER, or green
+lifting its fence on fewer than a majority of blue's nodes.
 
 **Inversions**: `tla/cutover_authority.inv-green-self-elect.cfg` (the accept
 action with its attestation guard removed);
-`test_an_unconfirmable_authority_holds_rather_than_guessing`.
+`test_an_unconfirmable_authority_holds_rather_than_guessing`;
+`a_minority_of_donor_nodes_cannot_confirm_a_handoff`;
+`silence_counts_against_the_handoff`.
 
 ### U5 — Reverse-Drain Completeness (FATAL)
 

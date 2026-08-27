@@ -51,10 +51,7 @@ pub struct BlueGreenPreflightReport {
 /// Any hard abort (large objects, replica identity, fence hole, missing bins).
 pub async fn run_blue_green_preflight(params: PostgresUpgradeParams) -> Result<()> {
     if !params.check_only {
-        bail!(
-            "Refusing --blue-green apply: cutover is steps 8–9 (TLA+ then \
-             orchestration). Run with --check for catalog preflight only."
-        );
+        return run_blue_green_cutover(params).await;
     }
     if params.experimental || params.confirm || params.rollback {
         bail!("--blue-green --check does not accept --experimental / --confirm / --rollback");
@@ -101,6 +98,230 @@ pub async fn run_blue_green_preflight(params: PostgresUpgradeParams) -> Result<(
     };
     let report = client.blue_green_preflight(&leader_mgmt, &req).await?;
     print_report(&report);
+    Ok(())
+}
+
+/// Drive the cutover protocol from the donor to an already-seeded recipient.
+///
+/// Scope: this runs the handoff, not the migration. Green must already be a
+/// healthy cluster at the new major with logical replication caught up —
+/// provisioning and seeding are not implemented, and this refuses rather than
+/// pretending otherwise (`UPGRADE_CHECKLIST.md`, Track C "Not implemented").
+///
+/// # Errors
+/// Preflight failure, a refused protocol step, or a drain that does not reach
+/// the sealed LSN.
+pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()> {
+    let plan = CutoverPlan::resolve(&params).await?;
+    let CutoverPlan {
+        client,
+        blue,
+        green,
+        blue_mgmt,
+        green_mgmt,
+        green_pg,
+        green_cluster_id,
+    } = plan;
+
+    info!(
+        donor = %blue_mgmt,
+        recipient = %green_mgmt,
+        "Cutover: arming"
+    );
+    client
+        .cutover_step(
+            &blue_mgmt,
+            "arm",
+            &serde_json::json!({ "target_cluster_id": green_cluster_id }),
+        )
+        .await?;
+
+    info!("Cutover: sealing (fence first, then the donor reads its own final LSN)");
+    client
+        .cutover_step(
+            &blue_mgmt,
+            "seal",
+            &serde_json::json!({ "app_roles": params.app_roles }),
+        )
+        .await?;
+
+    let sealed = client.get_cutover_status(&blue_mgmt).await?;
+    let Some(final_lsn) = sealed.sealed_final_lsn else {
+        bail!("SEAL recorded no final LSN; refusing to drain against nothing");
+    };
+    info!(final_lsn, "Donor sealed");
+
+    await_recipient_drain(&client, &green_mgmt, final_lsn).await?;
+    client
+        .cutover_step(&blue_mgmt, "drain-observed", &serde_json::json!({}))
+        .await?;
+
+    info!(recipient_pg = %green_pg, "Cutover: transferring");
+    client
+        .cutover_step(
+            &blue_mgmt,
+            "transfer",
+            &serde_json::json!({
+                "target_cluster_id": green_cluster_id,
+                "target_pg_addr": green_pg,
+                "reverse_slot_ready": true,
+            }),
+        )
+        .await?;
+
+    let transferred = client.get_cutover_status(&blue_mgmt).await?;
+    let donor_addrs: Vec<String> = blue.nodes.iter().map(|n| n.mgmt_addr.clone()).collect();
+    info!(
+        epoch = transferred.epoch,
+        donor_nodes = donor_addrs.len(),
+        "Cutover: recipient confirming the handoff against the donor's own nodes"
+    );
+    client
+        .cutover_step(
+            &green_mgmt,
+            "receive-authority",
+            &serde_json::json!({
+                "epoch": transferred.epoch,
+                "from_cluster_id": sealed.cluster_id,
+                "donor_mgmt_addrs": donor_addrs,
+            }),
+        )
+        .await?;
+
+    verify_single_authority(&client, &blue.nodes, &green.nodes, transferred.epoch).await?;
+    info!(
+        epoch = transferred.epoch,
+        "Cutover complete: write authority is {green_cluster_id}"
+    );
+    Ok(())
+}
+
+/// Everything a cutover needs, resolved and checked before anything commits.
+struct CutoverPlan {
+    client: crate::cluster::ClusterClient,
+    blue: crate::cluster::client::NodesResponse,
+    green: crate::cluster::client::NodesResponse,
+    blue_mgmt: String,
+    green_mgmt: String,
+    green_pg: String,
+    green_cluster_id: String,
+}
+
+impl CutoverPlan {
+    async fn resolve(params: &PostgresUpgradeParams) -> Result<Self> {
+        if !params.experimental {
+            bail!(
+                "Refusing --blue-green apply without --experimental: the cutover \
+                 hands write authority between two clusters. Run --check first."
+            );
+        }
+        if params.app_roles.is_empty() {
+            bail!("--app-role is required: the seal fences these roles on the donor");
+        }
+        let Some(green_entry) = params.green_node.clone() else {
+            bail!("--green-node is required: the recipient cluster's management address");
+        };
+        let Some(green_cluster_id) = params.green_cluster_id.clone() else {
+            bail!("--green-cluster-id is required so the donor names the recipient it means");
+        };
+
+        let (client, entry, _config) =
+            cluster_client_and_entry(params.node.clone(), params.config_path.as_deref()).await?;
+        let blue = client.get_nodes(&entry).await?;
+        let Some(blue_mgmt) = client.get_leader_info(&entry).await?.leader_mgmt_addr else {
+            bail!("No donor leader; cannot start a cutover");
+        };
+
+        let green = client.get_nodes(&green_entry).await?;
+        let green_leader = client.get_leader_info(&green_entry).await?;
+        let Some(green_mgmt) = green_leader.leader_mgmt_addr else {
+            bail!("No recipient leader at {green_entry}");
+        };
+        let Some(green_pg) = green_leader.leader_pg_addr else {
+            bail!("Recipient reports no PG address; gateways would have nowhere to relay");
+        };
+
+        let status = client.get_cutover_status(&green_mgmt).await?;
+        if status.cluster_id != green_cluster_id {
+            bail!(
+                "Recipient at {green_mgmt} reports cluster_id {:?}, not {green_cluster_id:?}",
+                status.cluster_id
+            );
+        }
+        if status.holds_client_write_authority {
+            bail!(
+                "Recipient already claims write authority. Set \
+                 `awaits_write_authority_from` on it before a cutover, or it is \
+                 not fenced and U1 is already at risk."
+            );
+        }
+        Ok(Self {
+            client,
+            blue,
+            green,
+            blue_mgmt,
+            green_mgmt,
+            green_pg,
+            green_cluster_id,
+        })
+    }
+}
+
+/// Block until the recipient's subscription has applied past `final_lsn`.
+///
+/// Read from the recipient's catalogs, never assumed from elapsed time.
+async fn await_recipient_drain(
+    client: &crate::cluster::ClusterClient,
+    green_mgmt: &str,
+    final_lsn: u64,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(30);
+    loop {
+        let applied = client.get_subscription_progress(green_mgmt).await?;
+        if applied >= final_lsn {
+            info!(applied, final_lsn, "Recipient drained past the sealed LSN");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "U2: recipient applied only {applied} of the donor's sealed {final_lsn}; \
+                 the donor is still sealed and can be unsealed with `cutover/abort`"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Refuse unless exactly one cluster claims write authority afterwards (U1).
+async fn verify_single_authority(
+    client: &crate::cluster::ClusterClient,
+    blue: &[crate::cluster::client::NodeInfo],
+    green: &[crate::cluster::client::NodeInfo],
+    epoch: u64,
+) -> Result<()> {
+    let mut claimants = Vec::new();
+    for n in blue.iter().chain(green) {
+        let status = client.get_cutover_status(&n.mgmt_addr).await?;
+        if status.holds_client_write_authority {
+            claimants.push(format!("{} ({})", n.mgmt_addr, status.cluster_id));
+        }
+        if status.holds_client_write_authority && status.epoch != epoch {
+            bail!(
+                "U1: {} claims authority at epoch {} but the transfer was {epoch}",
+                n.mgmt_addr,
+                status.epoch
+            );
+        }
+    }
+    if claimants.len() != green.len() {
+        bail!(
+            "U1: {} nodes claim write authority after the cutover ({}); expected \
+             exactly the {} recipient nodes",
+            claimants.len(),
+            claimants.join(", "),
+            green.len()
+        );
+    }
     Ok(())
 }
 

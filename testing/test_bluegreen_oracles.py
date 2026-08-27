@@ -250,7 +250,12 @@ class ReverseDrainTest(unittest.TestCase):
             mock.patch.object(bg, "_psql", side_effect=fake_psql),
             self.assertRaises(bg.ContractFailure) as caught,
         ):
-            bg._rollback_drill(_node("blue1"), _node("green1", "10.0.0.4"), [_node("blue1")])
+            bg._rollback_drill(
+                _node("blue1"),
+                _node("green1", "10.0.0.4"),
+                [_node("blue1")],
+                [_node("green1", "10.0.0.4")],
+            )
         self.assertIn("U5 violated", str(caught.exception))
         self.assertIn("rb-2", str(caught.exception))
 
@@ -279,7 +284,12 @@ class ReverseDrainTest(unittest.TestCase):
             mock.patch.object(bg, "_psql", return_value="rb-0"),
             mock.patch.object(bg, "_write_burst", return_value={"rb-0"}),
         ):
-            bg._rollback_drill(_node("blue1"), _node("green1", "10.0.0.4"), [_node("blue1")])
+            bg._rollback_drill(
+                _node("blue1"),
+                _node("green1", "10.0.0.4"),
+                [_node("blue1")],
+                [_node("green1", "10.0.0.4")],
+            )
         self.assertTrue(sent, "the drill must actually run a transfer")
         self.assertTrue(
             all(b["reverse_slot_ready"] for b in sent),

@@ -177,6 +177,10 @@ pub struct PostgresUpgradeParams {
     pub app_roles: Vec<String>,
     /// Track C: allow unlogged tables (empty on green).
     pub accept_empty_unlogged: bool,
+    /// Track C: entry management address on the green cluster.
+    pub green_node: Option<String>,
+    /// Track C: green's `cluster_id`, checked against what green reports.
+    pub green_cluster_id: Option<String>,
 }
 
 /// Result of a completed preflight (local or remote).
