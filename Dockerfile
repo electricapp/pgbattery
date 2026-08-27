@@ -30,16 +30,24 @@ ENV RUSTFLAGS="--remap-path-prefix=/app=/src --remap-path-prefix=/usr/local/carg
 # Cargo writes a custom profile to target/<profile>/; only `dev` is spelled
 # differently. Naming the profile rather than branching on it means a new one
 # needs no change here.
-# Two package versions in one image so Track A can prove a real N→N+1 binary
-# roll (not same-binary restart). Running binary stays workspace version;
-# `pgbattery-next` is built with PGBATTERY_VERSION_OVERRIDE=workspace+patch.
+# Two package versions in one image so Track A's roll exercises the real
+# orchestration: download, verify, replace, restart, rejoin, in lag order,
+# across a version boundary the semver anti-rollback enforces.
+#
+# It does NOT exercise wire or store compatibility: both binaries are the same
+# source, so the frame format and redb schema are identical by construction.
+# That property is covered by the committed goldens in
+# governor::compat_fixtures, which is where a real format change goes red.
+#
+# Only src/version.rs is dirtied between the two builds, so the second is an
+# incremental relink rather than a second full compile.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     out=$([ "$BUILD_PROFILE" = "dev" ] && echo debug || echo "$BUILD_PROFILE") && \
     cargo build --profile "$BUILD_PROFILE" --locked && \
     cp "target/$out/pgbattery" /pgbattery && \
     cur=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1) && \
-    next=$(python3 -c "v='$cur'.split('.'); print(f'{v[0]}.{v[1]}.{int(v[2])+1}')") && \
+    next=$(echo "$cur" | awk -F. '{print $1"."$2"."$3+1}') && \
     touch src/version.rs && \
     PGBATTERY_VERSION_OVERRIDE="$next" cargo build --profile "$BUILD_PROFILE" --locked && \
     cp "target/$out/pgbattery" /pgbattery-next && \
@@ -53,6 +61,9 @@ WORKDIR /app
 # 17→18 `pg_upgrade` and Track C can run blue@17 / green@18. Refuse the
 # build if either postgres binary is missing — a single-major image makes
 # every major-upgrade case pass while blind.
+# python3 is for testing/cluster_binary_upgrade_proof.py, which serves the
+# miniature release layout over the compose network from inside node1 — the
+# upgrade client has to fetch it from an address its peers can reach.
 RUN apt-get update && apt-get install -y tini libfaketime iproute2 iptables procps curl \
         python3 postgresql-17 && \
     test -x /usr/lib/postgresql/17/bin/postgres && \

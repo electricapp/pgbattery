@@ -107,20 +107,6 @@ TOPOLOGIES: Final[dict[str, tuple[NodeTarget, ...]]] = {
 PG_USER: Final[str] = "postgres"
 PG_DBNAME: Final[str] = "postgres"
 
-# Mutable for --user (client-vs-apply fence paths).
-_active_pg_user: str = PG_USER
-
-
-def set_pg_user(user: str) -> None:
-    """Probe as ``user`` (Track C app-role fence verification)."""
-    global _active_pg_user
-    _active_pg_user = user
-
-
-def active_pg_user() -> str:
-    return _active_pg_user
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Timing defaults
 # ─────────────────────────────────────────────────────────────────────────────
@@ -528,6 +514,10 @@ class ProbeReport:
     transport: str
     max_indeterminate_rate: float
     min_single_acceptance_rate: float
+    pg_user: str = PG_USER
+    """Role the probes connected as. A run as the superuser and one as a
+    fenced app role are different evidence, and a result file that does not
+    say which cannot be read back."""
 
     @property
     def indeterminate_rate(self) -> float:
@@ -610,6 +600,7 @@ class ProbeReport:
             "headline": self.headline,
             "contract": "L1 single writable leader (docs/CONTRACTS.md)",
             "transport": self.transport,
+            "pg_user": self.pg_user,
             "round_period_s": self.round_period_s,
             "wall_duration_s": self.wall_duration_s,
             "total_rounds": self.total_rounds,
@@ -649,6 +640,7 @@ def analyze(
     transport: str = "unknown",
     max_indeterminate_rate: float = DEFAULT_MAX_INDETERMINATE_RATE,
     min_single_acceptance_rate: float = 0.0,
+    pg_user: str = PG_USER,
 ) -> ProbeReport:
     """Reduce a round history to a verdict. Pure: no I/O, no clock reads.
 
@@ -708,6 +700,7 @@ def analyze(
         transport=transport,
         max_indeterminate_rate=max_indeterminate_rate,
         min_single_acceptance_rate=min_single_acceptance_rate,
+        pg_user=pg_user,
     )
 
 
@@ -995,12 +988,14 @@ class _NodeWorker(threading.Thread):
         node: NodeTarget,
         transport: Transport,
         attempt_timeout_s: float,
+        pg_user: str = PG_USER,
         connect_timeout_s: float = CONNECT_TIMEOUT_S,
         connect_backoff_s: float = CONNECT_BACKOFF_S,
     ) -> None:
         super().__init__(name=f"dwp-probe-{node.service}", daemon=True)
         self.node = node
         self._transport = transport
+        self._pg_user = pg_user
         self._attempt_timeout_s = attempt_timeout_s
         self._connect_timeout_s = connect_timeout_s
         self._connect_backoff_ns = int(connect_backoff_s * 1_000_000_000)
@@ -1154,7 +1149,7 @@ class _NodeWorker(threading.Thread):
             conn: psycopg.Connection[Any] = psycopg.connect(
                 host=host,
                 port=port,
-                user=active_pg_user(),
+                user=self._pg_user,
                 dbname=PG_DBNAME,
                 connect_timeout=max(1, round(self._connect_timeout_s)),
                 autocommit=True,
@@ -1214,6 +1209,10 @@ class ProberConfig:
     """Knobs. Defaults are the ones the CI oracle should use."""
 
     round_period_s: float = DEFAULT_ROUND_PERIOD_S
+    pg_user: str = PG_USER
+    """Role the probes connect as. Track C fences by role, so a run as the
+    superuser and one as the app role prove different things — which is why
+    the report records it."""
     attempt_timeout_s: float | None = None
     """Per-attempt deadline. None derives it from the round period."""
     transport: str = "auto"
@@ -1302,7 +1301,9 @@ class DualWritabilityProber:
         self._await_probe_table()
         attempt_timeout = self.config.effective_attempt_timeout_s()
         for node in self.config.nodes:
-            worker = _NodeWorker(node, self._transport, attempt_timeout)
+            worker = _NodeWorker(
+                node, self._transport, attempt_timeout, pg_user=self.config.pg_user
+            )
             worker.start()
             self._workers.append(worker)
 
@@ -1328,7 +1329,7 @@ class DualWritabilityProber:
             return psycopg.connect(
                 host=host,
                 port=port,
-                user=active_pg_user(),
+                user=self.config.pg_user,
                 dbname=PG_DBNAME,
                 connect_timeout=5,
                 autocommit=True,
@@ -1514,6 +1515,7 @@ class DualWritabilityProber:
             transport=self.transport_name,
             max_indeterminate_rate=self.config.max_indeterminate_rate,
             min_single_acceptance_rate=self.config.min_single_acceptance_rate,
+            pg_user=self.config.pg_user,
         )
 
 
@@ -1756,9 +1758,9 @@ def run(
             f"[red]unknown --topology {topology!r}[/]; expected one of {sorted(TOPOLOGIES)}"
         )
         raise typer.Exit(code=2)
-    set_pg_user(user)
     config = ProberConfig(
         nodes=TOPOLOGIES[topology],
+        pg_user=user,
         round_period_s=round_ms / 1000.0,
         attempt_timeout_s=(attempt_ms / 1000.0) if attempt_ms > 0 else None,
         transport=transport,

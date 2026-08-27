@@ -1,7 +1,10 @@
 # UPGRADE.md — Upgrade Design Spec
 
-Status: proposal. Nothing in this document is implemented unless explicitly
-marked "exists today". Three tracks, independently shippable:
+Status: design. This document is the target, not a status report —
+`UPGRADE_CHECKLIST.md` tracks what has landed. Tracks A and B are implemented;
+Track C's authority protocol, fences, and proofs are in, while its
+operator-facing orchestration is not (`--blue-green` still refuses apply).
+Three tracks, independently shippable:
 
 - Track A: rolling pgbattery self-upgrades (minor and major) with no cluster
   downtime.
@@ -468,6 +471,13 @@ committed source. The invariant generalizes cleanly: **write authority exists
 for exactly one `(epoch, cluster)` pair, and epochs advance only through blue's
 log.**
 
+One honest gap in the shipped version of this: green cannot read blue's log,
+so it cannot verify that `AUTHORITY_TRANSFERRED` was committed. It records the
+handoff in its own log and enforces the half it can check without blue — the
+epoch strictly increases — while the orchestrator attests the rest. The
+endpoint names that (`accept_unverified_provenance`), and closing it needs a
+signed entry or a shared witness, neither of which exists yet.
+
 The failure cases are where this earns its keep, and all of them fail closed:
 
 - **Blue unreachable mid-cutover.** Green does not take authority; no entry
@@ -511,6 +521,24 @@ and either fenced or accepted by name. It is a new fencing primitive with its
 own verification burden, and the prober has to be extended to prove it holds
 — connected as an application role, through those paths, not just a plain
 `INSERT`.
+
+### Configuration
+
+Both clusters set `cluster_id` (alphanumeric plus `_` and `-`); every node in
+one cluster agrees, and the two must differ. The recipient additionally sets:
+
+```toml
+cluster_id = "green"
+awaits_write_authority_from = "blue"
+client_fence_roles = ["app"]
+```
+
+Those two are what keep a second Raft group from electing itself into write
+authority the moment it boots: until green's own log records
+`CutoverAuthorityReceived`, its gateways hold and its supervisor revokes DML
+from the named roles on the local primary. Config is refused if
+`awaits_write_authority_from` names its own cluster, or if it is set without
+`client_fence_roles` — a gateway hold alone leaves the internal port writable.
 
 ### Prerequisites and the restrictions that decide feasibility
 

@@ -1,5 +1,8 @@
 # Green cluster — Raft id 5
 node_id = 5
+cluster_id = "green"
+awaits_write_authority_from = "blue"
+client_fence_roles = ["bg_app"]
 listen_addr = "0.0.0.0:5432"
 raft_addr = "0.0.0.0:5433"
 metrics_addr = "0.0.0.0:9090"

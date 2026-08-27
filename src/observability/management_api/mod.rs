@@ -133,6 +133,8 @@ pub struct ManagementApiState {
     /// Gateway/lease fence watch — Track B sets `upgrade_frozen` here so every
     /// gateway connection refuses queries without a second channel.
     pub fence_tx: watch::Sender<crate::governor::raft::FenceState>,
+    /// `Config::cluster_id` — the identity cutover authority records name.
+    pub cluster_id: Arc<str>,
 }
 
 /// The two paths needed to read a data directory's control file, plus Track B
@@ -387,6 +389,10 @@ pub async fn start_management_api(
         .route(
             "/api/v1/admin/cutover/force-transfer",
             post(cutover::cutover_force_transfer),
+        )
+        .route(
+            "/api/v1/admin/cutover/receive-authority",
+            post(cutover::cutover_receive_authority),
         )
         .route(
             "/api/v1/admin/postgres-upgrade/freeze",

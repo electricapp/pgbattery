@@ -48,9 +48,21 @@
   "CutoverDrainObserved",
   "CutoverTransfer",
   "CutoverAbortUnseal",
+  "CutoverAuthorityReceived",
   "CutoverAuthorityState",
   "CutoverPhase",
-  "green_leader_pg_addr",
+  "holds_client_write_authority",
+]
+"governor/raft.rs" = [
+  "cutover_authority_projection",
+  "client_write_authority",
+  "authority_pg_addr",
+]
+"observability/management_api/cutover.rs" = [
+  "cutover_seal",
+  "cutover_transfer",
+  "cutover_force_transfer",
+  "cutover_receive_authority",
 ]
 "commands/upgrade/blue_green.rs" = [
   "run_blue_green_preflight",

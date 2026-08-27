@@ -436,8 +436,28 @@ def count_raw_fault_verbs(source: str) -> list[int]:
     )
 
 
+def _can_go_red(name: str) -> bool:
+    """Whether `name` is an artifact CI can watch fail.
+
+    A harness under `testing/` runs and can raise; a `<spec>.inv-<name>.cfg`
+    is a counterexample model `make check-counterexamples` requires to fail.
+    An implementation file under `src/` or `crates/` is neither — naming one
+    satisfies a "has an inversion" check while proving nothing.
+    """
+    path = PROJECT_ROOT / name
+    if not path.is_file():
+        return False
+    if ".inv-" in path.name and path.suffix == ".cfg":
+        return True
+    return path.suffix == ".py" and TESTING_DIR in path.parents
+
+
 def check_fatal_contracts_have_inversions() -> None:
-    """Every FATAL contract in the registry must name resolvable inversions."""
+    """Every FATAL contract must name inversions that can actually go red.
+
+    Resolving is not enough: an implementation path under `src/` resolves and
+    can never fail. See [`_can_go_red`] for what counts.
+    """
     registry = load_contracts_registry()
     case_ids = {str(case.get("id", "")) for case in json.loads(MATRIX_PATH.read_text())["cases"]}
     fn_names = _known_test_function_names()
@@ -455,12 +475,13 @@ def check_fatal_contracts_have_inversions() -> None:
         dangling = [
             name
             for name in inversions
-            if name not in case_ids and name not in fn_names and not (PROJECT_ROOT / name).exists()
+            if name not in case_ids and name not in fn_names and not _can_go_red(name)
         ]
         if dangling:
             problems.append(
-                f"{cid}'s inversion points at {dangling}, which no longer exist "
-                f"as matrix cases, files, or functions"
+                f"{cid}'s inversion names {dangling}: not a matrix case, a test "
+                f"function, a testing/ harness, or an `inv-` model config, so "
+                f"nothing there can go red"
             )
         else:
             resolved_any = True

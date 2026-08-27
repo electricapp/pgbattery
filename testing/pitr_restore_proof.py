@@ -23,74 +23,66 @@ With archiving + this proof, abort RPO is bounded by ``archive_timeout``
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
-import sys
 import time
-import urllib.error
-import urllib.request
+from typing import Any, Final, NoReturn
 
-TOKEN = os.environ.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
-MGMT = os.environ.get("PGBATTERY_PITR_MGMT", "http://127.0.0.1:9081")
-GATEWAY = os.environ.get("PGBATTERY_PITR_GATEWAY", "127.0.0.1")
-GATEWAY_PORT = int(os.environ.get("PGBATTERY_PITR_GATEWAY_PORT", "5432"))
-COMPOSE = os.environ.get("COMPOSE_FILE", "docker-compose.yml")
-NODE = os.environ.get("PGBATTERY_PITR_NODE", "node1")
-WAL_ARCHIVE = "/var/lib/postgresql/wal_archive"
-PG_BIN = "/usr/lib/postgresql/18/bin"
-PG_USER = "postgres"
+import httpx
+import typer
+from rich.console import Console
+
+import topology
+from topology import Node, load
+
+TOKEN: Final[str] = os.environ.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
+WAL_ARCHIVE: Final[str] = "/var/lib/postgresql/wal_archive"
+PG_USER: Final[str] = "postgres"
+SCRATCH_PORT: Final[int] = 55_432
+
+console = Console()
+err_console = Console(stderr=True)
+app = typer.Typer(add_completion=False)
 
 
-def die(msg: str) -> None:
-    print(f"pitr_restore_proof: FAIL: {msg}", file=sys.stderr)
+def die(msg: str) -> NoReturn:
+    err_console.print(f"[red]pitr_restore_proof: FAIL:[/] {msg}")
     raise SystemExit(1)
 
 
-def api(method: str, path: str, body: dict[str, object] | None = None) -> dict[str, object]:
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        f"{MGMT}{path}",
-        data=data,
-        method=method,
-        headers={
-            "x-pgbattery-token": TOKEN,
-            "Content-Type": "application/json",
-        },
-    )
+def api(node: Node, method: str, path: str) -> dict[str, Any]:
+    url = f"http://127.0.0.1:{node.mgmt_port}{path}"
     try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            raw = resp.read().decode()
-    except urllib.error.HTTPError as e:
-        die(f"{method} {path}: HTTP {e.code}: {e.read().decode()}")
-    except Exception as e:
+        r = httpx.request(
+            method,
+            url,
+            headers={"x-pgbattery-token": TOKEN, "Content-Type": "application/json"},
+            timeout=600.0,
+        )
+        r.raise_for_status()
+        parsed = r.json()
+    except httpx.HTTPError as e:
         die(f"{method} {path}: {e}")
-    parsed = json.loads(raw)
+    except ValueError as e:
+        die(f"{method} {path}: response was not JSON: {e}")
     if not isinstance(parsed, dict):
-        die(f"{method} {path}: expected JSON object, got {type(parsed).__name__}")
-    out: dict[str, object] = {str(k): v for k, v in parsed.items()}
-    return out
+        die(f"{method} {path}: expected a JSON object")
+    return {str(k): v for k, v in parsed.items()}
 
 
-def compose_exec(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    cmd = ["docker", "compose", "-f", COMPOSE, "exec", "-T", NODE, *args]
-    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+def compose_exec(node: Node, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    cmd = ["docker", "compose", "exec", "-T", node.service, *args]
+    return subprocess.run(cmd, check=check, text=True, capture_output=True, env={**os.environ})
 
 
-def psql_gateway(sql: str) -> str:
-    cmd = [
-        "docker",
-        "compose",
-        "-f",
-        COMPOSE,
-        "exec",
-        "-T",
-        NODE,
+def psql_gateway(node: Node, sql: str) -> str:
+    r = compose_exec(
+        node,
         "psql",
         "-h",
         "127.0.0.1",
         "-p",
-        "5432",
+        str(topology.PG_CONTAINER_PORT),
         "-U",
         PG_USER,
         "-v",
@@ -99,37 +91,53 @@ def psql_gateway(sql: str) -> str:
         "-A",
         "-c",
         sql,
-    ]
-    r = subprocess.run(cmd, check=False, text=True, capture_output=True)
+        check=False,
+    )
     if r.returncode != 0:
         die(f"psql failed: {r.stderr or r.stdout}")
     return r.stdout.strip()
 
 
+def _pg_bin(node: Node) -> str:
+    """Active bindir, from the node itself rather than a pinned major."""
+    body = api(node, "GET", "/api/v1/postgres/status")
+    bindir = str(body.get("active_bin_dir", "")).strip()
+    if not bindir:
+        die(f"{node.service} reports no active PostgreSQL bindir")
+    return bindir
+
+
+@app.command()
 def main() -> None:
     if not TOKEN:
         die("PGBATTERY_MANAGEMENT_API_TOKEN is required")
+    node = load().nodes[0]
+    pg_bin = _pg_bin(node)
 
     # Prove archive_mode is on in the managed conf.
-    conf = compose_exec("cat", "/var/lib/postgresql/data/postgresql.conf").stdout
+    conf = compose_exec(node, "cat", "/var/lib/postgresql/data/postgresql.conf").stdout
     if "archive_mode = on" not in conf:
         die("postgresql.conf does not have archive_mode = on — set backup.wal_archive_dir")
 
-    compose_exec("mkdir", "-p", WAL_ARCHIVE)
+    compose_exec(node, "mkdir", "-p", WAL_ARCHIVE)
 
     marker = f"pitr-{int(time.time())}"
     psql_gateway(
+        node,
         "CREATE TABLE IF NOT EXISTS pitr_proof("
-        "id text PRIMARY KEY, when_ts timestamptz DEFAULT now());"
+        "id text PRIMARY KEY, when_ts timestamptz DEFAULT now());",
     )
-    psql_gateway(f"INSERT INTO pitr_proof(id) VALUES ('pre-{marker}') ON CONFLICT DO NOTHING;")
-    psql_gateway("SELECT pg_switch_wal();")
+    psql_gateway(
+        node,
+        f"INSERT INTO pitr_proof(id) VALUES ('pre-{marker}') ON CONFLICT DO NOTHING;",
+    )
+    psql_gateway(node, "SELECT pg_switch_wal();")
 
     # Wait for at least one archived segment.
     deadline = time.time() + 90
     while time.time() < deadline:
         listing = compose_exec(
-            "sh", "-c", f"ls -1 {WAL_ARCHIVE} 2>/dev/null | wc -l"
+            node, "sh", "-c", f"ls -1 {WAL_ARCHIVE} 2>/dev/null | wc -l"
         ).stdout.strip()
         if listing.isdigit() and int(listing) > 0:
             break
@@ -137,21 +145,22 @@ def main() -> None:
     else:
         die(f"no WAL segments appeared under {WAL_ARCHIVE} within 90s")
 
-    created = api("POST", "/api/v1/backup/create?type=full")
+    created = api(node, "POST", "/api/v1/backup/create?type=full")
     backup_path = created.get("path")
     if not created.get("success") or not backup_path:
         die(f"backup create failed: {created}")
 
-    psql_gateway(f"INSERT INTO pitr_proof(id) VALUES ('post-{marker}');")
-    psql_gateway("SELECT pg_switch_wal();")
+    psql_gateway(node, f"INSERT INTO pitr_proof(id) VALUES ('post-{marker}');")
+    psql_gateway(node, "SELECT pg_switch_wal();")
     time.sleep(3)  # allow archive_command to copy the post-backup segment
 
     scratch_in = f"/tmp/pitr-proof-{marker}"
-    compose_exec("rm", "-rf", scratch_in)
-    compose_exec("mkdir", "-p", scratch_in)
+    compose_exec(node, "rm", "-rf", scratch_in)
+    compose_exec(node, "mkdir", "-p", scratch_in)
 
     # Materialize an uncompressed datadir from the backup path inside the node.
     r = compose_exec(
+        node,
         "sh",
         "-c",
         f"""
@@ -171,7 +180,7 @@ test -d {scratch_in}/data
 cat > {scratch_in}/data/postgresql.auto.conf <<EOF
 restore_command = 'cp {WAL_ARCHIVE}/%f %p'
 recovery_target_action = 'promote'
-port = 55432
+port = {SCRATCH_PORT}
 EOF
 touch {scratch_in}/data/recovery.signal
 rm -f {scratch_in}/data/standby.signal
@@ -182,6 +191,7 @@ rm -f {scratch_in}/data/standby.signal
 
     # Refuse to claim coverage if we never actually started recovery.
     compose_exec(
+        node,
         "sh",
         "-c",
         f"test -f {scratch_in}/data/recovery.signal",
@@ -189,26 +199,28 @@ rm -f {scratch_in}/data/standby.signal
 
     # Start throwaway postmaster; wait for ready; assert markers; write; stop.
     compose_exec(
+        node,
         "sh",
         "-c",
         f"""
 set -e
-{PG_BIN}/pg_ctl -D {scratch_in}/data -l {scratch_in}/pg.log start
+{pg_bin}/pg_ctl -D {scratch_in}/data -l {scratch_in}/pg.log start
 for i in $(seq 1 60); do
-  {PG_BIN}/pg_isready -h 127.0.0.1 -p 55432 -U {PG_USER} && break
+  {pg_bin}/pg_isready -h 127.0.0.1 -p {SCRATCH_PORT} -U {PG_USER} && break
   sleep 1
 done
-{PG_BIN}/pg_isready -h 127.0.0.1 -p 55432 -U {PG_USER}
+{pg_bin}/pg_isready -h 127.0.0.1 -p {SCRATCH_PORT} -U {PG_USER}
 """,
     )
 
     def scratch_psql(sql: str) -> str:
         r = compose_exec(
+            node,
             "psql",
             "-h",
             "127.0.0.1",
             "-p",
-            "55432",
+            str(SCRATCH_PORT),
             "-U",
             PG_USER,
             "-v",
@@ -220,7 +232,7 @@ done
             check=False,
         )
         if r.returncode != 0:
-            log = compose_exec("cat", f"{scratch_in}/pg.log", check=False).stdout
+            log = compose_exec(node, "cat", f"{scratch_in}/pg.log", check=False).stdout
             die(f"scratch psql failed: {r.stderr}\n--- pg.log ---\n{log}")
         return r.stdout.strip()
 
@@ -240,14 +252,15 @@ done
             die("restored cluster did not accept a write")
     finally:
         compose_exec(
+            node,
             "sh",
             "-c",
-            f"{PG_BIN}/pg_ctl -D {scratch_in}/data stop -m fast || true; rm -rf {scratch_in}",
+            f"{pg_bin}/pg_ctl -D {scratch_in}/data stop -m fast || true; rm -rf {scratch_in}",
             check=False,
         )
 
-    print("pitr_restore_proof: PASS")
+    console.print("pitr_restore_proof: PASS")
 
 
 if __name__ == "__main__":
-    main()
+    app()

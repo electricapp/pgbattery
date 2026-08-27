@@ -189,21 +189,39 @@ only in part.
 
 ## Upgrade / cutover contracts (Track C)
 
+Clusters are named by `Config::cluster_id`; "blue" and "green" below are the
+roles a cluster plays in one migration, not identifiers the code compares.
+
 ### U1 — Cross-Cluster Single Write Authority (FATAL)
 
-At most one `(epoch, cluster)` accepts client writes. Generalization of L1
-across blue and green. Epoch advances only through blue's Raft log.
+At most one `(epoch, cluster_id)` accepts client writes. The generalization of
+L1 across both clusters. `CutoverAuthorityState::holds_client_write_authority`
+is the single read; authority in transit (SEALED/DRAINING) belongs to nobody.
+
+Enforced at two points, because a gateway-only fence is not sufficient by this
+project's own standard: the gateway holds or relays, and the supervisor
+revokes client DML on the local primary.
 
 **Violation**: confirmed acceptances on both clusters for overlapping windows.
 
-**Tests / inversions**: `tla/cutover_authority.tla` (`AtMostOneWriteAuthority`);
-counterexample `cutover_authority.inv-green-self-elect.cfg`.
+**Inversions**: `tla/cutover_authority.inv-green-self-elect.cfg`;
+`test_a_cluster_without_authority_never_reports_holding_it`;
+`test_a_fence_that_covers_nothing_is_refused` (SEAL reports success while the
+app role still writes to the internal port).
 
 ### U2 — Cutover Drain Completeness (FATAL)
 
 Every write acked by blue before SEAL is present on green after TRANSFER.
 
+The gate is the subscriber's confirmed LSN against the LSN blue recorded at
+SEAL, and SEAL fences before reading it. Committing SEAL first, or taking the
+LSN from the caller, leaves acked writes past the recorded LSN.
+
 **Violation**: missing pre-seal ack on green.
+
+**Inversions**: `test_a_drain_short_of_the_final_lsn_is_refused`;
+`test_matching_row_counts_do_not_prove_a_drain` (row-count equality passes on a
+history that is missing a key).
 
 ### U3 — Sequence Non-Collision (FATAL)
 
@@ -211,23 +229,33 @@ After cutover, no sequence on green issues a value blue already issued.
 
 **Violation**: green sequences not advanced past blue.
 
-**Tests**: Track C catalog preflight names sequences (`src/commands/upgrade/blue_green.rs`).
+**Inversions**: `test_an_unadvanced_sequence_is_caught`;
+`test_a_sequence_that_setval_cannot_reach_is_refused` (a column owning no
+sequence makes `setval` a silent no-op, so the check would pass while blind).
 
 ### U4 — Fail-Closed Cutover (FATAL)
 
-When the current epoch cannot be confirmed from a committed source (blue
-unreachable mid-cutover), no node takes authority. Green does not self-elect.
+When the current epoch cannot be confirmed from a committed source, no cluster
+takes authority. A recipient never lifts its own fence on a timeout, and a
+gateway with no confirmed relay address holds rather than falling back to its
+local Raft leader.
 
 **Violation**: green writable while blue unreachable before TRANSFER.
 
-**Inversion**: `tla/cutover_authority.inv-green-self-elect.cfg`.
+**Inversions**: `tla/cutover_authority.inv-green-self-elect.cfg` (the accept
+action with its attestation guard removed);
+`test_an_unconfirmable_authority_holds_rather_than_guessing`.
 
 ### U5 — Reverse-Drain Completeness (FATAL)
 
 While rollback is reported available, every write green has acked is on blue
-or captured in the reverse slot (slot must predate green's first accepted write).
+or captured in the reverse slot, which must predate green's first accepted
+write.
 
-**Violation**: fence lifted before reverse slot exists, plus a write in the gap.
+**Violation**: fence lifted before the reverse slot exists, plus a write in the gap.
+
+**Inversions**: `test_a_write_missing_from_the_reverse_stream_is_caught`;
+`test_a_transfer_without_a_reverse_slot_is_refused`.
 
 ---
 

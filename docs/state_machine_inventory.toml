@@ -19,8 +19,11 @@ enums.ClusterCommand = [
   "CutoverDrainObserved",
   "CutoverTransfer",
   "CutoverAbortUnseal",
+  "CutoverAuthorityReceived",
+  "SetUpgradeFreeze",
 ]
 enums.CutoverPhase = ["Idle", "Armed", "Sealed", "Draining", "Transferred", "Aborted"]
+enums.CommandOutcome = ["Applied", "OutOfOrder"]
 enums.PostmasterState = ["Running", "NotRunning", "Exited"]
 # Wire-compat labels on NodeInfo — not live Raft leadership (see STATE_MACHINE §5).
 enums.NodeRole = ["Leader", "Follower"]
@@ -42,6 +45,8 @@ types = [
   "ClusterCommand",
   "CutoverAuthorityState",
   "CutoverPhase",
+  "CommandOutcome",
+  "UpgradeSite",
   "ConnectionState",
   "HeartbeatGuard",
   "LeadershipObservation",

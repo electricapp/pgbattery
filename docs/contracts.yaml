@@ -101,36 +101,42 @@ contracts:
       - testing/test_checker_sanity.py
       - assert_flagged
 
+  # Every inversion below is a test or model that FAILS when the mechanism it
+  # names is removed. A source file, or a happy-path unit test, satisfies the
+  # lint without being able to go red — which is the failure this registry
+  # exists to prevent.
   U1:
     severity: FATAL
     title: Cross-Cluster Single Write Authority
     inversions:
       - tla/cutover_authority.inv-green-self-elect.cfg
-      - cutover_transfer_advances_epoch_to_green
+      - test_a_cluster_without_authority_never_reports_holding_it
+      - test_a_fence_that_covers_nothing_is_refused
 
   U2:
     severity: FATAL
     title: Cutover Drain Completeness
     inversions:
-      - cutover_abort_unseal_returns_blue_new_epoch
-      - tla/cutover_authority.tla
+      - test_a_drain_short_of_the_final_lsn_is_refused
+      - test_matching_row_counts_do_not_prove_a_drain
 
   U3:
     severity: FATAL
     title: Sequence Non-Collision
     inversions:
-      - src/commands/upgrade/blue_green.rs
-      - cutover_seal_ignored_unless_armed
+      - test_an_unadvanced_sequence_is_caught
+      - test_a_sequence_that_setval_cannot_reach_is_refused
 
   U4:
     severity: FATAL
     title: Fail-Closed Cutover
     inversions:
       - tla/cutover_authority.inv-green-self-elect.cfg
+      - test_an_unconfirmable_authority_holds_rather_than_guessing
 
   U5:
     severity: FATAL
     title: Reverse-Drain Completeness
     inversions:
-      - tla/cutover_authority.tla
-      - cutover_transfer_advances_epoch_to_green
+      - test_a_write_missing_from_the_reverse_stream_is_caught
+      - test_a_transfer_without_a_reverse_slot_is_refused

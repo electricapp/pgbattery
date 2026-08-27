@@ -25,55 +25,68 @@ use crate::config::Config;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CONFIG_PATH: &str = "pgbattery.toml";
+/// Bootstrap superuser every pgbattery cluster initdb's with.
+const PG_SUPERUSER: &str = "postgres";
 const SUBPROCESS_BUDGET: Duration = Duration::from_mins(10);
 /// Durable rollback anchor written next to PGDATA after a successful primary apply.
-const UPGRADE_ANCHOR_FILE: &str = ".pgbattery_pg_upgrade_anchor.json";
-
-/// Rollback anchor until `--confirm` (never deleted by a timer).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UpgradeAnchor {
-    pub from_major: u32,
-    pub to_major: u32,
-    pub old_data_dir: PathBuf,
-    pub new_data_dir: PathBuf,
-    pub old_bin_dir: PathBuf,
-    pub new_bin_dir: PathBuf,
-    pub transfer_mode: String,
+/// Where a data directory sits in a `pg_upgrade`, probed from disk.
+///
+/// `UPGRADE.md` refuses a marker file here: the flow must decide from which
+/// data directories exist and what state they are in, never from a note it
+/// wrote about its own intent. Every field below is read from the filesystem
+/// at the moment it is needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeSite {
+    /// Data directory carrying the lower major, if one is present.
+    pub old_data_dir: Option<PathBuf>,
+    pub old_major: Option<u32>,
+    /// Data directory carrying `to_major`, if `pg_upgrade` got that far.
+    pub new_data_dir: Option<PathBuf>,
+    /// `pg_upgrade --link` renames the old cluster's `global/pg_control`, so
+    /// its absence beside a present `pg_control.old` is how link mode is
+    /// recognised without having recorded it.
+    pub old_control_intact: bool,
 }
 
-impl UpgradeAnchor {
-    #[must_use]
-    pub fn path_beside(data_parent: &Path) -> PathBuf {
-        data_parent.join(UPGRADE_ANCHOR_FILE)
-    }
-
+impl UpgradeSite {
+    /// Probe `parent` for the data directories of a `from → to` upgrade.
+    ///
     /// # Errors
-    /// I/O or serialize failure.
-    pub fn write(&self, data_parent: &Path) -> Result<()> {
-        let path = Self::path_beside(data_parent);
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
-    }
-
-    /// # Errors
-    /// Missing file or parse failure.
-    pub fn read(data_parent: &Path) -> Result<Self> {
-        let path = Self::path_beside(data_parent);
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading upgrade anchor {}", path.display()))?;
-        serde_json::from_str(&raw).context("parsing upgrade anchor JSON")
-    }
-
-    /// # Errors
-    /// Remove failure (missing is Ok).
-    pub fn delete(data_parent: &Path) -> Result<()> {
-        let path = Self::path_beside(data_parent);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    /// When `parent` cannot be read.
+    pub fn probe(parent: &Path, to_major: u32) -> Result<Self> {
+        let mut site = Self {
+            old_data_dir: None,
+            old_major: None,
+            new_data_dir: None,
+            old_control_intact: false,
+        };
+        let entries = fs::read_dir(parent)
+            .with_context(|| format!("reading data parent {}", parent.display()))?;
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("listing {}", parent.display()))?
+                .path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(major) = data_dir_major(&path) else {
+                continue;
+            };
+            if major == to_major {
+                site.new_data_dir = Some(path);
+            } else if major < to_major && site.old_major.is_none_or(|m| major > m) {
+                site.old_control_intact = path.join("global/pg_control").is_file();
+                site.old_major = Some(major);
+                site.old_data_dir = Some(path);
+            }
         }
+        Ok(site)
+    }
+
+    /// Whether an in-place rollback to the old cluster is possible.
+    #[must_use]
+    pub const fn rollback_available(&self) -> bool {
+        self.old_data_dir.is_some() && self.old_control_intact
     }
 }
 
@@ -304,23 +317,25 @@ async fn apply_experimental(
     transfer_mode: &str,
     config_path: Option<&str>,
 ) -> Result<()> {
-    info!("Applying Track B freeze (refuse queries) on every node");
-    for n in nodes {
-        client.set_upgrade_freeze(&n.mgmt_addr, true).await?;
-    }
+    info!("Committing the Track B upgrade freeze");
+    client.set_upgrade_freeze(leader_mgmt, true).await?;
+
     let standbys: Vec<_> = nodes
         .iter()
         .filter(|n| Some(n.node_id) != leader_id)
         .collect();
+    let mut stopped: Vec<&crate::cluster::client::NodeInfo> = Vec::new();
     for n in &standbys {
         info!(
             node_id = n.node_id,
             "Stopping standby PostgreSQL for upgrade"
         );
         if let Err(e) = client.stop_postgres(&n.mgmt_addr).await {
-            unfreeze_all(client, nodes).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
+            unfreeze_all_logging(client, nodes).await;
             bail!("Failed to stop standby {}: {e}", n.node_id);
         }
+        stopped.push(n);
     }
 
     let apply_body = crate::observability::management_api::PostgresUpgradeApplyRequest {
@@ -340,21 +355,24 @@ async fn apply_experimental(
             );
         }
         Ok(r) => {
-            unfreeze_all(client, nodes).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
+            unfreeze_all_logging(client, nodes).await;
             bail!(
                 "Primary apply failed: {}",
                 r.message.unwrap_or_else(|| "no detail".into())
             );
         }
         Err(e) => {
-            unfreeze_all(client, nodes).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
+            unfreeze_all_logging(client, nodes).await;
             return Err(e);
         }
     }
 
-    // Unfreeze so the new primary can accept writes before standbys return
-    // (briefly ASYNC — status says so).
-    unfreeze_all(client, nodes).await;
+    // The apply probes a write before returning, so unfreezing here releases
+    // clients into a primary that answers. Standbys are still stopped, so
+    // durability is briefly ASYNC and the status output says so.
+    unfreeze_all(client, nodes).await?;
     info!("Unfrozen after primary upgrade (standbys still stopped; durability briefly ASYNC)");
 
     let leader = client.get_leader_info(leader_mgmt).await?;
@@ -362,7 +380,7 @@ async fn apply_experimental(
         bail!("No leader_pg_addr after primary upgrade");
     };
     let (host, port) = split_host_port(&leader_pg)?;
-    let pg_user = "postgres".to_string();
+    let pg_user = PG_SUPERUSER.to_string();
 
     for (i, n) in standbys.iter().enumerate() {
         info!(
@@ -454,10 +472,30 @@ async fn verify_post_upgrade(
 }
 
 /// Explicit `--confirm`: delete rollback anchor + old datadir on every node.
+/// Confirm: delete the rollback anchors. The one irreversible step.
+///
+/// Runs the same verification gate as the end of an apply first. Confirm is a
+/// separate operator invocation, so without this the gate covers only the
+/// happy path where both ran back to back.
 async fn run_confirm(params: PostgresUpgradeParams) -> Result<()> {
     let (client, entry, _) =
         cluster_client_and_entry(params.node.clone(), params.config_path.as_deref()).await?;
     let membership = client.get_nodes(&entry).await?;
+    let leader = client.get_leader_info(&entry).await?;
+    let Some(leader_mgmt) = leader.leader_mgmt_addr else {
+        bail!("No cluster leader; refusing to confirm");
+    };
+    info!("Re-running the verification gate before deleting rollback anchors");
+    verify_post_upgrade(
+        &client,
+        &membership.nodes,
+        &leader_mgmt,
+        params.to_major,
+        params.config_path.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Refusing confirm, verification failed: {e}"))?;
+
     for n in &membership.nodes {
         let resp = client
             .postgres_upgrade_confirm(&n.mgmt_addr, params.to_major)
@@ -492,9 +530,7 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
     };
 
     info!("Freezing cluster for rollback");
-    for n in &membership.nodes {
-        client.set_upgrade_freeze(&n.mgmt_addr, true).await?;
-    }
+    client.set_upgrade_freeze(&leader_mgmt, true).await?;
     for n in &membership.nodes {
         if Some(n.node_id) != leader.leader_id
             && let Err(e) = client.stop_postgres(&n.mgmt_addr).await
@@ -503,23 +539,30 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
         }
     }
 
-    let resp = client
+    let resp = match client
         .postgres_upgrade_rollback(&leader_mgmt, params.to_major, params.accept_write_loss)
-        .await?;
-    if !resp.success {
-        for n in &membership.nodes {
-            if let Err(e) = client.set_upgrade_freeze(&n.mgmt_addr, false).await {
-                tracing::warn!(node_id = n.node_id, error = %e, "unfreeze after rollback fail");
-            }
+        .await
+    {
+        Ok(resp) if resp.success => resp,
+        Ok(resp) => {
+            unfreeze_all_logging(&client, &membership.nodes).await;
+            bail!(
+                "Primary rollback failed: {}",
+                resp.message.unwrap_or_else(|| "no detail".into())
+            );
         }
-        bail!(
-            "Primary rollback failed: {}",
-            resp.message.unwrap_or_else(|| "no detail".into())
-        );
+        Err(e) => {
+            unfreeze_all_logging(&client, &membership.nodes).await;
+            return Err(e);
+        }
+    };
+    if let Some(msg) = resp.message.as_deref() {
+        info!(%msg, "Primary rolled back");
     }
 
     let leader_info = client.get_leader_info(&leader_mgmt).await?;
     let Some(leader_pg) = leader_info.leader_pg_addr else {
+        unfreeze_all_logging(&client, &membership.nodes).await;
         bail!("No leader_pg_addr after rollback");
     };
     let (host, port) = split_host_port(&leader_pg)?;
@@ -533,17 +576,20 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
             to_major: from_major,
             leader_pg_host: host.clone(),
             leader_pg_port: port,
-            pg_user: "postgres".into(),
+            pg_user: PG_SUPERUSER.into(),
         };
-        client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await?;
-        wait_standby_streaming(&client, &leader_mgmt, n.node_id).await?;
-    }
-
-    for n in &membership.nodes {
-        if let Err(e) = client.set_upgrade_freeze(&n.mgmt_addr, false).await {
-            tracing::warn!(node_id = n.node_id, error = %e, "unfreeze after rollback");
+        let rejoined = async {
+            client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await?;
+            wait_standby_streaming(&client, &leader_mgmt, n.node_id).await
+        }
+        .await;
+        if let Err(e) = rejoined {
+            unfreeze_all_logging(&client, &membership.nodes).await;
+            return Err(e);
         }
     }
+
+    unfreeze_all(&client, &membership.nodes).await?;
     require_doctor_strict(Some(leader_mgmt.clone()), params.config_path.clone()).await?;
     info!(from_major, "Rollback complete; cluster on old major");
     Ok(())
@@ -587,11 +633,83 @@ async fn wait_standby_streaming(
     }
 }
 
-async fn unfreeze_all(client: &ClusterClient, nodes: &[crate::cluster::client::NodeInfo]) {
+/// Clear the cluster-wide freeze.
+///
+/// The freeze is one committed entry, so one node accepting the call clears
+/// it everywhere. Every node failing means client connections stay held until
+/// the hold timeout severs them, which the caller must be told about.
+async fn unfreeze_all(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+) -> Result<()> {
+    let mut last_error = None;
     for n in nodes {
-        if let Err(e) = client.set_upgrade_freeze(&n.mgmt_addr, false).await {
-            tracing::warn!(node_id = n.node_id, error = %e, "Failed to clear upgrade freeze");
+        match client.set_upgrade_freeze(&n.mgmt_addr, false).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(node_id = n.node_id, error = %e, "Unfreeze call failed");
+                last_error = Some(e);
+            }
         }
+    }
+    bail!(
+        "Could not clear the upgrade freeze on any node; gateways will hold \
+         clients until the hold timeout: {}",
+        last_error.map_or_else(|| "no nodes".into(), |e| e.to_string())
+    )
+}
+
+/// Put standbys stopped for an upgrade back into replication after an abort.
+///
+/// Their data directories are still the old major and the primary never
+/// changed, so a plain rejoin against the unchanged primary is correct. Left
+/// out, an aborted upgrade leaves a single-copy cluster with no signal.
+async fn restart_stopped_standbys(
+    client: &ClusterClient,
+    stopped: &[&crate::cluster::client::NodeInfo],
+    leader_mgmt: &str,
+    to_major: u32,
+) {
+    if stopped.is_empty() {
+        return;
+    }
+    let Ok(leader) = client.get_leader_info(leader_mgmt).await else {
+        tracing::error!("Cannot resolve leader to restart standbys; they stay stopped");
+        return;
+    };
+    let Some(leader_pg) = leader.leader_pg_addr else {
+        tracing::error!("Leader reports no PG address; standbys stay stopped");
+        return;
+    };
+    let Ok((host, port)) = split_host_port(&leader_pg) else {
+        tracing::error!(%leader_pg, "Unparseable leader PG address; standbys stay stopped");
+        return;
+    };
+    for n in stopped {
+        let body = crate::observability::management_api::PostgresUpgradeRejoinRequest {
+            to_major,
+            leader_pg_host: host.clone(),
+            leader_pg_port: port,
+            pg_user: PG_SUPERUSER.into(),
+        };
+        match client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await {
+            Ok(r) if r.success => info!(node_id = n.node_id, "Standby restarted after abort"),
+            Ok(r) => tracing::error!(
+                node_id = n.node_id,
+                message = ?r.message,
+                "Standby did not restart after abort"
+            ),
+            Err(e) => {
+                tracing::error!(node_id = n.node_id, error = %e, "Standby restart failed");
+            }
+        }
+    }
+}
+
+/// Best-effort unfreeze on an error path, where the caller is already failing.
+async fn unfreeze_all_logging(client: &ClusterClient, nodes: &[crate::cluster::client::NodeInfo]) {
+    if let Err(e) = unfreeze_all(client, nodes).await {
+        tracing::error!(error = %e, "Cluster left frozen");
     }
 }
 
@@ -955,12 +1073,21 @@ pub fn filesystem_free_bytes(path: &Path) -> Result<u64> {
 }
 
 /// Parameters initdb must reuse so `pg_upgrade` accepts the new cluster.
+///
+/// Resolved once, in [`collect_initdb_params`], and reused by both preflight
+/// and apply. Deriving them twice risks a mismatch that aborts out of
+/// `pg_upgrade` after the freeze has already begun.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitdbParams {
     pub data_checksums: bool,
     pub wal_segsize_mb: Option<u32>,
     pub encoding: String,
-    pub locale: String,
+    pub lc_collate: String,
+    pub lc_ctype: String,
+    /// `libc` or `icu` — a provider change silently corrupts text indexes,
+    /// which `pg_upgrade` does not rebuild.
+    pub locale_provider: String,
+    pub icu_locale: Option<String>,
 }
 
 /// Parse checksum + WAL seg size from `pg_controldata` text.
@@ -1231,24 +1358,32 @@ async fn collect_initdb_params(
     };
     let (data_checksums, wal_segsize_mb) = initdb_params_from_controldata(&controldata);
 
-    let encoding = supervisor
-        .execute_sql("SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database();")
-        .await?
-        .trim()
-        .to_string();
-    let locale = supervisor
-        .execute_sql("SELECT datcollate FROM pg_database WHERE datname = current_database();")
-        .await?
-        .trim()
-        .to_string();
-    if encoding.is_empty() || locale.is_empty() {
-        bail!("Could not resolve encoding/locale from catalogs");
+    // One row, pipe-joined, so the five values cannot drift apart across
+    // separate round trips against a database being changed underneath us.
+    let row = supervisor
+        .execute_sql(
+            "SELECT pg_encoding_to_char(encoding) || '|' || datcollate || '|' || datctype \
+             || '|' || CASE datlocprovider WHEN 'c' THEN 'libc' WHEN 'i' THEN 'icu' \
+             ELSE 'builtin' END || '|' || COALESCE(datlocale, '') \
+             FROM pg_database WHERE datname = current_database();",
+        )
+        .await
+        .context("resolving encoding/locale from pg_database")?;
+    let fields: Vec<&str> = row.trim().split('|').collect();
+    let [encoding, lc_collate, lc_ctype, locale_provider, icu] = fields.as_slice() else {
+        bail!("Could not resolve encoding/locale from catalogs: {row:?}");
+    };
+    if encoding.is_empty() || lc_collate.is_empty() || lc_ctype.is_empty() {
+        bail!("Empty encoding/locale from catalogs: {row:?}");
     }
     Ok(InitdbParams {
         data_checksums,
         wal_segsize_mb,
-        encoding,
-        locale,
+        encoding: (*encoding).to_string(),
+        lc_collate: (*lc_collate).to_string(),
+        lc_ctype: (*lc_ctype).to_string(),
+        locale_provider: (*locale_provider).to_string(),
+        icu_locale: (!icu.is_empty()).then(|| (*icu).to_string()),
     })
 }
 
@@ -1589,12 +1724,21 @@ async fn run_pg_upgrade_check(
         &new_data.display().to_string(),
         "-U",
         "postgres",
+        // Throwaway scratch cluster for --check only; never started for real.
         "--no-sync",
         "-E",
         &initdb.encoding,
-        "--locale",
-        &initdb.locale,
-    ]);
+        "--lc-collate",
+        &initdb.lc_collate,
+        "--lc-ctype",
+        &initdb.lc_ctype,
+        "--locale-provider",
+        &initdb.locale_provider,
+    ])
+    .kill_on_drop(true);
+    if let Some(icu) = initdb.icu_locale.as_deref() {
+        cmd.args(["--icu-locale", icu]);
+    }
     if initdb.data_checksums {
         cmd.arg("--data-checksums");
     } else {
@@ -1707,12 +1851,29 @@ pub async fn run_primary_pg_upgrade_apply(
         .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?;
     let new_data = parent.join(format!("data_{to_major}"));
     if new_data.exists() {
-        bail!(
-            "New data directory {} already exists — refuse to overwrite; \
-             remove it only after verifying it is not a live cluster",
-            new_data.display()
+        // `pg_upgrade` has no restart point, so a leftover target is the
+        // wreckage of an interrupted run, not progress. Discarding it is the
+        // only way the flow can resume from the preserved old datadir.
+        let started = new_data.join("global/pg_control").is_file() && postmaster_has_run(&new_data);
+        if started {
+            bail!(
+                "{} has been started as a cluster: refusing to discard it. \
+                 Roll back or confirm before re-running the upgrade.",
+                new_data.display()
+            );
+        }
+        tracing::warn!(
+            path = %new_data.display(),
+            "Discarding a new datadir left by an interrupted pg_upgrade"
         );
+        fs::remove_dir_all(&new_data)
+            .with_context(|| format!("removing {}", new_data.display()))?;
     }
+
+    // Resolved while PostgreSQL is still up: the locale provider and ICU
+    // locale live in the catalogs, and a mismatch must abort here rather than
+    // out of pg_upgrade with the cluster already stopped.
+    let initdb = collect_initdb_params(supervisor, &old_bindir, &old_data).await?;
 
     info!(old = %old_data.display(), "Stopping primary for pg_upgrade");
     supervisor
@@ -1720,50 +1881,25 @@ pub async fn run_primary_pg_upgrade_apply(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let initdb = {
-        // Controldata + catalog params were collected at preflight; re-read
-        // controldata offline (PG stopped) for checksums / WAL seg size.
-        let output = Command::new(old_bindir.join("pg_controldata"))
-            .arg(&old_data)
-            .output()
-            .await
-            .context("pg_controldata")?;
-        if !output.status.success() {
-            bail!(
-                "pg_controldata failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let (data_checksums, wal_segsize_mb) =
-            initdb_params_from_controldata(&String::from_utf8_lossy(&output.stdout));
-        // Encoding/locale from PG_VERSION era: read postgresql.conf defaults
-        // is fragile; use en_US.UTF-8 only if we cannot read — prefer
-        // pg_controldata LC fields when present.
-        let fields = parse_kv_colon(&String::from_utf8_lossy(&output.stdout));
-        let locale = fields
-            .get("LC_COLLATE")
-            .cloned()
-            .unwrap_or_else(|| "C".into());
-        InitdbParams {
-            data_checksums,
-            wal_segsize_mb,
-            encoding: "UTF8".into(),
-            locale,
-        }
-    };
-
     let mut init = Command::new(new_bindir.join("initdb"));
     init.args([
         "-D",
         &new_data.display().to_string(),
         "-U",
         "postgres",
-        "--no-sync",
         "-E",
         &initdb.encoding,
-        "--locale",
-        &initdb.locale,
-    ]);
+        "--lc-collate",
+        &initdb.lc_collate,
+        "--lc-ctype",
+        &initdb.lc_ctype,
+        "--locale-provider",
+        &initdb.locale_provider,
+    ])
+    .kill_on_drop(true);
+    if let Some(icu) = initdb.icu_locale.as_deref() {
+        init.args(["--icu-locale", icu]);
+    }
     if initdb.data_checksums {
         init.arg("--data-checksums");
     } else {
@@ -1792,10 +1928,19 @@ pub async fn run_primary_pg_upgrade_apply(
             &new_bindir.display().to_string(),
             transfer_mode.as_pg_upgrade_flag(),
         ])
-        .current_dir(parent);
-    let output = tokio::time::timeout(SUBPROCESS_BUDGET, upgrade.output())
+        .current_dir(parent)
+        // Without this, a budget expiry drops the future and leaves pg_upgrade
+        // running detached, still writing into the target we are about to
+        // report as failed.
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(pg_upgrade_budget(&old_data), upgrade.output())
         .await
-        .map_err(|_| anyhow::anyhow!("pg_upgrade timed out"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "pg_upgrade exceeded its budget and was killed; the new datadir \
+                 is discarded on the next attempt"
+            )
+        })?
         .context("pg_upgrade")?;
     if !output.status.success() {
         bail!(
@@ -1811,16 +1956,29 @@ pub async fn run_primary_pg_upgrade_apply(
         .await
         .map_err(|e| anyhow::anyhow!("start after pg_upgrade: {e}"))?;
 
-    // Best-effort post-upgrade scripts if present next to new datadir.
-    let analyze = new_data.join("analyze_new_cluster.sh");
-    if analyze.is_file() {
-        drop(Command::new("bash").arg(&analyze).status().await);
-    }
+    // Probe before the gateway is unfrozen: held clients must be released
+    // into a primary that answers, not one still in startup.
+    supervisor
+        .execute_sql(
+            "CREATE TEMP TABLE pgbattery_upgrade_probe(i int); DROP TABLE pgbattery_upgrade_probe;",
+        )
+        .await
+        .context("upgraded primary did not accept a write")?;
+
+    run_post_upgrade_scripts(parent).await?;
+
+    // The LSN clients resume writing at. Rollback compares against it to say
+    // whether anything would actually be discarded.
+    let watermark = crate::commands::upgrade::client_fence::flush_lsn_bytes(supervisor).await?;
+    write_unfreeze_watermark(parent, watermark)?;
+    info!(watermark, "Recorded unfreeze write-loss watermark");
+
     // analyze-in-stages: gating for targets below 18; always run when vacuumdb exists.
     let vacuumdb = new_bindir.join("vacuumdb");
     if vacuumdb.is_file() {
-        let port = read_postmaster_port(&new_data).unwrap_or(5434);
+        let port = read_postmaster_port(&new_data)?;
         let status = Command::new(&vacuumdb)
+            .kill_on_drop(true)
             .args([
                 "-h",
                 "127.0.0.1",
@@ -1856,22 +2014,11 @@ pub async fn run_primary_pg_upgrade_apply(
         );
     }
 
-    let anchor = UpgradeAnchor {
-        from_major,
-        to_major,
-        old_data_dir: old_data.clone(),
-        new_data_dir: new_data.clone(),
-        old_bin_dir: old_bindir.clone(),
-        new_bin_dir: new_bindir.clone(),
-        transfer_mode: transfer_mode
-            .as_pg_upgrade_flag()
-            .trim_start_matches('-')
-            .to_string(),
-    };
-    anchor.write(parent)?;
+    let site = UpgradeSite::probe(parent, to_major)?;
     info!(
-        anchor = %UpgradeAnchor::path_beside(parent).display(),
-        "Wrote rollback anchor (delete only via --confirm)"
+        old_data = ?site.old_data_dir,
+        rollback_available = site.rollback_available(),
+        "pg_upgrade complete"
     );
 
     Ok(PreflightReport {
@@ -1893,107 +2040,205 @@ pub async fn run_primary_pg_upgrade_apply(
 pub fn confirm_local(data_dir: &Path, to_major: u32) -> Result<()> {
     let parent = data_dir
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve data parent for anchor"))?;
-    let path = UpgradeAnchor::path_beside(parent);
-    if !path.exists() {
-        info!(
-            path = %path.display(),
-            "No upgrade anchor on this node — confirm is a no-op"
-        );
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve data parent"))?;
+    let site = UpgradeSite::probe(parent, to_major)?;
+    let Some(old) = site.old_data_dir else {
+        info!("No older data directory beside PGDATA — confirm is a no-op here");
         return Ok(());
-    }
-    let anchor = UpgradeAnchor::read(parent)?;
-    if anchor.to_major != to_major {
+    };
+    let live = data_dir_major(data_dir)?;
+    if live != to_major {
         bail!(
-            "Anchor to_major {} != confirm --to {to_major}",
-            anchor.to_major
+            "Refusing confirm: this node is running major {live}, not {to_major}. \
+             Deleting the rollback anchor now would leave nothing to roll back to."
         );
     }
-    if matches!(anchor.transfer_mode.as_str(), "link") {
-        tracing::warn!("Confirming after --link: old cluster was already unusable");
-    }
-    if anchor.old_data_dir.exists() {
-        fs::remove_dir_all(&anchor.old_data_dir)
-            .with_context(|| format!("removing old datadir {}", anchor.old_data_dir.display()))?;
-    }
-    let anchor_parent = anchor
-        .old_data_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("old datadir has no parent"))?;
-    UpgradeAnchor::delete(anchor_parent)?;
+    fs::remove_dir_all(&old).with_context(|| format!("removing old datadir {}", old.display()))?;
+    info!(removed = %old.display(), "Rollback anchor deleted");
     Ok(())
 }
 
-/// Roll primary back to the old datadir under old binaries.
+/// Result of a completed in-place rollback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackReport {
+    pub from_major: u32,
+    pub to_major: u32,
+    pub old_data_dir: PathBuf,
+    /// Flush LSN recorded at unfreeze, if the upgrade reached that point.
+    pub unfreeze_watermark_lsn: Option<u64>,
+    /// Flush LSN on the new cluster just before it was stopped. Higher than
+    /// the watermark means client writes landed on the new major and are
+    /// being discarded.
+    pub new_cluster_final_lsn: Option<u64>,
+}
+
+/// Roll the primary back to the old datadir under the old binaries.
 ///
 /// # Errors
-/// Missing anchor, link mode, stop/start, or write-proof failures.
+/// No rollback anchor, link mode, unaccepted write loss, or start failure.
 pub async fn rollback_local(
     supervisor: &mut crate::supervisor::Supervisor,
+    bin_dirs: &BTreeMap<String, PathBuf>,
     to_major: u32,
     accept_write_loss: bool,
-) -> Result<UpgradeAnchor> {
+) -> Result<RollbackReport> {
     let parent = supervisor
         .data_dir()
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?;
-    let anchor = UpgradeAnchor::read(parent)?;
-    if anchor.to_major != to_major {
+        .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?
+        .to_path_buf();
+    let site = UpgradeSite::probe(&parent, to_major)?;
+    let (Some(old_data), Some(from_major)) = (site.old_data_dir.clone(), site.old_major) else {
         bail!(
-            "Anchor to_major {} != rollback --to {to_major}",
-            anchor.to_major
+            "No data directory below major {to_major} beside {}: there is \
+             nothing to roll back to. Restore from the preflight backup.",
+            parent.display()
+        );
+    };
+    if !site.old_control_intact {
+        bail!(
+            "{} has no global/pg_control: pg_upgrade --link renamed it and the \
+             new cluster has written through the hard links. There is no \
+             in-place rollback; restore from the preflight backup.",
+            old_data.display()
         );
     }
-    if anchor.transfer_mode == "link" {
-        bail!("Cannot in-place rollback after --link; restore from preflight backup");
-    }
-    if !accept_write_loss {
-        bail!("Refusing rollback without --accept-write-loss (writes on new major are lost)");
-    }
-    if !anchor.old_data_dir.exists() {
+
+    // Watermark first: once the new postmaster stops, what it accepted is
+    // unreadable, and the operator is entitled to know before it is discarded.
+    let new_cluster_final_lsn = crate::commands::upgrade::client_fence::flush_lsn_bytes(supervisor)
+        .await
+        .ok();
+    let watermark = read_unfreeze_watermark(&parent);
+    let wrote_past_watermark = match (watermark, new_cluster_final_lsn) {
+        (Some(mark), Some(now)) => now > mark,
+        _ => true,
+    };
+    if wrote_past_watermark && !accept_write_loss {
         bail!(
-            "Old datadir {} missing — cannot rollback",
-            anchor.old_data_dir.display()
+            "Refusing rollback without --accept-write-loss: the new cluster is \
+             at LSN {new_cluster_final_lsn:?}, past the unfreeze watermark \
+             {watermark:?}, so client writes would be discarded."
         );
     }
+
+    let old_bindir = bin_dirs
+        .get(&from_major.to_string())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("pg_bin_dirs has no entry for major {from_major}"))?;
 
     supervisor
         .stop()
         .await
         .map_err(|e| anyhow::anyhow!("stop for rollback: {e}"))?;
-    supervisor.retarget_paths(anchor.old_bin_dir.clone(), anchor.old_data_dir.clone());
+    supervisor.retarget_paths(old_bindir, old_data.clone());
     supervisor
         .start()
         .await
         .map_err(|e| anyhow::anyhow!("start old major: {e}"))?;
 
-    let port = read_postmaster_port(&anchor.old_data_dir)?;
-    let status = Command::new(anchor.old_bin_dir.join("psql"))
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            "postgres",
-            "-d",
-            "postgres",
-            "-c",
-            "CREATE TABLE IF NOT EXISTS pgbattery_rollback_proof(i int); INSERT INTO pgbattery_rollback_proof VALUES (1);",
-        ])
-        .status()
-        .await?;
-    if !status.success() {
-        bail!("Rolled-back cluster did not accept a write");
+    // Probe rather than assume: a rollback path that has never been exercised
+    // is the same failure mode as an oracle that has never failed. The write
+    // goes to a temp table so the drill leaves nothing in the user's schema.
+    supervisor
+        .execute_sql(
+            "CREATE TEMP TABLE pgbattery_rollback_probe(i int); \
+             INSERT INTO pgbattery_rollback_probe VALUES (1);",
+        )
+        .await
+        .context("rolled-back cluster did not accept a write")?;
+    let catalog_ok = supervisor
+        .execute_sql("SELECT count(*)::text FROM pg_class;")
+        .await
+        .context("rolled-back cluster catalogs unreadable")?;
+    if catalog_ok.trim().parse::<u64>().unwrap_or(0) == 0 {
+        bail!("Rolled-back cluster reports an empty pg_class");
     }
-    let major = data_dir_major(&anchor.old_data_dir)?;
-    if major != anchor.from_major {
-        bail!(
-            "After rollback PG_VERSION is {major}, expected {}",
-            anchor.from_major
-        );
+    let live = data_dir_major(&old_data)?;
+    if live != from_major {
+        bail!("After rollback PG_VERSION is {live}, expected {from_major}");
     }
-    Ok(anchor)
+    drop(fs::remove_file(unfreeze_watermark_path(&parent)));
+
+    Ok(RollbackReport {
+        from_major,
+        to_major,
+        old_data_dir: old_data,
+        unfreeze_watermark_lsn: watermark,
+        new_cluster_final_lsn,
+    })
+}
+
+/// Whether a postmaster has ever started in `data_dir`.
+///
+/// `pg_upgrade` leaves an initdb'd-but-never-started target behind when it is
+/// interrupted; one that has been started is a live cluster and must not be
+/// discarded. `pg_stat` and the WAL directory only exist after a start.
+fn postmaster_has_run(data_dir: &Path) -> bool {
+    data_dir.join("postmaster.pid").is_file()
+        || fs::read_dir(data_dir.join("pg_wal")).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Wall-clock budget for one `pg_upgrade`, scaled to the data directory.
+///
+/// A fixed budget is either too short for a real database or too long to
+/// catch a wedge. `--copy` reads and writes every relation file, so size is
+/// the term that matters; the floor covers catalog-only clone/link runs.
+fn pg_upgrade_budget(old_data: &Path) -> Duration {
+    const FLOOR: Duration = Duration::from_mins(10);
+    const BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
+    let Ok(bytes) = dir_size_approx(old_data) else {
+        return FLOOR;
+    };
+    FLOOR.max(Duration::from_secs(bytes / BYTES_PER_SEC))
+}
+
+/// Run the scripts `pg_upgrade` emitted into its working directory.
+///
+/// They land beside the data directories, not inside the new one — the
+/// distinction matters because looking in the wrong place silently runs
+/// nothing.
+async fn run_post_upgrade_scripts(work_dir: &Path) -> Result<()> {
+    for name in ["update_extensions.sql", "analyze_new_cluster.sh"] {
+        let script = work_dir.join(name);
+        if !script.is_file() {
+            continue;
+        }
+        info!(script = %script.display(), "Running pg_upgrade post-upgrade script");
+        let status = Command::new("bash")
+            .arg(&script)
+            .current_dir(work_dir)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .with_context(|| format!("running {}", script.display()))?;
+        if !status.success() {
+            bail!("post-upgrade script {} failed: {status}", script.display());
+        }
+    }
+    Ok(())
+}
+
+fn unfreeze_watermark_path(parent: &Path) -> PathBuf {
+    parent.join(".pgbattery_unfreeze_watermark")
+}
+
+/// Record the LSN the new cluster started accepting client writes at.
+///
+/// Not upgrade state — the LSN of a moment that has passed, and the only way
+/// to answer "did anything land on the new major" once it is stopped.
+///
+/// # Errors
+/// I/O failure.
+pub fn write_unfreeze_watermark(parent: &Path, lsn: u64) -> Result<()> {
+    let path = unfreeze_watermark_path(parent);
+    fs::write(&path, lsn.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+fn read_unfreeze_watermark(parent: &Path) -> Option<u64> {
+    fs::read_to_string(unfreeze_watermark_path(parent))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }
 
 /// Active major from `PG_VERSION`.
@@ -2108,23 +2353,89 @@ pub async fn run_standby_rebasebackup(
 mod tests {
     use super::*;
 
+    fn fake_datadir(parent: &Path, name: &str, major: u32, control: bool) -> PathBuf {
+        let dir = parent.join(name);
+        fs::create_dir_all(dir.join("global")).unwrap();
+        fs::write(dir.join("PG_VERSION"), format!("{major}\n")).unwrap();
+        if control {
+            fs::write(dir.join("global/pg_control"), b"x").unwrap();
+        }
+        dir
+    }
+
+    /// The upgrade's position is read off disk, not from a marker it wrote.
     #[test]
-    fn upgrade_anchor_roundtrip() {
+    fn probe_finds_both_datadirs_and_reports_rollback_available() {
         let dir = tempfile::tempdir().unwrap();
-        let anchor = UpgradeAnchor {
-            from_major: 18,
-            to_major: 19,
-            old_data_dir: dir.path().join("data"),
-            new_data_dir: dir.path().join("data_19"),
-            old_bin_dir: PathBuf::from("/old/bin"),
-            new_bin_dir: PathBuf::from("/new/bin"),
-            transfer_mode: "clone".into(),
-        };
-        anchor.write(dir.path()).unwrap();
-        let read = UpgradeAnchor::read(dir.path()).unwrap();
-        assert_eq!(read, anchor);
-        UpgradeAnchor::delete(dir.path()).unwrap();
-        assert!(UpgradeAnchor::read(dir.path()).is_err());
+        let old = fake_datadir(dir.path(), "data", 17, true);
+        let new = fake_datadir(dir.path(), "data_18", 18, true);
+
+        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        assert_eq!(site.old_data_dir.as_deref(), Some(old.as_path()));
+        assert_eq!(site.old_major, Some(17));
+        assert_eq!(site.new_data_dir.as_deref(), Some(new.as_path()));
+        assert!(site.rollback_available());
+    }
+
+    /// `pg_upgrade --link` renames the old cluster's control file, and that
+    /// absence is how link mode is recognised without having recorded it.
+    #[test]
+    fn a_renamed_old_control_file_means_no_in_place_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_datadir(dir.path(), "data", 17, false);
+        fake_datadir(dir.path(), "data_18", 18, true);
+
+        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        assert_eq!(site.old_major, Some(17));
+        assert!(!site.old_control_intact);
+        assert!(!site.rollback_available());
+    }
+
+    /// Before any upgrade there is nothing to roll back to.
+    #[test]
+    fn probe_on_an_unupgraded_cluster_finds_no_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_datadir(dir.path(), "data", 18, true);
+
+        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        assert!(site.old_data_dir.is_none());
+        assert!(!site.rollback_available());
+        assert!(site.new_data_dir.is_some());
+    }
+
+    /// An initdb'd-but-never-started target is wreckage from an interrupted
+    /// run; one that has been started is a live cluster.
+    #[test]
+    fn a_started_datadir_is_distinguishable_from_an_abandoned_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = fake_datadir(dir.path(), "data_18", 18, true);
+        fs::create_dir_all(data.join("pg_wal")).unwrap();
+        assert!(!postmaster_has_run(&data));
+
+        fs::write(data.join("pg_wal/000000010000000000000001"), b"w").unwrap();
+        assert!(postmaster_has_run(&data));
+    }
+
+    /// A fixed budget is either too short for a real database or too long to
+    /// catch a wedge, so it scales with the data directory.
+    #[test]
+    fn the_pg_upgrade_budget_grows_with_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = fake_datadir(dir.path(), "data", 17, true);
+        assert_eq!(pg_upgrade_budget(&small), Duration::from_mins(10));
+        assert_eq!(
+            pg_upgrade_budget(Path::new("/nonexistent")),
+            Duration::from_mins(10),
+            "an unreadable directory falls back to the floor, not to zero"
+        );
+    }
+
+    #[test]
+    fn the_unfreeze_watermark_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_unfreeze_watermark(dir.path()), None);
+        write_unfreeze_watermark(dir.path(), 987_654_321).unwrap();
+        assert_eq!(read_unfreeze_watermark(dir.path()), Some(987_654_321));
     }
 
     #[test]

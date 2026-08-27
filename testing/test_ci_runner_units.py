@@ -1380,15 +1380,33 @@ def test_inversion_check_rejects_a_dangling_reference() -> None:
     )
 
 
-def test_inversion_refs_resolve_by_case_file_or_function() -> None:
-    """The three shapes the real registry uses, each accepted on its own."""
+def test_inversion_refs_resolve_by_case_harness_model_or_function() -> None:
+    """The four shapes that can actually go red, each accepted on its own."""
     for name in (
         SAMPLE_INVERSION_CASE,
-        "docs/CONTRACTS.md",
+        "testing/torn_raft.py",
+        "tla/cutover_authority.inv-green-self-elect.cfg",
         "test_real_registry_defines_fatal_contracts",
     ):
         sample = CONTRACT_REGISTRY_SAMPLE.replace(SAMPLE_INVERSION_CASE, name)
         _check_registry(sample, Path(tempfile.mkdtemp(prefix="contracts-shape-")))
+
+
+def test_an_inversion_that_cannot_fail_is_refused() -> None:
+    """A prose doc or an implementation file resolves but proves nothing.
+
+    Without this the "FATAL contracts declare an inversion" gate is satisfied
+    by naming any path in the tree, which is how U1-U5 shipped with inversions
+    that could never turn red.
+    """
+    for name in ("docs/CONTRACTS.md", "src/commands/upgrade/blue_green.rs", "Cargo.toml"):
+        sample = CONTRACT_REGISTRY_SAMPLE.replace(SAMPLE_INVERSION_CASE, name)
+        try:
+            _check_registry(sample, Path(tempfile.mkdtemp(prefix="contracts-inert-")))
+        except AssertionError as exc:
+            assert "can go red" in str(exc), exc
+        else:
+            raise AssertionError(f"{name} was accepted as an inversion")
 
 
 def test_log_marker_check_catches_a_reworded_line() -> None:

@@ -15,21 +15,24 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 import httpx
 import typer
+from rich.console import Console
 
 os.environ.setdefault("COMPOSE_FILE", "docker-compose.yml")
 
+import topology
 from topology import load
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TOKEN = os.environ.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
 RELEASE_PORT = 8765
 
+console = Console()
+err_console = Console(stderr=True)
 app = typer.Typer(add_completion=False)
 
 
@@ -83,7 +86,7 @@ def _wait_versions(expected: str, timeout: float = 300.0) -> None:
                 got.append((n.service, f"err:{exc}"))
                 ok = False
         if ok:
-            print(f"all voters at {expected}: {got}")
+            console.print(f"all voters at {expected}: {got}")
             return
         time.sleep(2.0)
     raise SystemExit(f"timeout waiting for version {expected}: {got}")
@@ -156,7 +159,7 @@ def main(
     if live != cur_v:
         raise SystemExit(f"management API reports {live}, binary --version {cur_v}")
 
-    print(f"proving Track A upgrade {cur_v} → {next_v}")
+    console.print(f"proving Track A upgrade {cur_v} → {next_v}")
 
     # Platform binary name matches Rust std::env::consts::{OS,ARCH}.
     uname = _exec("node1", "uname", "-m").strip()
@@ -187,7 +190,8 @@ curl -sf "http://127.0.0.1:{RELEASE_PORT}/latest" | grep -qx "{next_v}"
 """
     _exec("node1", "sh", "-c", setup, user="root")
 
-    release_base = f"http://172.28.0.11:{RELEASE_PORT}"
+    release_base = f"http://{node1.ip}:{RELEASE_PORT}"
+    entry = f"{node1.ip}:{topology.MGMT_CONTAINER_PORT}"
     # Orchestrate from a *separate* container on the compose network. Running
     # `upgrade --cluster` inside node1 dies with the process when the former
     # leader replaces its own binary and restarts (exit 137).
@@ -226,7 +230,7 @@ curl -sf "http://127.0.0.1:{RELEASE_PORT}/latest" | grep -qx "{next_v}"
         "--cluster",
         "--yes",
         "--node",
-        "172.28.0.11:9091",
+        entry,
         "--version",
         next_v,
         "--url",
@@ -242,14 +246,14 @@ curl -sf "http://127.0.0.1:{RELEASE_PORT}/latest" | grep -qx "{next_v}"
         text=True,
         capture_output=True,
     )
-    print(proc.stdout)
+    console.print(proc.stdout)
     if proc.stderr:
-        print(proc.stderr, file=sys.stderr)
+        err_console.print(proc.stderr)
     if proc.returncode != 0:
         raise SystemExit(f"cluster upgrade failed rc={proc.returncode}")
 
     _wait_versions(next_v)
-    print(f"cluster-binary-upgrade-proof OK ({cur_v} → {next_v})")
+    console.print(f"cluster-binary-upgrade-proof OK ({cur_v} → {next_v})")
 
 
 if __name__ == "__main__":

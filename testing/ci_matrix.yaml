@@ -118,7 +118,7 @@
         "network-latency-stability",
         "follower-one-peer-partition",
         "rolling-upgrade",
-        "mixed-version-orientation",
+        "leadership-orientation-soak",
         "pg-upgrade-hold-chaos-mid-freeze",
         "wal-hole-resync",
         "rogue-pg-promote",
@@ -150,7 +150,12 @@
         "cluster-binary-upgrade-proof",
         "pg-major-upgrade-proof",
         "bluegreen-cutover",
-        "bluegreen-rollback-drill"
+        "bluegreen-rollback-drill",
+        "bluegreen-chaos-arm-seal",
+        "bluegreen-chaos-seal-transfer",
+        "bluegreen-chaos-mid-drain",
+        "bluegreen-chaos-blue-quorum",
+        "pg-major-upgrade-rollback-drill"
       ]
     }
   },
@@ -2577,9 +2582,9 @@
       ]
     },
     {
-      "id": "mixed-version-orientation",
+      "id": "leadership-orientation-soak",
       "contracts": ["W1", "V1"],
-      "description": "Track A mixed-orientation soak: leadership on node1 then node2 while followers restart (same binary in CI; procedure matches N/N-1 orientation swaps). Complements rolling-upgrade.",
+      "description": "Leadership moves to node1 then node2 while followers restart underneath. This is the restart-and-transfer shape a rolling upgrade passes through; it is NOT a mixed-version test — both orientations run one binary. Cross-version compatibility is covered by the frame/store fixtures in governor::compat_fixtures.",
       "actions": [
         {"type": "transfer_leadership", "target_node_id": 1},
         {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 60},
@@ -2621,8 +2626,8 @@
     },
     {
       "id": "pg-major-upgrade-proof",
-      "contracts": ["W1", "V1", "L1"],
-      "description": "Track B proof: live pg_upgrade 17→18 on docker-compose.pgupgrade.yml with dual majors in the image.",
+      "contracts": ["W1", "V1"],
+      "description": "Track B proof: live pg_upgrade 17→18 on docker-compose.pgupgrade.yml with dual majors in the image. A continuous writer records every acked key and every one is asserted present after the upgrade (W1); every node is asserted on the new major (V1). No L1 claim: this case runs no dual-writability prober, and the freeze stops writes rather than testing concurrent acceptance.",
       "actions": [
         {
           "type": "cmd",
@@ -2632,9 +2637,21 @@
       ]
     },
     {
+      "id": "pg-major-upgrade-rollback-drill",
+      "contracts": ["W1", "V1"],
+      "description": "Track B rollback before --confirm: upgrade 17 to 18 under continuous writes, then roll back. Asserts the write-loss refusal fires without --accept-write-loss, that the old cluster starts on 17, and that it accepts a write.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pg_major_upgrade_proof.py --rollback-drill",
+          "timeout_sec": 900
+        }
+      ]
+    },
+    {
       "id": "bluegreen-cutover",
-      "contracts": ["U1", "U2", "U3", "U5", "W1"],
-      "description": "Track C full cutover under continuous writes with reverse replication (blue@17 / green@18).",
+      "contracts": ["U1", "U2", "U3", "W1"],
+      "description": "Track C full cutover blue@17 to green@18. Asserts green is fenced from boot and after SEAL on its internal port, that every acked pre-seal key is on green (U2), that green issues no sequence value blue used (U3), that exactly one cluster claims authority and the six-port prober agrees as the app role (U1), and that writes through blue's gateway land on green and not on blue. U5 is claimed by bluegreen-rollback-drill, which runs the reverse protocol; this case only proves the reverse slot exists before the fence lifts.",
       "actions": [
         {
           "type": "cmd",
@@ -2646,7 +2663,7 @@
     {
       "id": "bluegreen-rollback-drill",
       "contracts": ["U5", "U1"],
-      "description": "Track C post-cutover rollback drill (U5 window).",
+      "description": "Track C post-cutover rollback: writes to green in the first moments after transfer, then runs the cutover protocol in reverse. Asserts every write green acked reached blue through the slot that predated green's fence lift (U5), and that authority ends up on blue alone (U1).",
       "actions": [
         {
           "type": "cmd",
@@ -2659,25 +2676,22 @@
       "id": "bluegreen-chaos-arm-seal",
       "contracts": ["U4"],
       "description": "Chaos: kill blue leader between ARMED and SEAL.",
-      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos arm-seal",
       "actions": [
-        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos arm-seal", "expect_exit": null}
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos arm-seal"}
       ]
     },
     {
       "id": "bluegreen-chaos-seal-transfer",
       "contracts": ["U4"],
       "description": "Chaos: kill blue after SEAL before TRANSFER.",
-      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos seal-transfer",
       "actions": [
-        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos seal-transfer", "expect_exit": null}
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos seal-transfer"}
       ]
     },
     {
       "id": "bluegreen-chaos-mid-drain",
       "contracts": ["U4", "U2"],
       "description": "Chaos: kill green mid-drain; blue abort-unseal.",
-      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos mid-drain",
       "actions": [
         {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos mid-drain"}
       ]
@@ -2686,9 +2700,8 @@
       "id": "bluegreen-chaos-blue-quorum",
       "contracts": ["U4"],
       "description": "Chaos: blue quorum loss after SEAL; force-transfer with accept_blue_write_loss.",
-      "ci_excluded_reason": "Chaos variants; happy-path bluegreen-cutover is in suite upgrade-proof. Run: testing/bluegreen_cutover.py --chaos blue-quorum",
       "actions": [
-        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos blue-quorum", "expect_exit": null}
+        {"type": "cmd", "cmd": "testing/bluegreen_cutover.py --chaos blue-quorum"}
       ]
     },
     {

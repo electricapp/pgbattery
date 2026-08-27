@@ -174,27 +174,42 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 
 ### 8b. Track B upgrade freeze (gateway)
 
-- **States**: `thawed | frozen` on `FenceState.upgrade_frozen` (same watch as lease fence; not a `ClusterState` projection).
-- **Source of truth**: operator/API `POST /api/v1/admin/postgres-upgrade/freeze` — Raft metrics updates **preserve** this bit (never re-derive from heartbeats).
-- **Gateway behaviour**: when `upgrade_frozen` **or** `cutover_client_hold`, **hold** idle sessions up to `upgrade_hold_timeout_ms`; when `authority_pg_addr` is set (post-TRANSFER), **route** to that committed green PG address instead of the local Raft leader. Missing green addr after transfer → hold (fail closed).
-- **`cutover_client_hold`**: derived from `ClusterState.cutover` Sealed/Draining (or Transferred without parseable green addr).
-- **Active PG major pointer**: `pg_bin_dir` (config) + `PG_VERSION` / `postgres --version` probes; dual map in `pg_bin_dirs`. No leadership projection.
-- **Code**: `FenceState` in `governor/raft.rs`; hold/route in `gateway/handlers`; Track B freeze via management API; Track C seal via Raft apply → fence bit + optional role REVOKE (`client_fence.rs`).
+- **States**: `thawed | frozen` on `ClusterState.upgrade_frozen`.
+- **Source of truth**: the **committed Raft log** — `ClusterCommand::SetUpgradeFreeze`, proposed by `POST /api/v1/admin/postgres-upgrade/freeze`. One call covers every node, the state survives a restart, and it clears only through another committed entry. `FenceState.upgrade_frozen` is a re-derived projection, refreshed every metrics tick, never latched.
+- **Gateway behaviour**: `FenceState::cutover_client_hold()` or `upgrade_frozen` → **hold** idle sessions up to `upgrade_hold_timeout_ms`, then a clean failover-shaped error. A session with a transaction open is errored immediately rather than held: a datadir swap cannot preserve it.
+- **Active PG major pointer**: `pg_bin_dir` (config) plus `PG_VERSION` / `postgres --version` probes; dual map in `pg_bin_dirs`. No leadership projection.
+- **Refused**: a per-node latched freeze bit. An orchestrator that died between freeze and unfreeze would leave every gateway holding with nothing able to clear it, and a node that restarted would silently thaw into a cluster mid-`pg_upgrade`.
+- **Code**: `FenceState` in `governor/raft.rs`; hold in `gateway/handlers`; freeze command in `governor/state_machine.rs`.
 
-### 8c. Track C blue/green catalog preflight (no authority SoT)
+### 8c. Track B upgrade position (probed, never marked)
 
-- **Purpose**: prove logical replication + client-vs-apply fence can cover this database before cutover exists.
-- **Source of truth**: live PG catalogs on blue primary (probed SQL); dual-bin map for green major extensions. No epoch, no second Raft group, no `ClusterState` projection.
-- **Code**: `commands/upgrade/blue_green.rs`; `POST /api/v1/admin/postgres-upgrade/blue-green/preflight`.
-- **Cutover authority / epoch SoT**: see §8d (`cutover_authority.tla`); Rust entries land after the TLA gate.
+- **Source of truth**: the data directories themselves. `UpgradeSite::probe` reads `PG_VERSION` from every directory beside PGDATA to find the old and new clusters, and reads `global/pg_control` to decide whether an in-place rollback exists — `pg_upgrade --link` renames that file, so its absence _is_ link mode.
+- **Rollback available**: an older data directory is present **and** its control file is intact.
+- **Resume after a crash**: `pg_upgrade` has no restart point, so a target directory that no postmaster has ever started is wreckage and is discarded; one that has been started is a live cluster and the upgrade refuses to touch it.
+- **Write-loss watermark**: `.pgbattery_unfreeze_watermark` beside PGDATA records the flush LSN clients resumed writing at. It is the LSN of a moment that has passed, not upgrade state — once the new postmaster stops, nothing else can answer whether a rollback discards anything.
+- **Refused**: a marker file describing the flow's own intent. Every other fact here is on disk already.
+- **Code**: `commands/upgrade/postgres.rs`.
 
 ### 8d. Track C cutover authority (epoch)
 
-- **Identity**: `(epoch, cluster_id, node_id)` — write authority for exactly one `(epoch, cluster)`.
-- **Source of truth**: **blue’s Raft log** only. Epoch advances via committed entries: `CUTOVER_ARMED` → `WRITE_AUTHORITY_SEALED` → (green drain, observed) → `AUTHORITY_TRANSFERRED` | `UNSEAL` (abort into new epoch).
-- **Green**: never elects itself into authority; receives it after `AUTHORITY_TRANSFERRED`. Fail closed if blue unreachable (`cutover_authority.tla` / U4).
-- **Invariant**: `AtMostOneWriteAuthority` across both clusters (U1). Model: `tla/cutover_authority.tla`.
-- **Code**: `ClusterCommand::{CutoverArmed,CutoverSeal,CutoverDrainObserved,CutoverTransfer,CutoverAbortUnseal}` → `ClusterState.cutover` (`state_machine.rs`). Gateway epoch routing + green drain orchestration: remaining step 8/9.
+- **Identity**: `(epoch, cluster_id)`. `cluster_id` is `Config::cluster_id`; every node in a cluster agrees, and two clusters in a cutover differ.
+- **Source of truth**: each cluster's **own committed log**. The donor advances the epoch through `CutoverArmed` → `CutoverSeal` → `CutoverDrainObserved` → `CutoverTransfer` (or `CutoverAbortUnseal` into a new epoch). The recipient records `CutoverAuthorityReceived` in its own log.
+- **The one read**: `CutoverAuthorityState::holds_client_write_authority(local_cluster_id)`. Authority in transit (SEALED/DRAINING) belongs to nobody; an authority naming another cluster excludes this one whatever its own Raft group thinks.
+- **SEAL ordering**: revoke client DML, then read `pg_current_wal_flush_lsn()`, then commit. Committing first, or taking the LSN from the caller, leaves a window where an acked client write carries an LSN past `final_lsn` and the recipient's drain gate passes without it (U2).
+- **Two enforcement points**: the gateway holds or relays; the supervisor's reconciler revokes DML from `fenced_app_roles` on the local primary. A gateway-only fence is insufficient by this project's own standard — `dual_writability_prober.py` writes straight to the internal PG port.
+- **Recipient before cutover**: `awaits_write_authority_from` plus `client_fence_roles` fence it from boot. Config speaks only until the recipient's own log says something; after that the committed record is the answer.
+- **Attestation, not proof**: the two Raft groups share no log, so the recipient cannot read the donor's `CutoverTransfer` entry. It enforces what it can without the donor — the epoch strictly increases — and the orchestrator attests the rest. `POST /api/v1/admin/cutover/receive-authority` requires `accept_unverified_provenance`.
+- **Forced transfer**: `CutoverTransfer { forced: true }` is a distinct committed record, so the log says permanently that writes acked before SEAL may be missing. It still needs donor quorum; a donor that can commit nothing is write-unavailable until quorum returns, which is the trade U4 makes. There is no timer.
+- **Invariant**: `AtMostOneWriteAuthority` across both clusters (U1). Model: `tla/cutover_authority.tla`, which gives the two clusters separate logs and a delivery step between them.
+- **Code**: `governor/state_machine.rs`, the projection in `governor/raft.rs`, `observability/management_api/cutover.rs`, `commands/upgrade/client_fence.rs`.
+
+### 8e. Track C blue/green catalog preflight
+
+- **Purpose**: prove logical replication and the client-vs-apply fence can cover this database before a cutover starts.
+- **Source of truth**: live PG catalogs on the donor primary (probed SQL); the dual-bin map for the recipient major's extension control files.
+- **Also a gate at SEAL**: `require_fence_covers_roles` runs again there. A table owner keeps implicit write privilege through `REVOKE`, so fencing such a role reports U1 held while blind, and a preflight run in a separate invocation cannot prevent that.
+- **Not implemented**: the DDL-freeze event trigger and schema digest `UPGRADE.md` specifies. Preflight reports the gap; nothing enforces it.
+- **Code**: `commands/upgrade/blue_green.rs`; `POST /api/v1/admin/postgres-upgrade/blue-green/preflight`.
 
 ### 9. Leadership transfer — lame-duck window
 

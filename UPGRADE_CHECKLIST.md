@@ -27,7 +27,14 @@ Shared spine before Track B/C is honest:
 | 6   | Track B gateway hold mode                                  | B        | [x]    |
 | 7   | Track C preflight (`--blue-green --check`)                 | C        | [x]    |
 | 8   | Track C cutover protocol — **TLA+ before code**            | C        | [x]    |
-| 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [x]    |
+| 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [~]    |
+
+Step 9 is `[~]`, not `[x]`. The cutover protocol, both fences, the epoch
+projection, and the proofs are in. What is missing is the operator-facing
+half: `pgbattery upgrade postgres --to N --blue-green` still refuses apply,
+green is provisioned and seeded by `testing/bluegreen_cutover.py` rather than
+by the product, and the DDL freeze and schema digest are unimplemented. See
+"Not implemented" under Track C.
 
 Do **not** parallelize 5, 6, and 8–9 in one branch. Do **not** ship wire-format
 and PG-major upgrade in the same release if avoidable.
@@ -67,14 +74,19 @@ and PG-major upgrade in the same release if avoidable.
 ### Tests
 
 - [x] Matrix: rolling upgrade under continuous writes — `rolling-upgrade` (W1/V1)
-- [x] Mixed-version soak both orientations — `mixed-version-orientation` (+ frame/store compat fixtures)
-- [x] Frame/store compat in CI
+- [x] Restart/transfer orientation soak — `leadership-orientation-soak`
+- [x] Frame/store compat in CI — `governor::compat_fixtures`, goldens committed
 
-### Proof gaps (must go red-then-green)
+### Proof gaps
 
 - [x] Image ships two distinct package versions (`0.1.0` running + `0.1.1` release artifact)
-- [x] Live N→N+1 binary rolling upgrade (`testing/cluster_binary_upgrade_proof.py`, matrix `cluster-binary-upgrade-proof`) — not same-binary restart
-- [x] Suite `upgrade-proof` runs that case in CI (or documents a dedicated workflow)
+- [x] Live N→N+1 rolling upgrade across a version boundary (`testing/cluster_binary_upgrade_proof.py`, matrix `cluster-binary-upgrade-proof`)
+- [x] Suite `upgrade-proof` runs that case in CI
+- [-] Cross-version **wire/store** proof. Both binaries are the same source, so
+  frame format and redb schema are identical by construction and the roll
+  cannot exercise them. `governor::compat_fixtures` covers that property
+  against committed goldens; a real cross-release roll needs two tagged
+  releases and is not reachable until one exists.
 
 ---
 
@@ -96,17 +108,25 @@ and PG-major upgrade in the same release if avoidable.
 ### Tests
 
 - [x] Happy path under continuous writes; bound pause — `pg-upgrade-hold-writes` + `testing/pg_upgrade_hold_chaos.py`
-- [x] Chaos: crash mid-freeze — `pg-upgrade-hold-chaos-mid-freeze` (hold/freeze path; mid-`pg_upgrade` chaos needs dual majors — see proof gaps)
-- [x] Rollback before `--confirm` — `rollback_local` refuses `--link`; unit + apply path
+- [x] Chaos: crash mid-freeze — `pg-upgrade-hold-chaos-mid-freeze`
+- [x] Rollback before `--confirm` — live drill `pg-major-upgrade-rollback-drill`; probes from disk, not from a marker
+- [x] Write-loss watermark recorded at unfreeze; rollback refuses without `--accept-write-loss` when writes landed past it
 - [x] `--link` / `--accept-no-rollback` refuses `--allow-no-backup` — unit `link_forbids_allow_no_backup_at_cli`
 - [x] Extension/collation preflight abort cases by name — units `missing_extension_control_named`, `collation_mismatch_abort_message_names_count`
+- [x] Freeze is a committed log entry, not a per-node latched bit
+- [x] `--confirm` re-runs the verification gate before deleting anything
 
-### Proof gaps (must go red-then-green)
+### Proof gaps
 
 - [x] Runtime image installs **two** PostgreSQL majors (`17` + `18`); `pg_bin_dirs` maps both; refuse green if either `postgres` missing
 - [x] Compose that boots the cluster on major N (`config/pgupgrade/` + `docker-compose.pgupgrade.yml`)
 - [x] Live `--to N+1 --experimental` apply + standby re-basebackup + `--confirm` (`testing/pg_major_upgrade_proof.py`, matrix `pg-major-upgrade-proof`)
-- [x] Post-upgrade `SELECT version()` / `PG_VERSION` prove N+1 on every node (anti-vacuity: refuse if still on N)
+- [x] Continuous writer with an acked-key ledger across the freeze (W1)
+- [x] Backup + verified-restore preflight actually runs (no `--allow-no-backup` in the proof)
+- [x] Post-upgrade `PG_VERSION` proves N+1 on every node (anti-vacuity: refuse if still on N)
+- [ ] Chaos mid-`pg_upgrade` itself (kill the process during file transfer). The
+      budget/`kill_on_drop` path and the discard-on-resume rule are unit-covered;
+      a live case still needs writing.
 
 ---
 
@@ -114,23 +134,29 @@ and PG-major upgrade in the same release if avoidable.
 
 ### Contracts
 
-- [x] Register U1–U5 with real inversion names
-- [x] Extend `dual_writability_prober` to six internal ports (`--topology bluegreen`) + `--user` app-role path
+- [x] Register U1–U5 with inversions that **can go red** — `testing/test_bluegreen_oracles.py` (16 tests, each driving one oracle to its failing answer)
+- [x] `lint_matrix` refuses an inversion that names an implementation file
+- [x] Extend `dual_writability_prober` to six internal ports (`--topology bluegreen`) + `--user` app-role path; the role is recorded in the result
 
 ### Authority model (step 8)
 
-- [x] TLA+ cutover spec + counterexample
-- [x] Raft SoT + gateway hold via `cutover_client_hold`
-- [x] Gateways route to highest epoch / green PG from committed `green_leader_pg_addr` (`FenceState.authority_pg_addr`)
-- [x] Fail closed (TLA U4 + hold without green addr)
-- [x] Force transfer with `--accept-blue-write-loss` (no timeout)
-- [x] Abort unseal into new epoch
+- [x] TLA+ cutover spec + counterexample. Two clusters, **separate logs**, a delivery step between them, and monotonicity as an action property
+- [x] `(epoch, cluster_id)` identity from `Config::cluster_id`; no blue/green magic strings
+- [x] `holds_client_write_authority` is the single read; authority in transit belongs to nobody
+- [x] SEAL fences first, then reads its own final LSN, then commits (U2)
+- [x] Out-of-phase commands report `OutOfOrder`, not `success: true`
+- [x] Gateways relay to the committed recipient address; no fallback to the local leader
+- [x] Fail closed: no confirmed address means hold
+- [x] Force transfer records `forced: true` permanently; requires `accept_write_loss`; no timeout
+- [x] Abort unseal into a new epoch
 
 ### Client-vs-apply fence
 
-- [x] Role-based revoke for app roles (`client_fence.rs`; SEAL API `app_roles`)
-- [x] Preflight proves fence coverage (`--blue-green --check --app-role`)
-- [x] Prober connected as app role (`--user`)
+- [x] Role-based revoke covering tables **and sequences** (`nextval` is a write)
+- [x] Lift restores exactly the recorded grants, so abort is a true inverse
+- [x] Fence coverage re-checked at SEAL, not only in a separate `--check` run
+- [x] Reconciler drives the fence from committed state, so a node promoted mid-cutover applies it
+- [x] Recipient fenced from boot via `awaits_write_authority_from` + `client_fence_roles`
 
 ### Preflight (step 7)
 
@@ -138,22 +164,31 @@ and PG-major upgrade in the same release if avoidable.
 
 ### Orchestration / rollback (step 9)
 
-- [x] Provision green; seed via logical; catch up — `testing/bluegreen_cutover.py`
-- [x] Run cutover protocol under continuous gateway writes
-- [x] Reverse replication; report rollback available
-- [x] Post-cutover rollback drill — `--rollback-drill`
+- [x] Seed via logical; catch up on a real LSN, not a sleep — `testing/bluegreen_cutover.py`
+- [x] Drain gate is subscriber-confirmed LSN vs the sealed final LSN, not row counts
+- [x] U2 ledger: every acked pre-seal key asserted present on green
+- [x] U3: green's sequence is a real identity column, advanced past blue, and the non-collision asserted
+- [x] Relay assertion: writes through the donor's gateway land on the recipient and not on the donor
+- [x] Post-cutover rollback drill runs the **reverse protocol**, not just a write check
 - [x] Six-node compose via `topology.py` — `docker-compose.bluegreen.yml`
-- [x] Chaos: arm-seal, seal-transfer, mid-drain, blue-quorum — `--chaos …`
+- [x] Chaos: arm-seal, seal-transfer, mid-drain, blue-quorum — each asserts an outcome, none use `expect_exit: null`, all four run in CI
 
-### Proof gaps (must go red-then-green)
+### Not implemented (Track C)
 
-- [x] Blue cluster boots on major N, green on N+1 (not same-major logical cutover only)
-- [x] Live six-node cutover green without `ci_excluded_reason` (`bluegreen-cutover` in suite `upgrade-proof`)
-- [x] Rollback-drill case similarly CI-runnable
-- [x] Prober U1 across six ports after cutover (not `--skip-prober` as the only path)
+- [ ] `pgbattery upgrade postgres --to N --blue-green` apply. The command still
+      refuses; `testing/bluegreen_cutover.py` drives the endpoints by hand.
+- [ ] Product-side green provisioning and logical seeding (`pg_createsubscriber`
+      or dump + `CREATE SUBSCRIPTION`).
+- [ ] DDL freeze event trigger and schema digest. `UPGRADE.md` calls these
+      "enforced, not requested"; preflight only reports the gap.
+- [ ] WAL-retention / slot-lag monitor that aborts before the donor is at risk.
+- [ ] Reverse-cutover state machine as a first-class flow. The drill runs the
+      forward protocol with the roles exchanged, which works, but there is no
+      `--rollback` command for it.
+- [ ] Verified provenance for the recipient's attestation. It checks epoch
+      monotonicity; it cannot read the donor's log.
 
-Matrix case IDs: `bluegreen-cutover`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`
-(chaos cases may stay excluded until the happy path is green in CI).
+Matrix case IDs: `bluegreen-cutover`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`.
 
 ---
 

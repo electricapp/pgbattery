@@ -1,5 +1,6 @@
 # Blue cluster — node 3
 node_id = 3
+cluster_id = "blue"
 listen_addr = "0.0.0.0:5432"
 raft_addr = "0.0.0.0:5433"
 metrics_addr = "0.0.0.0:9090"

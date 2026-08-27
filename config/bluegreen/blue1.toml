@@ -1,5 +1,6 @@
 # Blue cluster (write authority epoch source) — node 1
 node_id = 1
+cluster_id = "blue"
 listen_addr = "0.0.0.0:5432"
 raft_addr = "0.0.0.0:5433"
 metrics_addr = "0.0.0.0:9090"

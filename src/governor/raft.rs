@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::network::RaftRpcClient;
-use super::state_machine::{ClusterCommand, ClusterState, NodeId, NodeInfo, NodeRole};
+use super::state_machine::{
+    ClusterCommand, ClusterState, CommandOutcome, NodeId, NodeInfo, NodeRole,
+};
 use super::storage::{
     LastAppliedState, LocalStoredMembership, LogEntry, LogEntryPayload, PurgedLogId,
     RedbLogStorage, SnapshotMeta, Vote, panic_payload_text,
@@ -54,9 +56,24 @@ pub struct ClusterRequest {
 }
 
 /// Response type for cluster state changes.
+///
+/// `success` means the entry committed; `outcome` means it changed something.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterResponse {
     pub success: bool,
+    #[serde(default)]
+    pub outcome: CommandOutcome,
+}
+
+impl ClusterResponse {
+    /// For membership, blanks, and re-deliveries — none carry a phase.
+    #[must_use]
+    pub const fn applied() -> Self {
+        Self {
+            success: true,
+            outcome: CommandOutcome::Applied,
+        }
+    }
 }
 
 /// State sent on the fence channel.
@@ -79,13 +96,12 @@ pub struct FenceState {
     /// up to `upgrade_hold_timeout_ms`, then clean error. In-progress
     /// transactions error immediately. Raft fence updates preserve this flag.
     pub upgrade_frozen: bool,
-    /// Track C: blue has sealed client write authority (ARMED→SEAL→DRAIN).
-    /// Derived from `ClusterState.cutover` — Sealed/Draining only. After
-    /// TRANSFER, blue gateways **route** to `authority_pg_addr` instead of holding.
-    pub cutover_client_hold: bool,
-    /// When set (post-TRANSFER to green), gateways proxy to this PG address
-    /// instead of the local Raft leader. Fail-closed: `None` after transfer
-    /// with authority≠blue means hold/refuse (never guess).
+    /// Track C: whether this cluster holds client write authority. Re-derived
+    /// every metrics tick from `ClusterState.cutover` against the local
+    /// `cluster_id`; never latched, never cached across a restart.
+    pub client_write_authority: bool,
+    /// Recipient PG address to relay to after TRANSFER. `None` while another
+    /// cluster holds authority means hold, never guess.
     pub authority_pg_addr: Option<SocketAddr>,
 }
 
@@ -96,9 +112,23 @@ impl FenceState {
             fenced: false,
             has_quorum: true,
             upgrade_frozen: false,
-            cutover_client_hold: false,
+            client_write_authority: true,
             authority_pg_addr: None,
         }
+    }
+
+    /// Gateway must hold rather than route: not the authority, and nowhere
+    /// confirmed to send clients instead.
+    #[must_use]
+    pub const fn cutover_client_hold(&self) -> bool {
+        !self.client_write_authority && self.authority_pg_addr.is_none()
+    }
+
+    /// Local primary must have client DML revoked. Also true while relaying,
+    /// since a relay covers the gateway and not the internal PG port.
+    #[must_use]
+    pub const fn local_client_writes_fenced(&self) -> bool {
+        !self.client_write_authority
     }
 }
 
@@ -115,6 +145,12 @@ pub struct Governor {
     /// windows as multiples of this so they scale with the configured timeout
     /// instead of being hard-coded absolutes.
     election_timeout_ms: u64,
+    /// `Config::cluster_id`, compared against the committed cutover authority
+    /// to decide whether this cluster may accept client writes.
+    cluster_id: Arc<str>,
+    /// `Config::awaits_write_authority_from`. Present until this cluster's own
+    /// log records receiving authority, and it means: not the authority.
+    awaits_authority_from: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for Governor {
@@ -170,6 +206,8 @@ impl Governor {
         heartbeat_interval_ms: u64,
         lease: super::SharedLeaseState,
         tls_config: Option<&super::tls::RaftTlsConfig>,
+        cluster_id: &str,
+        awaits_authority_from: Option<&str>,
     ) -> Result<Self> {
         // Build Raft configuration
         let config = RaftConfig {
@@ -248,6 +286,8 @@ impl Governor {
             shutdown_rx,
             lease,
             election_timeout_ms,
+            cluster_id: Arc::from(cluster_id),
+            awaits_authority_from: awaits_authority_from.map(Arc::from),
         })
     }
 
@@ -618,33 +658,24 @@ impl Governor {
         // per heartbeat just to re-observe the same state. A late subscriber
         // still sees the current value: the stored state is always the latest
         // one, changed or not.
+        // Derived outside the watch closure: taking `state.read()` inside
+        // `send_if_modified` would hold the watch lock across another lock,
+        // on every metrics update.
+        let (client_write_authority, authority_pg_addr, upgrade_frozen) = {
+            let state = self.state.read();
+            let (authority, relay) = Self::cutover_authority_projection(
+                &state.cutover,
+                &self.cluster_id,
+                self.awaits_authority_from.as_deref(),
+            );
+            (authority, relay, state.upgrade_frozen)
+        };
         self.fence_tx.send_if_modified(|current| {
-            let cutover = self.state.read().cutover.clone();
-            let authority_pg_addr = if cutover.phase
-                == crate::governor::state_machine::CutoverPhase::Transferred
-                && cutover.authority_cluster != "blue"
-            {
-                cutover
-                    .green_leader_pg_addr
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-            } else {
-                None
-            };
-            // Fail closed (U4): transferred without a parseable green addr → hold.
-            let cutover_client_hold = matches!(
-                cutover.phase,
-                crate::governor::state_machine::CutoverPhase::Sealed
-                    | crate::governor::state_machine::CutoverPhase::Draining
-            ) || (cutover.phase
-                == crate::governor::state_machine::CutoverPhase::Transferred
-                && cutover.authority_cluster != "blue"
-                && authority_pg_addr.is_none());
             let new_fence = FenceState {
                 fenced: should_fence,
                 has_quorum,
-                upgrade_frozen: current.upgrade_frozen,
-                cutover_client_hold,
+                upgrade_frozen,
+                client_write_authority,
                 authority_pg_addr,
             };
             if *current == new_fence {
@@ -654,6 +685,32 @@ impl Governor {
                 true
             }
         });
+    }
+
+    /// `(this cluster holds authority, relay address)`.
+    ///
+    /// A relay is offered only when this cluster does not hold authority and
+    /// the recipient address parses; anything else is `None`, which the
+    /// gateway reads as hold. Never falls back to the local Raft leader —
+    /// that fallback is how a lost cutover entry becomes a split-brain.
+    fn cutover_authority_projection(
+        cutover: &crate::governor::state_machine::CutoverAuthorityState,
+        local_cluster_id: &str,
+        awaits_authority_from: Option<&str>,
+    ) -> (bool, Option<SocketAddr>) {
+        // Config only speaks before this cluster's log says anything: once an
+        // entry lands, the committed record is the answer.
+        if awaits_authority_from.is_some() && cutover.authority_cluster_id.is_none() {
+            return (false, None);
+        }
+        if cutover.holds_client_write_authority(local_cluster_id) {
+            return (true, None);
+        }
+        let relay = cutover
+            .target_pg_addr
+            .as_deref()
+            .and_then(|s| s.parse::<SocketAddr>().ok());
+        (false, relay)
     }
 
     fn log_leadership_changes(
@@ -805,7 +862,7 @@ impl Governor {
                 fenced: true,
                 has_quorum: false,
                 upgrade_frozen: current.upgrade_frozen,
-                cutover_client_hold: current.cutover_client_hold,
+                client_write_authority: current.client_write_authority,
                 authority_pg_addr: current.authority_pg_addr,
             };
             if *current == next {
@@ -1429,7 +1486,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
         for entry in entries {
             if Self::is_duplicate_entry(&entry, applied_end) {
-                responses.push(ClusterResponse { success: true });
+                responses.push(ClusterResponse::applied());
                 continue;
             }
             tracing::debug!(
@@ -1445,8 +1502,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
             match entry.payload {
                 EntryPayload::Normal(req) => {
-                    self.apply_normal_entry(req);
-                    responses.push(ClusterResponse { success: true });
+                    let outcome = self.apply_normal_entry(req);
+                    responses.push(ClusterResponse {
+                        success: true,
+                        outcome,
+                    });
                 }
                 EntryPayload::Membership(ref membership) => {
                     // Persist applied_membership and last_applied together in
@@ -1457,10 +1517,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                     self.apply_membership_entry_atomic(entry.log_id, membership)
                         .await
                         .map_err(|e| storage_write_err(&e))?;
-                    responses.push(ClusterResponse { success: true });
+                    responses.push(ClusterResponse::applied());
                 }
                 EntryPayload::Blank => {
-                    responses.push(ClusterResponse { success: true });
+                    responses.push(ClusterResponse::applied());
                 }
             }
         }
@@ -1596,10 +1656,10 @@ impl StateMachineStore {
         true
     }
 
-    fn apply_normal_entry(&self, req: ClusterRequest) {
+    fn apply_normal_entry(&self, req: ClusterRequest) -> CommandOutcome {
         let mut state = self.state.write();
         tracing::debug!(command = ?req.command, "Applied cluster command");
-        state.apply(req.command);
+        state.apply(req.command)
     }
 
     async fn apply_membership_entry_atomic(
@@ -2248,7 +2308,11 @@ fn replay_applied_entries(
     }
     for entry in storage.get_entries(from, last.saturating_add(1))? {
         match entry.payload {
-            LogEntryPayload::Normal(cmd) => state.apply(cmd),
+            LogEntryPayload::Normal(cmd) => {
+                // Replay only rebuilds state; an out-of-phase entry was
+                // already a no-op when it was first applied.
+                let _outcome = state.apply(cmd);
+            }
             LogEntryPayload::Membership(membership) => {
                 let (voters, learners) = split_membership_nodes(&membership);
                 sync_membership_into(state, &voters, &learners);
@@ -2489,7 +2553,7 @@ mod tests {
             fenced: true,
             has_quorum: false,
             upgrade_frozen: false,
-            cutover_client_hold: false,
+            client_write_authority: true,
             authority_pg_addr: None,
         };
         assert!(f.fenced);
@@ -2509,11 +2573,81 @@ mod tests {
     #[test]
     fn test_cluster_response_serde_roundtrip() {
         for success in [true, false] {
-            let resp = ClusterResponse { success };
-            let json = serde_json::to_string(&resp).unwrap();
-            let decoded: ClusterResponse = serde_json::from_str(&json).unwrap();
-            assert_eq!(decoded.success, success);
+            for outcome in [CommandOutcome::Applied, CommandOutcome::OutOfOrder] {
+                let resp = ClusterResponse { success, outcome };
+                let json = serde_json::to_string(&resp).unwrap();
+                let decoded: ClusterResponse = serde_json::from_str(&json).unwrap();
+                assert_eq!(decoded.success, success);
+                assert_eq!(decoded.outcome, outcome);
+            }
         }
+    }
+
+    /// Not the authority and no confirmed address means hold.
+    #[test]
+    fn cutover_projection_holds_when_authority_is_elsewhere() {
+        use crate::governor::state_machine::{CutoverAuthorityState, CutoverPhase};
+
+        let idle = CutoverAuthorityState::default();
+        assert_eq!(
+            Governor::cutover_authority_projection(&idle, "blue-1", None),
+            (true, None)
+        );
+
+        let sealed = CutoverAuthorityState {
+            phase: CutoverPhase::Sealed,
+            authority_cluster_id: Some("blue-1".into()),
+            ..CutoverAuthorityState::default()
+        };
+        assert_eq!(
+            Governor::cutover_authority_projection(&sealed, "blue-1", None),
+            (false, None),
+            "sealed donor holds its clients rather than routing them"
+        );
+
+        // A recipient that has never applied a cutover entry is fenced by
+        // config, so a second Raft group cannot elect itself into authority
+        // simply by booting.
+        assert_eq!(
+            Governor::cutover_authority_projection(&idle, "green-1", Some("blue-1")),
+            (false, None),
+            "a cluster awaiting authority does not hold it"
+        );
+
+        let transferred = CutoverAuthorityState {
+            phase: CutoverPhase::Transferred,
+            authority_cluster_id: Some("green-1".into()),
+            target_pg_addr: Some("10.9.0.4:5434".into()),
+            ..CutoverAuthorityState::default()
+        };
+        let (authority, relay) =
+            Governor::cutover_authority_projection(&transferred, "blue-1", None);
+        assert!(!authority);
+        assert_eq!(relay, Some("10.9.0.4:5434".parse().unwrap()));
+
+        // Once its own log records the handoff, the recipient's config no
+        // longer speaks.
+        let received = CutoverAuthorityState {
+            phase: CutoverPhase::Transferred,
+            authority_cluster_id: Some("green-1".into()),
+            epoch: 1,
+            ..CutoverAuthorityState::default()
+        };
+        assert_eq!(
+            Governor::cutover_authority_projection(&received, "green-1", Some("blue-1")),
+            (true, None),
+            "a committed handoff overrides the config fence"
+        );
+
+        let unparseable = CutoverAuthorityState {
+            target_pg_addr: Some("not-an-address".into()),
+            ..transferred
+        };
+        assert_eq!(
+            Governor::cutover_authority_projection(&unparseable, "blue-1", None),
+            (false, None),
+            "an address that does not parse is a hold, not a guess"
+        );
     }
 
     #[test]
@@ -2525,7 +2659,7 @@ mod tests {
                 fenced: true,
                 has_quorum: false,
                 upgrade_frozen: false,
-                cutover_client_hold: false,
+                client_write_authority: true,
                 authority_pg_addr: None,
             }
         );

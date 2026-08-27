@@ -50,6 +50,9 @@ test going red:
 | `transfer_leader_after` read the API token from a `.env` CI never wrote                                                                                     | `transfer` posted unauthenticated and transferred nothing                                                                |
 | a LazyFS fault worker was parked before its read loop, and writing to the control FIFO succeeds whether or not anything is reading                          | every `lazyfs::` command was accepted and never executed                                                                 |
 | libfaketime moves `CLOCK_MONOTONIC` with `CLOCK_REALTIME` on amd64, and not on arm64                                                                        | the lease clock moved with the injected wall-clock skew, so every clock-skew case on CI tested the opposite of its claim |
+| `*.bin` in `.gitignore` swallowed the Raft frame goldens                                                                                                    | two always-on frame-compat tests panicked on a clean checkout; they had only ever run against the author's working tree  |
+| the four Track C chaos cases carried `expect_exit: null` and printed instead of asserting                                                                   | each accepted any outcome, including a harness crash, while the checklist ticked them as done                            |
+| a Track C sequence check called `setval(pg_get_serial_sequence(...))` on a plain `bigint` column                                                            | the function returned NULL, the `WHERE ... IS NOT NULL` guard made it a no-op, and U3 passed having advanced nothing     |
 
 The lesson is the durable part: **a fault must verify its own effect and fail
 loudly, and the harness must not assume its environment.** Every one of these
@@ -67,6 +70,14 @@ fault fired. The distinction is only visible in LazyFS's own log, which is why
 `[filesystem].logfile` is set and why `verify_lazyfs_fault_channel` sends a
 deliberately unknown command and waits for the worker to echo it back.
 **Checking that a fault was _requested_ is not checking that it was _executed_.**
+
+The three Track C rows add a fourth shape: **a gate that checks a name rather
+than a behaviour.** `lint_matrix` required every FATAL contract to declare an
+inversion and checked that the name resolved somewhere in the tree — so
+`docs/CONTRACTS.md` and `src/commands/upgrade/blue_green.rs` both satisfied it,
+and U1–U5 shipped with nothing that could turn red. The gate now requires a
+matrix case, a test function, a `testing/` harness, or an `inv-` model config,
+and `test_an_inversion_that_cannot_fail_is_refused` holds it there.
 
 The related power bug: workers pinned to a killed leader's gateway spun on
 connection-refused at roughly 2800 attempts/second, producing 56,600 of 56,665

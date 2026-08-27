@@ -13,8 +13,10 @@ README.pdf
 *~
 
 *.bin
-# …but keep the cosign-verification test fixtures (a tiny signed test blob).
+# …but keep committed test fixtures: always-on tests read these.
 !tests/fixtures/cosign/*.bin
+!tests/fixtures/raft_compat/supported/*.bin
+!tests/fixtures/raft_compat/unsupported_newer/*.bin
 tla/*_TTrace_*.bin
 tla/*_TTrace_*.tla
 

@@ -369,33 +369,55 @@ pub struct UpgradeFreezeResponse {
     pub message: Option<String>,
 }
 
-/// Set or clear Track B/C upgrade freeze on this node's gateway (hold queries).
+/// Set or clear the Track B upgrade freeze for the whole cluster.
+///
+/// Committed to the Raft log, not latched per node: the gateways derive the
+/// hold from it every metrics tick, so one call covers every node and a
+/// restart re-derives the same answer instead of thawing.
 pub(super) async fn set_upgrade_freeze(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<UpgradeFreezeRequest>,
 ) -> impl IntoResponse {
-    state.fence_tx.send_if_modified(|current| {
-        if current.upgrade_frozen == body.frozen {
-            false
-        } else {
-            current.upgrade_frozen = body.frozen;
-            true
+    let already = state.cluster_state.read().upgrade_frozen == body.frozen;
+    if already {
+        return (
+            StatusCode::OK,
+            Json(UpgradeFreezeResponse {
+                success: true,
+                upgrade_frozen: body.frozen,
+                message: Some("Already in the requested freeze state".into()),
+            }),
+        );
+    }
+    match state
+        .raft
+        .client_write(crate::governor::raft::ClusterRequest {
+            command: crate::governor::state_machine::ClusterCommand::SetUpgradeFreeze {
+                frozen: body.frozen,
+            },
+        })
+        .await
+    {
+        Ok(_) => {
+            info!(upgrade_frozen = body.frozen, "Upgrade freeze committed");
+            (
+                StatusCode::OK,
+                Json(UpgradeFreezeResponse {
+                    success: true,
+                    upgrade_frozen: body.frozen,
+                    message: None,
+                }),
+            )
         }
-    });
-    let frozen = state.fence_tx.borrow().upgrade_frozen;
-    info!(
-        node_id = state.node_id,
-        upgrade_frozen = frozen,
-        "Upgrade freeze updated"
-    );
-    (
-        StatusCode::OK,
-        Json(UpgradeFreezeResponse {
-            success: true,
-            upgrade_frozen: frozen,
-            message: None,
-        }),
-    )
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(UpgradeFreezeResponse {
+                success: false,
+                upgrade_frozen: state.cluster_state.read().upgrade_frozen,
+                message: Some(format!("Freeze not committed: {e}")),
+            }),
+        ),
+    }
 }
 
 /// Stop the local postmaster cleanly (standbys during Track B freeze).
@@ -471,12 +493,12 @@ pub(super) async fn postgres_upgrade_apply(
         };
         paths.clone()
     };
-    if !state.fence_tx.borrow().upgrade_frozen {
+    if !state.cluster_state.read().upgrade_frozen {
         return (
             StatusCode::BAD_REQUEST,
             Json(PostgresUpgradeApplyResponse {
                 success: false,
-                message: Some("Refusing apply: upgrade freeze is not set on this node".into()),
+                message: Some("Refusing apply: upgrade freeze is not committed".into()),
                 from_major: 0,
                 to_major: body.to_major,
             }),
@@ -677,9 +699,13 @@ pub(super) async fn get_postgres_status(
         );
     };
     let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
-    let has_anchor = paths.data_dir.parent().is_some_and(|p| {
-        crate::commands::upgrade::postgres::UpgradeAnchor::path_beside(p).exists()
-    });
+    let has_anchor = match (major, paths.data_dir.parent()) {
+        (Some(m), Some(parent)) => {
+            crate::commands::upgrade::postgres::UpgradeSite::probe(parent, m)
+                .is_ok_and(|s| s.rollback_available())
+        }
+        _ => false,
+    };
     (
         StatusCode::OK,
         Json(PostgresStatusResponse {
@@ -778,15 +804,22 @@ pub(super) async fn postgres_upgrade_rollback(
             }),
         );
     };
+    let bin_dirs = state
+        .pg_paths
+        .lock()
+        .as_ref()
+        .map(|p| p.bin_dirs.clone())
+        .unwrap_or_default();
     let mut guard = pg.lock().await;
     match crate::commands::upgrade::postgres::rollback_local(
         &mut guard,
+        &bin_dirs,
         body.to_major,
         body.accept_write_loss,
     )
     .await
     {
-        Ok(anchor) => {
+        Ok(report) => {
             let updated = {
                 let guard_paths = state.pg_paths.lock();
                 guard_paths.as_ref().map(|p| {
@@ -803,8 +836,14 @@ pub(super) async fn postgres_upgrade_rollback(
                 StatusCode::OK,
                 Json(PostgresUpgradeRollbackResponse {
                     success: true,
-                    message: None,
-                    from_major: anchor.from_major,
+                    message: Some(format!(
+                        "Rolled back to major {}; unfreeze watermark {:?}, new-cluster \
+                         final LSN {:?}",
+                        report.from_major,
+                        report.unfreeze_watermark_lsn,
+                        report.new_cluster_final_lsn
+                    )),
+                    from_major: report.from_major,
                 }),
             )
         }

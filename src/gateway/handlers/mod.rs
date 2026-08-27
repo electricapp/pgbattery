@@ -846,11 +846,19 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// Where this connection's queries go.
+    ///
+    /// Once another cluster holds committed write authority this gateway is a
+    /// relay to it, so connection strings survive a cutover. Falling back to
+    /// the local Raft leader there would route clients into the cluster that
+    /// gave authority away, so no relay means no leader and the caller holds.
     fn get_leader(&self) -> Result<SocketAddr> {
-        // Post-cutover: blue gateways relay to green from committed cutover SoT.
-        let relay = self.fence_rx.borrow().authority_pg_addr;
-        if let Some(addr) = relay {
+        let fence = *self.fence_rx.borrow();
+        if let Some(addr) = fence.authority_pg_addr {
             return Ok(addr);
+        }
+        if fence.local_client_writes_fenced() {
+            return Err(Error::NoLeader);
         }
         self.leader_rx.borrow().ok_or(Error::NoLeader)
     }
@@ -926,16 +934,23 @@ impl ConnectionHandler {
         }
     }
 
+    /// Why this connection must be held, if it must. Runs before every client
+    /// message, so it stays a `Copy` read plus two bool tests.
+    const fn hold_reason(fence: &FenceState) -> Option<&'static str> {
+        if fence.upgrade_frozen {
+            Some("PostgreSQL major upgrade")
+        } else if fence.cutover_client_hold() {
+            Some("blue/green cutover (write authority is elsewhere)")
+        } else {
+            None
+        }
+    }
+
     /// Hold idle queries during Track B upgrade freeze or Track C cutover seal.
     async fn wait_for_upgrade_hold_if_needed(&mut self) -> Result<()> {
         let fence = *self.fence_rx.borrow();
-        if !fence.upgrade_frozen && !fence.cutover_client_hold {
+        let Some(reason) = Self::hold_reason(&fence) else {
             return Ok(());
-        }
-        let reason = if fence.upgrade_frozen {
-            "PostgreSQL major upgrade"
-        } else {
-            "blue/green cutover (write authority sealed)"
         };
         if self.state.read().tx_status != TransactionStatus::Idle {
             self.send_failover_error_response(&format!(
@@ -950,15 +965,12 @@ impl ConnectionHandler {
             conn_id = self.id,
             timeout_ms = self.config.upgrade_hold_timeout_ms,
             upgrade_frozen = fence.upgrade_frozen,
-            cutover_client_hold = fence.cutover_client_hold,
+            cutover_client_hold = fence.cutover_client_hold(),
             "Holding idle connection during upgrade/cutover hold"
         );
         metrics::counter!("pgbattery_connections_held_during_upgrade").increment(1);
         let deadline = tokio::time::Instant::now() + timeout;
-        while {
-            let f = self.fence_rx.borrow();
-            f.upgrade_frozen || f.cutover_client_hold
-        } {
+        while Self::hold_reason(&self.fence_rx.borrow()).is_some() {
             if !matches!(
                 tokio::time::timeout_at(deadline, self.fence_rx.changed()).await,
                 Ok(Ok(()))
@@ -3473,7 +3485,7 @@ mod tests {
             fenced: true,
             has_quorum: true,
             upgrade_frozen: false,
-            cutover_client_hold: false,
+            client_write_authority: true,
             authority_pg_addr: None,
         });
 
@@ -3503,7 +3515,7 @@ mod tests {
             fenced: true,
             has_quorum: false,
             upgrade_frozen: false,
-            cutover_client_hold: false,
+            client_write_authority: true,
             authority_pg_addr: None,
         });
 

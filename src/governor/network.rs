@@ -98,6 +98,17 @@ fn frame_version_accepted(version: u8) -> bool {
     (min..=RAFT_RPC_FRAME_VERSION).contains(&version)
 }
 
+/// Read `(version, corr_id)` from a staged frame header without consuming it.
+///
+/// The version refusal in [`take_frame`] leaves the bytes in place, so the
+/// server can still recover the correlation ID and answer the sender rather
+/// than closing on it silently.
+fn peek_frame_header(buf: &BytesMut) -> Option<(u8, u64)> {
+    let version = buf.get(4).copied()?;
+    let corr = buf.get(6..14)?;
+    Some((version, u64::from_be_bytes(<[u8; 8]>::try_from(corr).ok()?)))
+}
+
 /// Whether `version` is in this binary's Raft RPC accept window (`N-1..=N`).
 #[doc(hidden)]
 #[must_use]
@@ -270,6 +281,9 @@ pub enum RpcType {
     VoteResponse = 4,
     InstallSnapshot = 5,
     InstallSnapshotResponse = 6,
+    /// Typed refusal for a frame version outside the accept window, so the
+    /// sender learns why instead of seeing an unexplained close.
+    VersionNotAccepted = 7,
 }
 
 impl TryFrom<u8> for RpcType {
@@ -283,6 +297,7 @@ impl TryFrom<u8> for RpcType {
             4 => Ok(Self::VoteResponse),
             5 => Ok(Self::InstallSnapshot),
             6 => Ok(Self::InstallSnapshotResponse),
+            7 => Ok(Self::VersionNotAccepted),
             _ => Err(Error::Protocol(format!("Invalid RPC type: {value}"))),
         }
     }
@@ -464,8 +479,36 @@ where
         shrink_frame_buf(&mut response_buf);
 
         let frame = loop {
-            if let Some(frame) = take_frame(&mut read_buf, "request")? {
-                break frame;
+            match take_frame(&mut read_buf, "request") {
+                Ok(Some(frame)) => break frame,
+                Ok(None) => {}
+                Err(e) => {
+                    // Answer a version refusal before closing: the sender is a
+                    // peer running a release outside the window, and a bare
+                    // close is indistinguishable from a decode failure.
+                    if let Some((version, corr_id)) = peek_frame_header(&read_buf)
+                        && !frame_version_accepted(version)
+                    {
+                        tracing::warn!(
+                            %peer_addr,
+                            version,
+                            speaks = RAFT_RPC_FRAME_VERSION,
+                            "Refusing Raft RPC frame version"
+                        );
+                        response_buf.clear();
+                        append_frame_bytes(
+                            &mut response_buf,
+                            RpcType::VersionNotAccepted as u8,
+                            corr_id,
+                            &[RAFT_RPC_FRAME_VERSION],
+                        )?;
+                        drop(
+                            tokio::time::timeout(RPC_IO_TIMEOUT, stream.write_all(&response_buf))
+                                .await,
+                        );
+                    }
+                    return Err(e);
+                }
             }
             // Waiting between requests is idle time; once any bytes of a
             // frame are staged, each read gets the per-op budget instead so
@@ -815,6 +858,14 @@ impl FramedIo {
                     // the election path. Correlation plus this check make
                     // that impossible.
                     let resp_type = RpcType::try_from(frame.type_byte)?;
+                    if resp_type == RpcType::VersionNotAccepted {
+                        let peer_speaks = frame.body.first().copied();
+                        return Err(Error::Protocol(format!(
+                            "{addr} refused this node's Raft RPC frame version \
+                             {RAFT_RPC_FRAME_VERSION}; it speaks {peer_speaks:?}. \
+                             The supported window is adjacent releases only."
+                        )));
+                    }
                     if resp_type != expected {
                         return Err(Error::Protocol(format!(
                             "RPC response type mismatch from {addr}: \
@@ -1088,6 +1139,20 @@ mod tests {
             &newer[..],
             &before[..],
             "version refusal must not consume bytes"
+        );
+    }
+
+    /// A refused version is answered, not just closed on: the header stays
+    /// readable because `take_frame` does not consume it.
+    #[test]
+    fn a_refused_version_still_yields_its_correlation_id() {
+        let mut buf = BytesMut::new();
+        append_frame_bytes(&mut buf, RpcType::Vote as u8, 0x1234_5678, b"x").unwrap();
+        buf[4] = RAFT_RPC_FRAME_VERSION.saturating_add(1);
+        assert!(take_frame(&mut buf, "test").is_err());
+        assert_eq!(
+            peek_frame_header(&buf),
+            Some((RAFT_RPC_FRAME_VERSION.saturating_add(1), 0x1234_5678))
         );
     }
 

@@ -74,6 +74,16 @@ struct DataNodeTaskHandles {
     management_api: JoinHandle<()>,
     lease_enforcement: JoinHandle<()>,
     transition_observer: JoinHandle<()>,
+    client_fence_reconciler: JoinHandle<()>,
+}
+
+/// Handles the Track C client-write fence reconciler needs.
+struct ClientFenceReconcilerInputs {
+    fence_rx: watch::Receiver<FenceState>,
+    cluster_state: Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+    postgres: Arc<tokio::sync::Mutex<Supervisor>>,
+    shutdown_rx: watch::Receiver<bool>,
+    configured_roles: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -479,6 +489,8 @@ impl App {
             self.config.heartbeat_interval_ms,
             lease_state,
             raft_tls_config,
+            &self.config.cluster_id,
+            self.config.awaits_write_authority_from.as_deref(),
         )
         .await
         .map_err(anyhow::Error::from)
@@ -553,6 +565,12 @@ impl App {
         // Cloned before the gateway takes ownership of these receivers.
         let observer_leader_rx = leader_rx.clone();
         let observer_fence_rx = fence_rx.clone();
+        let fence_reconciler = self.client_fence_reconciler_inputs(
+            &fence_rx,
+            &cluster_state,
+            &postgres_manager,
+            &shutdown_rx,
+        );
 
         let rpc_server = RaftRpcServer::new_with_tls(
             self.config.raft_addr,
@@ -562,21 +580,13 @@ impl App {
             shutdown_rx.clone(),
         )
         .await?;
-        let gateway = Gateway::new(
-            self.config.gateway_config(),
-            leader_rx.clone(),
-            fence_rx,
-            lease_state.clone(),
-            shutdown_rx.clone(),
-        )?;
-        let mut replication_manager = ReplicationManager::<Supervisor>::new(
-            self.config.node_id,
-            postgres_manager.clone(),
-            cluster_state.clone(),
-            raft.clone(),
-            shutdown_rx.clone(),
-            self.config.replica_disconnect_timeout_ms,
-            lease_state.clone(),
+        let gateway = self.build_gateway(&leader_rx, fence_rx, &lease_state, &shutdown_rx)?;
+        let mut replication_manager = self.build_replication_manager(
+            &postgres_manager,
+            &cluster_state,
+            &raft,
+            &shutdown_rx,
+            &lease_state,
         );
         let supervisor_shutdown_rx = shutdown_rx.clone();
         let management_shutdown_rx = shutdown_rx.clone();
@@ -642,6 +652,114 @@ impl App {
                 observer_fence_rx,
                 observer_shutdown_rx,
             ),
+            client_fence_reconciler: Self::spawn_client_fence_reconciler(fence_reconciler),
+        })
+    }
+
+    /// Keep the PG-role client-write fence matching committed cutover state.
+    ///
+    /// The gateway hold is not enough on its own — `dual_writability_prober`
+    /// writes straight to the internal PG port, and it is right to. Driving
+    /// this from the log rather than from the SEAL request also means a node
+    /// promoted after SEAL applies the fence without being asked again.
+    fn build_gateway(
+        &self,
+        leader_rx: &watch::Receiver<Option<SocketAddr>>,
+        fence_rx: watch::Receiver<FenceState>,
+        lease_state: &crate::governor::SharedLeaseState,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Result<Gateway> {
+        Gateway::new(
+            self.config.gateway_config(),
+            leader_rx.clone(),
+            fence_rx,
+            lease_state.clone(),
+            shutdown_rx.clone(),
+        )
+        .map_err(anyhow::Error::from)
+    }
+
+    fn build_replication_manager(
+        &self,
+        postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+        shutdown_rx: &watch::Receiver<bool>,
+        lease_state: &crate::governor::SharedLeaseState,
+    ) -> ReplicationManager<Supervisor> {
+        ReplicationManager::<Supervisor>::new(
+            self.config.node_id,
+            postgres.clone(),
+            cluster_state.clone(),
+            raft.clone(),
+            shutdown_rx.clone(),
+            self.config.replica_disconnect_timeout_ms,
+            lease_state.clone(),
+        )
+    }
+
+    fn client_fence_reconciler_inputs(
+        &self,
+        fence_rx: &watch::Receiver<FenceState>,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> ClientFenceReconcilerInputs {
+        ClientFenceReconcilerInputs {
+            fence_rx: fence_rx.clone(),
+            cluster_state: cluster_state.clone(),
+            postgres: postgres.clone(),
+            shutdown_rx: shutdown_rx.clone(),
+            configured_roles: self.config.client_fence_roles.clone(),
+        }
+    }
+
+    fn spawn_client_fence_reconciler(input: ClientFenceReconcilerInputs) -> JoinHandle<()> {
+        let ClientFenceReconcilerInputs {
+            mut fence_rx,
+            cluster_state,
+            postgres,
+            mut shutdown_rx,
+            configured_roles,
+        } = input;
+        tokio::spawn(async move {
+            let mut applied = false;
+            loop {
+                let want_fenced = fence_rx.borrow().local_client_writes_fenced();
+                // A recipient fenced before any cutover entry has only its
+                // configured roles; a donor sealing gets them from the log.
+                let committed = cluster_state.read().cutover.fenced_app_roles.clone();
+                let roles = if committed.is_empty() {
+                    configured_roles.clone()
+                } else {
+                    committed
+                };
+                if !roles.is_empty() && want_fenced != applied {
+                    let guard = postgres.lock().await;
+                    let result = if want_fenced {
+                        crate::commands::upgrade::client_fence::apply_client_write_fence(
+                            &guard, &roles,
+                        )
+                        .await
+                    } else {
+                        crate::commands::upgrade::client_fence::lift_client_write_fence(
+                            &guard, &roles,
+                        )
+                        .await
+                    };
+                    drop(guard);
+                    match result {
+                        Ok(()) => applied = want_fenced,
+                        Err(e) => {
+                            warn!(error = %e, want_fenced, "Client-write fence reconcile failed");
+                        }
+                    }
+                }
+                tokio::select! {
+                    _ = fence_rx.changed() => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+            }
         })
     }
 
@@ -660,7 +778,17 @@ impl App {
         shutdown_tx.send(true)?;
 
         let shutdown_result = tokio::time::timeout(Duration::from_secs(30), async {
-            let (gov_res, gw_res, sup_res, rpc_res, repl_res, mgmt_res, lease_res, obs_res) = tokio::join!(
+            let (
+                gov_res,
+                gw_res,
+                sup_res,
+                rpc_res,
+                repl_res,
+                mgmt_res,
+                lease_res,
+                obs_res,
+                fence_res,
+            ) = tokio::join!(
                 handles.governor,
                 handles.gateway,
                 handles.supervisor,
@@ -669,7 +797,9 @@ impl App {
                 handles.management_api,
                 handles.lease_enforcement,
                 handles.transition_observer,
+                handles.client_fence_reconciler,
             );
+            Self::log_join_error(fence_res, "Client-write fence reconciler");
             Self::log_join_error(obs_res, "Transition observer");
             Self::log_join_error(gov_res, "Governor");
             Self::log_join_error(gw_res, "Gateway");
@@ -783,6 +913,7 @@ impl App {
                 },
             )),
             fence_tx,
+            cluster_id: Arc::from(self.config.cluster_id.as_str()),
         })
     }
 
@@ -4261,7 +4392,7 @@ mod tests {
                     fenced: true,
                     has_quorum: false,
                     upgrade_frozen: false,
-                    cutover_client_hold: false,
+                    client_write_authority: true,
                     authority_pg_addr: None,
                 })
                 .unwrap();
@@ -4308,7 +4439,7 @@ mod tests {
                     fenced: true,
                     has_quorum: true,
                     upgrade_frozen: false,
-                    cutover_client_hold: false,
+                    client_write_authority: true,
                     authority_pg_addr: None,
                 })
                 .unwrap();

@@ -62,6 +62,32 @@ pub struct Config {
     #[serde(default)]
     pub topology_mode: TopologyMode,
 
+    /// Identity of the pgbattery cluster this node belongs to.
+    ///
+    /// Track C names clusters by this when handing write authority between
+    /// them; a node compares it against the committed authority to decide
+    /// whether it may accept client writes. Every node in one cluster must
+    /// agree, and two clusters in a cutover must differ.
+    #[serde(default = "default_cluster_id")]
+    pub cluster_id: String,
+
+    /// Cluster this one is waiting to receive write authority from.
+    ///
+    /// Set on a Track C green cluster before cutover. Until its own log
+    /// records `CutoverAuthorityReceived`, the gateway holds clients and the
+    /// supervisor revokes DML from [`Config::client_fence_roles`] on the
+    /// local primary. Without it a second Raft group would elect itself into
+    /// write authority the moment it boots.
+    #[serde(default)]
+    pub awaits_write_authority_from: Option<String>,
+
+    /// Application roles the client-write fence covers.
+    ///
+    /// Required alongside `awaits_write_authority_from`: a gateway hold alone
+    /// leaves the internal PG port writable.
+    #[serde(default)]
+    pub client_fence_roles: Vec<String>,
+
     /// Path to `PostgreSQL` binaries (active major — the running pointer).
     #[serde(default)]
     pub pg_bin_dir: PathBuf,
@@ -205,6 +231,10 @@ const fn default_idle_timeout() -> u64 {
 
 const fn default_upgrade_hold_timeout() -> u64 {
     60_000
+}
+
+fn default_cluster_id() -> String {
+    "default".into()
 }
 
 const fn default_max_connections() -> usize {
@@ -568,11 +598,46 @@ impl Config {
     }
 
     /// Validate storage paths, auth mode, and TLS/SSL file existence.
+    /// Cluster identity and the Track C recipient fence it gates.
+    fn validate_cluster_identity(&self) -> Result<()> {
+        if self.cluster_id.trim().is_empty() {
+            anyhow::bail!("cluster_id must not be empty");
+        }
+        if !self
+            .cluster_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "cluster_id {:?} must be alphanumeric with `_` or `-` \
+                 (it is compared verbatim against committed authority records)",
+                self.cluster_id
+            );
+        }
+        let Some(donor) = self.awaits_write_authority_from.as_deref() else {
+            return Ok(());
+        };
+        if donor == self.cluster_id {
+            anyhow::bail!(
+                "awaits_write_authority_from must name a different cluster than \
+                 cluster_id ({donor})"
+            );
+        }
+        if self.client_fence_roles.is_empty() {
+            anyhow::bail!(
+                "awaits_write_authority_from requires client_fence_roles: a \
+                 gateway hold leaves the internal PostgreSQL port writable"
+            );
+        }
+        Ok(())
+    }
+
     fn validate_storage_and_tls(&self) -> Result<()> {
         // Validate PostgreSQL configuration
         if self.pg_bin_dir.as_os_str().is_empty() {
             anyhow::bail!("pg_bin_dir is required");
         }
+        self.validate_cluster_identity()?;
         for (major, path) in &self.pg_bin_dirs {
             if major.parse::<u32>().is_err() {
                 anyhow::bail!("pg_bin_dirs key {major:?} must be a PostgreSQL major number");

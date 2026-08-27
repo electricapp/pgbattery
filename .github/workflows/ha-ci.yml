@@ -344,8 +344,13 @@ jobs:
         case:
           - cluster-binary-upgrade-proof
           - pg-major-upgrade-proof
+          - pg-major-upgrade-rollback-drill
           - bluegreen-cutover
           - bluegreen-rollback-drill
+          - bluegreen-chaos-arm-seal
+          - bluegreen-chaos-seal-transfer
+          - bluegreen-chaos-mid-drain
+          - bluegreen-chaos-blue-quorum
     env:
       COMPOSE_PROJECT_NAME: pgbha_upg_${{ matrix.case }}_${{ github.run_id }}_${{ github.run_attempt }}
       PGBATTERY_PROBER_REQUIRE_TRANSPORT: direct

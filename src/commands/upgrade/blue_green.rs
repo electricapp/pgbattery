@@ -340,6 +340,28 @@ async fn collect_replica_identity_failures(
     Ok(bad)
 }
 
+/// Refuse unless the client-write fence can actually hold these roles.
+///
+/// Called at SEAL, not only from `--check`: a table owner keeps implicit
+/// write privilege through `REVOKE`, so fencing such a role reports U1 held
+/// while blind. Preflight in a separate invocation cannot gate this.
+///
+/// # Errors
+/// Any role the fence cannot cover, named.
+pub async fn require_fence_covers_roles(
+    supervisor: &crate::supervisor::Supervisor,
+    app_roles: &[String],
+) -> Result<()> {
+    let (failures, _secdef) = collect_fence_feasibility(supervisor, app_roles).await?;
+    if !failures.is_empty() {
+        bail!(
+            "client-vs-apply fence cannot cover these roles: {}",
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
 async fn collect_fence_feasibility(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
