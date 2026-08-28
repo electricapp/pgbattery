@@ -28,7 +28,7 @@ import typer
 from rich.console import Console
 
 import topology
-from topology import Topology, load
+from topology import Node, Topology, load
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 TOKEN: Final[str] = os.environ.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
@@ -164,29 +164,53 @@ class Writer(threading.Thread):
         self.join(timeout=10)
 
 
-@app.command()
-def _await_writer_stalled(writer: Writer, timeout: float = 30.0) -> int:
-    """Wait for the freeze to actually reach the gateways, return the ack count.
+def _held_connections(node: Node) -> int | None:
+    """Connections this node's gateway has parked for an upgrade hold.
 
-    Committing the freeze returns before every gateway has observed the new
-    fence, so a write already in flight is still acked. Counting from the
-    request would charge that propagation window to the hold. A writer that
-    never stalls means the freeze did nothing, which is the real failure.
+    `None` means the reading is unavailable right now, which is not the same
+    as zero: a scrape that failed must not read as "the gateway is not
+    holding" and end the wait early.
+    """
+    try:
+        r = httpx.get(f"http://127.0.0.1:{node.metrics_port}/metrics", timeout=5.0)
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    for line in r.text.splitlines():
+        if line.startswith("#"):
+            continue
+        series, _, value = line.rpartition(" ")
+        name = series.partition("{")[0].strip()
+        if name in (
+            "pgbattery_connections_held_during_upgrade",
+            "pgbattery_connections_held_during_upgrade_total",
+        ):
+            return int(float(value))
+    return 0
+
+
+def _await_gateway_holding(node: Node, before: int, timeout: float = 30.0) -> None:
+    """Wait until the gateway has actually parked a connection.
+
+    The freeze commits before every gateway observes it, so a write already in
+    flight is still acked; charging that window to the hold is what made this
+    case flap. The counter only increases, and it increments at the moment a
+    connection is held, so waiting for it to move past `before` is the effect
+    itself rather than a guess about how long propagation takes.
     """
     deadline = time.monotonic() + timeout
-    last = writer.acked
-    stable_since = time.monotonic()
     while time.monotonic() < deadline:
-        time.sleep(0.5)
-        now = writer.acked
-        if now != last:
-            last = now
-            stable_since = time.monotonic()
-        elif time.monotonic() - stable_since >= 1.5:
-            return now
-    raise ContractFailure(f"freeze committed but writers kept acking for {timeout:g}s")
+        held = _held_connections(node)
+        if held is not None and held > before:
+            return
+        time.sleep(0.25)
+    raise ContractFailure(
+        f"freeze committed but {node.service} never held a connection in {timeout:g}s"
+    )
 
 
+@app.command()
 def main(
     chaos: str | None = typer.Option(None, help="mid-freeze | mid-unfreeze"),
     hold_sec: float = typer.Option(5.0, "--hold-sec"),
@@ -203,9 +227,14 @@ def main(
     if before == 0:
         raise ContractFailure("writer acked nothing before the freeze; the run proves nothing")
 
+    held_before = _held_connections(topo.nodes[0]) or 0
     try:
         _set_freeze(topo, True)
-        held_from = _await_writer_stalled(writer)
+        _await_gateway_holding(topo.nodes[0], held_before)
+        # Baseline taken after the gateway is demonstrably holding, so any
+        # later ack is a write that got through the hold, not through the
+        # window before it took effect.
+        held_from = writer.acked
 
         if chaos == "mid-freeze":
             subprocess.run(
