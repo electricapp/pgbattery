@@ -29,6 +29,7 @@ from rich.console import Console
 
 import topology
 from topology import Node, Topology, load
+from waiting import WaitTimeout, await_until
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 TOKEN: Final[str] = os.environ.get("PGBATTERY_MANAGEMENT_API_TOKEN", "")
@@ -165,12 +166,7 @@ class Writer(threading.Thread):
 
 
 def _held_connections(node: Node) -> int | None:
-    """Connections this node's gateway has parked for an upgrade hold.
-
-    `None` means the reading is unavailable right now, which is not the same
-    as zero: a scrape that failed must not read as "the gateway is not
-    holding" and end the wait early.
-    """
+    """Connections parked for an upgrade hold. `None` is "no reading", not zero."""
     try:
         r = httpx.get(f"http://127.0.0.1:{node.metrics_port}/metrics", timeout=5.0)
     except httpx.HTTPError:
@@ -191,23 +187,21 @@ def _held_connections(node: Node) -> int | None:
 
 
 def _await_gateway_holding(node: Node, before: int, timeout: float = 30.0) -> None:
-    """Wait until the gateway has actually parked a connection.
+    """The freeze commits before gateways observe it; the counter says when."""
 
-    The freeze commits before every gateway observes it, so a write already in
-    flight is still acked; charging that window to the hold is what made this
-    case flap. The counter only increases, and it increments at the moment a
-    connection is held, so waiting for it to move past `before` is the effect
-    itself rather than a guess about how long propagation takes.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    def holding() -> bool | None:
         held = _held_connections(node)
-        if held is not None and held > before:
-            return
-        time.sleep(0.25)
-    raise ContractFailure(
-        f"freeze committed but {node.service} never held a connection in {timeout:g}s"
-    )
+        return True if held is not None and held > before else None
+
+    try:
+        await_until(
+            holding,
+            budget=timeout,
+            describe=f"{node.service} to hold a connection",
+            interval=0.25,
+        )
+    except WaitTimeout as exc:
+        raise ContractFailure(f"freeze committed but {exc}") from exc
 
 
 @app.command()

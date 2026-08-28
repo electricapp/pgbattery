@@ -31,6 +31,7 @@ os.environ.setdefault("COMPOSE_FILE", "docker-compose.pgupgrade.yml")
 
 import topology
 from topology import Node, load
+from waiting import WaitTimeout, await_until
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 COMPOSE_FILE: Final[str] = "docker-compose.pgupgrade.yml"
@@ -126,15 +127,11 @@ def _wait_leader(timeout: float = 180.0) -> None:
 
 
 def _await_pg_ready(node: Node, timeout: float = 180.0) -> None:
-    """Block until `node` answers SQL.
-
-    A node re-basebackuped or restarted by the upgrade answers the management
-    API before its postmaster finishes recovery, so probing it straight away
-    gets "the database system is starting up" and fails a run that was fine.
-    """
-    deadline = time.monotonic() + timeout
+    """A restarted node answers the management API before it answers SQL."""
     last = ""
-    while time.monotonic() < deadline:
+
+    def ready() -> bool | None:
+        nonlocal last
         proc = _compose(
             "exec",
             "-T",
@@ -149,10 +146,14 @@ def _await_pg_ready(node: Node, timeout: float = 180.0) -> None:
             check=False,
         )
         if proc.returncode == 0:
-            return
+            return True
         last = (proc.stderr or proc.stdout).strip()
-        time.sleep(2.0)
-    raise ContractFailure(f"{node.service} PostgreSQL not ready in {timeout:g}s: {last}")
+        return None
+
+    try:
+        await_until(ready, budget=timeout, describe=f"{node.service} to accept SQL", interval=2.0)
+    except WaitTimeout as exc:
+        raise ContractFailure(f"{exc}: {last}") from exc
 
 
 def _pg_major(node: Node) -> int:

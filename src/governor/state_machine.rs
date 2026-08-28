@@ -945,6 +945,72 @@ mod tests {
         assert_eq!(state.cutover.authority_cluster_id.as_deref(), Some(GREEN));
     }
 
+    /// Blue hands to green, then green hands back. Each cluster keeps its own
+    /// log, so the epochs only have to rise within each one — but a round trip
+    /// is where a recipient that recorded the donor's epoch could stall its own
+    /// next handoff. `tla/cutover_authority.tla` models the donor side only.
+    #[test]
+    fn authority_survives_a_round_trip_with_both_epochs_rising() {
+        let mut blue = ClusterState::new();
+        let mut green = ClusterState::new();
+
+        armed(&mut blue);
+        blue.apply(ClusterCommand::CutoverSeal {
+            final_lsn: 10,
+            app_roles: vec![],
+        });
+        blue.apply(ClusterCommand::CutoverDrainObserved);
+        blue.apply(ClusterCommand::CutoverTransfer {
+            target_cluster_id: GREEN.into(),
+            target_pg_addr: "172.30.0.21:5434".into(),
+            forced: false,
+        });
+        assert_eq!(blue.cutover.epoch, 1);
+        assert!(!blue.cutover.holds_client_write_authority(BLUE));
+
+        let handed = green.apply(ClusterCommand::CutoverAuthorityReceived {
+            epoch: blue.cutover.epoch,
+            from_cluster_id: BLUE.into(),
+            local_cluster_id: GREEN.into(),
+        });
+        assert_eq!(handed, CommandOutcome::Applied);
+        assert!(green.cutover.holds_client_write_authority(GREEN));
+
+        // Green now hands it back.
+        assert_eq!(
+            green.apply(ClusterCommand::CutoverArmed {
+                target_cluster_id: BLUE.into(),
+                local_cluster_id: GREEN.into(),
+            }),
+            CommandOutcome::Applied
+        );
+        green.apply(ClusterCommand::CutoverSeal {
+            final_lsn: 20,
+            app_roles: vec![],
+        });
+        green.apply(ClusterCommand::CutoverDrainObserved);
+        green.apply(ClusterCommand::CutoverTransfer {
+            target_cluster_id: BLUE.into(),
+            target_pg_addr: "172.30.0.11:5434".into(),
+            forced: false,
+        });
+        assert_eq!(green.cutover.epoch, 2, "green's own epoch must rise");
+        assert!(!green.cutover.holds_client_write_authority(GREEN));
+
+        let returned = blue.apply(ClusterCommand::CutoverAuthorityReceived {
+            epoch: green.cutover.epoch,
+            from_cluster_id: GREEN.into(),
+            local_cluster_id: BLUE.into(),
+        });
+        assert_eq!(
+            returned,
+            CommandOutcome::Applied,
+            "blue must accept the return: epoch 2 is past the 1 it recorded"
+        );
+        assert!(blue.cutover.holds_client_write_authority(BLUE));
+        assert!(!green.cutover.holds_client_write_authority(GREEN));
+    }
+
     /// Abort unseals the donor into a new epoch; the recipient never held it.
     #[test]
     fn cutover_abort_unseal_returns_authority_in_a_new_epoch() {

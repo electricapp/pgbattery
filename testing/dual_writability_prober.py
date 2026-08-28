@@ -1355,6 +1355,16 @@ class DualWritabilityProber:
                     continue
                 try:
                     with conn.cursor() as cur:
+                        # `CREATE TABLE IF NOT EXISTS` still needs CREATE on the
+                        # schema, so a probe user deliberately without it cannot
+                        # use the DDL to discover a table someone else made.
+                        cur.execute(f"SELECT to_regclass('{PROBE_TABLE}') IS NOT NULL")
+                        row = cur.fetchone()
+                        if row is not None and row[0]:
+                            self._setup_notes.append(
+                                f"probe table already present on node{node.node_id}"
+                            )
+                            return
                         cur.execute(CREATE_PROBE_TABLE_SQL)
                     self._setup_notes.append(f"probe table ensured on node{node.node_id}")
                     return

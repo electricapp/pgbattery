@@ -36,6 +36,7 @@ os.environ.setdefault("COMPOSE_FILE", "docker-compose.bluegreen.yml")
 
 import topology
 from topology import Node, Topology, load
+from waiting import WaitTimeout, await_until
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 APP_ROLE: Final[str] = "bg_app"
@@ -107,20 +108,28 @@ def _compose(
 
 
 def _wait_leader(node: Node, timeout: float = 120.0) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout
     last = ""
-    while time.monotonic() < deadline:
+
+    def leader() -> dict[str, Any] | None:
+        nonlocal last
         try:
             r = httpx.get(f"{_mgmt(node)}/api/v1/cluster/leader", timeout=2.0)
-            if r.status_code == 200:
-                body = r.json()
-                if isinstance(body, dict) and body.get("leader_id") is not None:
-                    return {str(k): v for k, v in body.items()}
-                last = str(body)
         except httpx.HTTPError as exc:
             last = str(exc)
-        time.sleep(1.0)
-    raise TimeoutError(f"no leader via {node.service}: {last}")
+            return None
+        if r.status_code != 200:
+            last = r.text
+            return None
+        body = r.json()
+        if body.get("leader_id") is None:
+            last = str(body)
+            return None
+        return {str(k): v for k, v in body.items()}
+
+    try:
+        return await_until(leader, budget=timeout, describe=f"a leader via {node.service}")
+    except WaitTimeout as exc:
+        raise TimeoutError(f"no leader via {node.service}: {last} ({exc})") from exc
 
 
 def _psql(node: Node, sql: str, user: str = SUB_OWNER) -> str:
@@ -290,22 +299,30 @@ def _slot_confirmed_lsn(blue_leader: Node, slot: str = "bg_slot") -> int | None:
     return _lsn_bytes(raw) if raw else None
 
 
-def _await_slot_confirms(blue_leader: Node, target_lsn: int, timeout: float) -> int:
-    """Block until the subscriber confirms `target_lsn`. The drain gate.
+def _await_slot_confirms(
+    blue_leader: Node, target_lsn: int, timeout: float, slot: str = "bg_slot"
+) -> int:
+    """The drain gate. Row counts cannot answer it; an UPDATE moves the LSN only.
 
-    Row counts cannot answer this: an UPDATE moves the LSN without moving the
-    count, and equal counts on both sides say nothing about which rows.
+    `slot` differs by direction: the reverse drain reads green's reverse slot.
     """
-    deadline = time.monotonic() + timeout
     last: int | None = None
-    while time.monotonic() < deadline:
-        last = _slot_confirmed_lsn(blue_leader)
-        if last is not None and last >= target_lsn:
-            return last
-        time.sleep(1.0)
-    raise ContractFailure(
-        f"U2: subscriber confirmed only {last} of blue's {target_lsn} within {timeout}s"
-    )
+
+    def confirmed() -> int | None:
+        nonlocal last
+        last = _slot_confirmed_lsn(blue_leader, slot)
+        return last if last is not None and last >= target_lsn else None
+
+    try:
+        return await_until(
+            confirmed,
+            budget=timeout,
+            describe=f"slot {slot} on {blue_leader.service} to confirm {target_lsn}",
+        )
+    except WaitTimeout as exc:
+        raise ContractFailure(
+            f"U2: subscriber confirmed only {last} of the donor's {target_lsn} ({exc})"
+        ) from exc
 
 
 def _advance_sequences(green_leader: Node, blue_leader: Node) -> int:
@@ -613,14 +630,26 @@ def _chaos_mid_drain(blue_leader: Node, green_leader: Node) -> None:
     raise ContractFailure("abort reported success but blue never accepted a write again")
 
 
-def _assert_stopped(nodes: list[Node]) -> None:
-    """Confirm the containers really are down before asserting on the effect.
+def _voter_ids(node: Node) -> list[int]:
+    """Raft voters as `node` sees them. Learners cannot carry a quorum."""
+    r = httpx.get(f"{_mgmt(node)}/api/v1/cluster/members", timeout=10.0)
+    r.raise_for_status()
+    members = r.json().get("members") or []
+    return [int(m["node_id"]) for m in members if str(m.get("role", "")).lower() == "voter"]
 
-    This is the fault, and it is what makes the next assertion sound: with two
-    of three gone no majority can ack, so any commit that still succeeds is a
-    real violation. Waiting instead for blue to stop *reporting* a leader would
-    test openraft's demotion timing, which is not the contract.
-    """
+
+def _assert_three_voters(node: Node) -> None:
+    """Stopping two only removes quorum if all three are voters, not learners."""
+    voters = _voter_ids(node)
+    if len(voters) != 3:
+        raise ContractFailure(
+            f"blue has {len(voters)} voters {voters}, not 3; stopping two would "
+            "not remove quorum and the case cannot test what it claims"
+        )
+
+
+def _assert_stopped(nodes: list[Node]) -> None:
+    """With the containers confirmed down, no majority can ack and timing is moot."""
     for n in nodes:
         state = _compose("ps", "-a", "--format", "{{.Service}} {{.State}}").stdout
         for line in state.splitlines():
@@ -633,6 +662,7 @@ def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) 
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
     followers = [n for n in blue if n.service != blue_leader.service]
+    _assert_three_voters(blue_leader)
     stopped = followers[:2]
     for f in stopped:
         _compose("stop", f.service, check=True)
@@ -690,7 +720,7 @@ def _rollback_drill(
     if not isinstance(final_lsn, int):
         raise ContractFailure(f"reverse SEAL recorded no final LSN: {st}")
 
-    _await_slot_confirms(green_leader, final_lsn, timeout=120.0)
+    _await_slot_confirms(green_leader, final_lsn, timeout=120.0, slot="bg_reverse_slot")
     _post(green_leader, "drain-observed").raise_for_status()
     _post(
         green_leader,

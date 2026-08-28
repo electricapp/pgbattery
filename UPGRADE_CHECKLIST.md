@@ -195,10 +195,14 @@ and PG-major upgrade in the same release if avoidable.
 - [ ] DDL freeze event trigger and schema digest. `UPGRADE.md` calls these
       "enforced, not requested"; preflight only reports the gap.
 - [ ] WAL-retention / slot-lag monitor that aborts before the donor is at risk.
-- [ ] Reverse-cutover as its own command. The state machine now lets the cluster
-      holding authority arm one, and `bluegreen-rollback-drill` runs the protocol
-      with the roles exchanged, but there is no `--rollback` flag that drives it
-      for an operator.
+- [x] Reverse cutover. What blocked it was the arm guard, not a missing command:
+      a recipient sat in TRANSFERRED and `CutoverArmed` took only IDLE/ABORTED.
+      With that fixed the existing command drives it by swapping `--node` and
+      `--green-node`, since neither the plan nor the protocol is
+      direction-specific. `bluegreen-rollback-drill` runs it.
+- [ ] Operator-facing naming for that reverse run. Rolling back means passing
+      `--green-node`/`--green-cluster-id` for the cluster being rolled back
+      _to_, which reads backwards. Sugar, not capability.
 
 Matrix case IDs: `bluegreen-cutover`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`.
 

@@ -187,21 +187,31 @@ pub async fn fence_is_applied(
         validate_role_ident(role)?;
         quoted.push(format!("'{}'", role.replace('\'', "''")));
     }
-    // to_regclass is NULL before the first seal ever ran, which is not an
-    // error: it means nothing is fenced.
-    let sql = format!(
-        "SELECT CASE WHEN to_regclass('{FENCE_TABLE}') IS NULL THEN false \
-         ELSE EXISTS(SELECT 1 FROM {FENCE_TABLE} WHERE role_name IN ({})) END;",
-        quoted.join(",")
-    );
+    // Asked separately because PostgreSQL plans both arms of a CASE: guarding
+    // the table reference with to_regclass in one statement still fails to
+    // parse before the first seal has created it.
+    let exists = supervisor
+        .execute_sql(&format!("SELECT to_regclass('{FENCE_TABLE}') IS NOT NULL;"))
+        .await
+        .context("probing for the client-fence snapshot table")?;
+    if !parse_pg_bool(&exists)? {
+        return Ok(false);
+    }
     let raw = supervisor
-        .execute_sql(&sql)
+        .execute_sql(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} WHERE role_name IN ({}));",
+            quoted.join(",")
+        ))
         .await
         .context("reading client-fence snapshot state")?;
+    parse_pg_bool(&raw)
+}
+
+fn parse_pg_bool(raw: &str) -> Result<bool> {
     match raw.trim() {
         "t" | "true" => Ok(true),
         "f" | "false" => Ok(false),
-        other => bail!("client-fence probe returned {other:?}, expected a boolean"),
+        other => bail!("expected a boolean from PostgreSQL, got {other:?}"),
     }
 }
 
@@ -283,6 +293,16 @@ mod tests {
     fn a_fence_already_matching_the_log_is_left_alone() {
         assert_eq!(fence_action(true, true), FenceAction::None);
         assert_eq!(fence_action(false, false), FenceAction::None);
+    }
+
+    /// The probe must read a plain `t`/`f`, and refuse anything else rather
+    /// than treating an unexpected reply as "not fenced".
+    #[test]
+    fn the_fence_probe_reads_postgres_booleans() {
+        assert!(parse_pg_bool("t\n").unwrap());
+        assert!(!parse_pg_bool(" f ").unwrap());
+        assert!(parse_pg_bool("").is_err());
+        assert!(parse_pg_bool("ERROR").is_err());
     }
 
     #[test]
