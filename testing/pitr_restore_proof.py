@@ -177,6 +177,9 @@ else
   exit 2
 fi
 test -d {scratch_in}/data
+# mkdir/tar leave the directory at the shell's umask; the postmaster refuses
+# to start on anything looser than 0750.
+chmod 0700 {scratch_in}/data
 cat > {scratch_in}/data/postgresql.auto.conf <<EOF
 restore_command = 'cp {WAL_ARCHIVE}/%f %p'
 recovery_target_action = 'promote'

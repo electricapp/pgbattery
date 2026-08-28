@@ -445,10 +445,18 @@ impl ClusterState {
                 target_cluster_id,
                 local_cluster_id,
             } => {
-                if !matches!(
-                    self.cutover.phase,
-                    CutoverPhase::Idle | CutoverPhase::Aborted
-                ) {
+                let may_arm = match self.cutover.phase {
+                    CutoverPhase::Idle | CutoverPhase::Aborted => true,
+                    // A cluster that took authority may hand it on — that is
+                    // the reverse cutover. One that gave authority away is
+                    // also TRANSFERRED, and must not re-arm itself back into
+                    // authority without a handoff.
+                    CutoverPhase::Transferred => {
+                        self.cutover.holds_client_write_authority(&local_cluster_id)
+                    }
+                    CutoverPhase::Armed | CutoverPhase::Sealed | CutoverPhase::Draining => false,
+                };
+                if !may_arm {
                     return CommandOutcome::OutOfOrder;
                 }
                 self.cutover.phase = CutoverPhase::Armed;
@@ -883,6 +891,58 @@ mod tests {
             state.cutover.target_pg_addr.as_deref(),
             Some("172.30.0.21:5434")
         );
+    }
+
+    /// Rollback is the reverse cutover, so the cluster now holding authority
+    /// has to be able to arm one. Refusing left green TRANSFERRED forever and
+    /// made the whole reverse direction unreachable.
+    #[test]
+    fn the_cluster_holding_authority_can_arm_the_reverse_cutover() {
+        let mut state = ClusterState::new();
+        let outcome = state.apply(ClusterCommand::CutoverAuthorityReceived {
+            epoch: 1,
+            from_cluster_id: BLUE.into(),
+            local_cluster_id: GREEN.into(),
+        });
+        assert_eq!(outcome, CommandOutcome::Applied);
+        assert_eq!(state.cutover.phase, CutoverPhase::Transferred);
+        assert!(state.cutover.holds_client_write_authority(GREEN));
+
+        let armed = state.apply(ClusterCommand::CutoverArmed {
+            target_cluster_id: BLUE.into(),
+            local_cluster_id: GREEN.into(),
+        });
+        assert_eq!(armed, CommandOutcome::Applied);
+        assert_eq!(state.cutover.phase, CutoverPhase::Armed);
+        assert_eq!(state.cutover.target_cluster_id.as_deref(), Some(BLUE));
+    }
+
+    /// The donor is TRANSFERRED too. Letting it arm would hand authority back
+    /// to itself with no handoff — both clusters writable at the same epoch.
+    #[test]
+    fn the_cluster_that_gave_authority_away_cannot_arm_itself_back() {
+        let mut state = ClusterState::new();
+        armed(&mut state);
+        state.apply(ClusterCommand::CutoverSeal {
+            final_lsn: 10,
+            app_roles: vec![],
+        });
+        state.apply(ClusterCommand::CutoverDrainObserved);
+        state.apply(ClusterCommand::CutoverTransfer {
+            target_cluster_id: GREEN.into(),
+            target_pg_addr: "172.30.0.21:5434".into(),
+            forced: false,
+        });
+        assert_eq!(state.cutover.phase, CutoverPhase::Transferred);
+        assert!(!state.cutover.holds_client_write_authority(BLUE));
+
+        let outcome = state.apply(ClusterCommand::CutoverArmed {
+            target_cluster_id: GREEN.into(),
+            local_cluster_id: BLUE.into(),
+        });
+        assert_eq!(outcome, CommandOutcome::OutOfOrder);
+        assert_eq!(state.cutover.phase, CutoverPhase::Transferred);
+        assert_eq!(state.cutover.authority_cluster_id.as_deref(), Some(GREEN));
     }
 
     /// Abort unseals the donor into a new epoch; the recipient never held it.

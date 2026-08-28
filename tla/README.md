@@ -79,6 +79,13 @@ so the mechanism is disabled only where a counterexample is the expected result.
 | `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions    |
 | `cutover_authority.tla`     | Track C: ≤1 `(epoch, cluster)` writable; green never self-elects (U1/U4)  |
 
+`cutover_authority.tla` models one direction: blue is the donor and only blue
+arms. The reverse cutover — the recipient arming from TRANSFERRED to hand
+authority back — is covered by `bluegreen-rollback-drill` and by
+`the_cluster_that_gave_authority_away_cannot_arm_itself_back`, not by the
+model. Blue's guard in the spec stays faithful either way: after a transfer
+the donor does not hold authority, so it still cannot arm.
+
 ## Properties (checked by each `.cfg`)
 
 **`lease_fencing.tla`** — passes (533,517 distinct states)
