@@ -16,6 +16,10 @@ use crate::commands::upgrade::postgres::{
     PostgresUpgradeParams, cluster_client_and_entry, missing_extension_controls,
     require_target_bin_on_node,
 };
+use crate::observability::management_api::{DonorRisk, donor_wal_risk};
+
+/// WAL the donor may hold for the cutover slot before the wait is abandoned.
+const DONOR_WAL_RETENTION_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Body for primary-side Track C catalog preflight.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +155,7 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
     };
     info!(final_lsn, "Donor sealed");
 
-    await_recipient_drain(&client, &green_mgmt, final_lsn).await?;
+    await_recipient_drain(&client, &green_mgmt, &blue_mgmt, final_lsn).await?;
     client
         .cutover_step(&blue_mgmt, "drain-observed", &serde_json::json!({}))
         .await?;
@@ -273,6 +277,7 @@ impl CutoverPlan {
 async fn await_recipient_drain(
     client: &crate::cluster::ClusterClient,
     green_mgmt: &str,
+    blue_mgmt: &str,
     final_lsn: u64,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(30);
@@ -281,6 +286,16 @@ async fn await_recipient_drain(
         if applied >= final_lsn {
             info!(applied, final_lsn, "Recipient drained past the sealed LSN");
             return Ok(());
+        }
+        // The donor is sealed and holding WAL for the whole wait, so a
+        // subscriber that never catches up fills the donor's disk.
+        let retained = client.get_donor_retention(blue_mgmt).await?;
+        if donor_wal_risk(retained, DONOR_WAL_RETENTION_BUDGET_BYTES) == DonorRisk::Abort {
+            bail!(
+                "Donor is holding {retained} bytes of WAL for the cutover slot, past \
+                 the {DONOR_WAL_RETENTION_BUDGET_BYTES}-byte budget. Aborting the wait \
+                 while the donor can still be unsealed with `cutover/abort`."
+            );
         }
         if std::time::Instant::now() >= deadline {
             bail!(

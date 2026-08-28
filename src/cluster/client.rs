@@ -882,6 +882,33 @@ impl ClusterClient {
         Ok(body.applied_lsn)
     }
 
+    /// WAL the donor is holding for its logical slots, in bytes.
+    ///
+    /// # Errors
+    /// The donor is unreachable or answers with a non-success status.
+    pub async fn get_donor_retention(&self, addr: &str) -> Result<u64> {
+        let url = format!("http://{addr}/api/v1/cutover/donor-retention");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "donor retention",
+                status,
+                &body,
+                false
+            ));
+        }
+        let body: crate::observability::management_api::DonorRetentionResponse =
+            resp.json().await?;
+        Ok(body.retained_bytes)
+    }
+
     /// Drive one step of the cutover protocol on `addr`.
     ///
     /// `step` is the path segment under `/api/v1/admin/cutover/`. A 409 means

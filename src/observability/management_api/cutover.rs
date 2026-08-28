@@ -491,6 +491,63 @@ pub struct SubscriptionProgressResponse {
 }
 
 /// Applied origin LSN, probed from the catalogs (`GET`, no auth: read-only).
+/// WAL the donor is holding for its cutover slot, and whether that is safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DonorRetentionResponse {
+    pub retained_bytes: u64,
+    pub slot_count: usize,
+}
+
+/// What a drain wait should do about the donor's retained WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DonorRisk {
+    Continue,
+    Abort,
+}
+
+/// A stalled subscriber holds the donor's slot, so green's problem fills
+/// blue's disk. Abort while the donor can still be unsealed.
+#[must_use]
+pub const fn donor_wal_risk(retained_bytes: u64, budget_bytes: u64) -> DonorRisk {
+    if retained_bytes >= budget_bytes {
+        DonorRisk::Abort
+    } else {
+        DonorRisk::Continue
+    }
+}
+
+pub(super) async fn get_donor_retention(
+    State(state): State<Arc<ManagementApiState>>,
+) -> impl IntoResponse {
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(DonorRetentionResponse {
+                retained_bytes: 0,
+                slot_count: 0,
+            }),
+        );
+    };
+    let guard = pg.lock().await;
+    // Logical slots only: a physical standby's slot is normal replication,
+    // not WAL held for a cutover that may never finish.
+    let sql = "SELECT count(*)::text || '|' || COALESCE(max(\
+               pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))::bigint, 0)::text \
+               FROM pg_replication_slots WHERE slot_type = 'logical' AND restart_lsn IS NOT NULL;";
+    let raw = guard.execute_sql(sql).await.unwrap_or_default();
+    drop(guard);
+    let (count, retained) = raw.trim().split_once('|').map_or((0, 0), |(c, b)| {
+        (c.parse().unwrap_or(0), b.parse().unwrap_or(0))
+    });
+    (
+        StatusCode::OK,
+        Json(DonorRetentionResponse {
+            retained_bytes: retained,
+            slot_count: count,
+        }),
+    )
+}
+
 pub(super) async fn get_subscription_progress(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
@@ -722,6 +779,17 @@ mod tests {
             DonorClaim::Contradicts,
         ];
         assert!(!donor_quorum_confirms(&mixed, 3));
+    }
+
+    /// The donor stays sealed while the recipient drains, so a subscriber that
+    /// never catches up turns a green-side stall into a blue-side outage.
+    #[test]
+    fn a_donor_holding_too_much_wal_aborts_rather_than_waiting_out_the_budget() {
+        let budget = 8 * 1024 * 1024 * 1024;
+        assert_eq!(donor_wal_risk(budget, budget), DonorRisk::Abort);
+        assert_eq!(donor_wal_risk(budget + 1, budget), DonorRisk::Abort);
+        assert_eq!(donor_wal_risk(budget - 1, budget), DonorRisk::Continue);
+        assert_eq!(donor_wal_risk(0, budget), DonorRisk::Continue);
     }
 
     /// Guard against the empty-set case reading as unanimous consent.
