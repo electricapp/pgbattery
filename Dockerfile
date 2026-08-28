@@ -4,7 +4,7 @@
 # the managed GUCs) through this default; CI can matrix it via --build-arg.
 ARG PG_MAJOR=18
 
-FROM rust:1.97 AS builder
+FROM rust:1.98 AS builder
 WORKDIR /app
 
 # Cargo profile for the binary. `ci` is release optimisation without the
