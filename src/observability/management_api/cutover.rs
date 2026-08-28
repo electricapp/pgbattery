@@ -548,6 +548,31 @@ pub(super) async fn get_donor_retention(
     )
 }
 
+/// Schema shape of this node, for comparing donor against recipient.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaDigestResponse {
+    pub digest: String,
+}
+
+pub(super) async fn get_schema_digest(
+    State(state): State<Arc<ManagementApiState>>,
+) -> impl IntoResponse {
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(SchemaDigestResponse {
+                digest: String::new(),
+            }),
+        );
+    };
+    let guard = pg.lock().await;
+    let digest = crate::commands::upgrade::ddl_freeze::schema_digest(&guard)
+        .await
+        .unwrap_or_default();
+    drop(guard);
+    (StatusCode::OK, Json(SchemaDigestResponse { digest }))
+}
+
 pub(super) async fn get_subscription_progress(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {

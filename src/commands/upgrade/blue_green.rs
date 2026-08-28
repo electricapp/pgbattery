@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::commands::doctor::require_doctor_strict;
+use crate::commands::upgrade::ddl_freeze::schema_digests_agree;
 use crate::commands::upgrade::postgres::{
     PostgresUpgradeParams, cluster_client_and_entry, missing_extension_controls,
     require_target_bin_on_node,
@@ -46,6 +47,9 @@ pub struct BlueGreenPreflightReport {
     pub fence_failures: Vec<String>,
     pub security_definer_paths: Vec<String>,
     pub extensions_ok: usize,
+    /// Schema shape, for comparing donor against recipient before a cutover.
+    #[serde(default)]
+    pub schema_digest: String,
     pub notes: Vec<String>,
 }
 
@@ -126,6 +130,18 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
         green_pg,
         green_cluster_id,
     } = plan;
+
+    // Before anything is fenced: logical replication carries rows, not DDL, so
+    // a column only blue has is one the cutover would silently drop.
+    let donor_schema = client.get_schema_digest(&blue_mgmt).await?;
+    let recipient_schema = client.get_schema_digest(&green_mgmt).await?;
+    if !schema_digests_agree(&donor_schema, &recipient_schema) {
+        bail!(
+            "Schema digests differ (donor {donor_schema:?}, recipient {recipient_schema:?}). \
+             Logical replication does not carry DDL, so the recipient must already have \
+             the donor's schema. An empty digest means no user tables were found."
+        );
+    }
 
     info!(
         donor = %blue_mgmt,
@@ -387,6 +403,7 @@ pub async fn run_local_blue_green_preflight(
         to_major: req.to_major,
         ..Default::default()
     };
+    report.schema_digest = crate::commands::upgrade::ddl_freeze::schema_digest(supervisor).await?;
     fill_logical_gaps(supervisor, req, &mut report).await?;
     audit_green_extensions(supervisor, bin_dirs, req, &mut report).await?;
     Ok(report)

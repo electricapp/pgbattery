@@ -12,6 +12,7 @@ pub(crate) mod blue_green;
 pub(crate) mod client_fence;
 mod cluster;
 mod cosign;
+pub(crate) mod ddl_freeze;
 pub(crate) mod postgres;
 
 pub use postgres::{PostgresUpgradeParams, TransferMode, run_postgres_upgrade};

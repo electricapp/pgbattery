@@ -715,7 +715,7 @@ impl App {
     }
 
     fn spawn_client_fence_reconciler(input: ClientFenceReconcilerInputs) -> JoinHandle<()> {
-        use crate::commands::upgrade::client_fence;
+        use crate::commands::upgrade::{client_fence, ddl_freeze};
 
         let ClientFenceReconcilerInputs {
             mut fence_rx,
@@ -743,10 +743,20 @@ impl App {
                     let result = match client_fence::fence_is_applied(&guard, &roles).await {
                         Ok(is_fenced) => match client_fence::fence_action(want_fenced, is_fenced) {
                             client_fence::FenceAction::Apply => {
-                                client_fence::apply_client_write_fence(&guard, &roles).await
+                                // DDL rides the fence: a digest compared while
+                                // DDL can still land says nothing.
+                                match ddl_freeze::install_ddl_freeze(&guard).await {
+                                    Ok(()) => {
+                                        client_fence::apply_client_write_fence(&guard, &roles).await
+                                    }
+                                    Err(e) => Err(e),
+                                }
                             }
                             client_fence::FenceAction::Lift => {
-                                client_fence::lift_client_write_fence(&guard, &roles).await
+                                match client_fence::lift_client_write_fence(&guard, &roles).await {
+                                    Ok(()) => ddl_freeze::remove_ddl_freeze(&guard).await,
+                                    Err(e) => Err(e),
+                                }
                             }
                             client_fence::FenceAction::None => Ok(()),
                         },

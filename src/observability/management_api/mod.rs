@@ -60,7 +60,7 @@ pub use backup::{
 pub use cluster::{MemberInfo, MembershipResponse, TransferResponse};
 pub use cutover::{
     CutoverActionResponse, CutoverStatusResponse, DonorRetentionResponse, DonorRisk,
-    SubscriptionProgressResponse, donor_wal_risk,
+    SchemaDigestResponse, SubscriptionProgressResponse, donor_wal_risk,
 };
 pub use discovery::{
     ClusterIdentityResponse, JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse,
@@ -405,6 +405,10 @@ pub async fn start_management_api(
         .route(
             "/api/v1/cutover/donor-retention",
             get(cutover::get_donor_retention),
+        )
+        .route(
+            "/api/v1/cutover/schema-digest",
+            get(cutover::get_schema_digest),
         )
         .route(
             "/api/v1/admin/postgres-upgrade/freeze",

@@ -909,6 +909,32 @@ impl ClusterClient {
         Ok(body.retained_bytes)
     }
 
+    /// Schema shape of the cluster at `addr`.
+    ///
+    /// # Errors
+    /// The node is unreachable or answers with a non-success status.
+    pub async fn get_schema_digest(&self, addr: &str) -> Result<String> {
+        let url = format!("http://{addr}/api/v1/cutover/schema-digest");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "schema digest",
+                status,
+                &body,
+                false
+            ));
+        }
+        let body: crate::observability::management_api::SchemaDigestResponse = resp.json().await?;
+        Ok(body.digest)
+    }
+
     /// Drive one step of the cutover protocol on `addr`.
     ///
     /// `step` is the path segment under `/api/v1/admin/cutover/`. A 409 means
