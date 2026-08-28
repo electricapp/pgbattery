@@ -398,6 +398,7 @@ pub async fn start_management_api(
             "/api/v1/admin/cutover/receive-authority",
             post(cutover::cutover_receive_authority),
         )
+        .route("/api/v1/admin/cutover/seed", post(cutover::seed_recipient))
         .route(
             "/api/v1/cutover/subscription-progress",
             get(cutover::get_subscription_progress),

@@ -548,6 +548,73 @@ pub(super) async fn get_donor_retention(
     )
 }
 
+/// Seed this node from a donor: schema first, then a copying subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedRecipientRequest {
+    /// libpq conninfo for the donor primary.
+    pub donor_conninfo: String,
+    pub publication: String,
+    pub subscription: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedRecipientResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Whether every subscribed table has finished its initial copy.
+    pub initial_sync_complete: bool,
+}
+
+pub(super) async fn seed_recipient(
+    State(state): State<Arc<ManagementApiState>>,
+    Json(body): Json<SeedRecipientRequest>,
+) -> impl IntoResponse {
+    use crate::commands::upgrade::seed_green;
+
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(SeedRecipientResponse {
+                success: false,
+                message: Some("No PostgreSQL supervisor on this node".into()),
+                initial_sync_complete: false,
+            }),
+        );
+    };
+    let guard = pg.lock().await;
+    let seeded = seed_green::seed_from_donor(
+        &guard,
+        &body.donor_conninfo,
+        &body.publication,
+        &body.subscription,
+    )
+    .await;
+    let states = seed_green::subscription_sync_states(&guard)
+        .await
+        .unwrap_or_default();
+    drop(guard);
+
+    match seeded {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SeedRecipientResponse {
+                success: true,
+                message: None,
+                initial_sync_complete: seed_green::initial_sync_complete(&states),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(SeedRecipientResponse {
+                success: false,
+                message: Some(format!("{e:#}")),
+                initial_sync_complete: false,
+            }),
+        ),
+    }
+}
+
 /// Schema shape of this node, for comparing donor against recipient.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaDigestResponse {

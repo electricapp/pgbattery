@@ -876,7 +876,9 @@ impl ClusterClient {
         if body.subscription_count == 0 {
             anyhow::bail!(
                 "{addr} has no logical subscriptions: the recipient must already be \
-                 streaming from the donor before a cutover can drain it"
+                 streaming from the donor before a cutover can drain it. Seed it with \
+                 POST /api/v1/admin/cutover/seed (donor schema, then a copying \
+                 subscription), and wait for the initial copy to finish."
             );
         }
         Ok(body.applied_lsn)

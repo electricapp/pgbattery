@@ -14,6 +14,7 @@ mod cluster;
 mod cosign;
 pub(crate) mod ddl_freeze;
 pub(crate) mod postgres;
+pub(crate) mod seed_green;
 
 pub use postgres::{PostgresUpgradeParams, TransferMode, run_postgres_upgrade};
 

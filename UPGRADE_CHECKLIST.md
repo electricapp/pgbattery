@@ -29,11 +29,12 @@ Shared spine before Track B/C is honest:
 | 8   | Track C cutover protocol — **TLA+ before code**            | C        | [x]    |
 | 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [~]    |
 
-Step 9 is `[~]`, not `[x]`. The cutover protocol, both fences, the epoch
-projection, provenance verification, the operator command, and the proofs are
-in. What is missing is everything _before_ the handoff: green provisioning and
-logical seeding, the DDL freeze, and the schema digest. See "Not implemented"
-under Track C.
+Step 9 is `[~]`, not `[x]`. Every piece is now written — protocol, both fences,
+the epoch projection, provenance verification, seeding, the DDL freeze and
+digest, the retention monitor. What is missing is evidence: the seeding, the
+DDL trigger, the digest query and the retention query have never run, and the
+Track C matrix cases have not passed since those changes. `[x]` here means
+written, not proven.
 
 Do **not** parallelize 5, 6, and 8–9 in one branch. Do **not** ship wire-format
 and PG-major upgrade in the same release if avoidable.
@@ -123,9 +124,9 @@ and PG-major upgrade in the same release if avoidable.
 - [x] Continuous writer with an acked-key ledger across the freeze (W1)
 - [x] Backup + verified-restore preflight actually runs (no `--allow-no-backup` in the proof)
 - [x] Post-upgrade `PG_VERSION` proves N+1 on every node (anti-vacuity: refuse if still on N)
-- [ ] Chaos mid-`pg_upgrade` itself (kill the process during file transfer). The
-      budget/`kill_on_drop` path and the discard-on-resume rule are unit-covered;
-      a live case still needs writing.
+- [x] Chaos mid-`pg_upgrade` itself — `pg-major-upgrade-chaos-mid-upgrade`. Waits
+      for `pg_upgrade` to actually be running before the SIGKILL, so a run that
+      killed nothing fails rather than passing. **Never executed.**
 
 ---
 
@@ -188,13 +189,19 @@ and PG-major upgrade in the same release if avoidable.
 
 ### Not implemented (Track C)
 
-- [ ] Product-side green provisioning and logical seeding (`pg_createsubscriber`
-      or dump + `CREATE SUBSCRIPTION`). The cutover command requires green to be
-      already streaming and says so rather than pretending; the e2e harness does
-      the seeding.
-- [ ] DDL freeze event trigger and schema digest. `UPGRADE.md` calls these
-      "enforced, not requested"; preflight only reports the gap.
-- [ ] WAL-retention / slot-lag monitor that aborts before the donor is at risk.
+- [x] Green provisioning and logical seeding — `POST /api/v1/admin/cutover/seed`
+      dumps the donor schema, restores it, and creates a copying subscription.
+      Refuses a recipient that already has tables. The initial-copy gate reads
+      `pg_subscription_rel.srsubstate`, where no subscribed tables is not
+      completion. **Never executed.**
+- [x] DDL freeze event trigger and schema digest. The trigger rides the
+      client-write fence so the reconciler removes it from committed state —
+      one left installed would block every DDL forever. The cutover refuses
+      mismatched digests, and two empty digests are a mismatch. **The trigger
+      and digest SQL have never executed**; `schema_digests_agree` is unit-tested.
+- [x] WAL-retention / slot-lag monitor — the drain wait reads donor retention
+      each round and aborts while the donor can still be unsealed.
+      `donor_wal_risk` is unit-tested; **the query has never executed.**
 - [x] Reverse cutover. What blocked it was the arm guard, not a missing command:
       a recipient sat in TRANSFERRED and `CutoverArmed` took only IDLE/ABORTED.
       With that fixed the existing command drives it by swapping `--node` and
