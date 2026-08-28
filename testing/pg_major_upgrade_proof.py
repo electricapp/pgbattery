@@ -126,52 +126,39 @@ def _wait_leader(timeout: float = 180.0) -> None:
     raise SystemExit(f"no leader: {last}")
 
 
-def _await_pg_ready(node: Node, timeout: float = 180.0) -> None:
-    """A restarted node answers the management API before it answers SQL."""
+def _pg_major(node: Node, timeout: float = 180.0) -> int:
+    """Poll the query itself: pg_isready can pass and the postmaster still bounce."""
     last = ""
 
-    def ready() -> bool | None:
+    def major() -> int | None:
         nonlocal last
         proc = _compose(
             "exec",
             "-T",
             node.service,
-            "pg_isready",
+            "psql",
             "-h",
             "127.0.0.1",
             "-p",
             str(topology.PG_INTERNAL_PORT),
             "-U",
             "postgres",
+            "-At",
+            "-c",
+            "SHOW server_version_num;",
             check=False,
         )
-        if proc.returncode == 0:
-            return True
-        last = (proc.stderr or proc.stdout).strip()
-        return None
+        if proc.returncode != 0:
+            last = (proc.stderr or proc.stdout).strip()
+            return None
+        return int(proc.stdout.strip()) // 10_000
 
     try:
-        await_until(ready, budget=timeout, describe=f"{node.service} to accept SQL", interval=2.0)
+        return await_until(
+            major, budget=timeout, describe=f"{node.service} to report its major", interval=2.0
+        )
     except WaitTimeout as exc:
         raise ContractFailure(f"{exc}: {last}") from exc
-
-
-def _pg_major(node: Node) -> int:
-    _await_pg_ready(node)
-    out = _exec(
-        node.service,
-        "psql",
-        "-h",
-        "127.0.0.1",
-        "-p",
-        str(topology.PG_INTERNAL_PORT),
-        "-U",
-        "postgres",
-        "-At",
-        "-c",
-        "SHOW server_version_num;",
-    ).strip()
-    return int(out) // 10_000
 
 
 def _assert_majors(expected: int) -> None:
