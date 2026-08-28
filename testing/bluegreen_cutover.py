@@ -39,6 +39,17 @@ from topology import Node, Topology, load
 
 PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 APP_ROLE: Final[str] = "bg_app"
+# The U1 prober's table, created here as the superuser and granted to the app
+# role. Letting the prober create it would need CREATE on schema public, and a
+# role that can create a table it owns writes to it whatever the fence revoked.
+PROBE_TABLE_DDL: Final[str] = f"""
+CREATE TABLE IF NOT EXISTS pgb_dual_write_probe (
+  node_id   integer PRIMARY KEY,
+  round_seq bigint  NOT NULL,
+  probe_ns  bigint  NOT NULL
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON pgb_dual_write_probe TO {APP_ROLE};
+"""
 # Bounds any single docker call; the image is built by the job beforehand.
 COMPOSE_TIMEOUT_SEC: Final[float] = 300.0
 SUB_OWNER: Final[str] = "postgres"
@@ -205,6 +216,7 @@ def _setup_schema(blue_leader: Node) -> None:
         );
         GRANT SELECT, INSERT, UPDATE, DELETE ON bg_kv TO {APP_ROLE};
         GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {APP_ROLE};
+        {PROBE_TABLE_DDL}
         """,
     )
 
@@ -244,6 +256,7 @@ def _seed_logical(blue_leader: Node, green_leader: Node) -> None:
         );
         GRANT SELECT, INSERT, UPDATE, DELETE ON bg_kv TO {APP_ROLE};
         GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {APP_ROLE};
+        {PROBE_TABLE_DDL}
         """,
     )
     blue_conn = (
@@ -600,32 +613,30 @@ def _chaos_mid_drain(blue_leader: Node, green_leader: Node) -> None:
     raise ContractFailure("abort reported success but blue never accepted a write again")
 
 
-def _await_quorum_loss(node: Node, timeout: float = 90.0) -> None:
-    """Block until `node` no longer reports a leader.
+def _assert_stopped(nodes: list[Node]) -> None:
+    """Confirm the containers really are down before asserting on the effect.
 
-    Stopping two of three containers is the request; losing quorum is the
-    effect, and openraft only notices once its heartbeats time out. Asserting
-    fail-closed before then tests how long `docker stop` took.
+    This is the fault, and it is what makes the next assertion sound: with two
+    of three gone no majority can ack, so any commit that still succeeds is a
+    real violation. Waiting instead for blue to stop *reporting* a leader would
+    test openraft's demotion timing, which is not the contract.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            r = httpx.get(f"{_mgmt(node)}/api/v1/cluster/leader", timeout=2.0)
-            if r.status_code != 200 or r.json().get("leader_id") is None:
-                return
-        except httpx.HTTPError:
-            return
-        time.sleep(1.0)
-    raise ContractFailure(f"{node.service} still reports a leader with two of three nodes stopped")
+    for n in nodes:
+        state = _compose("ps", "-a", "--format", "{{.Service}} {{.State}}").stdout
+        for line in state.splitlines():
+            service, _, status = line.partition(" ")
+            if service == n.service and status.strip().startswith("running"):
+                raise ContractFailure(f"{n.service} still running after compose stop: {status}")
 
 
 def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
     followers = [n for n in blue if n.service != blue_leader.service]
-    for f in followers[:2]:
+    stopped = followers[:2]
+    for f in stopped:
         _compose("stop", f.service, check=True)
-    _await_quorum_loss(blue_leader)
+    _assert_stopped(stopped)
 
     body = {
         "target_cluster_id": GREEN_CLUSTER,

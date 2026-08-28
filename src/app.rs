@@ -754,7 +754,14 @@ impl App {
                     };
                     drop(guard);
                     if let Err(e) = result {
-                        warn!(error = %e, want_fenced, "Client-write fence reconcile failed");
+                        // Waiting for the next fence change would strand the
+                        // cluster: the abort that needs lifting has already
+                        // been observed, and nothing else is coming.
+                        warn!(error = %e, want_fenced, "Client-write fence reconcile failed; retrying");
+                        tokio::select! {
+                            () = tokio::time::sleep(CLIENT_FENCE_RETRY_INTERVAL) => continue,
+                            _ = shutdown_rx.changed() => return,
+                        }
                     }
                 }
                 tokio::select! {
@@ -3379,6 +3386,10 @@ fn clear_dir_contents(data_dir: &std::path::Path) -> Result<()> {
 /// one.
 const JOIN_CLONE_ATTEMPTS: u32 = 12;
 const JOIN_CLONE_RETRY: Duration = Duration::from_secs(2);
+
+/// Gap before retrying a failed client-fence reconcile. The desired state is
+/// already known, so the only thing to wait for is `PostgreSQL`.
+const CLIENT_FENCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run `attempt` until it succeeds, up to `attempts` times, pausing `delay`
 /// between tries. The caller sees the last failure.

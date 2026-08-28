@@ -195,9 +195,10 @@ and PG-major upgrade in the same release if avoidable.
 - [ ] DDL freeze event trigger and schema digest. `UPGRADE.md` calls these
       "enforced, not requested"; preflight only reports the gap.
 - [ ] WAL-retention / slot-lag monitor that aborts before the donor is at risk.
-- [ ] Reverse-cutover as its own command. The protocol is symmetric and the
-      drill runs it with the roles exchanged, but there is no `--rollback` flag
-      that drives it.
+- [ ] Reverse-cutover as its own command. The state machine now lets the cluster
+      holding authority arm one, and `bluegreen-rollback-drill` runs the protocol
+      with the roles exchanged, but there is no `--rollback` flag that drives it
+      for an operator.
 
 Matrix case IDs: `bluegreen-cutover`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`.
 

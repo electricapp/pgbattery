@@ -125,7 +125,38 @@ def _wait_leader(timeout: float = 180.0) -> None:
     raise SystemExit(f"no leader: {last}")
 
 
+def _await_pg_ready(node: Node, timeout: float = 180.0) -> None:
+    """Block until `node` answers SQL.
+
+    A node re-basebackuped or restarted by the upgrade answers the management
+    API before its postmaster finishes recovery, so probing it straight away
+    gets "the database system is starting up" and fails a run that was fine.
+    """
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        proc = _compose(
+            "exec",
+            "-T",
+            node.service,
+            "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            str(topology.PG_INTERNAL_PORT),
+            "-U",
+            "postgres",
+            check=False,
+        )
+        if proc.returncode == 0:
+            return
+        last = (proc.stderr or proc.stdout).strip()
+        time.sleep(2.0)
+    raise ContractFailure(f"{node.service} PostgreSQL not ready in {timeout:g}s: {last}")
+
+
 def _pg_major(node: Node) -> int:
+    _await_pg_ready(node)
     out = _exec(
         node.service,
         "psql",

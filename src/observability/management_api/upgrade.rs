@@ -259,7 +259,7 @@ pub(super) async fn postgres_upgrade_preflight(
                 StatusCode::BAD_REQUEST,
                 Json(PostgresUpgradePreflightResponse {
                     success: false,
-                    message: Some(e.to_string()),
+                    message: Some(format!("{e:#}")),
                     from_major: 0,
                     to_major: body.to_major,
                     transfer_mode: body.transfer_mode,
@@ -348,7 +348,7 @@ pub(super) async fn blue_green_preflight(
                 StatusCode::BAD_REQUEST,
                 Json(BlueGreenPreflightHttpResponse {
                     success: false,
-                    message: Some(e.to_string()),
+                    message: Some(format!("{e:#}")),
                     report: None,
                 }),
             )
@@ -533,7 +533,7 @@ pub(super) async fn postgres_upgrade_apply(
                 StatusCode::BAD_REQUEST,
                 Json(PostgresUpgradeApplyResponse {
                     success: false,
-                    message: Some(e.to_string()),
+                    message: Some(format!("{e:#}")),
                     from_major: 0,
                     to_major: body.to_major,
                 }),
@@ -569,7 +569,7 @@ pub(super) async fn postgres_upgrade_apply(
                 StatusCode::BAD_REQUEST,
                 Json(PostgresUpgradeApplyResponse {
                     success: false,
-                    message: Some(e.to_string()),
+                    message: Some(format!("{e:#}")),
                     from_major: 0,
                     to_major: body.to_major,
                 }),
@@ -666,7 +666,7 @@ pub(super) async fn postgres_upgrade_rejoin(
             StatusCode::BAD_REQUEST,
             Json(PostgresUpgradeRejoinResponse {
                 success: false,
-                message: Some(e.to_string()),
+                message: Some(format!("{e:#}")),
             }),
         ),
     }
@@ -763,7 +763,7 @@ pub(super) async fn postgres_upgrade_confirm(
             StatusCode::BAD_REQUEST,
             Json(PostgresUpgradeConfirmResponse {
                 success: false,
-                message: Some(e.to_string()),
+                message: Some(format!("{e:#}")),
             }),
         ),
     }
@@ -857,7 +857,7 @@ pub(super) async fn postgres_upgrade_rollback(
             StatusCode::BAD_REQUEST,
             Json(PostgresUpgradeRollbackResponse {
                 success: false,
-                message: Some(e.to_string()),
+                message: Some(format!("{e:#}")),
                 from_major: 0,
             }),
         ),

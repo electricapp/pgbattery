@@ -165,6 +165,28 @@ class Writer(threading.Thread):
 
 
 @app.command()
+def _await_writer_stalled(writer: Writer, timeout: float = 30.0) -> int:
+    """Wait for the freeze to actually reach the gateways, return the ack count.
+
+    Committing the freeze returns before every gateway has observed the new
+    fence, so a write already in flight is still acked. Counting from the
+    request would charge that propagation window to the hold. A writer that
+    never stalls means the freeze did nothing, which is the real failure.
+    """
+    deadline = time.monotonic() + timeout
+    last = writer.acked
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        now = writer.acked
+        if now != last:
+            last = now
+            stable_since = time.monotonic()
+        elif time.monotonic() - stable_since >= 1.5:
+            return now
+    raise ContractFailure(f"freeze committed but writers kept acking for {timeout:g}s")
+
+
 def main(
     chaos: str | None = typer.Option(None, help="mid-freeze | mid-unfreeze"),
     hold_sec: float = typer.Option(5.0, "--hold-sec"),
@@ -183,6 +205,7 @@ def main(
 
     try:
         _set_freeze(topo, True)
+        held_from = _await_writer_stalled(writer)
 
         if chaos == "mid-freeze":
             subprocess.run(
@@ -191,7 +214,7 @@ def main(
                 check=False,
             )
             time.sleep(3)
-            during = writer.acked - before
+            during = writer.acked - held_from
             if during > 0:
                 raise ContractFailure(
                     f"L1/V1: {during} writes acked while frozen with the leader killed"
@@ -200,7 +223,7 @@ def main(
             return
 
         time.sleep(hold_sec)
-        during = writer.acked - before
+        during = writer.acked - held_from
         # The whole point of the freeze is that clients stop making progress.
         # Without this the case passes just as happily on a freeze that did
         # nothing at all.
