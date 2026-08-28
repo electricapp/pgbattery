@@ -345,6 +345,7 @@ jobs:
           - cluster-binary-upgrade-proof
           - pg-major-upgrade-proof
           - pg-major-upgrade-rollback-drill
+          - pg-major-upgrade-chaos-mid-upgrade
           - bluegreen-cutover
           - bluegreen-rollback-drill
           - bluegreen-chaos-arm-seal

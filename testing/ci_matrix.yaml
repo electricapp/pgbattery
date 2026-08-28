@@ -155,7 +155,8 @@
         "bluegreen-chaos-seal-transfer",
         "bluegreen-chaos-mid-drain",
         "bluegreen-chaos-blue-quorum",
-        "pg-major-upgrade-rollback-drill"
+        "pg-major-upgrade-rollback-drill",
+        "pg-major-upgrade-chaos-mid-upgrade"
       ]
     }
   },
@@ -2644,6 +2645,18 @@
         {
           "type": "cmd",
           "cmd": "testing/pg_major_upgrade_proof.py --rollback-drill",
+          "timeout_sec": 900
+        }
+      ]
+    },
+    {
+      "id": "pg-major-upgrade-chaos-mid-upgrade",
+      "contracts": ["W1", "V1"],
+      "description": "Track B chaos during pg_upgrade itself: SIGKILL pg_upgrade mid-transfer and require the old cluster to survive. Waits for pg_upgrade to actually be running before killing it, so a run that killed nothing fails rather than passing. Asserts the apply reports failure, the primary still reports major 17, and it accepts a write — the discard-on-resume rule, which treats a target directory no postmaster ever started as wreckage.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pg_major_upgrade_proof.py --chaos mid-upgrade",
           "timeout_sec": 900
         }
       ]

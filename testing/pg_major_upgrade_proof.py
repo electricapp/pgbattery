@@ -282,11 +282,63 @@ def _require_dual_majors() -> None:
 
 
 @app.command()
+def _unfreeze() -> None:
+    """Leave no cluster frozen: the next case would wedge on the gateway hold."""
+    for n in load().nodes:
+        try:
+            r = httpx.post(
+                f"http://127.0.0.1:{n.mgmt_port}/api/v1/admin/postgres-upgrade/freeze",
+                headers={"x-pgbattery-token": _token()},
+                json={"frozen": False},
+                timeout=30.0,
+            )
+            if r.status_code == 200:
+                return
+        except httpx.HTTPError:
+            continue
+
+
+def _chaos_mid_upgrade(service: str, entry: str, gateway: int) -> None:
+    """Kill pg_upgrade mid-transfer. The old cluster must survive intact."""
+    result: dict[str, int] = {}
+
+    def apply() -> None:
+        proc = _pgbattery(
+            service, f"upgrade postgres --to {TO_MAJOR} --experimental --node {entry}"
+        )
+        result["rc"] = proc.returncode
+
+    worker = threading.Thread(target=apply, name="pg-upgrade-apply", daemon=True)
+    worker.start()
+
+    def running() -> bool | None:
+        p = _compose("exec", "-T", service, "pgrep", "-f", "pg_upgrade", check=False)
+        return True if p.returncode == 0 else None
+
+    try:
+        await_until(running, budget=600.0, describe="pg_upgrade to start", interval=1.0)
+    except WaitTimeout as exc:
+        raise ContractFailure(f"pg_upgrade never ran, so the kill proved nothing: {exc}") from exc
+
+    _compose("exec", "-T", service, "pkill", "-9", "-f", "pg_upgrade", check=False)
+    worker.join(timeout=600)
+    if result.get("rc", 1) == 0:
+        raise ContractFailure("apply reported success after pg_upgrade was killed")
+
+    _unfreeze()
+    live = _pg_major(load().nodes[0])
+    if live != FROM_MAJOR:
+        raise ContractFailure(f"after a killed pg_upgrade the primary reports {live}, not FROM")
+    _seed(gateway)
+    console.print(f"chaos mid-upgrade OK: primary intact on {FROM_MAJOR}, still accepting writes")
+
+
 def main(
     no_up: bool = typer.Option(False, "--no-up", help="Skip docker compose up"),
     rollback_drill: bool = typer.Option(
         False, "--rollback-drill", help="Roll back instead of confirming"
     ),
+    chaos: str | None = typer.Option(None, help="mid-upgrade"),
 ) -> None:
     _token()
     os.environ["COMPOSE_FILE"] = COMPOSE_FILE
@@ -302,6 +354,12 @@ def main(
 
     gateway = topo.nodes[0].gateway_port
     _seed(gateway)
+
+    if chaos == "mid-upgrade":
+        _chaos_mid_upgrade(topo.nodes[0].service, _entry_addr(), gateway)
+        return
+    if chaos is not None:
+        raise SystemExit(f"unknown --chaos {chaos!r}")
 
     writer = Writer(gateway)
     writer.start()
