@@ -531,8 +531,12 @@ pub(super) async fn get_donor_retention(
     let guard = pg.lock().await;
     // Logical slots only: a physical standby's slot is normal replication,
     // not WAL held for a cutover that may never finish.
-    let sql = "SELECT count(*)::text || '|' || COALESCE(max(\
-               pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))::bigint, 0)::text \
+    // pg_current_wal_lsn() raises on a standby, so the CASE picks the receive
+    // position there. CASE short-circuits execution, which is enough for a
+    // function that errors — unlike a missing relation, which fails at parse.
+    let sql = "SELECT count(*)::text || '|' || COALESCE(max(pg_wal_lsn_diff(\
+               CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() \
+               ELSE pg_current_wal_lsn() END, restart_lsn))::bigint, 0)::text \
                FROM pg_replication_slots WHERE slot_type = 'logical' AND restart_lsn IS NOT NULL;";
     let raw = guard.execute_sql(sql).await.unwrap_or_default();
     drop(guard);

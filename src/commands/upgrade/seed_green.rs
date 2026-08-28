@@ -54,6 +54,9 @@ pub(crate) async fn seed_from_donor(
     publication: &str,
     subscription: &str,
 ) -> Result<()> {
+    if !super::client_fence::node_is_primary(supervisor).await? {
+        bail!("Seeding writes a schema and a subscription; run it on the recipient's primary");
+    }
     let digest = super::ddl_freeze::schema_digest(supervisor).await?;
     if !recipient_is_seedable(&digest) {
         bail!(

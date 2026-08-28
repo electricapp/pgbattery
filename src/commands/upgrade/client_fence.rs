@@ -167,6 +167,22 @@ pub const fn fence_action(want_fenced: bool, is_fenced: bool) -> FenceAction {
     }
 }
 
+/// Whether this node can be written to at all.
+///
+/// The fence and the DDL freeze are both writes, so on a standby every attempt
+/// is refused as read-only. Without this the reconciler's retry would spin for
+/// the life of the process on every follower.
+///
+/// # Errors
+/// SQL failure, or a reply that is not a boolean.
+pub async fn node_is_primary(supervisor: &crate::supervisor::Supervisor) -> Result<bool> {
+    let raw = supervisor
+        .execute_sql("SELECT NOT pg_is_in_recovery();")
+        .await
+        .context("probing whether this node is the primary")?;
+    parse_pg_bool(&raw)
+}
+
 /// Whether the fence is currently applied to any of `app_roles`.
 ///
 /// Read from the snapshot table rather than remembered: the seal handler

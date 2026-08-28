@@ -735,7 +735,19 @@ impl App {
                 } else {
                     committed
                 };
-                if !roles.is_empty() {
+                // A standby refuses every REVOKE and every CREATE EVENT
+                // TRIGGER, so retrying there would spin for the life of the
+                // process. The primary carries the fence; replication carries
+                // it to the rest.
+                let primary = if roles.is_empty() {
+                    Ok(false)
+                } else {
+                    let guard = postgres.lock().await;
+                    let answer = client_fence::node_is_primary(&guard).await;
+                    drop(guard);
+                    answer
+                };
+                if primary.unwrap_or(false) {
                     let guard = postgres.lock().await;
                     // Probed, never remembered: the seal handler fences
                     // directly, so a cached "what I applied" would be false
