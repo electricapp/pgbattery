@@ -1,12 +1,12 @@
 //! DDL freeze and schema digest for Track C cutovers.
 //!
-//! The digest is only meaningful while DDL cannot land, so both live on the
-//! same lifecycle as the client-write fence: driven from committed state by the
-//! reconciler, which retries. A one-shot install that failed to be removed
-//! would leave the database unable to run any DDL at all.
+//! Driven from the committed cutover phase by the reconciler, which retries: a
+//! trigger left installed would block every DDL in the database forever.
 
 use anyhow::{Context, Result};
 use tracing::info;
+
+use crate::governor::state_machine::CutoverPhase;
 
 const FENCE_SCHEMA: &str = "pgbattery";
 const DDL_TRIGGER: &str = "pgbattery_ddl_freeze";
@@ -27,6 +27,32 @@ const SCHEMA_DIGEST_SQL: &str = "SELECT COALESCE(md5(string_agg(sig, E'\\n' ORDE
          AND n.nspname NOT IN ('pg_catalog','information_schema','pgbattery') \
          AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' \
      ) s;";
+
+/// Whether DDL must be frozen in this cutover phase.
+///
+/// The donor mid-cutover, and nothing else. Tying this to the client-write
+/// fence instead would freeze a recipient that is fenced from boot, and a
+/// recipient that cannot run DDL cannot be seeded.
+#[must_use]
+pub(crate) const fn ddl_should_freeze(phase: CutoverPhase) -> bool {
+    matches!(phase, CutoverPhase::Sealed | CutoverPhase::Draining)
+}
+
+/// Whether the freeze trigger is installed. Probed, not remembered.
+///
+/// # Errors
+/// SQL failure, or a reply that is not a boolean.
+pub(crate) async fn ddl_freeze_installed(
+    supervisor: &crate::supervisor::Supervisor,
+) -> Result<bool> {
+    let raw = supervisor
+        .execute_sql(&format!(
+            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = '{DDL_TRIGGER}');"
+        ))
+        .await
+        .context("probing for the DDL freeze trigger")?;
+    super::client_fence::parse_pg_bool(&raw)
+}
 
 /// Digest of the user schema, for comparing donor against recipient.
 ///
@@ -96,6 +122,29 @@ mod tests {
     fn an_empty_schema_never_agrees_with_another_empty_one() {
         assert!(!schema_digests_agree("", ""));
         assert!(!schema_digests_agree("   ", ""));
+    }
+
+    /// A recipient waiting for authority is fenced from boot but its phase is
+    /// IDLE. Freezing it there would block the schema restore and the
+    /// CREATE SUBSCRIPTION that seeding needs — both are DDL.
+    #[test]
+    fn a_recipient_awaiting_authority_is_not_ddl_frozen() {
+        assert!(!ddl_should_freeze(CutoverPhase::Idle));
+        assert!(!ddl_should_freeze(CutoverPhase::Armed));
+    }
+
+    /// The donor mid-cutover is the whole point: the digest was taken here.
+    #[test]
+    fn the_donor_is_frozen_from_seal_until_the_handoff_resolves() {
+        assert!(ddl_should_freeze(CutoverPhase::Sealed));
+        assert!(ddl_should_freeze(CutoverPhase::Draining));
+    }
+
+    /// Once it resolves either way, DDL has to come back.
+    #[test]
+    fn a_resolved_cutover_leaves_ddl_alone() {
+        assert!(!ddl_should_freeze(CutoverPhase::Transferred));
+        assert!(!ddl_should_freeze(CutoverPhase::Aborted));
     }
 
     #[test]

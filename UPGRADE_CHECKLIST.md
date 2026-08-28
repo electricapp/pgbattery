@@ -195,10 +195,10 @@ and PG-major upgrade in the same release if avoidable.
       `pg_subscription_rel.srsubstate`, where no subscribed tables is not
       completion. **Never executed.**
 - [x] DDL freeze event trigger and schema digest. The trigger rides the
-      client-write fence so the reconciler removes it from committed state —
-      one left installed would block every DDL forever. The cutover refuses
-      mismatched digests, and two empty digests are a mismatch. **The trigger
-      and digest SQL have never executed**; `schema_digests_agree` is unit-tested.
+      committed cutover phase, so the reconciler removes it from state —
+      one left installed would block every DDL forever. Frozen SEALED through
+      DRAINING only: a recipient fenced from boot is IDLE, and freezing it
+      there would block the very DDL seeding needs. **Never executed.**
 - [x] WAL-retention / slot-lag monitor — the drain wait reads donor retention
       each round and aborts while the donor can still be unsealed.
       `donor_wal_risk` is unit-tested; **the query has never executed.**

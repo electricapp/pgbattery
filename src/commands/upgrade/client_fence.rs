@@ -223,7 +223,7 @@ pub async fn fence_is_applied(
     parse_pg_bool(&raw)
 }
 
-fn parse_pg_bool(raw: &str) -> Result<bool> {
+pub(crate) fn parse_pg_bool(raw: &str) -> Result<bool> {
     match raw.trim() {
         "t" | "true" => Ok(true),
         "f" | "false" => Ok(false),

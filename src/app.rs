@@ -715,7 +715,7 @@ impl App {
     }
 
     fn spawn_client_fence_reconciler(input: ClientFenceReconcilerInputs) -> JoinHandle<()> {
-        use crate::commands::upgrade::{client_fence, ddl_freeze};
+        use crate::commands::upgrade::client_fence;
 
         let ClientFenceReconcilerInputs {
             mut fence_rx,
@@ -748,32 +748,12 @@ impl App {
                     answer
                 };
                 if primary.unwrap_or(false) {
+                    let phase = cluster_state.read().cutover.phase;
                     let guard = postgres.lock().await;
-                    // Probed, never remembered: the seal handler fences
-                    // directly, so a cached "what I applied" would be false
-                    // exactly when the abort needs to lift.
-                    let result = match client_fence::fence_is_applied(&guard, &roles).await {
-                        Ok(is_fenced) => match client_fence::fence_action(want_fenced, is_fenced) {
-                            client_fence::FenceAction::Apply => {
-                                // DDL rides the fence: a digest compared while
-                                // DDL can still land says nothing.
-                                match ddl_freeze::install_ddl_freeze(&guard).await {
-                                    Ok(()) => {
-                                        client_fence::apply_client_write_fence(&guard, &roles).await
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            }
-                            client_fence::FenceAction::Lift => {
-                                match client_fence::lift_client_write_fence(&guard, &roles).await {
-                                    Ok(()) => ddl_freeze::remove_ddl_freeze(&guard).await,
-                                    Err(e) => Err(e),
-                                }
-                            }
-                            client_fence::FenceAction::None => Ok(()),
-                        },
-                        Err(e) => Err(e),
-                    };
+                    // Unfreeze before touching the fence and freeze after:
+                    // applying the fence creates the snapshot table, which is
+                    // DDL the freeze would refuse.
+                    let result = reconcile_ddl_and_fence(&guard, &roles, want_fenced, phase).await;
                     drop(guard);
                     if let Err(e) = result {
                         // Waiting for the next fence change would strand the
@@ -3412,6 +3392,41 @@ const JOIN_CLONE_RETRY: Duration = Duration::from_secs(2);
 /// Gap before retrying a failed client-fence reconcile. The desired state is
 /// already known, so the only thing to wait for is `PostgreSQL`.
 const CLIENT_FENCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Bring the DDL freeze and the client-write fence in line with committed state.
+///
+/// Order matters: the fence's snapshot table is created with DDL, so the freeze
+/// has to be off while the fence is touched and go back on afterwards.
+async fn reconcile_ddl_and_fence(
+    supervisor: &Supervisor,
+    roles: &[String],
+    want_fenced: bool,
+    phase: crate::governor::state_machine::CutoverPhase,
+) -> Result<()> {
+    use crate::commands::upgrade::{client_fence, ddl_freeze};
+
+    let want_freeze = ddl_freeze::ddl_should_freeze(phase);
+    let frozen = ddl_freeze::ddl_freeze_installed(supervisor).await?;
+    if frozen {
+        ddl_freeze::remove_ddl_freeze(supervisor).await?;
+    }
+
+    let is_fenced = client_fence::fence_is_applied(supervisor, roles).await?;
+    match client_fence::fence_action(want_fenced, is_fenced) {
+        client_fence::FenceAction::Apply => {
+            client_fence::apply_client_write_fence(supervisor, roles).await?;
+        }
+        client_fence::FenceAction::Lift => {
+            client_fence::lift_client_write_fence(supervisor, roles).await?;
+        }
+        client_fence::FenceAction::None => {}
+    }
+
+    if want_freeze {
+        ddl_freeze::install_ddl_freeze(supervisor).await?;
+    }
+    Ok(())
+}
 
 /// Run `attempt` until it succeeds, up to `attempts` times, pausing `delay`
 /// between tries. The caller sees the last failure.
