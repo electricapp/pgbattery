@@ -602,22 +602,42 @@ pub(super) async fn cutover_force_transfer(
     .await
 }
 
-/// How far this cluster's logical subscriptions have applied.
+/// This cluster's subscription shape, for the recipient side of a drain gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionProgressResponse {
-    /// Lowest applied origin LSN across every subscription, in bytes. The
-    /// minimum, not the maximum: a drain is complete only when the furthest
-    /// *behind* subscription has caught up.
+    /// Lowest applied origin LSN across enabled subscriptions, in bytes.
+    /// Observability only: pgoutput skips empty transactions, so an idle
+    /// sealed donor's origin plateaus below a `final_lsn` taken after
+    /// catalog-only WAL. The drain gate reads the donor's slot confirmation.
     pub applied_lsn: u64,
     pub subscription_count: usize,
+    /// A disabled subscription applies nothing; only these count for a drain.
+    #[serde(default)]
+    pub enabled_subscription_count: usize,
+    /// `pg_subscription_rel` rows, and how many are in state `r` (ready).
+    /// Zero rows is no initial copy at all, never a completed one.
+    #[serde(default)]
+    pub tables_total: usize,
+    #[serde(default)]
+    pub tables_ready: usize,
 }
 
-/// Applied origin LSN, probed from the catalogs (`GET`, no auth: read-only).
-/// WAL the donor is holding for its cutover slot, and whether that is safe.
+/// WAL the donor is holding for its cutover slots, and how far the subscriber
+/// has confirmed. Both sides of the drain wait, read on the donor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DonorRetentionResponse {
     pub retained_bytes: u64,
     pub slot_count: usize,
+    /// Minimum `confirmed_flush_lsn` across the donor's logical slots, in
+    /// bytes. `None` when there are no logical slots or any slot has not
+    /// confirmed — not drained, never zero. Keepalives advance this across
+    /// WAL that pgoutput never publishes, so it is the one signal that both
+    /// reaches a quiet donor's `final_lsn` and proves everything decodable
+    /// up to it was applied and flushed on the subscriber.
+    #[serde(default)]
+    pub min_confirmed_flush_lsn: Option<u64>,
+    #[serde(default)]
+    pub slot_names: Vec<String>,
 }
 
 /// What a drain wait should do about the donor's retained WAL.
@@ -638,39 +658,78 @@ pub const fn donor_wal_risk(retained_bytes: u64, budget_bytes: u64) -> DonorRisk
     }
 }
 
+/// Logical slots only: a physical standby's slot is normal replication, not
+/// WAL held for a cutover that may never finish. `pg_current_wal_lsn()`
+/// raises on a standby, so the CASE picks the receive position there. The
+/// NULL-confirmed count is carried separately because `min()` skips NULLs,
+/// and a slot that has confirmed nothing must read as "not drained".
+const DONOR_RETENTION_SQL: &str = "SELECT count(*)::text || '|' || COALESCE(max(pg_wal_lsn_diff(\
+     CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() \
+     ELSE pg_current_wal_lsn() END, restart_lsn))::bigint, 0)::text \
+     || '|' || (count(*) FILTER (WHERE confirmed_flush_lsn IS NULL))::text \
+     || '|' || COALESCE(min(confirmed_flush_lsn)::text, '') \
+     || '|' || COALESCE(string_agg(slot_name, ',' ORDER BY slot_name), '') \
+     FROM pg_replication_slots WHERE slot_type = 'logical';";
+
+/// Parse the one-line donor retention reply. `None` means the reply itself is
+/// malformed, which the handler reports as an error — never as zero bytes.
+fn parse_donor_retention_line(raw: &str) -> Option<DonorRetentionResponse> {
+    let mut parts = raw.trim().splitn(5, '|');
+    let slot_count: usize = parts.next()?.trim().parse().ok()?;
+    // The diff is negative when a standby's receive position trails a slot;
+    // clamped, not wrapped.
+    let retained_bytes = u64::try_from(parts.next()?.trim().parse::<i64>().ok()?.max(0)).ok()?;
+    let unconfirmed: usize = parts.next()?.trim().parse().ok()?;
+    let min_confirmed_text = parts.next()?.trim();
+    let names = parts.next()?.trim();
+    let min_confirmed_flush_lsn = if slot_count == 0 || unconfirmed > 0 {
+        None
+    } else {
+        Some(parse_lsn_strict(min_confirmed_text)?)
+    };
+    let slot_names = if names.is_empty() {
+        Vec::new()
+    } else {
+        names.split(',').map(str::to_string).collect()
+    };
+    Some(DonorRetentionResponse {
+        retained_bytes,
+        slot_count,
+        min_confirmed_flush_lsn,
+        slot_names,
+    })
+}
+
+/// Refuse a probe endpoint's request with the failure named.
+///
+/// Fail closed: this once answered `retained_bytes: 0` exactly when the query
+/// failed, and 0 is the one value that always passes the WAL-risk check.
+fn probe_failure(context: &str, detail: &str) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "success": false,
+            "message": format!("{context}: {detail}"),
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn get_donor_retention(
     State(state): State<Arc<ManagementApiState>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let Some(pg) = state.postgres_manager.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(DonorRetentionResponse {
-                retained_bytes: 0,
-                slot_count: 0,
-            }),
-        );
+        return probe_failure("donor retention", "no PostgreSQL supervisor on this node");
     };
     let guard = pg.lock().await;
-    // Logical slots only: a physical standby's slot is normal replication,
-    // not WAL held for a cutover that may never finish.
-    // pg_current_wal_lsn() raises on a standby, so the CASE picks the receive
-    // position there. CASE short-circuits execution, which is enough for a
-    // function that errors — unlike a missing relation, which fails at parse.
-    let sql = "SELECT count(*)::text || '|' || COALESCE(max(pg_wal_lsn_diff(\
-               CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() \
-               ELSE pg_current_wal_lsn() END, restart_lsn))::bigint, 0)::text \
-               FROM pg_replication_slots WHERE slot_type = 'logical' AND restart_lsn IS NOT NULL;";
-    let raw = guard.execute_sql(sql).await.unwrap_or_default();
+    let raw = match guard.execute_sql(DONOR_RETENTION_SQL).await {
+        Ok(raw) => raw,
+        Err(e) => return probe_failure("donor retention query failed", &e.to_string()),
+    };
     drop(guard);
-    let (count, retained) = raw.trim().split_once('|').map_or((0, 0), |(c, b)| {
-        (c.parse().unwrap_or(0), b.parse().unwrap_or(0))
-    });
-    (
-        StatusCode::OK,
-        Json(DonorRetentionResponse {
-            retained_bytes: retained,
-            slot_count: count,
-        }),
+    parse_donor_retention_line(&raw).map_or_else(
+        || probe_failure("donor retention reply unparseable", raw.trim()),
+        |resp| (StatusCode::OK, Json(resp)).into_response(),
     )
 }
 
@@ -766,45 +825,62 @@ pub(super) async fn get_schema_digest(
     (StatusCode::OK, Json(SchemaDigestResponse { digest }))
 }
 
+/// `pg_replication_origin_progress` is the applied position, unlike
+/// `pg_stat_subscription.received_lsn`, which is only what arrived. The
+/// origin minimum spans only enabled subscriptions — a disabled one applies
+/// nothing and would pin the minimum at 0 forever.
+const SUBSCRIPTION_PROGRESS_SQL: &str = "SELECT (SELECT count(*) FROM pg_subscription)::text \
+     || '|' || (SELECT count(*) FROM pg_subscription WHERE subenabled)::text \
+     || '|' || (SELECT COALESCE(min(\
+        pg_replication_origin_progress('pg_' || s.oid::text, true))::text, '0/0') \
+        FROM pg_subscription s WHERE s.subenabled) \
+     || '|' || (SELECT count(*) FROM pg_subscription_rel)::text \
+     || '|' || (SELECT count(*) FROM pg_subscription_rel WHERE srsubstate = 'r')::text;";
+
+fn parse_subscription_progress_line(raw: &str) -> Option<SubscriptionProgressResponse> {
+    let mut parts = raw.trim().splitn(5, '|');
+    let subscription_count: usize = parts.next()?.trim().parse().ok()?;
+    let enabled_subscription_count: usize = parts.next()?.trim().parse().ok()?;
+    let applied_lsn = parse_lsn_strict(parts.next()?.trim())?;
+    let tables_total: usize = parts.next()?.trim().parse().ok()?;
+    let tables_ready: usize = parts.next()?.trim().parse().ok()?;
+    Some(SubscriptionProgressResponse {
+        applied_lsn,
+        subscription_count,
+        enabled_subscription_count,
+        tables_total,
+        tables_ready,
+    })
+}
+
 pub(super) async fn get_subscription_progress(
     State(state): State<Arc<ManagementApiState>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let Some(pg) = state.postgres_manager.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(SubscriptionProgressResponse {
-                applied_lsn: 0,
-                subscription_count: 0,
-            }),
+        return probe_failure(
+            "subscription progress",
+            "no PostgreSQL supervisor on this node",
         );
     };
     let guard = pg.lock().await;
-    // `pg_replication_origin_progress` is the applied position, unlike
-    // `pg_stat_subscription.received_lsn`, which is only what arrived.
-    let sql = "SELECT count(*)::text || '|' || COALESCE(min(\
-               pg_replication_origin_progress('pg_' || s.oid::text, true))::text, '0/0') \
-               FROM pg_subscription s;";
-    let raw = guard.execute_sql(sql).await.unwrap_or_default();
+    let raw = match guard.execute_sql(SUBSCRIPTION_PROGRESS_SQL).await {
+        Ok(raw) => raw,
+        Err(e) => return probe_failure("subscription progress query failed", &e.to_string()),
+    };
     drop(guard);
-    let (count, lsn) = raw
-        .trim()
-        .split_once('|')
-        .map_or((0, 0), |(c, l)| (c.parse().unwrap_or(0), parse_lsn(l)));
-    (
-        StatusCode::OK,
-        Json(SubscriptionProgressResponse {
-            applied_lsn: lsn,
-            subscription_count: count,
-        }),
+    parse_subscription_progress_line(&raw).map_or_else(
+        || probe_failure("subscription progress reply unparseable", raw.trim()),
+        |resp| (StatusCode::OK, Json(resp)).into_response(),
     )
 }
 
-fn parse_lsn(text: &str) -> u64 {
-    text.trim().split_once('/').map_or(0, |(hi, lo)| {
-        let hi = u64::from_str_radix(hi.trim(), 16).unwrap_or(0);
-        let lo = u64::from_str_radix(lo.trim(), 16).unwrap_or(0);
-        (hi << 32) | lo
-    })
+/// Parse `X/Y` LSN text to bytes, refusing garbage rather than reading it
+/// as position 0 — 0 always passes a "below the target" gate.
+fn parse_lsn_strict(text: &str) -> Option<u64> {
+    let (hi, lo) = text.trim().split_once('/')?;
+    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
+    Some((hi << 32) | lo)
 }
 
 /// Ask one donor node what it has committed about this handoff.
@@ -964,6 +1040,10 @@ pub(super) async fn cutover_receive_authority(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test code asserts on known-good values and panics are the failure signal"
+)]
 mod tests {
     use super::*;
 
@@ -1084,5 +1164,74 @@ mod tests {
             ),
             DonorPollVerdict::Expired
         );
+    }
+
+    #[test]
+    fn donor_retention_parses_slots_and_confirmed_minimum() {
+        let resp = parse_donor_retention_line("2|1024|0|0/16B3C90|bg_slot,other").unwrap();
+        assert_eq!(resp.slot_count, 2);
+        assert_eq!(resp.retained_bytes, 1_024);
+        assert_eq!(resp.min_confirmed_flush_lsn, Some(0x016B_3C90));
+        assert_eq!(resp.slot_names, vec!["bg_slot", "other"]);
+    }
+
+    /// `min()` skips NULLs, so the NULL count travels separately: one slot
+    /// that has confirmed nothing means not drained, never "use the others".
+    #[test]
+    fn a_slot_that_confirmed_nothing_reads_as_not_drained() {
+        let resp = parse_donor_retention_line("2|1024|1|0/10|a,b").unwrap();
+        assert_eq!(resp.min_confirmed_flush_lsn, None);
+    }
+
+    /// Zero logical slots is nothing to drain against, not position 0.
+    #[test]
+    fn zero_slots_is_no_confirmation_at_all() {
+        let resp = parse_donor_retention_line("0|0|0||").unwrap();
+        assert_eq!(resp.min_confirmed_flush_lsn, None);
+        assert!(resp.slot_names.is_empty());
+    }
+
+    /// A malformed reply is an error the handler must report — the previous
+    /// shape read every failure as 0 retained bytes, the one value that
+    /// always passes the WAL-risk check.
+    #[test]
+    fn a_garbled_retention_reply_is_refused_not_zero() {
+        assert!(parse_donor_retention_line("ERROR: relation missing").is_none());
+        assert!(parse_donor_retention_line("").is_none());
+        assert!(parse_donor_retention_line("1|not-a-number|0|0/10|s").is_none());
+    }
+
+    /// A standby's receive position can trail a slot; negative retention is
+    /// clamped rather than wrapped into an enormous unsigned value.
+    #[test]
+    fn negative_retention_clamps_to_zero() {
+        let resp = parse_donor_retention_line("1|-512|0|0/10|s").unwrap();
+        assert_eq!(resp.retained_bytes, 0);
+    }
+
+    #[test]
+    fn subscription_progress_parses_enabled_and_table_states() {
+        let resp = parse_subscription_progress_line("2|1|1/0|3|2").unwrap();
+        assert_eq!(resp.subscription_count, 2);
+        assert_eq!(resp.enabled_subscription_count, 1);
+        assert_eq!(resp.applied_lsn, 1 << 32);
+        assert_eq!(resp.tables_total, 3);
+        assert_eq!(resp.tables_ready, 2);
+    }
+
+    #[test]
+    fn a_garbled_progress_reply_is_refused_not_zeroed() {
+        assert!(parse_subscription_progress_line("").is_none());
+        assert!(parse_subscription_progress_line("2|1|garbage|3|2").is_none());
+    }
+
+    /// Strict LSN parsing: garbage is `None`, because 0 always sits below
+    /// every drain target.
+    #[test]
+    fn lsn_parsing_refuses_garbage_instead_of_reading_zero() {
+        assert_eq!(parse_lsn_strict("1/0"), Some(1 << 32));
+        assert_eq!(parse_lsn_strict("0/16B3C90"), Some(0x016B_3C90));
+        assert_eq!(parse_lsn_strict("16B3C90"), None);
+        assert_eq!(parse_lsn_strict("zz/1"), None);
     }
 }

@@ -847,13 +847,17 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
-    /// Lowest applied origin LSN across `addr`'s logical subscriptions.
+    /// Subscription shape on `addr`: enabled count, table sync states, and
+    /// the applied origin minimum (observability only).
     ///
     /// # Errors
     /// Unreachable, non-success, or a node with no subscriptions — draining
     /// against a cluster that is not subscribed would wait out the budget and
     /// report a failure that names the wrong cause.
-    pub async fn get_subscription_progress(&self, addr: &str) -> Result<u64> {
+    pub async fn get_subscription_progress(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::SubscriptionProgressResponse> {
         let url = format!("http://{addr}/api/v1/cutover/subscription-progress");
         let resp = self
             .client
@@ -881,14 +885,20 @@ impl ClusterClient {
                  subscription), and wait for the initial copy to finish."
             );
         }
-        Ok(body.applied_lsn)
+        Ok(body)
     }
 
-    /// WAL the donor is holding for its logical slots, in bytes.
+    /// WAL the donor is holding for its logical slots, and how far the
+    /// subscriber has confirmed on them.
     ///
     /// # Errors
-    /// The donor is unreachable or answers with a non-success status.
-    pub async fn get_donor_retention(&self, addr: &str) -> Result<u64> {
+    /// The donor is unreachable, answers non-success, or could not read its
+    /// own slots — an error, never zero bytes, because zero always passes
+    /// the WAL-risk check.
+    pub async fn get_donor_retention(
+        &self,
+        addr: &str,
+    ) -> Result<crate::observability::management_api::DonorRetentionResponse> {
         let url = format!("http://{addr}/api/v1/cutover/donor-retention");
         let resp = self
             .client
@@ -906,9 +916,7 @@ impl ClusterClient {
                 false
             ));
         }
-        let body: crate::observability::management_api::DonorRetentionResponse =
-            resp.json().await?;
-        Ok(body.retained_bytes)
+        Ok(resp.json().await?)
     }
 
     /// Schema shape of the cluster at `addr`.

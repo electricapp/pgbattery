@@ -287,9 +287,73 @@ impl CutoverPlan {
     }
 }
 
-/// Block until the recipient's subscription has applied past `final_lsn`.
+/// Whether the drain is complete, or why it is not yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DrainGate {
+    Drained,
+    Waiting(String),
+}
+
+/// The drain gate, decided over facts from both sides.
 ///
-/// Read from the recipient's catalogs, never assumed from elapsed time.
+/// The authoritative signal is DONOR-side: the minimum `confirmed_flush_lsn`
+/// across its logical slots must reach the sealed LSN. The recipient's
+/// `pg_replication_origin_progress` cannot gate this — pgoutput skips empty
+/// transactions, so an idle sealed donor's origin plateaus below a
+/// `final_lsn` taken after catalog-only WAL, while keepalives still advance
+/// the slot's confirmation. The recipient contributes structure, not
+/// position: at least one enabled subscription, and every subscribed table's
+/// initial copy finished (`pg_subscription_rel` all `r`, zero rows is not
+/// ready).
+pub(crate) fn drain_gate(
+    donor_min_confirmed_flush_lsn: Option<u64>,
+    sealed_final_lsn: u64,
+    enabled_subscriptions: usize,
+    tables_total: usize,
+    tables_ready: usize,
+) -> DrainGate {
+    if enabled_subscriptions == 0 {
+        return DrainGate::Waiting(
+            "the recipient has no enabled subscription; a disabled one applies nothing".into(),
+        );
+    }
+    if tables_total == 0 {
+        return DrainGate::Waiting(
+            "the recipient's subscription covers zero tables; nothing has copied".into(),
+        );
+    }
+    if tables_ready < tables_total {
+        return DrainGate::Waiting(format!(
+            "initial table copy incomplete: {tables_ready} of {tables_total} \
+             pg_subscription_rel rows are ready"
+        ));
+    }
+    match donor_min_confirmed_flush_lsn {
+        None => DrainGate::Waiting(
+            "a donor logical slot has not confirmed any flush (or no slot exists)".into(),
+        ),
+        Some(confirmed) if confirmed < sealed_final_lsn => DrainGate::Waiting(format!(
+            "donor slots confirm only {confirmed} of the sealed {sealed_final_lsn}"
+        )),
+        Some(_) => DrainGate::Drained,
+    }
+}
+
+/// Consecutive donor-retention read failures that abort the drain wait.
+///
+/// Fail closed without flinching at one blip: an unreadable donor is a donor
+/// whose WAL retention nobody is watching, and this wait exists to bound it.
+pub(crate) const RETENTION_FAILURE_ABORT_THRESHOLD: u32 = 3;
+
+#[must_use]
+pub(crate) const fn retention_failures_abort(consecutive: u32) -> bool {
+    consecutive >= RETENTION_FAILURE_ABORT_THRESHOLD
+}
+
+/// Block until the drain gate opens: donor slots confirmed past `final_lsn`,
+/// on a recipient whose subscription is enabled and fully copied.
+///
+/// Read from the two clusters' catalogs, never assumed from elapsed time.
 async fn await_recipient_drain(
     client: &crate::cluster::ClusterClient,
     green_mgmt: &str,
@@ -297,25 +361,55 @@ async fn await_recipient_drain(
     final_lsn: u64,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(30);
+    let mut retention_failures: u32 = 0;
     loop {
-        let applied = client.get_subscription_progress(green_mgmt).await?;
-        if applied >= final_lsn {
-            info!(applied, final_lsn, "Recipient drained past the sealed LSN");
-            return Ok(());
-        }
-        // The donor is sealed and holding WAL for the whole wait, so a
-        // subscriber that never catches up fills the donor's disk.
-        let retained = client.get_donor_retention(blue_mgmt).await?;
-        if donor_wal_risk(retained, DONOR_WAL_RETENTION_BUDGET_BYTES) == DonorRisk::Abort {
-            bail!(
-                "Donor is holding {retained} bytes of WAL for the cutover slot, past \
-                 the {DONOR_WAL_RETENTION_BUDGET_BYTES}-byte budget. Aborting the wait \
-                 while the donor can still be unsealed with `cutover/abort`."
-            );
-        }
+        let progress = client.get_subscription_progress(green_mgmt).await?;
+        let reason = match client.get_donor_retention(blue_mgmt).await {
+            Ok(retention) => {
+                retention_failures = 0;
+                // The donor is sealed and holding WAL for the whole wait, so a
+                // subscriber that never catches up fills the donor's disk.
+                let retained = retention.retained_bytes;
+                if donor_wal_risk(retained, DONOR_WAL_RETENTION_BUDGET_BYTES) == DonorRisk::Abort {
+                    bail!(
+                        "Donor is holding {retained} bytes of WAL for the cutover slot, past \
+                         the {DONOR_WAL_RETENTION_BUDGET_BYTES}-byte budget. Aborting the wait \
+                         while the donor can still be unsealed with `cutover/abort`."
+                    );
+                }
+                match drain_gate(
+                    retention.min_confirmed_flush_lsn,
+                    final_lsn,
+                    progress.enabled_subscription_count,
+                    progress.tables_total,
+                    progress.tables_ready,
+                ) {
+                    DrainGate::Drained => {
+                        info!(
+                            final_lsn,
+                            slots = ?retention.slot_names,
+                            "Drain complete: donor slots confirmed past the sealed LSN"
+                        );
+                        return Ok(());
+                    }
+                    DrainGate::Waiting(reason) => reason,
+                }
+            }
+            Err(e) => {
+                retention_failures += 1;
+                if retention_failures_abort(retention_failures) {
+                    bail!(
+                        "Donor retention unreadable {retention_failures} times in a row \
+                         ({e}); failing closed while the donor can still be unsealed \
+                         with `cutover/abort`"
+                    );
+                }
+                format!("donor retention read failed ({e})")
+            }
+        };
         if std::time::Instant::now() >= deadline {
             bail!(
-                "U2: recipient applied only {applied} of the donor's sealed {final_lsn}; \
+                "U2: drain did not complete within the wait budget ({reason}); \
                  the donor is still sealed and can be unsealed with `cutover/abort`"
             );
         }
@@ -889,6 +983,7 @@ async fn sql_u64(supervisor: &crate::supervisor::Supervisor, sql: &str) -> Resul
 #[allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
+    clippy::panic,
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
@@ -989,5 +1084,72 @@ mod tests {
         assert_eq!(quoted, "'bg_app','other'");
         assert!(quoted_role_literals(&["bad; DROP".into()]).is_err());
         assert!(quoted_role_literals(&[String::new()]).is_err());
+    }
+
+    /// The world every clean cutover lives in: the sealed donor is idle, its
+    /// last WAL is catalog-only, so the recipient's origin progress plateaus
+    /// below `final_lsn` forever — but keepalives advance the slot's
+    /// confirmation. The origin-based gate timed out here; this one passes.
+    #[test]
+    fn an_idle_donor_with_confirmed_slots_is_drained_despite_a_plateaued_origin() {
+        assert_eq!(drain_gate(Some(1_000), 1_000, 1, 3, 3), DrainGate::Drained);
+        assert_eq!(drain_gate(Some(1_500), 1_000, 1, 3, 3), DrainGate::Drained);
+    }
+
+    /// A seal during initial table copy: the slot confirms past `final_lsn`
+    /// (keepalives) while half the tables are still copying. The old gate
+    /// never looked at srsubstate on the drain path and called this drained.
+    #[test]
+    fn half_copied_tables_refuse_the_drain() {
+        let DrainGate::Waiting(reason) = drain_gate(Some(2_000), 1_000, 1, 3, 2) else {
+            panic!("a half-copied recipient must not read as drained");
+        };
+        assert!(reason.contains("2 of 3"));
+    }
+
+    /// Zero subscribed tables is no copy at all, not a finished one.
+    #[test]
+    fn zero_subscribed_tables_refuse_the_drain() {
+        assert!(matches!(
+            drain_gate(Some(2_000), 1_000, 1, 0, 0),
+            DrainGate::Waiting(_)
+        ));
+    }
+
+    /// A disabled subscription applies nothing; only enabled ones count.
+    #[test]
+    fn a_recipient_with_only_disabled_subscriptions_refuses_the_drain() {
+        let DrainGate::Waiting(reason) = drain_gate(Some(2_000), 1_000, 0, 3, 3) else {
+            panic!("disabled subscriptions must not read as drained");
+        };
+        assert!(reason.contains("enabled"));
+    }
+
+    /// NULL `confirmed_flush_lsn` (or no slot) is not drained, never zero.
+    #[test]
+    fn an_unconfirmed_or_missing_slot_refuses_the_drain() {
+        assert!(matches!(
+            drain_gate(None, 1_000, 1, 3, 3),
+            DrainGate::Waiting(_)
+        ));
+    }
+
+    #[test]
+    fn a_slot_short_of_the_sealed_lsn_keeps_waiting() {
+        let DrainGate::Waiting(reason) = drain_gate(Some(999), 1_000, 1, 3, 3) else {
+            panic!("confirmation below the sealed LSN must keep waiting");
+        };
+        assert!(reason.contains("999"));
+    }
+
+    /// One retention blip is a retry; three in a row is a donor whose WAL
+    /// nobody is watching, and the wait exists to bound exactly that.
+    #[test]
+    fn the_retention_monitor_fails_closed_after_three_consecutive_failures() {
+        assert!(!retention_failures_abort(0));
+        assert!(!retention_failures_abort(1));
+        assert!(!retention_failures_abort(2));
+        assert!(retention_failures_abort(3));
+        assert!(retention_failures_abort(4));
     }
 }
