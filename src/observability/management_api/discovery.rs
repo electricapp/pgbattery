@@ -264,7 +264,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: VersionResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back, resp);
-        assert_eq!(back.raft_rpc_frame_version, 0);
-        assert_eq!(back.store_schema_version, 0);
+        assert_eq!(back.raft_rpc_frame_version, RAFT_RPC_FRAME_VERSION);
+        assert_eq!(back.store_schema_version, STORE_SCHEMA_VERSION);
     }
 }

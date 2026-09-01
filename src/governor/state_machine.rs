@@ -124,6 +124,36 @@ pub struct ClusterState {
     pub upgrade_frozen: bool,
 }
 
+/// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
+/// `upgrade_frozen`. Postcard is positional, so the 0→1 store migration must
+/// decode old snapshots with exactly this field set. `failover_started_at` is
+/// `serde(skip)` on the live struct and so absent from the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ClusterStateV0 {
+    pub nodes: HashMap<NodeId, NodeInfo>,
+    pub voter_ids: std::collections::HashSet<NodeId>,
+    pub learner_ids: std::collections::HashSet<NodeId>,
+    pub node_lsns: HashMap<NodeId, (u64, u64)>,
+    pub max_cluster_lsn: u64,
+    pub sync_replication_active: Option<bool>,
+}
+
+impl From<ClusterStateV0> for ClusterState {
+    fn from(v0: ClusterStateV0) -> Self {
+        Self {
+            nodes: v0.nodes,
+            voter_ids: v0.voter_ids,
+            learner_ids: v0.learner_ids,
+            node_lsns: v0.node_lsns,
+            max_cluster_lsn: v0.max_cluster_lsn,
+            failover_started_at: None,
+            sync_replication_active: v0.sync_replication_active,
+            cutover: CutoverAuthorityState::default(),
+            upgrade_frozen: false,
+        }
+    }
+}
+
 /// The `(epoch, cluster_id)` write authority from `tla/cutover_authority.tla`.
 ///
 /// Not a leadership projection: Raft leadership stays `RaftMetrics::current_leader`.

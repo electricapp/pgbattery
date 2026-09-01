@@ -62,9 +62,17 @@ and PG-major upgrade in the same release if avoidable.
 - [x] Frame: `version(1) + type(1) + corr_id(8)` (`RAFT_RPC_FRAME_VERSION = 0`)
 - [x] redb schema-version key at create; missing key = schema 0
 - [x] Open: equal → proceed; older → forward migrate before Raft join; newer → refuse (no downgrade)
-- [x] Policy: patch/minor must not change frame/schema (CI compat fixtures)
+- [x] Schema 1: `ClusterState` grew `cutover`/`upgrade_frozen`, so v0 snapshots
+      are rewritten on open (`migrate_snapshot_v0_to_v1`); a store the new
+      binary touches is stamped 1 and refuses the old binary
+- [x] Policy: patch/minor must not change frame/schema (CI compat fixtures).
+      The schema is the postcard record encodings, not the constant: the
+      committed `.bin` pins and populated schema-0/schema-1 golden stores turn
+      red on any stored-type field change
 - [x] Major may change either within N−1→N only
-- [x] Release-tag fixtures: prior release frames + store; HEAD must decode/open them
+- [x] Format fixtures: populated prior-schema + current-schema stores and
+      encoding pins; HEAD must decode/open/migrate them (release-tagged
+      fixtures still need a first tagged release — see the `[-]` below)
 
 ### Orchestration (step 2)
 

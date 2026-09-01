@@ -25,10 +25,16 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// On-disk Raft store schema version this binary writes and expects.
 ///
-/// Missing key = schema 0 (every existing store adopts without a migrate).
+/// Missing key = schema 0 (every existing store adopts without a stamp).
 /// Older → forward migrate before Raft join; newer → refuse (no downgrade).
 /// See `UPGRADE_CHECKLIST.md` step 1.
-pub const STORE_SCHEMA_VERSION: u32 = 0;
+///
+/// Schema 1: snapshots serialize the current `ClusterState` (with `cutover`
+/// and `upgrade_frozen`); schema 0 snapshots carry the shorter v0 layout and
+/// are rewritten on open. The schema covers postcard-encoded record layouts,
+/// not just table shapes — postcard is positional, so any field change in a
+/// stored type is a schema change.
+pub const STORE_SCHEMA_VERSION: u32 = 1;
 
 /// Entry payload type for storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,8 +322,12 @@ impl RedbLogStorage {
             )));
         }
 
-        // Forward migrations for each step `(on_disk+1)..=STORE_SCHEMA_VERSION`
-        // go here when the constant is bumped. Schema 0 has nothing to migrate.
+        // Forward migrations, one step per version, inside the open write
+        // transaction — the rewrite and the stamp commit together or not at
+        // all, and everything runs before Raft joins.
+        if on_disk < 1 {
+            Self::migrate_snapshot_v0_to_v1(write_txn)?;
+        }
 
         if !key_present || on_disk != STORE_SCHEMA_VERSION {
             let bytes = STORE_SCHEMA_VERSION.to_le_bytes();
@@ -327,6 +337,51 @@ impl RedbLogStorage {
                 })?;
         }
 
+        Ok(())
+    }
+
+    /// 0→1: `ClusterState` gained trailing fields, and postcard is positional,
+    /// so a schema-0 snapshot no longer decodes. Rewrite it in the current
+    /// layout (new fields at their defaults) with a fresh digest.
+    ///
+    /// Tries the current layout first, so re-running after a crash mid-open is
+    /// a no-op — and so a brand-new store (no snapshot at all) passes through
+    /// untouched. Log entries need no rewrite: `ClusterCommand` only appended
+    /// enum variants, and postcard discriminants are stable.
+    fn migrate_snapshot_v0_to_v1(write_txn: &redb::WriteTransaction) -> Result<()> {
+        use super::state_machine::{ClusterState, ClusterStateV0};
+
+        let mut table = write_txn
+            .open_table(SNAPSHOT_TABLE)
+            .map_err(|e| Error::Storage(format!("Failed to open snapshot table: {e}")))?;
+
+        let Some(data) = table
+            .get("data")
+            .map_err(|e| Error::Storage(format!("Failed to read snapshot data: {e}")))?
+            .map(|v| v.value().to_vec())
+        else {
+            return Ok(());
+        };
+
+        if postcard::from_bytes::<ClusterState>(&data).is_ok() {
+            return Ok(());
+        }
+
+        let v0: ClusterStateV0 = postcard::from_bytes(&data).map_err(|e| {
+            Error::Storage(format!(
+                "schema 0→1 migration: snapshot decodes as neither the current \
+                 nor the v0 ClusterState layout (corrupt store?): {e}"
+            ))
+        })?;
+        let migrated = postcard::to_allocvec(&ClusterState::from(v0))?;
+        let digest = Sha256::digest(&migrated);
+        table
+            .insert("data", migrated.as_slice())
+            .map_err(|e| Error::Storage(format!("Failed to rewrite snapshot data: {e}")))?;
+        table
+            .insert("data_sha256", digest.as_slice())
+            .map_err(|e| Error::Storage(format!("Failed to rewrite snapshot digest: {e}")))?;
+        tracing::info!("Migrated raft.db snapshot from store schema 0 to 1");
         Ok(())
     }
 
@@ -1056,6 +1111,131 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Build a raft.db exactly as a schema-0 (pre-versioning) binary left it:
+    /// no `schema_version` key, snapshot payload in the v0 `ClusterState`
+    /// layout, plus a vote and one log entry to prove records survive.
+    fn write_schema0_store(path: &Path) {
+        use super::super::state_machine::{ClusterStateV0, NodeInfo, NodeRole};
+
+        let db = redb::Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut logs = txn.open_table(LOGS_TABLE).unwrap();
+            let entry = LogEntry {
+                index: 1,
+                term: 1,
+                leader_node_id: 1,
+                payload: LogEntryPayload::Normal(ClusterCommand::UpdateLsn {
+                    node_id: 1,
+                    lsn_bytes: 4096,
+                    timestamp: 1_700_000_000,
+                }),
+            };
+            let bytes = postcard::to_allocvec(&entry).unwrap();
+            logs.insert(1, bytes.as_slice()).unwrap();
+
+            let mut meta = txn.open_table(META_TABLE).unwrap();
+            let vote = Vote {
+                term: 3,
+                voted_for: Some(1),
+                committed: true,
+            };
+            let vote_bytes = postcard::to_allocvec(&vote).unwrap();
+            meta.insert("vote", vote_bytes.as_slice()).unwrap();
+
+            let mut snap = txn.open_table(SNAPSHOT_TABLE).unwrap();
+            let addr = "127.0.0.1:5434".parse().unwrap();
+            let mut nodes = std::collections::HashMap::new();
+            nodes.insert(
+                1,
+                NodeInfo {
+                    id: 1,
+                    pg_addr: addr,
+                    raft_addr: addr,
+                    mgmt_addr: addr,
+                    metrics_addr: addr,
+                    role: NodeRole::Follower,
+                    last_seen: 1_700_000_000,
+                },
+            );
+            let v0 = ClusterStateV0 {
+                nodes,
+                voter_ids: std::collections::HashSet::from([1]),
+                learner_ids: std::collections::HashSet::new(),
+                node_lsns: std::collections::HashMap::from([(1, (4096, 1_700_000_000))]),
+                max_cluster_lsn: 4096,
+                sync_replication_active: Some(true),
+            };
+            let data = postcard::to_allocvec(&v0).unwrap();
+            let digest = Sha256::digest(&data);
+            snap.insert("data", data.as_slice()).unwrap();
+            snap.insert("data_sha256", digest.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn schema0_snapshot_migrates_on_open() {
+        use super::super::state_machine::ClusterState;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        write_schema0_store(&path);
+
+        let storage = RedbLogStorage::new(&path).expect("schema-0 store must open");
+
+        let data = storage
+            .load_snapshot_verified()
+            .expect("digest must verify after migration")
+            .expect("migration must not drop the snapshot");
+        let state: ClusterState = postcard::from_bytes(&data)
+            .expect("post-migration snapshot must decode as the current ClusterState");
+        assert_eq!(state.max_cluster_lsn, 4096);
+        assert_eq!(state.sync_replication_active, Some(true));
+        assert!(state.nodes.contains_key(&1));
+        assert_eq!(state.voter_ids, std::collections::HashSet::from([1]));
+        assert_eq!(
+            state.cutover,
+            super::super::state_machine::CutoverAuthorityState::default()
+        );
+        assert!(!state.upgrade_frozen);
+
+        // Records written by the old binary still decode, and the store is
+        // stamped with the current schema so an old binary now refuses it.
+        let vote = storage.load_vote().unwrap();
+        assert_eq!(vote.term, 3);
+        let entry = storage.get_entry(1).unwrap().expect("log entry survives");
+        assert_eq!(entry.index, 1);
+        let read = storage.database().begin_read().unwrap();
+        let meta = read.open_table(META_TABLE).unwrap();
+        let raw: [u8; 4] = meta
+            .get(SCHEMA_VERSION_KEY)
+            .unwrap()
+            .expect("schema stamped")
+            .value()
+            .try_into()
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(raw), STORE_SCHEMA_VERSION);
+    }
+
+    /// A migrated (or already-current) store re-opens as a no-op: the
+    /// migration must be idempotent and must not touch a current snapshot.
+    #[test]
+    fn schema0_migration_is_idempotent_across_reopens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft.db");
+        write_schema0_store(&path);
+
+        {
+            let _ = RedbLogStorage::new(&path).expect("first open migrates");
+        }
+        let storage = RedbLogStorage::new(&path).expect("second open is a no-op");
+        let data = storage.load_snapshot_verified().unwrap().unwrap();
+        let state: super::super::state_machine::ClusterState =
+            postcard::from_bytes(&data).unwrap();
+        assert_eq!(state.max_cluster_lsn, 4096);
+    }
+
     #[test]
     fn test_log_entries() {
         let dir = tempdir().unwrap();
@@ -1131,8 +1311,10 @@ mod tests {
         );
     }
 
+    /// A store with no `schema_version` key adopts as schema 0, runs the
+    /// forward migrations, and comes out stamped with the current schema.
     #[test]
-    fn missing_schema_key_adopts_as_version_zero() {
+    fn missing_schema_key_adopts_and_migrates_to_current() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("raft.db");
         let storage = RedbLogStorage::new(&path).unwrap();
@@ -1150,7 +1332,10 @@ mod tests {
         let read = reopened.db.begin_read().unwrap();
         let meta = read.open_table(META_TABLE).unwrap();
         let bytes = meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap();
-        assert_eq!(decode_schema_version(bytes.value()).unwrap(), 0);
+        assert_eq!(
+            decode_schema_version(bytes.value()).unwrap(),
+            STORE_SCHEMA_VERSION
+        );
     }
 
     #[test]

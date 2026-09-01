@@ -2,5 +2,5 @@
 # Patch/minor releases must not change these values. Bumping either
 # requires updating supported/ fixtures and keeping accept window N-1..=N.
 frame_version=0
-store_schema_version=0
+store_schema_version=1
 package_version=0.1.0
