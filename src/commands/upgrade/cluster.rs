@@ -38,31 +38,42 @@ impl NodeVersion {
     }
 }
 
-/// Abort when starting versions are mixed — Track A requires a uniform base.
+/// Resolve the roll's starting version, accepting a resumable mix.
+///
+/// A mid-roll abort leaves `[target, old, old]`; re-running must resume, so
+/// the accepted version sets are exactly {one starting version} and
+/// {one starting version, target}. Anything else is a genuinely mixed cluster.
 ///
 /// # Errors
-/// Returns an error naming the disagreeing nodes when package versions differ.
-pub(crate) fn require_uniform_package_versions(nodes: &[NodeVersion]) -> Result<()> {
-    let Some(first) = nodes.first() else {
+/// Returns an error naming the disagreeing nodes when the mix is not resumable.
+pub(crate) fn starting_version_for_roll(nodes: &[NodeVersion], target: &str) -> Result<String> {
+    if nodes.is_empty() {
         bail!("cluster version preflight: no nodes reported");
-    };
-    let mut disagree: Vec<String> = Vec::new();
-    for n in nodes.iter().skip(1) {
-        if n.version != first.version {
-            disagree.push(format!(
-                "node {} at {} reports {} (expected {})",
-                n.node_id, n.mgmt_addr, n.version, first.version
-            ));
-        }
     }
+    let mut non_target: Vec<&NodeVersion> = nodes.iter().filter(|n| n.version != target).collect();
+    non_target.sort_by_key(|n| n.node_id);
+    let Some(first) = non_target.first() else {
+        // Every node already reports the target.
+        return Ok(target.to_string());
+    };
+    let disagree: Vec<String> = non_target
+        .iter()
+        .filter(|n| n.version != first.version)
+        .map(|n| {
+            format!(
+                "node {} at {} reports {} (expected {} or target {})",
+                n.node_id, n.mgmt_addr, n.version, first.version, target
+            )
+        })
+        .collect();
     if !disagree.is_empty() {
         bail!(
-            "Refusing cluster upgrade: mixed starting versions (all nodes must \
-             share one package version before a rolling upgrade). {}",
+            "Refusing cluster upgrade: mixed starting versions (every node must be on \
+             one starting version or already on the target {target}). {}",
             disagree.join("; ")
         );
     }
-    Ok(())
+    Ok(first.version.clone())
 }
 
 /// Refuse a target outside the adjacent-major window (`N-1` → `N` only).
@@ -150,14 +161,13 @@ fn is_explicit_addr(s: &str) -> bool {
     s.parse::<u64>().is_err()
 }
 
-/// Probe every member's `/api/v1/version` and enforce Track A version preflight.
-///
-/// Does not yet run doctor / SYNC / backup gates — those land next on the
-/// checklist. This check is still load-bearing: mixed or out-of-window
-/// versions must refuse before any binary is replaced.
+/// Probe every member's `/api/v1/version` and enforce Track A version preflight:
+/// resumable-mix versions, major window, doctor --strict, and the backup gate.
+/// Mixed or out-of-window versions must refuse before any binary is replaced.
 ///
 /// # Errors
-/// Returns when discovery, a version probe, uniformity, or the major window fails.
+/// Returns when discovery, a version probe, the version mix, the major window,
+/// doctor, or the backup gate fails.
 pub(crate) async fn run_cluster_version_preflight(
     node: Option<String>,
     target: &str,
@@ -229,12 +239,8 @@ pub(crate) async fn run_cluster_version_preflight(
         versions.push(NodeVersion::from_response(&n.mgmt_addr, resp));
     }
 
-    require_uniform_package_versions(&versions)?;
-    let current = versions
-        .first()
-        .map(|n| n.version.as_str())
-        .ok_or_else(|| anyhow::anyhow!("cluster version preflight: no nodes reported"))?;
-    require_adjacent_major_jump(current, target)?;
+    let current = starting_version_for_roll(&versions, target)?;
+    require_adjacent_major_jump(&current, target)?;
 
     // doctor --strict (includes SYNC as warn→fail). Discover via the same
     // entry management address we already reached.
@@ -446,11 +452,14 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         }
         out
     };
-    require_uniform_package_versions(&final_versions)?;
+    if final_versions.is_empty() {
+        bail!("Postflight: cluster reports zero nodes");
+    }
     for n in &final_versions {
         if n.version != params.target {
             bail!(
-                "Postflight: node {} still reports {} (want {})",
+                "Postflight: node {} still reports {} (want {}). Re-running the same \
+                 upgrade command resumes the roll.",
                 n.node_id,
                 n.version,
                 params.target
@@ -521,7 +530,7 @@ async fn wait_until_safe_to_bounce_follower(
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "Timed out waiting for a second sync standby before bouncing node {bounce_id} \
-                 (still sole sync candidate)"
+                 (still sole sync candidate). Re-running the same upgrade command resumes the roll."
             );
         }
         tokio::time::sleep(NODE_POLL_INTERVAL).await;
@@ -553,7 +562,10 @@ async fn wait_for_node_version(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("Timed out waiting for node {node_id} at {mgmt_addr} to report version {target}");
+            bail!(
+                "Timed out waiting for node {node_id} at {mgmt_addr} to report version {target}. \
+                 Re-running the same upgrade command resumes the roll."
+            );
         }
         tokio::time::sleep(NODE_POLL_INTERVAL).await;
     }
@@ -587,7 +599,10 @@ async fn wait_for_streaming(client: &ClusterClient, leader_mgmt: &str, node_id: 
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("Timed out waiting for node {node_id} to resume streaming replication");
+            bail!(
+                "Timed out waiting for node {node_id} to resume streaming replication. \
+                 Re-running the same upgrade command resumes the roll."
+            );
         }
         tokio::time::sleep(NODE_POLL_INTERVAL).await;
     }
@@ -614,27 +629,47 @@ mod tests {
     }
 
     #[test]
-    fn uniform_versions_ok() {
-        let nodes = vec![node(1, "0.1.0"), node(2, "0.1.0"), node(3, "0.1.0")];
-        require_uniform_package_versions(&nodes).unwrap();
+    fn resume_mix_of_target_and_starting_version_ok() {
+        // Mid-roll abort state: node 1 already bounced to the target.
+        let nodes = vec![node(1, "0.2.0"), node(2, "0.1.0"), node(3, "0.1.0")];
+        let start = starting_version_for_roll(&nodes, "0.2.0").unwrap();
+        assert_eq!(start, "0.1.0");
     }
 
     #[test]
-    fn mixed_versions_abort() {
-        let nodes = vec![node(1, "0.1.0"), node(2, "0.2.0"), node(3, "0.1.0")];
-        let err = require_uniform_package_versions(&nodes)
+    fn uniform_starting_version_ok_for_roll() {
+        let nodes = vec![node(1, "0.1.0"), node(2, "0.1.0"), node(3, "0.1.0")];
+        assert_eq!(starting_version_for_roll(&nodes, "0.2.0").unwrap(), "0.1.0");
+    }
+
+    #[test]
+    fn all_on_target_ok_for_roll() {
+        let nodes = vec![node(1, "0.2.0"), node(2, "0.2.0"), node(3, "0.2.0")];
+        assert_eq!(starting_version_for_roll(&nodes, "0.2.0").unwrap(), "0.2.0");
+    }
+
+    #[test]
+    fn two_version_mix_without_target_refused() {
+        let nodes = vec![node(1, "0.1.0"), node(2, "0.1.5"), node(3, "0.1.0")];
+        let err = starting_version_for_roll(&nodes, "0.2.0")
             .unwrap_err()
             .to_string();
         assert!(err.contains("mixed starting versions"), "{err}");
-        assert!(err.contains("node 2"), "{err}");
     }
 
     #[test]
-    fn empty_cluster_aborts() {
-        let err = require_uniform_package_versions(&[])
+    fn three_distinct_versions_refused() {
+        let nodes = vec![node(1, "0.2.0"), node(2, "0.1.0"), node(3, "0.1.5")];
+        let err = starting_version_for_roll(&nodes, "0.2.0")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no nodes"));
+        assert!(err.contains("mixed starting versions"), "{err}");
+        assert!(err.contains("node 3"), "{err}");
+    }
+
+    #[test]
+    fn empty_cluster_refused_for_roll() {
+        assert!(starting_version_for_roll(&[], "0.2.0").is_err());
     }
 
     #[test]
