@@ -95,11 +95,15 @@ impl UpgradeSite {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
             let Some(name) = name else { continue };
             let is_configured = name == configured_name;
+            // The bare base is the name the flow started from: after a
+            // retarget the config names `data_18` and the rollback anchor
+            // is still plain `data`.
+            let is_base = name == base;
             let is_flow_sibling = name
                 .strip_prefix(&base)
                 .and_then(|rest| rest.strip_prefix('_'))
                 .is_some_and(|suffix| suffix.parse::<u32>().is_ok());
-            if !is_configured && !is_flow_sibling {
+            if !is_configured && !is_base && !is_flow_sibling {
                 continue;
             }
             let Ok(major) = data_dir_major(&path) else {
@@ -1406,7 +1410,10 @@ pub async fn run_local_preflight(
     let reflink_ok = probe_reflink(&work)?;
     let transfer_mode = resolve_transfer_mode(requested, reflink_ok, req.accept_no_rollback)?;
 
-    let data_bytes = dir_size_approx(data_dir).unwrap_or(0);
+    // Propagated, not defaulted: a failed walk reading as zero bytes would
+    // pass the disk-headroom gate on a full disk.
+    let data_bytes = dir_size_approx(data_dir)
+        .with_context(|| format!("sizing {} for the disk-headroom gate", data_dir.display()))?;
     let need = transfer_mode_headroom_hint(transfer_mode, data_bytes);
     let free = filesystem_free_bytes(parent)?;
     if free < need {
@@ -1633,17 +1640,39 @@ async fn prove_backup_restore_and_start(
                     bail!("pg_verifybackup failed for {}", created.path.display());
                 }
             }
-            prove_full_backup_start(old_bindir, &scratch, &created.path).await?;
+            match prove_full_backup_start(old_bindir, &scratch, &created.path).await? {
+                BackupProof::RestoredAndStarted => {}
+                BackupProof::ExistenceOnly => {
+                    tracing::warn!(
+                        path = %created.path.display(),
+                        "Backup proof DEGRADED for non-directory format: the archive \
+                         exists and verified on create, but restore-and-start was NOT \
+                         proven — an unrestorable backup passes this gate"
+                    );
+                    info!("Backup existence proof passed (restore-and-start NOT proven)");
+                    return Ok(());
+                }
+            }
         }
     }
     info!("Backup restore-and-start proof passed");
     Ok(())
 }
 
+/// A free localhost TCP port for a throwaway scratch postmaster.
+///
+/// Probed, not fixed: a hardcoded port collides with whatever else runs on
+/// the host (a second preflight included) and fails the proof spuriously.
+fn free_local_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("probing for a free local port")?;
+    Ok(listener.local_addr()?.port())
+}
+
 async fn prove_dump_restore(bindir: &Path, scratch: &Path, dump_path: &Path) -> Result<()> {
     let data = scratch.join("data");
     initdb_simple(bindir, &data).await?;
-    let port = 55432_u16;
+    let port = free_local_port()?;
     start_postgres_temp(bindir, &data, port).await?;
     let psql = bindir.join("psql");
     // Compressed dumps: gunzip -c | psql. Plain: psql -f.
@@ -1725,16 +1754,30 @@ async fn prove_dump_restore(bindir: &Path, scratch: &Path, dump_path: &Path) -> 
     Ok(())
 }
 
-async fn prove_full_backup_start(bindir: &Path, scratch: &Path, backup_path: &Path) -> Result<()> {
-    // If it's a directory basebackup, copy PG_VERSION presence check + try start
-    // after copying tree. For tar.gz, skip extract in preflight and require
-    // pg_verifybackup already done by BackupManager on create.
+/// What [`prove_full_backup_start`] actually proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupProof {
+    /// A scratch postmaster started from the backup and answered a query.
+    RestoredAndStarted,
+    /// Only that the archive exists (verified on create); restore-and-start
+    /// was NOT proven.
+    ExistenceOnly,
+}
+
+async fn prove_full_backup_start(
+    bindir: &Path,
+    scratch: &Path,
+    backup_path: &Path,
+) -> Result<BackupProof> {
+    // A directory basebackup restores by copying the tree and starting a
+    // scratch postmaster. Compressed / opaque formats skip the extract in
+    // preflight; pg_verifybackup ran on create.
     if backup_path.is_dir() && backup_path.join("PG_VERSION").exists() {
         let data = scratch.join("data");
         copy_dir_recursive(backup_path, &data)?;
         // Remove standby.signal so we can start read-write briefly.
         drop(fs::remove_file(data.join("standby.signal")));
-        let port = 55433_u16;
+        let port = free_local_port()?;
         start_postgres_temp(bindir, &data, port).await?;
         let psql = bindir.join("psql");
         let write = Command::new(&psql)
@@ -1756,19 +1799,12 @@ async fn prove_full_backup_start(bindir: &Path, scratch: &Path, backup_path: &Pa
         if !write.success() {
             bail!("Restored full backup did not accept a query");
         }
-        return Ok(());
+        return Ok(BackupProof::RestoredAndStarted);
     }
-    // Compressed / opaque: BackupManager already ran pg_verifybackup on create.
-    // Refuse if the path is missing; otherwise accept inventory + verify as the
-    // floor and require WAL PITR matrix for archive depth.
     if !backup_path.exists() {
         bail!("Full backup path does not exist: {}", backup_path.display());
     }
-    info!(
-        path = %backup_path.display(),
-        "Full backup present (verify on create); scratch start skipped for non-dir format"
-    );
-    Ok(())
+    Ok(BackupProof::ExistenceOnly)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -1885,7 +1921,7 @@ async fn run_pg_upgrade_check(
 
     // Bring the copy up on an ephemeral port and stop cleanly so pg_control
     // reports "shut down" rather than "in production".
-    let check_port: u16 = 55432;
+    let check_port = free_local_port()?;
     let sock_dir = work.join("check_sockets");
     fs::create_dir_all(&sock_dir)?;
     let pg_ctl = old_bindir.join("pg_ctl");
@@ -2021,6 +2057,9 @@ fn dir_size_approx(path: &Path) -> Result<u64> {
         }
         Ok(())
     }
+    // Stat the root explicitly: `walk` skips anything that is neither file
+    // nor directory, which would silently read a missing root as zero bytes.
+    fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let mut total = 0_u64;
     walk(path, &mut total)?;
     Ok(total)
@@ -2253,7 +2292,7 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
         // running detached, still writing into the target we are about to
         // report as failed.
         .kill_on_drop(true);
-    let output = tokio::time::timeout(pg_upgrade_budget(old_data), upgrade.output())
+    let output = tokio::time::timeout(pg_upgrade_budget(old_data)?, upgrade.output())
         .await
         .map_err(|_| {
             anyhow::anyhow!(
@@ -2373,6 +2412,12 @@ pub fn confirm_local(data_dir: &Path, to_major: u32) -> Result<()> {
         );
     }
     fs::remove_dir_all(&old).with_context(|| format!("removing old datadir {}", old.display()))?;
+    // The watermark described a moment on the cluster whose anchor is now
+    // gone; left behind it would poison the next upgrade's crash-resume and
+    // rollback decisions.
+    if let Some(parent) = data_dir.parent() {
+        drop(fs::remove_file(unfreeze_watermark_path(parent)));
+    }
     info!(removed = %old.display(), "Rollback anchor deleted");
     Ok(())
 }
@@ -2557,13 +2602,16 @@ const fn interrupted_target_is_discardable(
 /// A fixed budget is either too short for a real database or too long to
 /// catch a wedge. `--copy` reads and writes every relation file, so size is
 /// the term that matters; the floor covers catalog-only clone/link runs.
-fn pg_upgrade_budget(old_data: &Path) -> Duration {
+///
+/// # Errors
+/// When the size walk fails: a floor-sized fallback budget would kill a
+/// healthy large `pg_upgrade` partway through.
+fn pg_upgrade_budget(old_data: &Path) -> Result<Duration> {
     const FLOOR: Duration = Duration::from_mins(10);
     const BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
-    let Ok(bytes) = dir_size_approx(old_data) else {
-        return FLOOR;
-    };
-    FLOOR.max(Duration::from_secs(bytes / BYTES_PER_SEC))
+    let bytes = dir_size_approx(old_data)
+        .with_context(|| format!("sizing {} for the pg_upgrade budget", old_data.display()))?;
+    Ok(FLOOR.max(Duration::from_secs(bytes / BYTES_PER_SEC)))
 }
 
 /// How one `pg_upgrade`-emitted script runs.
@@ -3077,12 +3125,17 @@ mod tests {
     fn the_pg_upgrade_budget_grows_with_the_data_directory() {
         let dir = tempfile::tempdir().unwrap();
         let small = fake_datadir(dir.path(), "data", 17, true);
-        assert_eq!(pg_upgrade_budget(&small), Duration::from_mins(10));
-        assert_eq!(
-            pg_upgrade_budget(Path::new("/nonexistent")),
-            Duration::from_mins(10),
-            "an unreadable directory falls back to the floor, not to zero"
-        );
+        assert_eq!(pg_upgrade_budget(&small).unwrap(), Duration::from_mins(10));
+    }
+
+    /// A failed size walk must propagate: read as zero bytes it passes the
+    /// disk-headroom gate on a full disk, and it shrinks the `pg_upgrade`
+    /// budget to the floor, killing a healthy large run partway through.
+    #[test]
+    fn an_unreadable_data_dir_fails_the_size_walk_instead_of_reading_zero() {
+        let missing = Path::new("/nonexistent-pgbattery-size-probe");
+        assert!(dir_size_approx(missing).is_err());
+        assert!(pg_upgrade_budget(missing).is_err());
     }
 
     /// The gate must be passable: a cluster whose flush LSN still sits at
@@ -3097,6 +3150,25 @@ mod tests {
         assert!(rollback_may_discard_writes(None, Some(500)));
         assert!(rollback_may_discard_writes(Some(500), None));
         assert!(rollback_may_discard_writes(None, None));
+    }
+
+    /// The watermark describes a moment on a cluster whose rollback anchor
+    /// confirm just deleted; left behind it would poison the next upgrade's
+    /// crash-resume and rollback decisions.
+    #[test]
+    fn confirm_removes_the_watermark_with_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = fake_datadir(dir.path(), "data", 17, true);
+        let new = fake_datadir(dir.path(), "data_18", 18, true);
+        write_unfreeze_watermark(dir.path(), 7).unwrap();
+
+        confirm_local(&new, 18).unwrap();
+        assert!(!old.exists(), "the rollback anchor is deleted");
+        assert_eq!(
+            read_unfreeze_watermark(dir.path()),
+            None,
+            "the watermark goes with it"
+        );
     }
 
     #[test]
