@@ -59,6 +59,8 @@
   "authority_pg_addr",
 ]
 "observability/management_api/cutover.rs" = [
+  "cutover_arm",
+  "holds_authority",
   "cutover_seal",
   "cutover_transfer",
   "cutover_force_transfer",

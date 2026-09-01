@@ -110,6 +110,7 @@ contracts:
     title: Cross-Cluster Single Write Authority
     inversions:
       - tla/cutover_authority.inv-green-self-elect.cfg
+      - tla/cutover_authority.inv-green-self-arm.cfg
       - test_a_cluster_without_authority_never_reports_holding_it
       - test_a_fence_that_covers_nothing_is_refused
 

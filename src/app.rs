@@ -84,6 +84,9 @@ struct ClientFenceReconcilerInputs {
     postgres: Arc<tokio::sync::Mutex<Supervisor>>,
     shutdown_rx: watch::Receiver<bool>,
     configured_roles: Vec<String>,
+    cluster_id: Arc<str>,
+    awaits_write_authority_from: Option<Arc<str>>,
+    fence_apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -565,11 +568,15 @@ impl App {
         // Cloned before the gateway takes ownership of these receivers.
         let observer_leader_rx = leader_rx.clone();
         let observer_fence_rx = fence_rx.clone();
+        // Shared between the seal/abort handlers and the fence reconciler so
+        // neither can change the PG-side fence inside the other's window.
+        let client_fence_apply_lock = Arc::new(tokio::sync::Mutex::new(()));
         let fence_reconciler = self.client_fence_reconciler_inputs(
             &fence_rx,
             &cluster_state,
             &postgres_manager,
             &shutdown_rx,
+            &client_fence_apply_lock,
         );
 
         let rpc_server = RaftRpcServer::new_with_tls(
@@ -610,6 +617,7 @@ impl App {
             Arc::clone(&debug_events),
             shutdown_tx.clone(),
             fence_tx,
+            Arc::clone(&client_fence_apply_lock),
         );
         // Also clone the token into an owned String copy for the CLI-style
         // HTTP client used by the auto-promotion path, below.
@@ -704,6 +712,7 @@ impl App {
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
         shutdown_rx: &watch::Receiver<bool>,
+        fence_apply_lock: &Arc<tokio::sync::Mutex<()>>,
     ) -> ClientFenceReconcilerInputs {
         ClientFenceReconcilerInputs {
             fence_rx: fence_rx.clone(),
@@ -711,6 +720,13 @@ impl App {
             postgres: postgres.clone(),
             shutdown_rx: shutdown_rx.clone(),
             configured_roles: self.config.client_fence_roles.clone(),
+            cluster_id: Arc::from(self.config.cluster_id.as_str()),
+            awaits_write_authority_from: self
+                .config
+                .awaits_write_authority_from
+                .as_deref()
+                .map(Arc::from),
+            fence_apply_lock: Arc::clone(fence_apply_lock),
         }
     }
 
@@ -723,10 +739,26 @@ impl App {
             postgres,
             mut shutdown_rx,
             configured_roles,
+            cluster_id,
+            awaits_write_authority_from,
+            fence_apply_lock,
         } = input;
         tokio::spawn(async move {
             loop {
-                let want_fenced = fence_rx.borrow().local_client_writes_fenced();
+                // Wanted state comes from the committed log (plus boot-fence
+                // config), read fresh each pass — not from the metrics-tick
+                // fence projection, which lags apply and once let a wake
+                // during a SEAL lift the fence the handler had just applied.
+                // The watch below is only the wake-up, never the truth.
+                let (want_fenced, phase) = {
+                    let state = cluster_state.read();
+                    let (holds, _) = Governor::cutover_authority_projection(
+                        &state.cutover,
+                        &cluster_id,
+                        awaits_write_authority_from.as_deref(),
+                    );
+                    (!holds, state.cutover.phase)
+                };
                 // A recipient fenced before any cutover entry has only its
                 // configured roles; a donor sealing gets them from the log.
                 let committed = cluster_state.read().cutover.fenced_app_roles.clone();
@@ -747,19 +779,37 @@ impl App {
                     drop(guard);
                     answer
                 };
-                if primary.unwrap_or(false) {
-                    let phase = cluster_state.read().cutover.phase;
-                    let guard = postgres.lock().await;
-                    // Unfreeze before touching the fence and freeze after:
-                    // applying the fence creates the snapshot table, which is
-                    // DDL the freeze would refuse.
-                    let result = reconcile_ddl_and_fence(&guard, &roles, want_fenced, phase).await;
-                    drop(guard);
-                    if let Err(e) = result {
-                        // Waiting for the next fence change would strand the
-                        // cluster: the abort that needs lifting has already
-                        // been observed, and nothing else is coming.
-                        warn!(error = %e, want_fenced, "Client-write fence reconcile failed; retrying");
+                match primary {
+                    Ok(true) => {
+                        // Same lock the seal/abort handlers hold across their
+                        // direct fence changes: a reconcile must not interleave
+                        // with a seal's fence→LSN-read→commit window.
+                        let _fence_guard = fence_apply_lock.lock().await;
+                        let guard = postgres.lock().await;
+                        // Unfreeze before touching the fence and freeze after:
+                        // applying the fence creates the snapshot table, which is
+                        // DDL the freeze would refuse.
+                        let result =
+                            reconcile_ddl_and_fence(&guard, &roles, want_fenced, phase).await;
+                        drop(guard);
+                        if let Err(e) = result {
+                            // Waiting for the next fence change would strand the
+                            // cluster: the abort that needs lifting has already
+                            // been observed, and nothing else is coming.
+                            warn!(error = %e, want_fenced, "Client-write fence reconcile failed; retrying");
+                            tokio::select! {
+                                () = tokio::time::sleep(CLIENT_FENCE_RETRY_INTERVAL) => continue,
+                                _ = shutdown_rx.changed() => return,
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // "Could not probe" is not "not primary": a node
+                        // promoted mid-cutover whose PG is briefly unready
+                        // must retry, or its internal port stays unfenced
+                        // with no further wake-up coming.
+                        warn!(error = %e, "Client-write fence primary probe failed; retrying");
                         tokio::select! {
                             () = tokio::time::sleep(CLIENT_FENCE_RETRY_INTERVAL) => continue,
                             _ = shutdown_rx.changed() => return,
@@ -898,6 +948,7 @@ impl App {
         debug_events: Arc<crate::observability::debug_events::DebugEventBuffer>,
         shutdown_tx: watch::Sender<bool>,
         fence_tx: watch::Sender<FenceState>,
+        client_fence_apply_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Arc<ManagementApiState> {
         Arc::new(ManagementApiState {
             node_id: self.config.node_id,
@@ -925,6 +976,12 @@ impl App {
             )),
             fence_tx,
             cluster_id: Arc::from(self.config.cluster_id.as_str()),
+            awaits_write_authority_from: self
+                .config
+                .awaits_write_authority_from
+                .as_deref()
+                .map(Arc::from),
+            client_fence_apply_lock,
         })
     }
 

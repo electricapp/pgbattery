@@ -165,13 +165,31 @@ pub struct CutoverActionResponse {
     pub status: Option<CutoverStatusResponse>,
 }
 
+/// The one authority read (STATE_MACHINE 8d), config-aware and fresh.
+///
+/// The raw log read reports a virgin recipient (`authority_cluster_id: None`)
+/// as holding authority; only the projection knows that a cluster configured
+/// with `awaits_write_authority_from` holds nothing until its own log says so.
+/// Reporting the raw value here once made the CLI refuse every correctly
+/// configured fresh recipient while its gateway simultaneously reported a
+/// hold.
+fn holds_authority(state: &ManagementApiState) -> bool {
+    let cutover = state.cluster_state.read().cutover.clone();
+    crate::governor::Governor::cutover_authority_projection(
+        &cutover,
+        &state.cluster_id,
+        state.awaits_write_authority_from.as_deref(),
+    )
+    .0
+}
+
 fn status_from(state: &ManagementApiState) -> CutoverStatusResponse {
     let cutover = state.cluster_state.read().cutover.clone();
     let fence = *state.fence_tx.borrow();
     CutoverStatusResponse {
         epoch: cutover.epoch,
         cluster_id: state.cluster_id.to_string(),
-        holds_client_write_authority: cutover.holds_client_write_authority(&state.cluster_id),
+        holds_client_write_authority: holds_authority(state),
         authority_cluster_id: cutover.authority_cluster_id,
         phase: cutover.phase.as_str().into(),
         sealed_final_lsn: cutover.sealed_final_lsn,
@@ -179,6 +197,29 @@ fn status_from(state: &ManagementApiState) -> CutoverStatusResponse {
         transfer_forced: cutover.transfer_forced,
         cutover_client_hold: fence.cutover_client_hold(),
     }
+}
+
+/// Refuse a cutover step's target naming: empty, or this cluster itself.
+fn validate_target(
+    state: &ManagementApiState,
+    target: &str,
+    step: &str,
+) -> Option<(StatusCode, Json<CutoverActionResponse>)> {
+    if target.is_empty() {
+        return Some(refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            format!("target_cluster_id is required to {step}"),
+        ));
+    }
+    if target == &*state.cluster_id {
+        return Some(refuse(
+            state,
+            StatusCode::BAD_REQUEST,
+            format!("Refusing to {step} a cutover to this cluster ({target})"),
+        ));
+    }
+    None
 }
 
 fn refuse(
@@ -249,18 +290,22 @@ pub(super) async fn cutover_arm(
     Json(body): Json<CutoverArmRequest>,
 ) -> impl IntoResponse {
     let target = body.target_cluster_id.trim().to_string();
-    if target.is_empty() {
-        return refuse(
-            &state,
-            StatusCode::BAD_REQUEST,
-            "target_cluster_id is required",
-        );
+    if let Some(rejection) = validate_target(&state, &target, "arm") {
+        return rejection;
     }
-    if target == *state.cluster_id {
+    // Arming claims authority for the local cluster, so only a cluster that
+    // holds it may arm. The apply-level guard cannot see config, and a virgin
+    // recipient's log is indistinguishable from a virgin donor's — this read
+    // is what tells them apart. Without it, one authenticated arm call on a
+    // boot-fenced recipient self-elects it into write authority while the
+    // donor still holds it (U1).
+    if !holds_authority(&state) {
         return refuse(
             &state,
-            StatusCode::BAD_REQUEST,
-            format!("Refusing to arm a cutover to this cluster ({target})"),
+            StatusCode::CONFLICT,
+            "Refusing to arm: this cluster does not hold client write \
+             authority. A recipient earns authority through \
+             /api/v1/admin/cutover/receive-authority, never by arming",
         );
     }
     info!(%target, "Cutover ARMED");
@@ -313,6 +358,12 @@ pub(super) async fn cutover_seal(
         );
     };
 
+    // Held from fence-apply through the Raft commit: the reconciler derives
+    // its wanted state from the committed log, which still says "unfenced"
+    // inside this window, so an unguarded wake here would lift the fence and
+    // let an acked write carry an LSN past the recorded final_lsn (U2).
+    let _fence_guard = state.client_fence_apply_lock.lock().await;
+
     let guard = pg.lock().await;
     if let Err(e) =
         crate::commands::upgrade::blue_green::require_fence_covers_roles(&guard, &body.app_roles)
@@ -334,24 +385,48 @@ pub(super) async fn cutover_seal(
     let final_lsn = match crate::commands::upgrade::client_fence::flush_lsn_bytes(&guard).await {
         Ok(lsn) => lsn,
         Err(e) => {
+            let lifted =
+                crate::commands::upgrade::client_fence::lift_client_write_fence(
+                    &guard,
+                    &body.app_roles,
+                )
+                .await;
+            let suffix = match lifted {
+                Ok(()) => "the fence was lifted",
+                Err(_) => "lifting the fence also failed — clients are fenced with no seal entry; retry SEAL or abort",
+            };
             return refuse(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Fence applied but final LSN unreadable, not sealing: {e}"),
+                format!("Final LSN unreadable, not sealing ({e}); {suffix}"),
             );
         }
     };
     drop(guard);
 
     info!(final_lsn, "Cutover SEAL (fence applied, LSN read after)");
-    apply_cutover(
+    let (status, resp) = apply_cutover(
         &state,
         ClusterCommand::CutoverSeal {
             final_lsn,
-            app_roles: body.app_roles,
+            app_roles: body.app_roles.clone(),
         },
     )
-    .await
+    .await;
+    if status != StatusCode::OK {
+        // The fence went on but no SEAL committed (leadership or quorum lost
+        // mid-handler). Leaving it on locks the application out with the
+        // committed state still Armed — and the reconciler, reading that
+        // state, would never lift it. Undo what this handler did.
+        let guard = pg.lock().await;
+        if let Err(e) =
+            crate::commands::upgrade::client_fence::lift_client_write_fence(&guard, &body.app_roles)
+                .await
+        {
+            warn!(error = %e, "SEAL did not commit and the fence lift failed; clients stay fenced until abort or a seal retry");
+        }
+    }
+    (status, resp)
 }
 
 pub(super) async fn cutover_drain_observed(
@@ -373,6 +448,10 @@ pub(super) async fn cutover_transfer(
              must predate the recipient's first accepted write)",
         );
     }
+    let target = body.target_cluster_id.trim().to_string();
+    if let Some(rejection) = validate_target(&state, &target, "transfer") {
+        return rejection;
+    }
     if let Err(e) = body.target_pg_addr.parse::<std::net::SocketAddr>() {
         return refuse(
             &state,
@@ -392,7 +471,7 @@ pub(super) async fn cutover_transfer(
     apply_cutover(
         &state,
         ClusterCommand::CutoverTransfer {
-            target_cluster_id: body.target_cluster_id,
+            target_cluster_id: target,
             target_pg_addr: body.target_pg_addr,
             forced: false,
         },
@@ -427,6 +506,9 @@ pub(super) async fn cutover_abort(
     let Some(pg) = state.postgres_manager.as_ref() else {
         return (status, resp);
     };
+    // Same exclusion as SEAL: the lift must not interleave with a reconcile
+    // or an in-flight seal's fence window.
+    let _fence_guard = state.client_fence_apply_lock.lock().await;
     let guard = pg.lock().await;
     if let Err(e) =
         crate::commands::upgrade::client_fence::lift_client_write_fence(&guard, &body.app_roles)
@@ -458,6 +540,10 @@ pub(super) async fn cutover_force_transfer(
              no timer here; the operator accepts the loss explicitly)",
         );
     }
+    let target = body.target_cluster_id.trim().to_string();
+    if let Some(rejection) = validate_target(&state, &target, "force-transfer") {
+        return rejection;
+    }
     if let Err(e) = body.target_pg_addr.parse::<std::net::SocketAddr>() {
         return refuse(
             &state,
@@ -472,7 +558,7 @@ pub(super) async fn cutover_force_transfer(
     apply_cutover(
         &state,
         ClusterCommand::CutoverTransfer {
-            target_cluster_id: body.target_cluster_id,
+            target_cluster_id: target,
             target_pg_addr: body.target_pg_addr,
             forced: true,
         },

@@ -693,7 +693,7 @@ impl Governor {
     /// the recipient address parses; anything else is `None`, which the
     /// gateway reads as hold. Never falls back to the local Raft leader —
     /// that fallback is how a lost cutover entry becomes a split-brain.
-    fn cutover_authority_projection(
+    pub(crate) fn cutover_authority_projection(
         cutover: &crate::governor::state_machine::CutoverAuthorityState,
         local_cluster_id: &str,
         awaits_authority_from: Option<&str>,

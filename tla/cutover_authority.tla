@@ -57,10 +57,12 @@ EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     MaxEpoch,                 \* bound epochs for TLC
-    AllowGreenSelfElect       \* FALSE in safety models; TRUE in inv- config
+    AllowGreenSelfElect,      \* FALSE in safety models; TRUE in inv- config
+    AllowGreenSelfArm         \* FALSE in safety models; TRUE in inv- config
 
 ASSUME MaxEpoch \in Nat /\ MaxEpoch >= 2
 ASSUME AllowGreenSelfElect \in BOOLEAN
+ASSUME AllowGreenSelfArm \in BOOLEAN
 
 Clusters == {"blue", "green"}
 
@@ -172,11 +174,14 @@ ForceTransfer ==
     /\ UNCHANGED <<greenEpoch, greenWritable, greenDrained, blueReachable,
                    reverseSlotReady, attested>>
 
-\* Green failed to drain: unseal blue into a NEW epoch. Safe only because
-\* green never wrote — which AtMostOneWriteAuthority is checking.
+\* Abort into a NEW epoch. From armed nothing was sealed, so the "unseal" is
+\* only the epoch bump and phase move — the exit a wrong-target arm takes
+\* without fencing clients first. Guarded ONLY on blue's own log: the
+\* implementation cannot read green's, so a cross-cluster conjunct here would
+\* check a mechanism the code does not have. Safety of aborting while green
+\* wrote is exactly what AtMostOneWriteAuthority must prove, not assume.
 AbortUnseal ==
-    /\ bluePhase \in {"sealed", "draining"}
-    /\ ~greenWritable
+    /\ bluePhase \in {"armed", "sealed", "draining"}
     /\ blueEpoch < MaxEpoch
     /\ blueEpoch' = blueEpoch + 1
     /\ bluePhase' = "aborted"
@@ -250,6 +255,21 @@ GreenSelfElect ==
     /\ UNCHANGED <<blueEpoch, bluePhase, blueWritable, greenDrained,
                    blueReachable, reverseSlotReady, attested>>
 
+\* Defect action for the arm-guard counterexample: green arms itself from its
+\* virgin log while blue is untouched and fully writable. Arming records
+\* authority for the LOCAL cluster, so with the handler's holds-authority
+\* guard (`cutover_arm` / `holds_authority`) removed, one authenticated arm
+\* call self-elects a boot-fenced recipient into write authority while blue
+\* still holds it — U1's inversion, the timeout-free sibling of
+\* GreenSelfElect.
+
+GreenSelfArm ==
+    /\ AllowGreenSelfArm
+    /\ ~greenWritable
+    /\ greenWritable' = TRUE
+    /\ UNCHANGED <<blueEpoch, bluePhase, blueWritable, greenEpoch,
+                   greenDrained, blueReachable, reverseSlotReady, attested>>
+
 Next ==
     \/ Arm
     \/ Seal
@@ -264,6 +284,7 @@ Next ==
     \/ LoseBlue
     \/ RestoreBlue
     \/ GreenSelfElect
+    \/ GreenSelfArm
 
 Spec == Init /\ [][Next]_vars
 

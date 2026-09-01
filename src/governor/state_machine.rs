@@ -537,9 +537,12 @@ impl ClusterState {
                 self.cutover.transfer_forced = forced;
             }
             ClusterCommand::CutoverAbortUnseal { local_cluster_id } => {
+                // Armed is included so a wrong-target arm has an exit that
+                // does not require fencing clients first; nothing is sealed
+                // there, so "unseal" is only the epoch bump and phase move.
                 if !matches!(
                     self.cutover.phase,
-                    CutoverPhase::Sealed | CutoverPhase::Draining
+                    CutoverPhase::Armed | CutoverPhase::Sealed | CutoverPhase::Draining
                 ) {
                     return CommandOutcome::OutOfOrder;
                 }
@@ -1058,6 +1061,25 @@ mod tests {
         assert!(state.cutover.holds_client_write_authority(BLUE));
         assert_eq!(state.cutover.epoch, 1);
         assert!(state.cutover.sealed_final_lsn.is_none());
+    }
+
+    /// A wrong-target arm needs an exit that does not fence clients first:
+    /// abort applies from Armed directly, into a new epoch.
+    #[test]
+    fn an_armed_cutover_can_be_aborted_without_sealing() {
+        let mut state = ClusterState::new();
+        armed(&mut state);
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverAbortUnseal {
+                local_cluster_id: BLUE.into(),
+            }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.cutover.phase, CutoverPhase::Aborted);
+        assert_eq!(state.cutover.authority_cluster_id.as_deref(), Some(BLUE));
+        assert!(state.cutover.holds_client_write_authority(BLUE));
+        assert_eq!(state.cutover.epoch, 1);
+        assert!(state.cutover.target_cluster_id.is_none());
     }
 
     /// A command that cannot apply from the current phase says so.

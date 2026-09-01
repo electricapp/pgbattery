@@ -65,6 +65,7 @@ coverage the next time somebody added a spec.
 | `commit_probing`        | LSN election gate (leader holds every replicated txn) | `AckedSuccessIsDurable`         |
 | `timeline_verification` | pg_rewind's divergence gate                           | `TimelineMonotonic`             |
 | `cutover_authority`     | green refuses to self-elect while blue unreachable    | `FailClosedWhenBlueUnreachable` |
+| `cutover_authority`     | arming requires holding authority (`inv-green-self-arm`) | `AtMostOneWriteAuthority`    |
 
 Each switch is a `CONSTANT` defaulting to the safe value in every other model,
 so the mechanism is disabled only where a counterexample is the expected result.
@@ -80,8 +81,12 @@ so the mechanism is disabled only where a counterexample is the expected result.
 | `cutover_authority.tla`     | Track C: ≤1 `(epoch, cluster)` writable; green never self-elects (U1/U4)  |
 
 `cutover_authority.tla` models one direction: blue is the donor and only blue
-arms. The reverse cutover — the recipient arming from TRANSFERRED to hand
-authority back — is covered by `bluegreen-rollback-drill` and by
+arms honestly. The `GreenSelfArm` defect action models green arming with the
+handler's holds-authority guard removed — the guard that stops a boot-fenced
+recipient from self-electing — and `inv-green-self-arm.cfg` requires TLC to
+produce that U1 counterexample. The reverse cutover — the recipient arming
+from TRANSFERRED to hand authority back — is covered by
+`bluegreen-rollback-drill` and by
 `the_cluster_that_gave_authority_away_cannot_arm_itself_back`, not by the
 model. Blue's guard in the spec stays faithful either way: after a transfer
 the donor does not hold authority, so it still cannot arm.

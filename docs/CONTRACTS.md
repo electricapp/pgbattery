@@ -205,6 +205,9 @@ revokes client DML on the local primary.
 **Violation**: confirmed acceptances on both clusters for overlapping windows.
 
 **Inversions**: `tla/cutover_authority.inv-green-self-elect.cfg`;
+`tla/cutover_authority.inv-green-self-arm.cfg` (arming claims authority for
+the local cluster, so an arm without the holds-authority guard self-elects a
+boot-fenced recipient);
 `test_a_cluster_without_authority_never_reports_holding_it`;
 `test_a_fence_that_covers_nothing_is_refused` (SEAL reports success while the
 app role still writes to the internal port).

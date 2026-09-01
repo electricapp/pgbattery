@@ -139,6 +139,15 @@ pub struct ManagementApiState {
     pub fence_tx: watch::Sender<crate::governor::raft::FenceState>,
     /// `Config::cluster_id` — the identity cutover authority records name.
     pub cluster_id: Arc<str>,
+    /// `Config::awaits_write_authority_from` — the recipient-side boot fence.
+    /// Config speaks only until this cluster's own log records an authority
+    /// entry; handlers must read authority through
+    /// `Governor::cutover_authority_projection`, never the raw log state.
+    pub awaits_write_authority_from: Option<Arc<str>>,
+    /// Shared with the client-fence reconciler: whoever changes the PG-side
+    /// fence holds this, so a reconcile cannot lift the fence inside a seal
+    /// handler's fence→LSN-read→commit window (U2).
+    pub client_fence_apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The two paths needed to read a data directory's control file, plus Track B
