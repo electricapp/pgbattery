@@ -2628,7 +2628,7 @@
     {
       "id": "cluster-binary-upgrade-proof",
       "contracts": ["W1", "V1"],
-      "description": "Track A proof: rolling self-upgrade to a distinct package version shipped in the runtime image (not same-binary restart).",
+      "description": "Track A proof: rolling self-upgrade to a distinct package version shipped in the runtime image (not same-binary restart). A continuous keyed writer runs through the whole roll and every acked key is asserted present afterwards by set difference on the leader (W1); every voter must report the new version (V1) and every follower must report is_synced again before the case passes.",
       "actions": [
         {
           "type": "cmd",

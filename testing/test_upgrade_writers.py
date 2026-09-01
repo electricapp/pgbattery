@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 os.environ.setdefault("PGBATTERY_MANAGEMENT_API_TOKEN", "self-test-token")
 
+import cluster_binary_upgrade_proof
 import pg_major_upgrade_proof
 import pg_upgrade_hold_chaos
 from topology import Node
@@ -95,6 +96,9 @@ class WriterThreadHygieneTest(unittest.TestCase):
 
     def test_the_major_upgrade_writer_leaves_thread_internals_alone(self) -> None:
         self._assert_no_collision(pg_major_upgrade_proof.Writer(gateway_port=1))
+
+    def test_the_binary_upgrade_writer_leaves_thread_internals_alone(self) -> None:
+        self._assert_no_collision(cluster_binary_upgrade_proof.Writer(gateway_port=1))
 
 
 class ProofEntrypointTest(unittest.TestCase):
@@ -163,6 +167,23 @@ class AckedKeySetTest(unittest.TestCase):
             return_value={"w-0", "w-1", "w-2", "w-99"},
         ):
             pg_upgrade_hold_chaos._assert_acked_survived(_node(), set(ACKED_KEYS))
+
+    def test_the_binary_upgrade_oracle_names_the_lost_key(self) -> None:
+        with (
+            mock.patch.object(
+                cluster_binary_upgrade_proof,
+                "_present_keys",
+                return_value=set(PRESENT_RAW.split()),
+            ),
+            self.assertRaises(cluster_binary_upgrade_proof.ContractFailure) as caught,
+        ):
+            cluster_binary_upgrade_proof._assert_acked_survived("node1", set(ACKED_KEYS))
+        self.assertIn("w-1", str(caught.exception))
+
+    def test_the_binary_upgrade_oracle_refuses_an_empty_ledger(self) -> None:
+        with self.assertRaises(cluster_binary_upgrade_proof.ContractFailure) as caught:
+            cluster_binary_upgrade_proof._assert_acked_survived("node1", set())
+        self.assertIn("vacuous", str(caught.exception))
 
 
 class HoldChaosKillEffectTest(unittest.TestCase):
