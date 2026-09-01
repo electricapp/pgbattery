@@ -106,6 +106,21 @@ pub enum DonorClaim {
     Silent,
 }
 
+/// Whether the caller's donor list can possibly contain a donor majority.
+///
+/// The quorum denominator is otherwise caller-supplied: an honest caller
+/// listing one node of a three-node donor would let that node's word count
+/// as "a majority of the list". Each confirming donor's own reported voter
+/// count bounds the real cluster size; a list too short to hold that
+/// cluster's majority is refused. A lying donor set is the same trust as
+/// before — this catches mistakes, not adversaries (the documented
+/// network-trust stance stands).
+#[must_use]
+pub const fn donor_list_covers_majority(listed: usize, reported_voters: usize) -> bool {
+    // Strictly more than half: the list must be able to hold V/2 + 1 nodes.
+    listed > reported_voters / 2
+}
+
 /// Whether the donor's own nodes confirm the handoff.
 ///
 /// A strict majority of the donor's *configured* nodes must confirm — silence
@@ -1067,6 +1082,30 @@ pub(super) async fn advance_sequences(
         .into_response()
 }
 
+/// One donor node's answer: its claim, and — when it confirms — how many
+/// voters it says its cluster has.
+struct DonorAnswer {
+    claim: DonorClaim,
+    voter_count: Option<usize>,
+}
+
+/// Voters in one donor node's own membership view.
+async fn donor_voter_count(client: &reqwest::Client, addr: &str) -> Option<usize> {
+    let url = format!("http://{addr}/api/v1/cluster/members");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let members = resp.json::<super::MembershipResponse>().await.ok()?;
+    Some(
+        members
+            .members
+            .iter()
+            .filter(|m| m.role == crate::cluster::MemberRole::Voter)
+            .count(),
+    )
+}
+
 /// Ask one donor node what it has committed about this handoff.
 async fn donor_claim(
     client: &reqwest::Client,
@@ -1074,16 +1113,20 @@ async fn donor_claim(
     epoch: u64,
     donor_cluster_id: &str,
     recipient_cluster_id: &str,
-) -> DonorClaim {
+) -> DonorAnswer {
     let url = format!("http://{addr}/api/v1/cutover/status");
+    let silent = DonorAnswer {
+        claim: DonorClaim::Silent,
+        voter_count: None,
+    };
     let Ok(resp) = client.get(&url).send().await else {
-        return DonorClaim::Silent;
+        return silent;
     };
     if !resp.status().is_success() {
-        return DonorClaim::Silent;
+        return silent;
     }
     let Ok(status) = resp.json::<CutoverStatusResponse>().await else {
-        return DonorClaim::Silent;
+        return silent;
     };
     let confirms = status.cluster_id == donor_cluster_id
         && status.phase == CutoverPhase::Transferred.as_str()
@@ -1091,9 +1134,15 @@ async fn donor_claim(
         && status.authority_cluster_id.as_deref() == Some(recipient_cluster_id)
         && !status.holds_client_write_authority;
     if confirms {
-        DonorClaim::Confirms
+        DonorAnswer {
+            claim: DonorClaim::Confirms,
+            voter_count: donor_voter_count(client, addr).await,
+        }
     } else {
-        DonorClaim::Contradicts
+        DonorAnswer {
+            claim: DonorClaim::Contradicts,
+            voter_count: None,
+        }
     }
 }
 
@@ -1120,11 +1169,15 @@ async fn await_donor_quorum(
             let recipient = state.cluster_id.to_string();
             poll.spawn(async move { donor_claim(&client, &addr, epoch, &donor, &recipient).await });
         }
-        let mut claims = Vec::with_capacity(body.donor_mgmt_addrs.len());
+        let mut answers = Vec::with_capacity(body.donor_mgmt_addrs.len());
         while let Some(joined) = poll.join_next().await {
             // A panicked probe task told us nothing about the donor.
-            claims.push(joined.unwrap_or(DonorClaim::Silent));
+            answers.push(joined.unwrap_or(DonorAnswer {
+                claim: DonorClaim::Silent,
+                voter_count: None,
+            }));
         }
+        let claims: Vec<DonorClaim> = answers.iter().map(|a| a.claim).collect();
         let confirming = claims
             .iter()
             .filter(|c| **c == DonorClaim::Confirms)
@@ -1135,7 +1188,34 @@ async fn await_donor_quorum(
             started.elapsed(),
             DONOR_QUORUM_BUDGET,
         ) {
-            DonorPollVerdict::Confirmed => return Ok(confirming),
+            DonorPollVerdict::Confirmed => {
+                // The denominator above is the caller's list. Each confirming
+                // donor's own voter count bounds the real cluster size; a
+                // list too short to hold that cluster's majority is an honest
+                // caller's mistake this refusal catches. A donor that reports
+                // no membership proves nothing either way and is skipped.
+                let listed = body.donor_mgmt_addrs.len();
+                for answer in &answers {
+                    let Some(voters) = answer.voter_count else {
+                        continue;
+                    };
+                    if answer.claim == DonorClaim::Confirms
+                        && !donor_list_covers_majority(listed, voters)
+                    {
+                        return Err(refuse(
+                            state,
+                            StatusCode::CONFLICT,
+                            format!(
+                                "Refusing: a confirming donor reports {voters} voters, \
+                                 but only {listed} donor node(s) were given to confirm \
+                                 against — a majority of the real donor cluster cannot \
+                                 fit in that list. Pass the donor's full node set."
+                            ),
+                        ));
+                    }
+                }
+                return Ok(confirming);
+            }
             DonorPollVerdict::Retry => tokio::time::sleep(DONOR_POLL_INTERVAL).await,
             DonorPollVerdict::Expired => {
                 return Err(refuse(
@@ -1348,6 +1428,18 @@ mod tests {
             ),
             DonorPollVerdict::Expired
         );
+    }
+
+    /// The quorum denominator is caller-supplied: listing one node of a
+    /// three-node donor once let that node's word read as "a majority of the
+    /// list". A confirming donor's own voter count bounds the list.
+    #[test]
+    fn a_donor_list_too_short_for_the_reported_voters_is_refused() {
+        assert!(!donor_list_covers_majority(1, 3));
+        assert!(donor_list_covers_majority(2, 3));
+        assert!(donor_list_covers_majority(3, 3));
+        assert!(!donor_list_covers_majority(2, 5));
+        assert!(donor_list_covers_majority(3, 5));
     }
 
     #[test]
