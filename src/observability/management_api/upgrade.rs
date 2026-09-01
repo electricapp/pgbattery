@@ -838,6 +838,17 @@ pub(super) async fn postgres_upgrade_confirm(
             }),
         );
     };
+    // Same exclusion as apply/rejoin/rollback: a confirm racing a rollback
+    // deletes the datadir the rollback is restarting into.
+    let Ok(_lock) = state.upgrade_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(PostgresUpgradeConfirmResponse {
+                success: false,
+                message: Some("Upgrade in progress".into()),
+            }),
+        );
+    };
     match crate::commands::upgrade::postgres::confirm_local(&paths.data_dir, body.to_major) {
         Ok(()) => (
             StatusCode::OK,
