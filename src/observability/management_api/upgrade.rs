@@ -527,14 +527,38 @@ pub struct PostgresUpgradeApplyResponse {
 }
 
 /// Run primary-side `pg_upgrade` (standbys must already be stopped; cluster frozen).
-#[allow(
-    clippy::too_many_lines,
-    reason = "apply handler is one refuse path + one success path"
-)]
+///
+/// The work runs in its own task: axum drops a handler future when the HTTP
+/// client disconnects, and `pg_upgrade` is `kill_on_drop`, so an unwrapped
+/// body would kill it mid-run on a dropped connection. The `upgrade_lock`
+/// inside the task still serializes re-entry; the handler awaits the task.
 pub(super) async fn postgres_upgrade_apply(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<PostgresUpgradeApplyRequest>,
 ) -> impl IntoResponse {
+    let to_major = body.to_major;
+    match tokio::spawn(postgres_upgrade_apply_inner(state, body)).await {
+        Ok(resp) => resp,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(PostgresUpgradeApplyResponse {
+                success: false,
+                message: Some(format!("apply task panicked or was cancelled: {e}")),
+                from_major: 0,
+                to_major,
+            }),
+        ),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "apply handler is one refuse path + one success path"
+)]
+async fn postgres_upgrade_apply_inner(
+    state: Arc<ManagementApiState>,
+    body: PostgresUpgradeApplyRequest,
+) -> (StatusCode, Json<PostgresUpgradeApplyResponse>) {
     let mut paths = {
         let guard = state.pg_paths.lock();
         let Some(paths) = guard.as_ref() else {

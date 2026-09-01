@@ -336,7 +336,7 @@ async fn apply_experimental(
         );
         if let Err(e) = client.stop_postgres(&n.mgmt_addr).await {
             restart_stopped_standbys(client, &stopped, leader_mgmt).await;
-            unfreeze_all_logging(client, nodes).await;
+            unfreeze_after_serving_primary_logging(client, nodes).await;
             bail!("Failed to stop standby {}: {e}", n.node_id);
         }
         stopped.push(n);
@@ -360,7 +360,7 @@ async fn apply_experimental(
         }
         Ok(r) => {
             restart_stopped_standbys(client, &stopped, leader_mgmt).await;
-            unfreeze_all_logging(client, nodes).await;
+            unfreeze_after_serving_primary_logging(client, nodes).await;
             bail!(
                 "Primary apply failed: {}",
                 r.message.unwrap_or_else(|| "no detail".into())
@@ -368,14 +368,16 @@ async fn apply_experimental(
         }
         Err(e) => {
             restart_stopped_standbys(client, &stopped, leader_mgmt).await;
-            unfreeze_all_logging(client, nodes).await;
+            unfreeze_after_serving_primary_logging(client, nodes).await;
             return Err(e);
         }
     }
 
-    // The apply probes a write before returning, so unfreezing here releases
-    // clients into a primary that answers. Standbys are still stopped, so
-    // durability is briefly ASYNC and the status output says so.
+    // Probed, not assumed: the apply's own write probe ran inside the
+    // handler, and the unfreeze must not trust a response over a primary
+    // that has since died. Standbys are still stopped, so durability is
+    // briefly ASYNC and the status output says so.
+    wait_for_serving_primary(client, nodes).await?;
     unfreeze_all(client, nodes).await?;
     info!("Unfrozen after primary upgrade (standbys still stopped; durability briefly ASYNC)");
 
@@ -549,14 +551,14 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
     {
         Ok(resp) if resp.success => resp,
         Ok(resp) => {
-            unfreeze_all_logging(&client, &membership.nodes).await;
+            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
             bail!(
                 "Primary rollback failed: {}",
                 resp.message.unwrap_or_else(|| "no detail".into())
             );
         }
         Err(e) => {
-            unfreeze_all_logging(&client, &membership.nodes).await;
+            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
             return Err(e);
         }
     };
@@ -566,7 +568,7 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
 
     let leader_info = client.get_leader_info(&leader_mgmt).await?;
     let Some(leader_pg) = leader_info.leader_pg_addr else {
-        unfreeze_all_logging(&client, &membership.nodes).await;
+        unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
         bail!("No leader_pg_addr after rollback");
     };
     let (host, port) = split_host_port(&leader_pg)?;
@@ -588,11 +590,12 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
         }
         .await;
         if let Err(e) = rejoined {
-            unfreeze_all_logging(&client, &membership.nodes).await;
+            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
             return Err(e);
         }
     }
 
+    wait_for_serving_primary(&client, &membership.nodes).await?;
     unfreeze_all(&client, &membership.nodes).await?;
     require_doctor_strict(Some(leader_mgmt.clone()), params.config_path.clone()).await?;
     info!(from_major, "Rollback complete; cluster on old major");
@@ -634,6 +637,58 @@ async fn wait_standby_streaming(
             bail!("Timed out waiting for standby {node_id} to become SYNC after rejoin");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Confirm some primary answers SQL before releasing held clients.
+///
+/// `GET /api/v1/cluster/txid-status/{txid}` runs a real query on the
+/// leader's `PostgreSQL` under a 2 s budget, so a 200 is proof of a serving
+/// primary. Leader metadata alone only proves an election happened; after a
+/// failed apply the elected node's postmaster can be stopped.
+async fn wait_for_serving_primary(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(3);
+    loop {
+        'probe: for n in nodes {
+            let Ok(leader) = client.get_leader_info(&n.mgmt_addr).await else {
+                continue;
+            };
+            let Some(leader_mgmt) = leader.leader_mgmt_addr else {
+                continue;
+            };
+            let url = format!("http://{leader_mgmt}/api/v1/cluster/txid-status/1");
+            if let Ok(resp) = client.http_client().get(&url).send().await
+                && resp.status().is_success()
+            {
+                info!(leader = %leader_mgmt, "Primary confirmed serving");
+                return Ok(());
+            }
+            // One leader probe per round; re-resolve after the sleep.
+            break 'probe;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("no node's PostgreSQL answered a query as primary within 3 minutes");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Unfreeze only once a primary is confirmed serving; otherwise leave the
+/// cluster frozen and say so. Releasing held clients into a cluster with no
+/// primary turns a recoverable abort into an outage.
+async fn unfreeze_after_serving_primary_logging(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+) {
+    match wait_for_serving_primary(client, nodes).await {
+        Ok(()) => unfreeze_all_logging(client, nodes).await,
+        Err(e) => tracing::error!(
+            error = %e,
+            "Cluster left FROZEN: no serving primary to release held clients into"
+        ),
     }
 }
 
@@ -1883,15 +1938,57 @@ fn dir_size_approx(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Whether the old cluster can restart in place after a failed apply step.
+///
+/// `pg_upgrade --link` renames the old cluster's `global/pg_control`;
+/// without it `PostgreSQL` cannot open the directory and the only recovery
+/// is the preflight backup.
+fn old_cluster_recoverable(old_data: &Path) -> bool {
+    old_data.join("global/pg_control").is_file()
+}
+
+/// Fold a failed post-stop apply step into an error that also reports what
+/// happened to the primary.
+///
+/// Pre-confirm the old bin/data dirs are intact, so a failed initdb,
+/// `pg_upgrade`, start, or post-upgrade script must not leave the primary
+/// stopped for the CLI to unfreeze clients into: restart the old cluster
+/// and say whether that worked.
+async fn recover_old_cluster_after_failed_apply(
+    supervisor: &mut crate::supervisor::Supervisor,
+    old_bindir: &Path,
+    old_data: &Path,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if !old_cluster_recoverable(old_data) {
+        return err.context(
+            "no in-place recovery: the old cluster's control file is gone \
+             (pg_upgrade --link); the primary is DOWN, restore from the \
+             preflight backup",
+        );
+    }
+    // The failed step may have left the new cluster running.
+    if supervisor.has_postmaster()
+        && let Err(stop) = supervisor.stop().await
+    {
+        tracing::warn!(error = %stop, "Stop before old-cluster recovery failed; continuing");
+    }
+    supervisor.retarget_paths(old_bindir.to_path_buf(), old_data.to_path_buf());
+    match supervisor.start().await {
+        Ok(()) => err.context("recovery: the old cluster restarted and is serving again"),
+        Err(start) => err.context(format!(
+            "recovery FAILED: the old cluster did not restart ({start}); the primary is DOWN"
+        )),
+    }
+}
+
 /// Apply `pg_upgrade` on this (primary) node. Caller must already have frozen
 /// the cluster and stopped standbys.
 ///
 /// # Errors
-/// Stop, initdb, `pg_upgrade`, retarget, or start failures.
-#[allow(
-    clippy::too_many_lines,
-    reason = "primary apply is one auditable sequence"
-)]
+/// Stop, initdb, `pg_upgrade`, retarget, or start failures. Any failure after
+/// the stop also attempts to restart the old cluster and reports the outcome
+/// in the error.
 pub async fn run_primary_pg_upgrade_apply(
     supervisor: &mut crate::supervisor::Supervisor,
     bin_dirs: &BTreeMap<String, PathBuf>,
@@ -1914,7 +2011,8 @@ pub async fn run_primary_pg_upgrade_apply(
 
     let parent = old_data
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?;
+        .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?
+        .to_path_buf();
     let new_data = parent.join(format!("data_{to_major}"));
     if new_data.exists() {
         // `pg_upgrade` has no restart point, so a leftover target is the
@@ -1946,6 +2044,62 @@ pub async fn run_primary_pg_upgrade_apply(
         .stop()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match run_apply_after_stop(ApplyAfterStop {
+        supervisor,
+        old_bindir: &old_bindir,
+        new_bindir: &new_bindir,
+        old_data: &old_data,
+        new_data: &new_data,
+        parent: &parent,
+        initdb: &initdb,
+        from_major,
+        to_major,
+        transfer_mode,
+    })
+    .await
+    {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            Err(recover_old_cluster_after_failed_apply(supervisor, &old_bindir, &old_data, e).await)
+        }
+    }
+}
+
+/// Everything [`run_apply_after_stop`] needs; a struct so the recovery split
+/// does not turn into ten positional arguments.
+struct ApplyAfterStop<'a> {
+    supervisor: &'a mut crate::supervisor::Supervisor,
+    old_bindir: &'a Path,
+    new_bindir: &'a Path,
+    old_data: &'a Path,
+    new_data: &'a Path,
+    parent: &'a Path,
+    initdb: &'a InitdbParams,
+    from_major: u32,
+    to_major: u32,
+    transfer_mode: TransferMode,
+}
+
+/// The post-stop half of the primary apply. Every error returned here passes
+/// through [`recover_old_cluster_after_failed_apply`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "primary apply is one auditable sequence"
+)]
+async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport> {
+    let ApplyAfterStop {
+        supervisor,
+        old_bindir,
+        new_bindir,
+        old_data,
+        new_data,
+        parent,
+        initdb,
+        from_major,
+        to_major,
+        transfer_mode,
+    } = ctx;
 
     let mut init = Command::new(new_bindir.join("initdb"));
     init.args([
@@ -1999,7 +2153,7 @@ pub async fn run_primary_pg_upgrade_apply(
         // running detached, still writing into the target we are about to
         // report as failed.
         .kill_on_drop(true);
-    let output = tokio::time::timeout(pg_upgrade_budget(&old_data), upgrade.output())
+    let output = tokio::time::timeout(pg_upgrade_budget(old_data), upgrade.output())
         .await
         .map_err(|_| {
             anyhow::anyhow!(
@@ -2016,7 +2170,7 @@ pub async fn run_primary_pg_upgrade_apply(
         );
     }
 
-    supervisor.retarget_paths(new_bindir.clone(), new_data.clone());
+    supervisor.retarget_paths(new_bindir.to_path_buf(), new_data.to_path_buf());
     supervisor
         .start()
         .await
@@ -2031,7 +2185,7 @@ pub async fn run_primary_pg_upgrade_apply(
         .await
         .context("upgraded primary did not accept a write")?;
 
-    run_post_upgrade_scripts(parent, &new_bindir, read_postmaster_port(&new_data)?).await?;
+    run_post_upgrade_scripts(parent, new_bindir, read_postmaster_port(new_data)?).await?;
 
     // The LSN clients resume writing at. Rollback compares against it to say
     // whether anything would actually be discarded.
@@ -2042,7 +2196,7 @@ pub async fn run_primary_pg_upgrade_apply(
     // analyze-in-stages: gating for targets below 18; always run when vacuumdb exists.
     let vacuumdb = new_bindir.join("vacuumdb");
     if vacuumdb.is_file() {
-        let port = read_postmaster_port(&new_data)?;
+        let port = read_postmaster_port(new_data)?;
         let status = Command::new(&vacuumdb)
             .kill_on_drop(true)
             .args([
@@ -2776,6 +2930,19 @@ backup_dir = \"/var/backups/pgbattery\"
             parse_postgres_major("pg_config (PostgreSQL) 19.0").unwrap(),
             19
         );
+    }
+
+    /// A failed apply step must restart the old cluster instead of leaving
+    /// the primary stopped — possible exactly while its control file is
+    /// intact, which `pg_upgrade --link` is what takes away.
+    #[test]
+    fn a_failed_apply_can_recover_in_place_only_with_an_intact_control_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let intact = fake_datadir(dir.path(), "data", 17, true);
+        assert!(old_cluster_recoverable(&intact));
+
+        let linked = fake_datadir(dir.path(), "data_linked", 17, false);
+        assert!(!old_cluster_recoverable(&linked));
     }
 
     /// A standby rejoin wipes PGDATA and basebackups from the primary, so
