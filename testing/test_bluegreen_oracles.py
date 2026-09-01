@@ -36,6 +36,69 @@ def _node(service: str = "blue1", ip: str = "10.0.0.1") -> Node:
     )
 
 
+class FenceProbeClassificationTest(unittest.TestCase):
+    """The probe tells the fence's own denial apart from a probe that is broken."""
+
+    def test_an_acked_write_reads_as_allowed(self) -> None:
+        self.assertTrue(bg._classify_write_probe(0, "INSERT 0 1", ""))
+
+    def test_the_revoke_fence_denial_reads_as_fenced(self) -> None:
+        self.assertFalse(
+            bg._classify_write_probe(1, "", "ERROR:  permission denied for table bg_kv")
+        )
+
+    def test_the_read_only_fence_denial_reads_as_fenced(self) -> None:
+        self.assertFalse(
+            bg._classify_write_probe(
+                1, "", "ERROR:  cannot execute INSERT in a read-only transaction"
+            )
+        )
+
+    def test_a_missing_role_is_a_broken_probe_not_a_fence(self) -> None:
+        """The classifier this replaced read every non-zero exit as fenced, so a
+        green with no bg_app role passed the boot-fence assertion unimplemented."""
+        err = 'psql: error: FATAL:  role "bg_app" does not exist'
+        with self.assertRaises(RuntimeError):
+            bg._classify_write_probe(2, "", err)
+
+    def test_a_missing_table_is_a_broken_probe_not_a_fence(self) -> None:
+        with self.assertRaises(RuntimeError):
+            bg._classify_write_probe(1, "", 'ERROR:  relation "bg_kv" does not exist')
+
+
+class BootFenceTest(unittest.TestCase):
+    """U1: the boot-fence assertion passes only on an explicit denial."""
+
+    def test_a_green_that_keeps_accepting_writes_is_refused(self) -> None:
+        with (
+            mock.patch.object(bg, "_psql_allowed", return_value=True),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._assert_green_boot_fenced(_node("green1"), budget=0.2)
+        self.assertIn("U1", str(caught.exception))
+
+    def test_an_explicit_denial_passes_and_removes_the_probe_row(self) -> None:
+        deletes: list[str] = []
+
+        def record_delete(_node: Any, sql: str, **_kw: Any) -> str:
+            deletes.append(sql)
+            return ""
+
+        with (
+            mock.patch.object(bg, "_psql_allowed", return_value=False),
+            mock.patch.object(bg, "_psql", side_effect=record_delete),
+        ):
+            bg._assert_green_boot_fenced(_node("green1"), budget=0.2)
+        self.assertTrue(any("DELETE" in sql for sql in deletes))
+
+    def test_a_broken_probe_raises_instead_of_reading_as_fenced(self) -> None:
+        with (
+            mock.patch.object(bg, "_psql_allowed", side_effect=RuntimeError("role missing")),
+            self.assertRaises(RuntimeError),
+        ):
+            bg._assert_green_boot_fenced(_node("green1"), budget=0.2)
+
+
 class DrainCompletenessTest(unittest.TestCase):
     """U2: every write blue acked before SEAL is present on green."""
 
