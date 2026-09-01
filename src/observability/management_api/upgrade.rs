@@ -786,13 +786,10 @@ pub(super) async fn get_postgres_status(
         );
     };
     let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
-    let rollback_available = match (major, paths.data_dir.parent()) {
-        (Some(m), Some(parent)) => {
-            crate::commands::upgrade::postgres::UpgradeSite::probe(parent, m)
-                .is_ok_and(|s| s.rollback_available())
-        }
-        _ => false,
-    };
+    let rollback_available = major.is_some_and(|m| {
+        crate::commands::upgrade::postgres::UpgradeSite::probe(&paths.data_dir, m)
+            .is_ok_and(|s| s.rollback_available())
+    });
     (
         StatusCode::OK,
         Json(PostgresStatusResponse {

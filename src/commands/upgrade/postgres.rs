@@ -48,18 +48,41 @@ pub struct UpgradeSite {
     pub old_control_intact: bool,
 }
 
+/// The base the flow derives sibling datadir names from: the configured
+/// directory's name with a trailing `_<major>` stripped, so `data_18` and
+/// `data` share the base `data`.
+fn upgrade_site_base_name(data_dir_name: &str) -> &str {
+    match data_dir_name.rsplit_once('_') {
+        Some((base, suffix)) if suffix.parse::<u32>().is_ok() => base,
+        _ => data_dir_name,
+    }
+}
+
 impl UpgradeSite {
-    /// Probe `parent` for the data directories of a `from → to` upgrade.
+    /// Probe beside `data_dir` for the data directories of a `from → to`
+    /// upgrade.
+    ///
+    /// Candidates are only the configured `data_dir` itself and siblings
+    /// named by the convention this flow creates (`<base>_<major>`). An
+    /// operator's manual copy (`data_backup`, a snapshot) holds a parseable
+    /// `PG_VERSION` too, and trusting it would let `--rollback` start it or
+    /// `--confirm` delete it. Two candidates claiming the same major refuse
+    /// with both names.
     ///
     /// # Errors
-    /// When `parent` cannot be read.
-    pub fn probe(parent: &Path, to_major: u32) -> Result<Self> {
-        let mut site = Self {
-            old_data_dir: None,
-            old_major: None,
-            new_data_dir: None,
-            old_control_intact: false,
-        };
+    /// When the parent cannot be read, or candidates are ambiguous.
+    pub fn probe(data_dir: &Path, to_major: u32) -> Result<Self> {
+        let parent = data_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent", data_dir.display()))?;
+        let configured_name = data_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", data_dir.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let base = upgrade_site_base_name(&configured_name).to_string();
+
+        let mut by_major: BTreeMap<u32, Vec<PathBuf>> = BTreeMap::new();
         let entries = fs::read_dir(parent)
             .with_context(|| format!("reading data parent {}", parent.display()))?;
         for entry in entries {
@@ -69,7 +92,40 @@ impl UpgradeSite {
             if !path.is_dir() {
                 continue;
             }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let Some(name) = name else { continue };
+            let is_configured = name == configured_name;
+            let is_flow_sibling = name
+                .strip_prefix(&base)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|suffix| suffix.parse::<u32>().is_ok());
+            if !is_configured && !is_flow_sibling {
+                continue;
+            }
             let Ok(major) = data_dir_major(&path) else {
+                continue;
+            };
+            by_major.entry(major).or_default().push(path);
+        }
+        for (major, paths) in &by_major {
+            if paths.len() > 1 {
+                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                bail!(
+                    "multiple data directories claim major {major}: {}; move the \
+                     copies not in use out of the {base}_<major> naming convention",
+                    names.join(", ")
+                );
+            }
+        }
+
+        let mut site = Self {
+            old_data_dir: None,
+            old_major: None,
+            new_data_dir: None,
+            old_control_intact: false,
+        };
+        for (major, paths) in by_major {
+            let Some(path) = paths.into_iter().next() else {
                 continue;
             };
             if major == to_major {
@@ -2013,7 +2069,14 @@ pub async fn run_primary_pg_upgrade_apply(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?
         .to_path_buf();
-    let new_data = parent.join(format!("data_{to_major}"));
+    // The naming convention the whole flow probes by: `<base>_<major>`
+    // beside the configured datadir, base derived from its name.
+    let old_name = old_data
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("data dir has no name"))?
+        .to_string_lossy()
+        .into_owned();
+    let new_data = parent.join(format!("{}_{to_major}", upgrade_site_base_name(&old_name)));
     if new_data.exists() {
         // `pg_upgrade` has no restart point, so a leftover target is the
         // wreckage of an interrupted run, not progress. Discarding it is the
@@ -2239,7 +2302,7 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
         );
     }
 
-    let site = UpgradeSite::probe(parent, to_major)?;
+    let site = UpgradeSite::probe(new_data, to_major)?;
     info!(
         old_data = ?site.old_data_dir,
         rollback_available = site.rollback_available(),
@@ -2263,10 +2326,7 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
 /// # Errors
 /// Wrong major, or delete failure.
 pub fn confirm_local(data_dir: &Path, to_major: u32) -> Result<()> {
-    let parent = data_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve data parent"))?;
-    let site = UpgradeSite::probe(parent, to_major)?;
+    let site = UpgradeSite::probe(data_dir, to_major)?;
     let Some(old) = site.old_data_dir else {
         info!("No older data directory beside PGDATA — confirm is a no-op here");
         return Ok(());
@@ -2312,7 +2372,7 @@ pub async fn rollback_local(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?
         .to_path_buf();
-    let site = UpgradeSite::probe(&parent, to_major)?;
+    let site = UpgradeSite::probe(supervisor.data_dir(), to_major)?;
     let (Some(old_data), Some(from_major)) = (site.old_data_dir.clone(), site.old_major) else {
         bail!(
             "No data directory below major {to_major} beside {}: there is \
@@ -2825,7 +2885,7 @@ mod tests {
         let old = fake_datadir(dir.path(), "data", 17, true);
         let new = fake_datadir(dir.path(), "data_18", 18, true);
 
-        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        let site = UpgradeSite::probe(&old, 18).unwrap();
         assert_eq!(site.old_data_dir.as_deref(), Some(old.as_path()));
         assert_eq!(site.old_major, Some(17));
         assert_eq!(site.new_data_dir.as_deref(), Some(new.as_path()));
@@ -2837,10 +2897,10 @@ mod tests {
     #[test]
     fn a_renamed_old_control_file_means_no_in_place_rollback() {
         let dir = tempfile::tempdir().unwrap();
-        fake_datadir(dir.path(), "data", 17, false);
+        let old = fake_datadir(dir.path(), "data", 17, false);
         fake_datadir(dir.path(), "data_18", 18, true);
 
-        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        let site = UpgradeSite::probe(&old, 18).unwrap();
         assert_eq!(site.old_major, Some(17));
         assert!(!site.old_control_intact);
         assert!(!site.rollback_available());
@@ -2850,12 +2910,56 @@ mod tests {
     #[test]
     fn probe_on_an_unupgraded_cluster_finds_no_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        fake_datadir(dir.path(), "data", 18, true);
+        let data = fake_datadir(dir.path(), "data", 18, true);
 
-        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        let site = UpgradeSite::probe(&data, 18).unwrap();
         assert!(site.old_data_dir.is_none());
         assert!(!site.rollback_available());
         assert!(site.new_data_dir.is_some());
+    }
+
+    /// An operator's manual copy carries a parseable `PG_VERSION` too;
+    /// trusting it lets `--rollback` start it and `--confirm` delete it.
+    /// Only the configured datadir and the flow's own `<base>_<major>`
+    /// names are candidates.
+    #[test]
+    fn a_manual_copy_outside_the_naming_convention_is_never_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = fake_datadir(dir.path(), "data_18", 18, true);
+        fake_datadir(dir.path(), "data_backup", 17, true);
+        fake_datadir(dir.path(), "snapshot", 17, true);
+
+        let site = UpgradeSite::probe(&configured, 18).unwrap();
+        assert!(
+            site.old_data_dir.is_none(),
+            "a manual copy must never become the rollback anchor: {site:?}"
+        );
+        assert_eq!(site.new_data_dir.as_deref(), Some(configured.as_path()));
+    }
+
+    /// Two directories claiming the same major cannot be tie-broken by
+    /// directory-listing order; the probe names both and refuses.
+    #[test]
+    fn duplicate_candidates_for_one_major_refuse_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = fake_datadir(dir.path(), "data", 17, true);
+        fake_datadir(dir.path(), "data_17", 17, true);
+
+        let err = UpgradeSite::probe(&configured, 18).unwrap_err().to_string();
+        assert!(err.contains("data"), "error names the dirs: {err}");
+        assert!(err.contains("data_17"), "error names the dirs: {err}");
+        assert!(err.contains("17"), "error names the major: {err}");
+    }
+
+    /// A second upgrade starts from `data_18`, whose base is still `data`:
+    /// its sibling names stay `data_19`, never `data_18_19`.
+    #[test]
+    fn the_base_name_strips_one_major_suffix() {
+        assert_eq!(upgrade_site_base_name("data"), "data");
+        assert_eq!(upgrade_site_base_name("data_18"), "data");
+        assert_eq!(upgrade_site_base_name("pgdata"), "pgdata");
+        assert_eq!(upgrade_site_base_name("pg_data"), "pg_data");
+        assert_eq!(upgrade_site_base_name("data_backup"), "data_backup");
     }
 
     /// The old discriminator counted a non-empty `pg_wal` as "a postmaster
