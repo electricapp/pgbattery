@@ -126,6 +126,7 @@ ENVIRONMENT:
   PGBATTERY_CONFIG                      Default --config path
   PGBATTERY_MANAGEMENT_API_TOKEN_FILE   Default --token-file path
   PGBATTERY_MANAGEMENT_API_TOKEN        Management API token (prefer --token-file)
+  PGBATTERY_GREEN_MANAGEMENT_API_TOKEN  Track C recipient token (default --green-token)
   RUST_LOG                              Log filter (overridden by -v/-vv/-vvv)
   NO_COLOR / TERM=dumb                  Disable colored output
 
@@ -405,7 +406,7 @@ pub enum UpgradeSubcommand {
         blue_green: bool,
 
         /// Application role for client-vs-apply fence feasibility (repeatable; required with --blue-green)
-        #[arg(long = "app-role", value_name = "ROLE")]
+        #[arg(long = "app-role", value_name = "ROLE", value_parser = parse_role_name)]
         app_roles: Vec<String>,
 
         /// Track C: allow unlogged tables (they arrive empty on green)
@@ -419,7 +420,33 @@ pub enum UpgradeSubcommand {
         /// Track C: green's cluster_id, checked against what green reports
         #[arg(long)]
         green_cluster_id: Option<String>,
+
+        /// Track C: accept a SECURITY DEFINER function by name (schema.func; repeatable).
+        /// Paths not named here still refuse the seal
+        #[arg(long = "accept-security-definer", value_name = "NAME")]
+        accept_security_definer: Vec<String>,
+
+        /// Track C: management API token for the green cluster (defaults to the donor token)
+        #[arg(
+            long = "green-token",
+            value_name = "TOKEN",
+            env = "PGBATTERY_GREEN_MANAGEMENT_API_TOKEN",
+            hide_env_values = true
+        )]
+        green_token: Option<String>,
     },
+}
+
+/// Refuse a malformed role name at parse time: one bad name otherwise makes
+/// the whole fence bail at reconcile, and the recipient boots unfenced.
+fn parse_role_name(s: &str) -> Result<String, String> {
+    if crate::config::is_valid_pg_role_name(s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "{s:?} is not a valid role name (^[a-zA-Z_][a-zA-Z0-9_$]*$)"
+        ))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -893,5 +920,41 @@ mod tests {
         );
         let long = nodes.get_long_help().unwrap().to_string();
         assert!(long.contains("If not specified"), "{long}");
+    }
+
+    /// One malformed role name once bailed the whole fence at reconcile;
+    /// the CLI now refuses it before anything runs, naming the offender.
+    #[test]
+    fn test_app_role_names_are_validated_at_parse() {
+        assert_eq!(parse_role_name("bg_app").unwrap(), "bg_app");
+        let err = parse_role_name("9bad-role").unwrap_err();
+        assert!(err.contains("9bad-role"), "{err}");
+
+        let refused = Cli::try_parse_from([
+            "pgbattery",
+            "upgrade",
+            "postgres",
+            "--to",
+            "18",
+            "--blue-green",
+            "--app-role",
+            "9bad-role",
+        ]);
+        assert!(refused.is_err(), "a malformed --app-role must not parse");
+        let parsed = Cli::try_parse_from([
+            "pgbattery",
+            "upgrade",
+            "postgres",
+            "--to",
+            "18",
+            "--blue-green",
+            "--app-role",
+            "bg_app",
+            "--accept-security-definer",
+            "public.audit_log",
+            "--green-token",
+            "tok",
+        ]);
+        assert!(parsed.is_ok(), "{parsed:?}");
     }
 }

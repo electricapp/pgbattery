@@ -59,6 +59,10 @@ pub struct CutoverSealRequest {
     /// Application roles to REVOKE DML from (client-vs-apply fence).
     /// Required: without them the seal fences nothing on the internal port.
     pub app_roles: Vec<String>,
+    /// SECURITY DEFINER functions accepted by name (`schema.func`); paths
+    /// not named here still refuse the seal.
+    #[serde(default)]
+    pub accepted_security_definer: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,9 +414,12 @@ pub(super) async fn cutover_seal(
     let _fence_guard = state.client_fence_apply_lock.lock().await;
 
     let guard = pg.lock().await;
-    if let Err(e) =
-        crate::commands::upgrade::blue_green::require_fence_covers_roles(&guard, &body.app_roles)
-            .await
+    if let Err(e) = crate::commands::upgrade::blue_green::require_fence_covers_roles(
+        &guard,
+        &body.app_roles,
+        &body.accepted_security_definer,
+    )
+    .await
     {
         return refuse(
             &state,

@@ -172,33 +172,42 @@ async fn main() -> Result<()> {
                 accept_empty_unlogged,
                 green_node,
                 green_cluster_id,
+                accept_security_definer,
+                green_token,
             }) = command
             {
                 let mode = match transfer_mode {
                     Some(ref s) => Some(pgbattery::commands::TransferMode::parse(s)?),
                     None => None,
                 };
-                pgbattery::commands::run_postgres_upgrade(
-                    pgbattery::commands::PostgresUpgradeParams {
-                        to_major: to,
-                        check_only: pg_check,
-                        experimental,
-                        confirm,
-                        rollback,
-                        node: pg_node.or(node),
-                        allow_no_backup: pg_allow_no_backup || allow_no_backup,
-                        accept_no_rollback,
-                        accept_write_loss,
-                        transfer_mode: mode,
-                        config_path: cli.config,
-                        blue_green,
-                        app_roles,
-                        accept_empty_unlogged,
-                        green_node,
-                        green_cluster_id,
-                    },
-                )
-                .await
+                let params = pgbattery::commands::PostgresUpgradeParams {
+                    to_major: to,
+                    check_only: pg_check,
+                    experimental,
+                    confirm,
+                    rollback,
+                    node: pg_node.or(node),
+                    allow_no_backup: pg_allow_no_backup || allow_no_backup,
+                    accept_no_rollback,
+                    accept_write_loss,
+                    transfer_mode: mode,
+                    config_path: cli.config,
+                    blue_green,
+                    app_roles,
+                    accept_empty_unlogged,
+                    green_node,
+                    green_cluster_id,
+                };
+                if blue_green {
+                    pgbattery::commands::run_blue_green(pgbattery::commands::BlueGreenParams {
+                        base: params,
+                        green_token,
+                        accepted_security_definer: accept_security_definer,
+                    })
+                    .await
+                } else {
+                    pgbattery::commands::run_postgres_upgrade(params).await
+                }
             } else {
                 run_upgrade(
                     check,

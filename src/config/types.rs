@@ -632,12 +632,28 @@ impl Config {
         Ok(())
     }
 
+    /// One malformed name makes the whole fence bail at reconcile time — the
+    /// recipient boots unfenced and warn-loops. Refuse at load instead.
+    fn validate_fence_role_names(&self) -> Result<()> {
+        for role in &self.client_fence_roles {
+            if !is_valid_pg_role_name(role) {
+                anyhow::bail!(
+                    "client_fence_roles entry {role:?} is not a valid role name \
+                     (^[a-zA-Z_][a-zA-Z0-9_$]*$); the fence would refuse the whole \
+                     set at runtime and the recipient would boot unfenced"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_storage_and_tls(&self) -> Result<()> {
         // Validate PostgreSQL configuration
         if self.pg_bin_dir.as_os_str().is_empty() {
             anyhow::bail!("pg_bin_dir is required");
         }
         self.validate_cluster_identity()?;
+        self.validate_fence_role_names()?;
         for (major, path) in &self.pg_bin_dirs {
             if major.parse::<u32>().is_err() {
                 anyhow::bail!("pg_bin_dirs key {major:?} must be a PostgreSQL major number");
@@ -891,6 +907,21 @@ impl Config {
     }
 }
 
+/// Whether `name` is a role name the fence machinery accepts.
+///
+/// The shape is `^[a-zA-Z_][a-zA-Z0-9_$]*$`. Shared by config load, CLI
+/// parse, and the fence SQL builders, so a name is refused once — at the
+/// edge — instead of bailing the whole fence at reconcile time.
+#[must_use]
+pub fn is_valid_pg_role_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -926,6 +957,42 @@ mod tests {
         assert_eq!(config.pg_user, "postgres");
         assert_eq!(config.ssl_mode, SslModeConfig::Disable);
         assert_eq!(config.topology_mode, TopologyMode::Standard);
+    }
+
+    /// The regex the whole fence path shares: `^[a-zA-Z_][a-zA-Z0-9_$]*$`.
+    #[test]
+    fn role_names_are_validated_at_the_edge() {
+        for ok in ["bg_app", "_internal", "App2", "a$fund"] {
+            assert!(is_valid_pg_role_name(ok), "{ok} should be accepted");
+        }
+        for bad in ["", "9lead", "app-role", "app role", "app;drop", "app'x"] {
+            assert!(!is_valid_pg_role_name(bad), "{bad:?} should be refused");
+        }
+    }
+
+    /// One malformed fence role once bailed the whole fence at reconcile
+    /// time: the recipient booted unfenced and warn-looped. Config load now
+    /// refuses, naming the offender.
+    #[test]
+    fn a_malformed_fence_role_is_refused_at_load() {
+        let toml = r#"
+            node_id = 1
+            listen_addr = "0.0.0.0:5432"
+            raft_addr = "0.0.0.0:5433"
+            metrics_addr = "0.0.0.0:9090"
+            management_api_token = "test-token"
+            pg_bin_dir = "/usr/lib/postgresql/16/bin"
+            pg_data_dir = "/var/lib/postgresql/data"
+            pg_auth_mode = "trust"
+            client_fence_roles = ["bg_app", "9bad-role"]
+        "#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(toml.as_bytes()).unwrap();
+        let err = Config::load_from(file.path().to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("9bad-role"), "{err}");
+        assert!(err.contains("client_fence_roles"), "{err}");
     }
 
     #[test]

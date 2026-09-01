@@ -38,6 +38,10 @@ pub struct BlueGreenPreflightRequest {
     /// Allow non-empty unlogged tables (they arrive empty on green).
     #[serde(default)]
     pub accept_empty_unlogged: bool,
+    /// SECURITY DEFINER functions accepted by name (`schema.func`).
+    /// Unmatched paths still refuse.
+    #[serde(default)]
+    pub accepted_security_definer: Vec<String>,
 }
 
 /// Named findings from logical-replication feasibility probes.
@@ -58,14 +62,56 @@ pub struct BlueGreenPreflightReport {
     pub notes: Vec<String>,
 }
 
-/// Entry: doctor + dual-bin target major + primary catalog logical checks.
+/// Environment default for the recipient-cluster token.
+const GREEN_TOKEN_ENV: &str = "PGBATTERY_GREEN_MANAGEMENT_API_TOKEN";
+
+/// Operator inputs for the Track C path beyond [`PostgresUpgradeParams`].
+#[derive(Debug, Clone)]
+pub struct BlueGreenParams {
+    pub base: PostgresUpgradeParams,
+    /// Token for every recipient-addressed call. Falls back to
+    /// `PGBATTERY_GREEN_MANAGEMENT_API_TOKEN`, then to the donor token —
+    /// two clusters rarely share one.
+    pub green_token: Option<String>,
+    /// SECURITY DEFINER functions accepted by name (`schema.func`).
+    pub accepted_security_definer: Vec<String>,
+}
+
+/// CLI entry for `upgrade postgres --blue-green`.
+///
+/// # Errors
+/// Any preflight or cutover refusal.
+pub async fn run_blue_green(params: BlueGreenParams) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_level(false)
+        .without_time()
+        .init();
+    dispatch(params).await
+}
+
+/// Compat entry used by `run_postgres_upgrade`, which owns tracing already.
 ///
 /// # Errors
 /// Any hard abort (large objects, replica identity, fence hole, missing bins).
-pub async fn run_blue_green_preflight(params: PostgresUpgradeParams) -> Result<()> {
-    if !params.check_only {
+pub async fn run_blue_green_preflight(base: PostgresUpgradeParams) -> Result<()> {
+    dispatch(BlueGreenParams {
+        base,
+        green_token: None,
+        accepted_security_definer: Vec::new(),
+    })
+    .await
+}
+
+async fn dispatch(params: BlueGreenParams) -> Result<()> {
+    if !params.base.check_only {
         return run_blue_green_cutover(params).await;
     }
+    let BlueGreenParams {
+        base: params,
+        accepted_security_definer,
+        ..
+    } = params;
     if params.experimental || params.confirm || params.rollback {
         bail!("--blue-green --check does not accept --experimental / --confirm / --rollback");
     }
@@ -108,6 +154,7 @@ pub async fn run_blue_green_preflight(params: PostgresUpgradeParams) -> Result<(
         to_major: params.to_major,
         app_roles: params.app_roles.clone(),
         accept_empty_unlogged: params.accept_empty_unlogged,
+        accepted_security_definer,
     };
     let report = client.blue_green_preflight(&leader_mgmt, &req).await?;
     print_report(&report);
@@ -124,10 +171,11 @@ pub async fn run_blue_green_preflight(params: PostgresUpgradeParams) -> Result<(
 /// # Errors
 /// Preflight failure, a refused protocol step, or a drain that does not reach
 /// the sealed LSN.
-pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()> {
+pub async fn run_blue_green_cutover(params: BlueGreenParams) -> Result<()> {
     let plan = CutoverPlan::resolve(&params).await?;
     let CutoverPlan {
         client,
+        green_client,
         blue,
         green,
         blue_mgmt,
@@ -139,7 +187,7 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
     // Before anything is fenced: logical replication carries rows, not DDL, so
     // a column only blue has is one the cutover would silently drop.
     let donor_schema = client.get_schema_digest(&blue_mgmt).await?;
-    let recipient_schema = client.get_schema_digest(&green_mgmt).await?;
+    let recipient_schema = green_client.get_schema_digest(&green_mgmt).await?;
     if !schema_digests_agree(&donor_schema, &recipient_schema) {
         bail!(
             "Schema digests differ (donor {donor_schema:?}, recipient {recipient_schema:?}). \
@@ -166,7 +214,10 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
         .cutover_step(
             &blue_mgmt,
             "seal",
-            &serde_json::json!({ "app_roles": params.app_roles }),
+            &serde_json::json!({
+                "app_roles": params.base.app_roles,
+                "accepted_security_definer": params.accepted_security_definer,
+            }),
         )
         .await?;
 
@@ -176,12 +227,12 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
     };
     info!(final_lsn, "Donor sealed");
 
-    await_recipient_drain(&client, &green_mgmt, &blue_mgmt, final_lsn).await?;
+    await_recipient_drain(&client, &green_client, &green_mgmt, &blue_mgmt, final_lsn).await?;
     client
         .cutover_step(&blue_mgmt, "drain-observed", &serde_json::json!({}))
         .await?;
 
-    advance_recipient_sequences(&client, &blue_mgmt, &green_mgmt).await?;
+    advance_recipient_sequences(&client, &green_client, &blue_mgmt, &green_mgmt).await?;
 
     info!(recipient_pg = %green_pg, "Cutover: transferring");
     client
@@ -203,7 +254,7 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
         donor_nodes = donor_addrs.len(),
         "Cutover: recipient confirming the handoff against the donor's own nodes"
     );
-    client
+    green_client
         .cutover_step(
             &green_mgmt,
             "receive-authority",
@@ -217,6 +268,7 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
 
     verify_single_authority(
         &client,
+        &green_client,
         &blue.nodes,
         &green.nodes,
         &green_cluster_id,
@@ -233,6 +285,9 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
 /// Everything a cutover needs, resolved and checked before anything commits.
 struct CutoverPlan {
     client: crate::cluster::ClusterClient,
+    /// The donor client with the recipient's token; two clusters rarely
+    /// share one, and every recipient-addressed call goes through this.
+    green_client: crate::cluster::ClusterClient,
     blue: crate::cluster::client::NodesResponse,
     green: crate::cluster::client::NodesResponse,
     blue_mgmt: String,
@@ -242,32 +297,42 @@ struct CutoverPlan {
 }
 
 impl CutoverPlan {
-    async fn resolve(params: &PostgresUpgradeParams) -> Result<Self> {
-        if !params.experimental {
+    async fn resolve(params: &BlueGreenParams) -> Result<Self> {
+        if !params.base.experimental {
             bail!(
                 "Refusing --blue-green apply without --experimental: the cutover \
                  hands write authority between two clusters. Run --check first."
             );
         }
-        if params.app_roles.is_empty() {
+        if params.base.app_roles.is_empty() {
             bail!("--app-role is required: the seal fences these roles on the donor");
         }
-        let Some(green_entry) = params.green_node.clone() else {
+        let Some(green_entry) = params.base.green_node.clone() else {
             bail!("--green-node is required: the recipient cluster's management address");
         };
-        let Some(green_cluster_id) = params.green_cluster_id.clone() else {
+        let Some(green_cluster_id) = params.base.green_cluster_id.clone() else {
             bail!("--green-cluster-id is required so the donor names the recipient it means");
         };
 
         let (client, entry, _config) =
-            cluster_client_and_entry(params.node.clone(), params.config_path.as_deref()).await?;
+            cluster_client_and_entry(params.base.node.clone(), params.base.config_path.as_deref())
+                .await?;
+        // --green-token, then the environment, then the donor token.
+        let green_token = params.green_token.clone().or_else(|| {
+            std::env::var(GREEN_TOKEN_ENV)
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        });
+        let green_client = client.clone().with_token(green_token);
+
         let blue = client.get_nodes(&entry).await?;
         let Some(blue_mgmt) = client.get_leader_info(&entry).await?.leader_mgmt_addr else {
             bail!("No donor leader; cannot start a cutover");
         };
 
-        let green = client.get_nodes(&green_entry).await?;
-        let green_leader = client.get_leader_info(&green_entry).await?;
+        let green = green_client.get_nodes(&green_entry).await?;
+        let green_leader = green_client.get_leader_info(&green_entry).await?;
         let Some(green_mgmt) = green_leader.leader_mgmt_addr else {
             bail!("No recipient leader at {green_entry}");
         };
@@ -275,7 +340,7 @@ impl CutoverPlan {
             bail!("Recipient reports no PG address; gateways would have nowhere to relay");
         };
 
-        let status = client.get_cutover_status(&green_mgmt).await?;
+        let status = green_client.get_cutover_status(&green_mgmt).await?;
         if status.cluster_id != green_cluster_id {
             bail!(
                 "Recipient at {green_mgmt} reports cluster_id {:?}, not {green_cluster_id:?}",
@@ -291,6 +356,7 @@ impl CutoverPlan {
         }
         Ok(Self {
             client,
+            green_client,
             blue,
             green,
             blue_mgmt,
@@ -307,6 +373,7 @@ impl CutoverPlan {
 /// is an error from the endpoint, never a silent skip.
 async fn advance_recipient_sequences(
     client: &crate::cluster::ClusterClient,
+    green_client: &crate::cluster::ClusterClient,
     blue_mgmt: &str,
     green_mgmt: &str,
 ) -> Result<()> {
@@ -315,7 +382,7 @@ async fn advance_recipient_sequences(
         info!("U3: donor reports no user sequences; nothing to advance");
         return Ok(());
     }
-    let advanced = client
+    let advanced = green_client
         .advance_sequences(
             green_mgmt,
             &crate::observability::management_api::AdvanceSequencesRequest {
@@ -401,6 +468,7 @@ pub(crate) const fn retention_failures_abort(consecutive: u32) -> bool {
 /// Read from the two clusters' catalogs, never assumed from elapsed time.
 async fn await_recipient_drain(
     client: &crate::cluster::ClusterClient,
+    green_client: &crate::cluster::ClusterClient,
     green_mgmt: &str,
     blue_mgmt: &str,
     final_lsn: u64,
@@ -408,7 +476,7 @@ async fn await_recipient_drain(
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(30);
     let mut retention_failures: u32 = 0;
     loop {
-        let progress = client.get_subscription_progress(green_mgmt).await?;
+        let progress = green_client.get_subscription_progress(green_mgmt).await?;
         let reason = match client.get_donor_retention(blue_mgmt).await {
             Ok(retention) => {
                 retention_failures = 0;
@@ -523,6 +591,7 @@ const AUTHORITY_VERIFY_INTERVAL: std::time::Duration = std::time::Duration::from
 /// transfer after its leader, so mismatches retry within a bounded budget.
 async fn verify_single_authority(
     client: &crate::cluster::ClusterClient,
+    green_client: &crate::cluster::ClusterClient,
     blue: &[crate::cluster::client::NodeInfo],
     green: &[crate::cluster::client::NodeInfo],
     green_cluster_id: &str,
@@ -542,7 +611,7 @@ async fn verify_single_authority(
         }
         let mut recipients = Vec::with_capacity(green.len());
         for n in green {
-            let status = client.get_cutover_status(&n.mgmt_addr).await?;
+            let status = green_client.get_cutover_status(&n.mgmt_addr).await?;
             recipients.push(AuthorityObservation {
                 addr: n.mgmt_addr.clone(),
                 holds: status.holds_client_write_authority,
@@ -775,7 +844,9 @@ async fn fill_logical_gaps(
         );
     }
 
-    let (fence_failures, secdef) = collect_fence_feasibility(supervisor, &req.app_roles).await?;
+    let (fence_failures, secdef) =
+        collect_fence_feasibility(supervisor, &req.app_roles, &req.accepted_security_definer)
+            .await?;
     report.fence_failures = fence_failures;
     report.security_definer_paths = secdef;
     if !report.fence_failures.is_empty() {
@@ -903,8 +974,10 @@ async fn collect_replica_identity_failures(
 pub async fn require_fence_covers_roles(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
+    accepted_security_definer: &[String],
 ) -> Result<()> {
-    let (failures, _secdef) = collect_fence_feasibility(supervisor, app_roles).await?;
+    let (failures, _secdef) =
+        collect_fence_feasibility(supervisor, app_roles, accepted_security_definer).await?;
     if !failures.is_empty() {
         bail!(
             "client-vs-apply fence cannot cover these roles: {}",
@@ -914,9 +987,30 @@ pub async fn require_fence_covers_roles(
     Ok(())
 }
 
+/// The SECURITY DEFINER paths not covered by an explicit acceptance.
+///
+/// A path reads `role -> schema.func()`; an acceptance names the function as
+/// `schema.func` or `schema.func()`. Unmatched acceptances accept nothing,
+/// and unmatched paths still refuse — the accept list is per-name, never a
+/// blanket.
+pub(crate) fn unaccepted_secdef_paths(paths: &[String], accepted: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            let func = path
+                .rsplit_once(" -> ")
+                .map_or(path.as_str(), |(_, f)| f)
+                .trim_end_matches("()");
+            !accepted.iter().any(|a| a.trim_end_matches("()") == func)
+        })
+        .cloned()
+        .collect()
+}
+
 async fn collect_fence_feasibility(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
+    accepted_security_definer: &[String],
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut failures = Vec::new();
     let mut secdef_paths = Vec::new();
@@ -927,11 +1021,13 @@ async fn collect_fence_feasibility(
     let quoted = quoted_role_literals(app_roles)?;
     let inherited_rows = sql_lines(supervisor, &inherited_write_paths_sql(&quoted)).await?;
     failures.extend(coverage_gap_failures(&public_rows, &inherited_rows));
-    if !secdef_paths.is_empty() {
+    let unaccepted = unaccepted_secdef_paths(&secdef_paths, accepted_security_definer);
+    if !unaccepted.is_empty() {
         failures.push(format!(
-            "SECURITY DEFINER paths reachable from app roles (must be fenced or \
-             accepted by name before cutover): {}",
-            secdef_paths.join(", ")
+            "SECURITY DEFINER paths reachable from app roles: {} — fence the \
+             owner, drop the function, or accept each by name with \
+             --accept-security-definer <schema.func>",
+            unaccepted.join(", ")
         ));
     }
     Ok((failures, secdef_paths))
@@ -1012,14 +1108,8 @@ fn inherited_write_paths_sql(quoted_fenced_roles: &str) -> String {
 fn quoted_role_literals(app_roles: &[String]) -> Result<String> {
     let mut quoted = Vec::with_capacity(app_roles.len());
     for role in app_roles {
-        if role.trim().is_empty() {
-            bail!("empty app role");
-        }
-        if !role
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            bail!("app role {role:?} must be a simple identifier");
+        if !crate::config::is_valid_pg_role_name(role) {
+            bail!("app role {role:?} is not a valid role name (^[a-zA-Z_][a-zA-Z0-9_$]*$)");
         }
         quoted.push(format!("'{}'", role.replace('\'', "''")));
     }
@@ -1070,14 +1160,8 @@ async fn check_one_app_role(
     failures: &mut Vec<String>,
     secdef_paths: &mut Vec<String>,
 ) -> Result<()> {
-    if role.trim().is_empty() {
-        bail!("empty --app-role is not allowed");
-    }
-    if !role
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        bail!("app role {role:?} must be a simple identifier (alnum/_/-) for fence preflight");
+    if !crate::config::is_valid_pg_role_name(role) {
+        bail!("app role {role:?} is not a valid role name (^[a-zA-Z_][a-zA-Z0-9_$]*$)");
     }
     let escaped = role.replace('\'', "''");
 
@@ -1289,6 +1373,37 @@ mod tests {
         assert_eq!(quoted, "'bg_app','other'");
         assert!(quoted_role_literals(&["bad; DROP".into()]).is_err());
         assert!(quoted_role_literals(&[String::new()]).is_err());
+        assert!(quoted_role_literals(&["9leading-digit".into()]).is_err());
+    }
+
+    /// The refusal message promised an accept path that did not exist (M7):
+    /// with no accept list, every SECURITY DEFINER path still refuses.
+    #[test]
+    fn secdef_paths_refuse_without_an_explicit_acceptance() {
+        let paths = vec!["bg_app -> public.audit_log()".to_string()];
+        assert_eq!(unaccepted_secdef_paths(&paths, &[]), paths);
+    }
+
+    /// Accepting by name clears exactly that path, parens optional; an
+    /// unmatched acceptance accepts nothing.
+    #[test]
+    fn secdef_acceptance_matches_by_name_and_never_blankets() {
+        let paths = vec![
+            "bg_app -> public.audit_log()".to_string(),
+            "bg_app -> public.other_fn()".to_string(),
+        ];
+        let accepted = vec!["public.audit_log".to_string()];
+        assert_eq!(
+            unaccepted_secdef_paths(&paths, &accepted),
+            vec!["bg_app -> public.other_fn()"]
+        );
+        let with_parens = vec!["public.audit_log()".to_string()];
+        assert_eq!(
+            unaccepted_secdef_paths(&paths, &with_parens),
+            vec!["bg_app -> public.other_fn()"]
+        );
+        let unmatched = vec!["public.nothing".to_string()];
+        assert_eq!(unaccepted_secdef_paths(&paths, &unmatched), paths);
     }
 
     /// The world every clean cutover lives in: the sealed donor is idle, its

@@ -20,7 +20,9 @@ pub use doctor::run_doctor;
 pub use init::{InitParams, run_init};
 pub use join::run_join;
 pub use status::run_status;
-pub use upgrade::blue_green::{BlueGreenPreflightReport, BlueGreenPreflightRequest};
+pub use upgrade::blue_green::{
+    BlueGreenParams, BlueGreenPreflightReport, BlueGreenPreflightRequest, run_blue_green,
+};
 pub use upgrade::postgres::{
     PostgresBinDirInfo, PostgresBinsResponse, PostgresUpgradePreflightRequest,
 };

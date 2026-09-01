@@ -30,7 +30,7 @@ const MANAGEMENT_API_TOKEN_HEADER: &str = "x-pgbattery-token";
 ///
 /// Handles address resolution, HTTP requests, and provides a clean
 /// interface for CLI commands.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClusterClient {
     client: Client,
     /// Our own management address (for local queries)

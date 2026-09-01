@@ -374,14 +374,8 @@ async fn ensure_fence_table(supervisor: &crate::supervisor::Supervisor) -> Resul
 }
 
 fn validate_role_ident(role: &str) -> Result<()> {
-    if role.trim().is_empty() {
-        bail!("empty app role");
-    }
-    if !role
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        bail!("app role {role:?} must be a simple identifier");
+    if !crate::config::is_valid_pg_role_name(role) {
+        bail!("app role {role:?} is not a valid role name (^[a-zA-Z_][a-zA-Z0-9_$]*$)");
     }
     Ok(())
 }
