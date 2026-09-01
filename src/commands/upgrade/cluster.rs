@@ -493,7 +493,56 @@ fn build_cluster_client(
     Ok((client, entry))
 }
 
-/// Never bounce the only sync standby — wait until another is synced.
+/// Whether a follower may be restarted right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BounceDecision {
+    Proceed,
+    /// Not safe yet; the reason is retried until the caller's deadline.
+    Wait(String),
+}
+
+/// Decide whether bouncing `bounce_id` is safe, failing closed on every
+/// unknown: unknown leader, any failed lag probe, zero synced followers, or
+/// `bounce_id` being the sole sync standby all wait rather than proceed.
+///
+/// `probes` holds each follower's lag probe as `(node_id, Ok(is_synced) | Err)`.
+pub(crate) fn safe_to_bounce(
+    probes: &[(u64, Result<bool, String>)],
+    leader_id: Option<u64>,
+    bounce_id: u64,
+) -> BounceDecision {
+    let Some(leader) = leader_id else {
+        return BounceDecision::Wait("cluster leader is unknown".to_string());
+    };
+    let followers: Vec<&(u64, Result<bool, String>)> =
+        probes.iter().filter(|(id, _)| *id != leader).collect();
+    let failed: Vec<String> = followers
+        .iter()
+        .filter_map(|(id, r)| {
+            r.as_ref()
+                .err()
+                .map(|e| format!("lag probe for node {id} failed: {e}"))
+        })
+        .collect();
+    if !failed.is_empty() {
+        return BounceDecision::Wait(failed.join("; "));
+    }
+    let synced: Vec<u64> = followers
+        .iter()
+        .filter(|(_, r)| matches!(r, Ok(true)))
+        .map(|(id, _)| *id)
+        .collect();
+    if synced.is_empty() {
+        return BounceDecision::Wait("no synced followers visible".to_string());
+    }
+    if synced == [bounce_id] {
+        return BounceDecision::Wait(format!("node {bounce_id} is the sole sync standby"));
+    }
+    BounceDecision::Proceed
+}
+
+/// Never bounce the only sync standby — retry [`safe_to_bounce`] until it
+/// proceeds or the deadline passes.
 async fn wait_until_safe_to_bounce_follower(
     client: &ClusterClient,
     leader_mgmt: &str,
@@ -501,40 +550,53 @@ async fn wait_until_safe_to_bounce_follower(
 ) -> Result<()> {
     let deadline = tokio::time::Instant::now() + SYNC_WAIT_TIMEOUT;
     loop {
-        let membership = client.get_nodes(leader_mgmt).await?;
-        let leader_id = client
-            .get_leader_info(leader_mgmt)
-            .await?
-            .leader_id
-            .unwrap_or(0);
-        let mut synced_followers = Vec::new();
-        for n in &membership.nodes {
-            if n.node_id == leader_id {
-                continue;
-            }
-            if let Ok(lag) = client.get_node_lag(leader_mgmt, n.node_id).await
-                && lag.is_synced
-            {
-                synced_followers.push(n.node_id);
+        match probe_bounce_safety(client, leader_mgmt, bounce_id).await {
+            BounceDecision::Proceed => return Ok(()),
+            BounceDecision::Wait(reason) => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!(
+                        "Timed out waiting until it is safe to bounce node {bounce_id}: {reason}. \
+                         Re-running the same upgrade command resumes the roll."
+                    );
+                }
+                info!(bounce_id, %reason, "Waiting before bouncing follower");
+                tokio::time::sleep(NODE_POLL_INTERVAL).await;
             }
         }
-        let sole_sync =
-            synced_followers.len() == 1 && synced_followers.first().copied() == Some(bounce_id);
-        if !sole_sync {
-            return Ok(());
-        }
-        info!(
-            bounce_id,
-            "Waiting for another standby to become sync before bounce"
-        );
-        if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "Timed out waiting for a second sync standby before bouncing node {bounce_id} \
-                 (still sole sync candidate). Re-running the same upgrade command resumes the roll."
-            );
-        }
-        tokio::time::sleep(NODE_POLL_INTERVAL).await;
     }
+}
+
+/// One probe pass feeding [`safe_to_bounce`]: every transient failure becomes
+/// a `Wait` so the caller retries instead of proceeding or aborting.
+async fn probe_bounce_safety(
+    client: &ClusterClient,
+    leader_mgmt: &str,
+    bounce_id: u64,
+) -> BounceDecision {
+    let leader_id = match client.get_leader_info(leader_mgmt).await {
+        Ok(info) => info.leader_id,
+        Err(e) => return BounceDecision::Wait(format!("leader probe failed: {e}")),
+    };
+    if leader_id.is_none() {
+        return safe_to_bounce(&[], None, bounce_id);
+    }
+    let membership = match client.get_nodes(leader_mgmt).await {
+        Ok(m) => m,
+        Err(e) => return BounceDecision::Wait(format!("membership probe failed: {e}")),
+    };
+    let mut probes: Vec<(u64, Result<bool, String>)> = Vec::new();
+    for n in &membership.nodes {
+        if Some(n.node_id) == leader_id {
+            continue;
+        }
+        let probe = client
+            .get_node_lag(leader_mgmt, n.node_id)
+            .await
+            .map(|lag| lag.is_synced)
+            .map_err(|e| e.to_string());
+        probes.push((n.node_id, probe));
+    }
+    safe_to_bounce(&probes, leader_id, bounce_id)
 }
 
 async fn wait_for_node_version(
@@ -703,13 +765,54 @@ mod tests {
         assert_eq!(need[1].node_id, 3);
     }
 
+    fn wait_reason(d: &BounceDecision) -> &str {
+        match d {
+            BounceDecision::Wait(reason) => reason,
+            BounceDecision::Proceed => panic!("expected Wait, got Proceed"),
+        }
+    }
+
     #[test]
-    fn sole_sync_detection() {
-        let synced = [2u64];
-        let bounce = 2u64;
-        let sole = synced.len() == 1 && synced.first().copied() == Some(bounce);
-        assert!(sole);
-        let synced2 = [2u64, 3u64];
-        assert!(!(synced2.len() == 1 && synced2.first().copied() == Some(bounce)));
+    fn bounce_waits_when_sole_sync() {
+        let probes = vec![(2u64, Ok(true)), (3u64, Ok(false))];
+        let d = safe_to_bounce(&probes, Some(1), 2);
+        assert!(wait_reason(&d).contains("sole sync"), "{d:?}");
+    }
+
+    #[test]
+    fn bounce_proceeds_with_another_sync_standby() {
+        let probes = vec![(2u64, Ok(true)), (3u64, Ok(true))];
+        assert_eq!(safe_to_bounce(&probes, Some(1), 2), BounceDecision::Proceed);
+    }
+
+    #[test]
+    fn bounce_waits_on_probe_error() {
+        // Node 2 is synced but node 3's probe failed: the failed probe could
+        // hide the real sole sync standby, so we must wait, not proceed.
+        let probes = vec![(2u64, Ok(true)), (3u64, Err("timeout".to_string()))];
+        let d = safe_to_bounce(&probes, Some(1), 3);
+        assert!(wait_reason(&d).contains("lag probe"), "{d:?}");
+    }
+
+    #[test]
+    fn bounce_waits_on_zero_synced_followers() {
+        let probes = vec![(2u64, Ok(false)), (3u64, Ok(false))];
+        let d = safe_to_bounce(&probes, Some(1), 2);
+        assert!(wait_reason(&d).contains("no synced"), "{d:?}");
+    }
+
+    #[test]
+    fn bounce_waits_on_unknown_leader() {
+        let probes = vec![(2u64, Ok(true)), (3u64, Ok(true))];
+        let d = safe_to_bounce(&probes, None, 2);
+        assert!(wait_reason(&d).contains("leader"), "{d:?}");
+    }
+
+    #[test]
+    fn bounce_ignores_leader_entry_in_probes() {
+        // A defensive caller may include the leader; it is not a follower.
+        let probes = vec![(1u64, Ok(true)), (2u64, Ok(true)), (3u64, Ok(false))];
+        let d = safe_to_bounce(&probes, Some(1), 2);
+        assert!(wait_reason(&d).contains("sole sync"), "{d:?}");
     }
 }
