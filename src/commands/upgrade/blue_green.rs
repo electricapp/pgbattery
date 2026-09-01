@@ -531,6 +531,8 @@ pub async fn run_local_blue_green_preflight(
         bail!("blue/green preflight must run on the primary (node is in recovery)");
     }
 
+    refuse_unmanaged_databases(supervisor).await?;
+
     let mut report = BlueGreenPreflightReport {
         to_major: req.to_major,
         ..Default::default()
@@ -539,6 +541,94 @@ pub async fn run_local_blue_green_preflight(
     fill_logical_gaps(supervisor, req, &mut report).await?;
     audit_green_extensions(supervisor, bin_dirs, req, &mut report).await?;
     Ok(report)
+}
+
+/// Databases the cutover would silently leave behind: connectable,
+/// non-template, and not the one every Track C statement runs in.
+const OTHER_DATABASES_SQL: &str = "SELECT datname FROM pg_database \
+     WHERE datallowconn AND NOT datistemplate AND datname <> current_database() \
+     ORDER BY 1;";
+
+/// User relations inside one database, counted from within it.
+const USER_RELATIONS_COUNT_SQL: &str = "SELECT count(*)::text FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE c.relkind IN ('r','p','S','m','f') \
+       AND n.nspname NOT IN ('pg_catalog','information_schema') \
+       AND n.nspname NOT LIKE 'pg_toast%' \
+       AND n.nspname NOT LIKE 'pg_temp%';";
+
+/// The databases that hold user relations, from probed (name, count) rows.
+/// Pure: the refusal is provable without a live catalog.
+pub(crate) fn unmanaged_database_findings(rows: &[(String, u64)]) -> Vec<String> {
+    rows.iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(db, count)| format!("{db} ({count} user relations)"))
+        .collect()
+}
+
+/// Refuse when any other connectable database contains user relations.
+///
+/// Every Track C statement — fence, freeze, digest, publication, drain —
+/// runs in the one database the supervisor session is wired to. A second
+/// database with user tables would cut over unfenced and unreplicated,
+/// which is silent data loss, not a smaller cutover.
+async fn refuse_unmanaged_databases(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
+    let others = sql_lines(supervisor, OTHER_DATABASES_SQL).await?;
+    if others.is_empty() {
+        return Ok(());
+    }
+    let (psql, port, user) = supervisor.local_psql_probe_params();
+    let mut probed = Vec::with_capacity(others.len());
+    for db in &others {
+        let conninfo = format!(
+            "host=127.0.0.1 port={port} user={user} dbname={}",
+            conninfo_value(db)
+        );
+        let out = tokio::process::Command::new(&psql)
+            .args([
+                "-w",
+                "-tAXq",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                USER_RELATIONS_COUNT_SQL,
+                "-d",
+            ])
+            .arg(&conninfo)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| format!("probing database {db} for user relations"))?;
+        if !out.status.success() {
+            // Fail closed: a database that cannot be inspected cannot be
+            // declared empty.
+            bail!(
+                "could not inspect database {db:?} for user relations ({}); \
+                 refusing the preflight rather than assuming it is empty",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let count: u64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .with_context(|| format!("unparseable relation count from database {db}"))?;
+        probed.push((db.clone(), count));
+    }
+    let findings = unmanaged_database_findings(&probed);
+    if !findings.is_empty() {
+        bail!(
+            "Track C covers only the current database; these databases hold user \
+             relations the cutover would leave unfenced and unreplicated: {}. \
+             Move them out, drop them, or run their own cutover.",
+            findings.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Quote one libpq conninfo value: single-quoted, `\` and `'` escaped.
+fn conninfo_value(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 async fn fill_logical_gaps(
@@ -1189,5 +1279,37 @@ mod tests {
         assert!(!retention_failures_abort(2));
         assert!(retention_failures_abort(3));
         assert!(retention_failures_abort(4));
+    }
+
+    /// A second database with user tables cuts over unfenced and
+    /// unreplicated — data loss, not a smaller cutover. Named, per database.
+    #[test]
+    fn a_database_with_user_relations_is_named_and_refused() {
+        let rows = vec![
+            ("analytics".to_string(), 12_u64),
+            ("empty_db".to_string(), 0_u64),
+        ];
+        let findings = unmanaged_database_findings(&rows);
+        assert_eq!(findings, vec!["analytics (12 user relations)"]);
+        assert!(unmanaged_database_findings(&[("d".into(), 0)]).is_empty());
+    }
+
+    /// The database sweep must skip templates and unconnectable databases,
+    /// and never count the one Track C actually manages.
+    #[test]
+    fn the_database_sweep_covers_connectable_non_template_others() {
+        assert!(OTHER_DATABASES_SQL.contains("datallowconn"));
+        assert!(OTHER_DATABASES_SQL.contains("NOT datistemplate"));
+        assert!(OTHER_DATABASES_SQL.contains("current_database()"));
+        assert!(USER_RELATIONS_COUNT_SQL.contains("'pg_catalog'"));
+    }
+
+    /// libpq conninfo values: quoted, with backslash and quote escapes, so a
+    /// hostile database name cannot smuggle extra conninfo keys.
+    #[test]
+    fn conninfo_values_are_quoted_and_escaped() {
+        assert_eq!(conninfo_value("plain"), "'plain'");
+        assert_eq!(conninfo_value("od'd"), "'od\\'d'");
+        assert_eq!(conninfo_value("back\\slash"), "'back\\\\slash'");
     }
 }
