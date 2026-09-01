@@ -426,6 +426,18 @@ pub struct UpgradeFreezeResponse {
     pub message: Option<String>,
 }
 
+/// Whether a freeze request must be proposed to the Raft log.
+///
+/// This node's APPLIED state lags commit: "already in the requested state"
+/// read locally can be a stale answer on a lagging node, and an unfreeze
+/// acked from that read may never commit — leaving every gateway holding
+/// while the CLI reports success. Applying the entry is idempotent, so the
+/// proposal costs one log entry.
+const fn freeze_needs_proposal(applied_frozen: bool, requested_frozen: bool) -> bool {
+    let _ = (applied_frozen, requested_frozen);
+    true
+}
+
 /// Set or clear the Track B upgrade freeze for the whole cluster.
 ///
 /// Committed to the Raft log, not latched per node: the gateways derive the
@@ -435,8 +447,8 @@ pub(super) async fn set_upgrade_freeze(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<UpgradeFreezeRequest>,
 ) -> impl IntoResponse {
-    let already = state.cluster_state.read().upgrade_frozen == body.frozen;
-    if already {
+    let applied = state.cluster_state.read().upgrade_frozen;
+    if !freeze_needs_proposal(applied, body.frozen) {
         return (
             StatusCode::OK,
             Json(UpgradeFreezeResponse {
@@ -940,5 +952,25 @@ pub(super) async fn postgres_upgrade_rollback(
                 from_major: 0,
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::freeze_needs_proposal;
+
+    /// A node's APPLIED state lags commit, so a locally-matching freeze
+    /// state is no proof the cluster committed the requested one. An
+    /// unfreeze acked from that stale read may never commit, leaving every
+    /// gateway holding while the CLI reports success — so every request is
+    /// proposed (apply is idempotent).
+    #[test]
+    fn every_freeze_request_is_proposed_regardless_of_applied_state() {
+        for (applied, requested) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(
+                freeze_needs_proposal(applied, requested),
+                "applied={applied} requested={requested}"
+            );
+        }
     }
 }
