@@ -860,8 +860,7 @@ impl ClusterClient {
     ) -> Result<crate::observability::management_api::SubscriptionProgressResponse> {
         let url = format!("http://{addr}/api/v1/cutover/subscription-progress");
         let resp = self
-            .client
-            .get(&url)
+            .add_management_token(self.client.get(&url))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
@@ -872,7 +871,7 @@ impl ClusterClient {
                 "subscription progress",
                 status,
                 &body,
-                false
+                self.management_api_token.is_some()
             ));
         }
         let body: crate::observability::management_api::SubscriptionProgressResponse =
@@ -901,8 +900,7 @@ impl ClusterClient {
     ) -> Result<crate::observability::management_api::DonorRetentionResponse> {
         let url = format!("http://{addr}/api/v1/cutover/donor-retention");
         let resp = self
-            .client
-            .get(&url)
+            .add_management_token(self.client.get(&url))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
@@ -913,7 +911,7 @@ impl ClusterClient {
                 "donor retention",
                 status,
                 &body,
-                false
+                self.management_api_token.is_some()
             ));
         }
         Ok(resp.json().await?)
@@ -926,8 +924,7 @@ impl ClusterClient {
     pub async fn get_schema_digest(&self, addr: &str) -> Result<String> {
         let url = format!("http://{addr}/api/v1/cutover/schema-digest");
         let resp = self
-            .client
-            .get(&url)
+            .add_management_token(self.client.get(&url))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
@@ -938,7 +935,7 @@ impl ClusterClient {
                 "schema digest",
                 status,
                 &body,
-                false
+                self.management_api_token.is_some()
             ));
         }
         let body: crate::observability::management_api::SchemaDigestResponse = resp.json().await?;
@@ -1256,5 +1253,61 @@ mod tests {
             assert!(msg.contains("rejected"), "{msg}");
             assert!(msg.contains("management_api_token"), "{msg}");
         }
+    }
+
+    /// Serve one canned HTTP response and hand back the raw request bytes.
+    async fn capture_one_request(
+        response_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(buf.get(..n).unwrap()).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+            request
+        });
+        (addr, handle)
+    }
+
+    /// The cutover probe routes are token-gated on the server; a client that
+    /// sends no token gets 401s from every donor and recipient it must read.
+    #[tokio::test]
+    async fn cutover_probe_gets_carry_the_management_token() {
+        let client = ClusterClient::new(5)
+            .unwrap()
+            .with_token(Some("sekrit".into()));
+
+        let (addr, handle) = capture_one_request(r#"{"retained_bytes":0,"slot_count":0}"#).await;
+        client.get_donor_retention(&addr).await.unwrap();
+        let req = handle.await.unwrap().to_lowercase();
+        assert!(req.contains("x-pgbattery-token: sekrit"), "{req}");
+
+        let (addr, handle) = capture_one_request(
+            r#"{"applied_lsn":0,"subscription_count":1,"enabled_subscription_count":1,"tables_total":1,"tables_ready":1}"#,
+        )
+        .await;
+        client.get_subscription_progress(&addr).await.unwrap();
+        let req = handle.await.unwrap().to_lowercase();
+        assert!(req.contains("x-pgbattery-token: sekrit"), "{req}");
+
+        let (addr, handle) = capture_one_request(r#"{"digest":"abc"}"#).await;
+        client.get_schema_digest(&addr).await.unwrap();
+        let req = handle.await.unwrap().to_lowercase();
+        assert!(req.contains("x-pgbattery-token: sekrit"), "{req}");
+
+        let (addr, handle) = capture_one_request(r#"{"sequences":[]}"#).await;
+        client.get_sequence_values(&addr).await.unwrap();
+        let req = handle.await.unwrap().to_lowercase();
+        assert!(req.contains("x-pgbattery-token: sekrit"), "{req}");
     }
 }
