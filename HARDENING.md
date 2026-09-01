@@ -37,9 +37,9 @@ sorting by component, because each kind needs a different investment.
 
 There are two versions of this. The second is worse, and it is not theoretical.
 
-**A1: the fault silently fails to inject, and the test passes anyway.** Seven
-confirmed instances, all found by adding effect verification rather than by any
-test going red:
+**A1: the fault silently fails to inject, and the test passes anyway.** Every
+confirmed instance below was found by adding effect verification (or by
+auditing the oracle), never by the test itself going red:
 
 | What                                                                                                                                                        | Consequence                                                                                                              |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -53,6 +53,10 @@ test going red:
 | `*.bin` in `.gitignore` swallowed the Raft frame goldens                                                                                                    | two always-on frame-compat tests panicked on a clean checkout; they had only ever run against the author's working tree  |
 | the four Track C chaos cases carried `expect_exit: null` and printed instead of asserting                                                                   | each accepted any outcome, including a harness crash, while the checklist ticked them as done                            |
 | a Track C sequence check called `setval(pg_get_serial_sequence(...))` on a plain `bigint` column                                                            | the function returned NULL, the `WHERE ... IS NOT NULL` guard made it a no-op, and U3 passed having advanced nothing     |
+| the bluegreen boot-fence probe ran before the app role existed on green, and read every psql failure as "fenced"                                            | "green is fenced read-only from boot" printed on `role does not exist`; the headline U1 boot check could not fail        |
+| the mid-freeze chaos case killed hardcoded `node1` — the container hosting the writer's only gateway — and asserted zero acks                               | zero acks was guaranteed by the writer's own gateway dying; a cluster dual-accepting through the survivors passed        |
+| two Track B W1 ledgers compared row COUNTS against the acked count                                                                                          | a write committed-but-unacked on the writer's own error path offset a genuinely lost acked key                           |
+| `@app.command()` decorated the `_unfreeze` helper in the pg-major proof, not `main`                                                                         | invoking the proof performed a silent unfreeze and exited 0; the proof body had never run                                |
 
 The lesson is the durable part: **a fault must verify its own effect and fail
 loudly, and the harness must not assume its environment.** Every one of these
