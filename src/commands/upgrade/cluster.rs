@@ -401,21 +401,33 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         }
         on_target
     };
-    let transfer_target = post_followers.first().copied().ok_or_else(|| {
-        anyhow::anyhow!(
+    if post_followers.is_empty() {
+        bail!(
             "No upgraded follower available for leadership transfer — aborting before \
-             bouncing the leader"
-        )
-    })?;
+             bouncing the leader. Re-running the same upgrade command resumes the roll."
+        );
+    }
 
-    info!(
-        from = leader_id,
-        to = transfer_target,
-        "Transferring leadership"
-    );
-    client
-        .transfer_leadership(&leader_mgmt, transfer_target)
-        .await?;
+    // Try each upgraded follower in order; only abort when all refuse
+    // (e.g. every candidate is behind on WAL).
+    let mut refusals: Vec<(u64, String)> = Vec::new();
+    for target in &post_followers {
+        info!(from = leader_id, to = *target, "Transferring leadership");
+        match client.transfer_leadership(&leader_mgmt, *target).await {
+            Ok(()) => break,
+            Err(e) => {
+                tracing::warn!(
+                    target = *target,
+                    error = %e,
+                    "Transfer target refused; trying the next upgraded follower"
+                );
+                refusals.push((*target, format!("{e:#}")));
+            }
+        }
+    }
+    if refusals.len() == post_followers.len() {
+        return Err(transfer_refusals_error(&refusals));
+    }
 
     // Former leader (may still be on old version).
     let former = versions
@@ -487,6 +499,20 @@ fn build_cluster_client(
             .ok_or_else(|| anyhow::anyhow!("Pass --node <host:port>"))?,
     };
     Ok((client, entry))
+}
+
+/// Error when every upgraded follower refused the leadership transfer,
+/// naming each candidate and its refusal.
+pub(crate) fn transfer_refusals_error(refusals: &[(u64, String)]) -> anyhow::Error {
+    let detail: Vec<String> = refusals
+        .iter()
+        .map(|(id, why)| format!("node {id}: {why}"))
+        .collect();
+    anyhow::anyhow!(
+        "Leadership transfer failed: every upgraded follower refused ({}). Aborting before \
+         bouncing the leader. Re-running the same upgrade command resumes the roll.",
+        detail.join("; ")
+    )
 }
 
 /// Identify the post-transfer leader, or `None` when it is not yet resolved.
@@ -817,6 +843,19 @@ mod tests {
             leader_pg_addr: None,
             leader_mgmt_addr: mgmt.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn transfer_refusal_error_names_each_target() {
+        let refusals = vec![
+            (2u64, "target is behind on WAL".to_string()),
+            (3u64, "request timed out".to_string()),
+        ];
+        let msg = transfer_refusals_error(&refusals).to_string();
+        assert!(msg.contains("node 2"), "{msg}");
+        assert!(msg.contains("behind on WAL"), "{msg}");
+        assert!(msg.contains("node 3"), "{msg}");
+        assert!(msg.contains("timed out"), "{msg}");
     }
 
     #[test]
