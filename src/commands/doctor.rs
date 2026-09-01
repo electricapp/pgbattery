@@ -153,18 +153,37 @@ pub(crate) async fn require_doctor_strict(
     config_path: Option<String>,
 ) -> Result<()> {
     let report = collect_doctor_report(None, discover, false, false, config_path).await?;
-    if report.fail_count == 0 && report.warn_count == 0 {
+    let violations = strict_gate_violations(&report.checks);
+    if violations.is_empty() {
         return Ok(());
     }
+    bail!(
+        "Refusing cluster upgrade: doctor --strict is not green \
+         ({} gating checks). {}",
+        violations.len(),
+        violations.join("; ")
+    );
+}
+
+/// Fail/warn checks that gate the upgrade preflight, formatted for the
+/// refusal message. Advisory results are exempt:
+///
+/// - Ahead-of-parser warns (gateway may sever newer grammar on failover):
+///   must not block Track A/B preflight when the fleet runs a newer major
+///   than the embedded `libpg_query`.
+/// - Network-latency warns: they measure operator→node latency, not
+///   inter-node RTT (see `check_network_latency`), so an operator on a slow
+///   VPN must still be able to roll.
+fn strict_gate_violations(checks: &[CheckResult]) -> Vec<String> {
     let mut parts = Vec::new();
-    for c in &report.checks {
+    for c in checks {
         if matches!(c.status, CheckStatus::Fail | CheckStatus::Warn) {
-            // Ahead-of-parser is advisory (gateway may sever newer grammar on
-            // failover). It must not block Track A/B upgrade preflight when
-            // the fleet runs a newer major than the embedded libpg_query.
             if c.name.starts_with("pg-version:")
                 && c.message.contains("ahead of the embedded SQL parser")
             {
+                continue;
+            }
+            if c.name.starts_with("network:operator") && c.status == CheckStatus::Warn {
                 continue;
             }
             parts.push(format!(
@@ -179,16 +198,7 @@ pub(crate) async fn require_doctor_strict(
             ));
         }
     }
-    if parts.is_empty() {
-        return Ok(());
-    }
-    bail!(
-        "Refusing cluster upgrade: doctor --strict is not green \
-         ({} fail, {} warn). {}",
-        report.fail_count,
-        report.warn_count,
-        parts.join("; ")
-    );
+    parts
 }
 
 fn build_report(checks: Vec<CheckResult>) -> DoctorReport {
@@ -882,6 +892,48 @@ mod tests {
         assert_eq!(report.warn_count, 0);
         assert_eq!(report.fail_count, 0);
         assert_eq!(report.skip_count, 1);
+    }
+
+    #[test]
+    fn strict_gate_ignores_network_latency_warn() {
+        // Operator->node latency is not inter-node RTT; a VPN'd operator must
+        // still be able to roll. See check_network_latency.
+        let check = CheckResult {
+            name: "network:operator→node1".to_string(),
+            status: CheckStatus::Warn,
+            message: "Reachability latency from this host: 250ms".to_string(),
+            details: None,
+        };
+        assert!(strict_gate_violations(&[check]).is_empty());
+    }
+
+    #[test]
+    fn strict_gate_keeps_other_warns_fatal() {
+        let check = make_check(CheckStatus::Warn, "replication:sync");
+        let violations = strict_gate_violations(&[check]);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations.first().unwrap().contains("replication:sync"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn strict_gate_keeps_fails_fatal() {
+        let check = make_check(CheckStatus::Fail, "cluster:quorum");
+        assert_eq!(strict_gate_violations(&[check]).len(), 1);
+    }
+
+    #[test]
+    fn strict_gate_ignores_parser_ahead_warn() {
+        let check = CheckResult {
+            name: "pg-version:n1".to_string(),
+            status: CheckStatus::Warn,
+            message: "Node n1 runs PostgreSQL 19, ahead of the embedded SQL parser (PostgreSQL 17)"
+                .to_string(),
+            details: None,
+        };
+        assert!(strict_gate_violations(&[check]).is_empty());
     }
 
     #[test]
