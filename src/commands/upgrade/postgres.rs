@@ -282,13 +282,7 @@ pub async fn run_postgres_upgrade(params: PostgresUpgradeParams) -> Result<()> {
         );
     }
 
-    if params.accept_no_rollback && params.allow_no_backup {
-        bail!(
-            "Refusing: --accept-no-rollback (link mode / no rollback after new \
-             start) cannot be combined with --allow-no-backup; a verified backup \
-             is mandatory."
-        );
-    }
+    require_backup_when_no_rollback(params.accept_no_rollback, params.allow_no_backup)?;
 
     let discover = params.node.clone();
     require_doctor_strict(discover.clone(), params.config_path.clone())
@@ -840,6 +834,44 @@ async fn unfreeze_all_logging(client: &ClusterClient, nodes: &[crate::cluster::c
     }
 }
 
+/// Refuse `--accept-no-rollback` combined with `--allow-no-backup`: link
+/// mode (or any no-rollback path) makes the backup the only way back, so a
+/// verified backup is mandatory. One predicate for the CLI and the
+/// primary-side preflight, so the two cannot drift.
+///
+/// # Errors
+/// When both flags are set.
+pub(crate) fn require_backup_when_no_rollback(
+    accept_no_rollback: bool,
+    allow_no_backup: bool,
+) -> Result<()> {
+    if accept_no_rollback && allow_no_backup {
+        bail!(
+            "Refusing: --accept-no-rollback (link mode / no rollback after new \
+             start) cannot be combined with --allow-no-backup; a verified backup \
+             is mandatory."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a preflight over collation version mismatches: libc/ICU drift
+/// silently corrupts text indexes across `pg_upgrade`, which does not
+/// rebuild them.
+///
+/// # Errors
+/// When `count > 0`; the message names the count.
+pub(crate) fn refuse_collation_mismatches(count: usize) -> Result<()> {
+    if count > 0 {
+        bail!(
+            "Collation version mismatches on primary ({count} \
+             entries): libc/ICU drift would corrupt indexes across pg_upgrade. \
+             Rebuild affected collations before upgrading."
+        );
+    }
+    Ok(())
+}
+
 fn resolve_transfer_mode_cli(
     requested: Option<TransferMode>,
     accept_no_rollback: bool,
@@ -1349,9 +1381,7 @@ pub async fn run_local_preflight(
         );
     }
 
-    if req.accept_no_rollback && req.allow_no_backup {
-        bail!("--accept-no-rollback cannot combine with --allow-no-backup");
-    }
+    require_backup_when_no_rollback(req.accept_no_rollback, req.allow_no_backup)?;
 
     let requested = TransferMode::parse(&req.transfer_mode)?;
     if matches!(requested, TransferMode::Link) && !req.accept_no_rollback {
@@ -1410,14 +1440,7 @@ pub async fn run_local_preflight(
         );
     }
 
-    let collation_mismatches = count_collation_mismatches(supervisor).await?;
-    if collation_mismatches > 0 {
-        bail!(
-            "Collation version mismatches on primary ({collation_mismatches} \
-             entries): libc/ICU drift would corrupt indexes across pg_upgrade. \
-             Rebuild affected collations before upgrading."
-        );
-    }
+    refuse_collation_mismatches(count_collation_mismatches(supervisor).await?)?;
 
     let initdb = collect_initdb_params(supervisor, &old_bindir, data_dir).await?;
     info!(?initdb, "initdb parameters resolved from old cluster");
@@ -1471,14 +1494,23 @@ pub(crate) fn missing_extension_controls(
     extensions: &[String],
 ) -> Result<Vec<String>> {
     let sharedir = pg_config_sharedir(new_bindir)?;
-    let mut missing = Vec::new();
-    for ext in extensions {
-        let control = sharedir.join("extension").join(format!("{ext}.control"));
-        if !control.is_file() {
-            missing.push(ext.clone());
-        }
-    }
-    Ok(missing)
+    Ok(missing_controls_in_sharedir(&sharedir, extensions))
+}
+
+/// Extensions with no `.control` file under `sharedir` — the filesystem
+/// check behind [`missing_extension_controls`], split from the `pg_config`
+/// probe so it is testable against a fixture sharedir.
+fn missing_controls_in_sharedir(sharedir: &Path, extensions: &[String]) -> Vec<String> {
+    extensions
+        .iter()
+        .filter(|ext| {
+            !sharedir
+                .join("extension")
+                .join(format!("{ext}.control"))
+                .is_file()
+        })
+        .cloned()
+        .collect()
 }
 
 fn pg_config_sharedir(bindir: &Path) -> Result<PathBuf> {
@@ -3253,48 +3285,48 @@ Bytes per WAL segment:                16777216\n";
         assert_eq!(wal, Some(16));
     }
 
+    /// Drives the refusing function itself: the previous version of this
+    /// test asserted its own literals and kept passing with the production
+    /// check deleted.
     #[test]
     fn link_forbids_allow_no_backup_at_cli() {
-        let req = PostgresUpgradePreflightRequest {
-            to_major: 19,
-            transfer_mode: "link".into(),
-            allow_no_backup: true,
-            accept_no_rollback: true,
-            accept_write_loss: false,
-        };
-        // Same predicate run_postgres_upgrade / run_local_preflight refuse.
+        let err = require_backup_when_no_rollback(true, true).unwrap_err();
         assert!(
-            req.accept_no_rollback && req.allow_no_backup,
-            "link + allow_no_backup must be refused"
+            err.to_string().contains("--allow-no-backup"),
+            "refusal names the flag: {err}"
         );
+
+        assert!(require_backup_when_no_rollback(true, false).is_ok());
+        assert!(require_backup_when_no_rollback(false, true).is_ok());
+        assert!(require_backup_when_no_rollback(false, false).is_ok());
     }
 
+    /// Drives the real filesystem check (the previous version reimplemented
+    /// its loop inline, so the production check could rot unnoticed).
     #[test]
     fn missing_extension_control_named() {
-        let dir = std::env::temp_dir().join(format!("pgbattery-ext-probe-{}", std::process::id()));
-        let ext_dir = dir.join("extension");
-        drop(fs::remove_dir_all(&dir));
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("extension");
         fs::create_dir_all(&ext_dir).unwrap();
         fs::write(ext_dir.join("ok.control"), "comment = 'x'\n").unwrap();
-        let extensions = ["ok", "missing_ext"];
-        let mut missing = Vec::new();
-        for ext in extensions {
-            if !ext_dir.join(format!("{ext}.control")).is_file() {
-                missing.push(ext.to_string());
-            }
-        }
-        drop(fs::remove_dir_all(&dir));
-        assert_eq!(missing, vec!["missing_ext".to_string()]);
+
+        let extensions = vec!["ok".to_string(), "missing_ext".to_string()];
+        assert_eq!(
+            missing_controls_in_sharedir(dir.path(), &extensions),
+            vec!["missing_ext".to_string()]
+        );
+        let present_only = vec!["ok".to_string()];
+        assert!(missing_controls_in_sharedir(dir.path(), &present_only).is_empty());
     }
 
+    /// Drives the refusing function (the previous version formatted a copy
+    /// of the message and grepped it).
     #[test]
     fn collation_mismatch_abort_message_names_count() {
-        let n = 3usize;
-        let msg = format!(
-            "Collation version mismatches on primary ({n} \
-             entries): libc/ICU drift would corrupt indexes across pg_upgrade."
-        );
-        assert!(msg.contains("Collation version mismatches"));
-        assert!(msg.contains("(3 "));
+        let err = refuse_collation_mismatches(3).unwrap_err().to_string();
+        assert!(err.contains("Collation version mismatches"), "{err}");
+        assert!(err.contains("(3 "), "the count is named: {err}");
+
+        assert!(refuse_collation_mismatches(0).is_ok());
     }
 }
