@@ -186,6 +186,23 @@ class AckedKeySetTest(unittest.TestCase):
         self.assertIn("vacuous", str(caught.exception))
 
 
+class PreflightBackupFreshnessTest(unittest.TestCase):
+    """The apply's preflight backup must be from this run, not a leftover."""
+
+    def test_no_artifact_newer_than_the_start_marker_is_refused(self) -> None:
+        with (
+            mock.patch.object(pg_major_upgrade_proof, "_exec", return_value="\n"),
+            self.assertRaises(pg_major_upgrade_proof.ContractFailure) as caught,
+        ):
+            pg_major_upgrade_proof._assert_preflight_backup_fresh("node1")
+        self.assertIn("preflight backup missing", str(caught.exception))
+
+    def test_a_fresh_artifact_passes(self) -> None:
+        listing = "/var/lib/postgresql/backups/backup-2026-09-01.tar.gz\n"
+        with mock.patch.object(pg_major_upgrade_proof, "_exec", return_value=listing):
+            pg_major_upgrade_proof._assert_preflight_backup_fresh("node1")
+
+
 class HoldChaosKillEffectTest(unittest.TestCase):
     """The mid-freeze kill asserts its effect, never that it was requested."""
 

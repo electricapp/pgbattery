@@ -151,8 +151,22 @@ def main() -> None:
         die(f"backup create failed: {created}")
 
     psql_gateway(node, f"INSERT INTO pitr_proof(id) VALUES ('post-{marker}');")
+    # The segment holding the post-backup marker, named before the switch.
+    # Segments archive in order, so this one reaching the archive proves the
+    # marker is recoverable — a fixed pause proves nothing either way.
+    marker_segment = psql_gateway(node, "SELECT pg_walfile_name(pg_current_wal_insert_lsn());")
     psql_gateway(node, "SELECT pg_switch_wal();")
-    time.sleep(3)  # allow archive_command to copy the post-backup segment
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        probe = compose_exec(node, "test", "-f", f"{WAL_ARCHIVE}/{marker_segment}", check=False)
+        if probe.returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        die(
+            f"segment {marker_segment} holding the post-backup marker never "
+            f"reached {WAL_ARCHIVE} within 90s"
+        )
 
     scratch_in = f"/tmp/pitr-proof-{marker}"
     compose_exec(node, "rm", "-rf", scratch_in)

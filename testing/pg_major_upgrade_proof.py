@@ -40,6 +40,10 @@ COMPOSE_TIMEOUT_SEC: Final[float] = 300.0
 TOKEN_ENV: Final[str] = "PGBATTERY_MANAGEMENT_API_TOKEN"
 FROM_MAJOR: Final[int] = 17
 TO_MAJOR: Final[int] = 18
+# backup.backup_dir from config/pgupgrade/*.toml, container-side: where the
+# apply's fresh-backup preflight leaves its artifact.
+BACKUP_DIR: Final[str] = "/var/lib/postgresql/backups"
+START_MARKER: Final[str] = "/tmp/pgb-harness-start"
 
 console = Console()
 err_console = Console(stderr=True)
@@ -101,29 +105,42 @@ def _entry_addr() -> str:
     return f"{node.ip}:{topology.MGMT_CONTAINER_PORT}"
 
 
-def _wait_leader(timeout: float = 180.0) -> None:
+def _leader_node(timeout: float = 180.0) -> Node:
+    """The actual leader, from the management API — never an assumed node."""
     topo = load()
-    deadline = time.monotonic() + timeout
     last = ""
-    while time.monotonic() < deadline:
+
+    def leader() -> Node | None:
+        nonlocal last
         for n in topo.nodes:
             try:
                 r = httpx.get(
                     f"http://127.0.0.1:{n.mgmt_port}/api/v1/cluster/leader",
                     timeout=2.0,
                 )
-                body = r.json()
-                if (
-                    r.status_code == 200
-                    and isinstance(body, dict)
-                    and body.get("leader_id") is not None
-                ):
-                    return
-                last = r.text
-            except (httpx.HTTPError, ValueError) as exc:
+            except httpx.HTTPError as exc:
                 last = str(exc)
-        time.sleep(2.0)
-    raise SystemExit(f"no leader: {last}")
+                continue
+            if r.status_code != 200:
+                last = r.text
+                continue
+            try:
+                lid = r.json().get("leader_id")
+            except ValueError as exc:
+                last = str(exc)
+                continue
+            if lid is None:
+                last = r.text
+                continue
+            for cand in topo.nodes:
+                if cand.node_id == int(lid):
+                    return cand
+        return None
+
+    try:
+        return await_until(leader, budget=timeout, describe="a leader via the management API")
+    except WaitTimeout as exc:
+        raise SystemExit(f"no leader: {last} ({exc})") from exc
 
 
 def _pg_major(node: Node, timeout: float = 180.0) -> int:
@@ -246,6 +263,27 @@ def _assert_acked_survived(node: Node, acked: list[str]) -> None:
     console.print(f"W1 OK: all {len(set(acked))} acked keys survived the upgrade")
 
 
+def _assert_preflight_backup_fresh(service: str) -> None:
+    """The apply's no-skip preflight really took a backup on this run.
+
+    The apply runs without --allow-no-backup, so a fresh artifact must exist
+    on the primary; an old artifact from an earlier run satisfies an
+    existence check while the preflight silently skipped.
+    """
+    out = _exec(
+        service,
+        "sh",
+        "-c",
+        f"find {BACKUP_DIR} -mindepth 1 -newer {START_MARKER} 2>/dev/null | head -5; true",
+    )
+    if not out.strip():
+        raise ContractFailure(
+            f"preflight backup missing: nothing under {BACKUP_DIR} on {service} "
+            "is newer than the harness start marker"
+        )
+    console.print(f"preflight backup fresh on {service}: {out.strip().splitlines()[0]}")
+
+
 def _seed(gateway_port: int) -> None:
     with psycopg.connect(
         host="127.0.0.1",
@@ -349,9 +387,9 @@ def main(
         _compose("down", "-v", check=False)
         _compose("up", "-d", "--remove-orphans")
 
-    _wait_leader()
+    leader = _leader_node()
     topo = load()
-    console.print(f"topology: {[n.service for n in topo.nodes]}")
+    console.print(f"topology: {[n.service for n in topo.nodes]}; leader={leader.service}")
     _require_dual_majors()
     _assert_majors(FROM_MAJOR)
 
@@ -369,6 +407,8 @@ def main(
     time.sleep(2)
 
     entry = _entry_addr()
+    # Freshness baseline for the preflight backup, on the primary taking it.
+    _exec(leader.service, "touch", START_MARKER)
     # No --allow-no-backup: the fresh-backup, restore-into-a-scratch-cluster
     # preflight is the abort path this whole track leans on, and skipping it
     # here would leave it unexercised.
@@ -379,6 +419,7 @@ def main(
     writer.stop()
     if proc.returncode != 0:
         raise ContractFailure(f"postgres upgrade apply failed rc={proc.returncode}")
+    _assert_preflight_backup_fresh(leader.service)
 
     _assert_majors(TO_MAJOR)
     _assert_acked_survived(topo.nodes[0], writer.acked)
