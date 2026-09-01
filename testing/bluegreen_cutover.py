@@ -576,6 +576,44 @@ def _assert_authority_is_green_only(blue: list[Node], green_leader: Node, epoch:
     console.print(f"U1 OK: authority is green at epoch {epoch}; no blue node claims it")
 
 
+def _assert_relay_wrote_nothing_local(before: int, after: int, relayed: int) -> None:
+    """U1: with no reverse subscription wired, the relay adds nothing to blue.
+
+    Probed before `_wire_reverse`: once the reverse stream runs, blue legally
+    grows by exactly the relayed rows — the same number a dual-writing gateway
+    would add, so a post-wiring bound can never fail.
+    """
+    if after != before:
+        raise ContractFailure(
+            f"U1 violated: blue's own database changed by {after - before} rows "
+            f"behind {relayed} relayed writes with no reverse subscription wired"
+        )
+
+
+def _await_reverse_arrival(blue_leader: Node, relayed: set[str], timeout: float = 90.0) -> None:
+    """The reverse stream is live: green's rows actually reach blue through it."""
+    missing: set[str] = set(relayed)
+
+    def arrived() -> bool | None:
+        nonlocal missing
+        present = set(
+            _psql(
+                blue_leader,
+                "SELECT string_agg(k, E'\\n') FROM bg_kv WHERE k LIKE 'post-%';",
+            ).splitlines()
+        )
+        missing = relayed - present
+        return True if not missing else None
+
+    try:
+        await_until(arrived, budget=timeout, describe="the reverse stream to reach blue")
+    except WaitTimeout as exc:
+        raise ContractFailure(
+            f"rollback unavailable: {len(missing)} relayed rows never reached blue "
+            f"through the reverse stream, e.g. {sorted(missing)[:5]} ({exc})"
+        ) from exc
+
+
 def _wire_reverse(blue_leader: Node, green_leader: Node) -> None:
     green_conn = (
         f"host={green_leader.ip} port={topology.PG_INTERNAL_PORT} user={SUB_OWNER} dbname=postgres"
@@ -888,12 +926,9 @@ def main(
     if status.get("phase") != "transferred":
         raise ContractFailure(f"expected transferred, got {status}")
 
-    _wire_reverse(blue_leader, green_leader)
-    if not _rollback_available(blue_leader):
-        raise ContractFailure("reverse subscription not active — rollback unavailable")
-
-    # Blue's gateway is a relay now: this write must land on green, and blue's
-    # own database must not have grown a row behind it.
+    # Blue's gateway is a relay now: these writes must land on green, and
+    # blue's own database must not grow at all behind them. This runs before
+    # reverse wiring, where zero growth is the only legal answer.
     blue_rows_before = int(_psql(blue_leader, "SELECT count(*)::text FROM bg_kv;"))
     relayed = _write_burst(blue_leader.gateway_port, 10, "post")
     on_green = int(_psql(green_leader, "SELECT count(*)::text FROM bg_kv WHERE k LIKE 'post-%';"))
@@ -902,9 +937,14 @@ def main(
             f"blue's gateway relayed {on_green} of {len(relayed)} writes to green"
         )
     blue_rows_after = int(_psql(blue_leader, "SELECT count(*)::text FROM bg_kv;"))
-    if blue_rows_after > blue_rows_before + len(relayed):
-        raise ContractFailure("U1 violated: blue's own database grew independently of the relay")
-    console.print(f"relay OK: {on_green} writes through blue's gateway landed on green")
+    _assert_relay_wrote_nothing_local(blue_rows_before, blue_rows_after, len(relayed))
+    console.print(f"relay OK: {on_green} writes through blue's gateway landed on green only")
+
+    _wire_reverse(blue_leader, green_leader)
+    if not _rollback_available(blue_leader):
+        raise ContractFailure("reverse subscription not active — rollback unavailable")
+    _await_reverse_arrival(blue_leader, relayed)
+    console.print("reverse stream OK: green's rows reach blue")
 
     if rollback_drill:
         _rollback_drill(blue_leader, green_leader, blue, green)

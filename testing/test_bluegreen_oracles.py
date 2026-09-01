@@ -288,6 +288,36 @@ class FenceCoverageTest(unittest.TestCase):
         self.assertIn("still reports write authority", str(caught.exception))
 
 
+class RelayLocalGrowthTest(unittest.TestCase):
+    """U1: before reverse wiring, relayed writes grow blue by exactly zero."""
+
+    def test_a_dual_writing_gateway_is_caught(self) -> None:
+        """Blue grew by exactly the relayed count — the dual-write signature.
+
+        The bound this replaced (`after <= before + relayed`) ran after
+        reverse wiring, where this exact world is also the legal one, so it
+        could never fail.
+        """
+        with self.assertRaises(bg.ContractFailure) as caught:
+            bg._assert_relay_wrote_nothing_local(before=100, after=110, relayed=10)
+        self.assertIn("U1 violated", str(caught.exception))
+
+    def test_partial_local_growth_is_caught(self) -> None:
+        with self.assertRaises(bg.ContractFailure):
+            bg._assert_relay_wrote_nothing_local(before=100, after=101, relayed=10)
+
+    def test_a_pure_relay_passes(self) -> None:
+        bg._assert_relay_wrote_nothing_local(before=100, after=100, relayed=10)
+
+    def test_a_reverse_stream_that_carries_nothing_is_caught(self) -> None:
+        with (
+            mock.patch.object(bg, "_psql", return_value="post-0\npost-1"),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._await_reverse_arrival(_node(), {"post-0", "post-1", "post-2"}, timeout=0.2)
+        self.assertIn("post-2", str(caught.exception))
+
+
 class ReverseDrainTest(unittest.TestCase):
     """U5: while rollback is reported available, green's acks are on blue."""
 
