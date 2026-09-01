@@ -2925,6 +2925,7 @@ dependencies = [
  "terminal_size",
  "tokio",
  "tokio-rustls",
+ "toml_edit 0.22.27",
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",

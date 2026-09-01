@@ -62,6 +62,10 @@ enum LeaseAction {
 #[derive(Debug)]
 pub struct App {
     config: Config,
+    /// Config file this process was started from; Track B retargets rewrite
+    /// its `pg_bin_dir` / `pg_data_dir` keys so the active-PG pointer
+    /// survives a restart.
+    config_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -190,7 +194,18 @@ impl App {
     /// Create a new App instance with the given configuration.
     #[must_use]
     pub const fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            config_path: None,
+        }
+    }
+
+    /// Record the config file this process was started from, so Track B
+    /// retargets can rewrite its path keys durably.
+    #[must_use]
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.config_path = path;
+        self
     }
 
     /// Run the application.
@@ -977,6 +992,7 @@ impl App {
                     wal_archive_dir: self.config.backup.wal_archive_dir.clone(),
                 },
             )),
+            config_path: self.config_path.clone(),
             fence_tx,
             cluster_id: Arc::from(self.config.cluster_id.as_str()),
             awaits_write_authority_from: self
@@ -1412,9 +1428,14 @@ impl App {
 
         // node_id → pg_addr is membership data (Raft-replicated, static per
         // node), not leadership data, so the nodes map is the right source.
-        let leader_pg_addr = {
+        // upgrade_frozen rides the same committed-state read: the Track B
+        // freeze decides below whether a stopped standby is left alone.
+        let (leader_pg_addr, upgrade_frozen) = {
             let state = cluster_state.read();
-            state.nodes.get(&leader_id).map(|n| n.pg_addr)
+            (
+                state.nodes.get(&leader_id).map(|n| n.pg_addr),
+                state.upgrade_frozen,
+            )
         };
         let Some(addr) = leader_pg_addr else {
             warn!(
@@ -1435,7 +1456,7 @@ impl App {
             return LeadershipObservation::not_leading();
         }
 
-        Self::demote_to_leader(postgres, addr, "follow leader").await;
+        Self::demote_to_leader(postgres, addr, "follow leader", upgrade_frozen).await;
         LeadershipObservation::not_leading()
     }
 
@@ -1771,6 +1792,7 @@ impl App {
         postgres: &Arc<tokio::sync::Mutex<P>>,
         leader_addr: SocketAddr,
         context: &str,
+        upgrade_frozen: bool,
     ) {
         // We log + count per-cause failures here rather than propagating: the
         // caller is the reconcile loop, which retries on the next tick (every
@@ -1802,7 +1824,27 @@ impl App {
         // stalled lease tick cannot miss an unfenced-writes window on it —
         // but it does stall this node's lease/health probing for the
         // duration.
+        // Logged once per freeze so the 2 s tick does not flood the log.
+        static FREEZE_SKIP_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
         let mut pg = postgres.lock().await;
+        // A stopped standby stays stopped while the committed upgrade freeze
+        // is on: the orchestrator stopped it and rejoins it itself, and an
+        // auto-start here races that rejoin.
+        if Self::reconcile_leaves_stopped_standby(upgrade_frozen, pg.has_postmaster()) {
+            if !FREEZE_SKIP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                info!(
+                    %leader_addr,
+                    "Upgrade freeze committed: leaving the stopped standby to the \
+                     upgrade orchestrator (further skips not logged)"
+                );
+            }
+            return;
+        }
+        if !upgrade_frozen {
+            FREEZE_SKIP_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         // The fence applies only to a (possibly) writable primary — see
         // `should_fence_before_demote`. A steady-state follower takes the
         // probe-and-skip path every reconcile tick, leaving hot-standby
@@ -2235,6 +2277,15 @@ impl App {
     /// process is listening on.
     const fn should_fence_before_demote(has_postmaster: bool, in_recovery: Option<bool>) -> bool {
         has_postmaster && !matches!(in_recovery, Some(true))
+    }
+
+    /// Pure decision for `demote_to_leader`: while the committed Track B
+    /// upgrade freeze is on, a stopped standby stays stopped. The upgrade
+    /// orchestrator stopped it deliberately and rejoins it with a wipe plus
+    /// basebackup from the upgraded primary; a reconcile-tick auto-start
+    /// races that rejoin with the pre-upgrade binaries.
+    const fn reconcile_leaves_stopped_standby(upgrade_frozen: bool, has_postmaster: bool) -> bool {
+        upgrade_frozen && !has_postmaster
     }
 
     /// Pure decision for `lease_enforcement_tick`, given the post-probe lease
@@ -4837,6 +4888,19 @@ mod tests {
         // Probe failure: role unknown → treat as a possibly-writable primary
         // and fence (fail closed).
         assert!(App::should_fence_before_demote(true, None));
+    }
+
+    /// The upgrade orchestrator stops standbys and rejoins them itself; a
+    /// reconcile-tick auto-start races the orchestrated rejoin with the
+    /// pre-upgrade binaries. A running standby is still reconciled normally,
+    /// and everything reconciles once the freeze clears.
+    #[test]
+    fn the_reconcile_loop_leaves_a_stopped_standby_alone_while_frozen() {
+        assert!(App::reconcile_leaves_stopped_standby(true, false));
+
+        assert!(!App::reconcile_leaves_stopped_standby(true, true));
+        assert!(!App::reconcile_leaves_stopped_standby(false, false));
+        assert!(!App::reconcile_leaves_stopped_standby(false, true));
     }
 
     #[test]

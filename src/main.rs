@@ -263,7 +263,15 @@ async fn main() -> Result<()> {
         }
         Commands::Run { bootstrap } => {
             let config = load_config(cli.config.as_deref())?;
-            App::new(config).run(bootstrap).await
+            // load_config refused a missing file above, so the resolved path
+            // names the file this process actually read. Track B retargets
+            // rewrite its pg_bin_dir / pg_data_dir keys.
+            let config_path =
+                std::path::PathBuf::from(cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_PATH));
+            App::new(config)
+                .with_config_path(Some(config_path))
+                .run(bootstrap)
+                .await
         }
     }
 }

@@ -58,14 +58,14 @@ nothing. All four specs have one, and `make check-counterexamples` fails when a
 spec does not — a target that silently checked three of four would read as
 coverage the next time somebody added a spec.
 
-| Spec                    | Mechanism disabled                                    | Invariant that must then break  |
-| ----------------------- | ----------------------------------------------------- | ------------------------------- |
-| `lease_fencing`         | hold-down anchored at the campaign it wins            | `AtMostOneWriteAuthority`       |
-| `raft_lsn`              | one vote per term                                     | `ElectionSafety`                |
-| `commit_probing`        | LSN election gate (leader holds every replicated txn) | `AckedSuccessIsDurable`         |
-| `timeline_verification` | pg_rewind's divergence gate                           | `TimelineMonotonic`             |
-| `cutover_authority`     | green refuses to self-elect while blue unreachable    | `FailClosedWhenBlueUnreachable` |
-| `cutover_authority`     | arming requires holding authority (`inv-green-self-arm`) | `AtMostOneWriteAuthority`    |
+| Spec                    | Mechanism disabled                                       | Invariant that must then break  |
+| ----------------------- | -------------------------------------------------------- | ------------------------------- |
+| `lease_fencing`         | hold-down anchored at the campaign it wins               | `AtMostOneWriteAuthority`       |
+| `raft_lsn`              | one vote per term                                        | `ElectionSafety`                |
+| `commit_probing`        | LSN election gate (leader holds every replicated txn)    | `AckedSuccessIsDurable`         |
+| `timeline_verification` | pg_rewind's divergence gate                              | `TimelineMonotonic`             |
+| `cutover_authority`     | green refuses to self-elect while blue unreachable       | `FailClosedWhenBlueUnreachable` |
+| `cutover_authority`     | arming requires holding authority (`inv-green-self-arm`) | `AtMostOneWriteAuthority`       |
 
 Each switch is a `CONSTANT` defaulting to the safe value in every other model,
 so the mechanism is disabled only where a counterexample is the expected result.

@@ -4,15 +4,15 @@ CI gate for `UPGRADE_CHECKLIST.md` step 1 / `UPGRADE.md` Track A compat.
 
 ## Layout
 
-| Path                                 | Role                                                                             |
-| ------------------------------------ | -------------------------------------------------------------------------------- |
-| `manifest`                           | Pins `frame_version` and `store_schema_version` to the binary constants          |
-| `supported/frame_v0_vote.bin`        | Current frame bytes; HEAD must decode and re-emit them byte-identically          |
-| `supported/store_schema0.raft.db`    | Populated pre-versioning store; HEAD must open it and run the 0→1 migration      |
-| `supported/store_schema1.raft.db`    | Populated current-schema store; HEAD must open it and decode every record        |
-| `supported/snapshot_state_schema1.bin` | Postcard bytes of a populated `ClusterState`; HEAD must re-encode identically  |
-| `supported/log_entries_schema1.bin`  | Postcard bytes of every `ClusterCommand` variant; HEAD must re-encode identically |
-| `unsupported_newer/`                 | Inversion artifacts HEAD **must** refuse                                         |
+| Path                                   | Role                                                                              |
+| -------------------------------------- | --------------------------------------------------------------------------------- |
+| `manifest`                             | Pins `frame_version` and `store_schema_version` to the binary constants           |
+| `supported/frame_v0_vote.bin`          | Current frame bytes; HEAD must decode and re-emit them byte-identically           |
+| `supported/store_schema0.raft.db`      | Populated pre-versioning store; HEAD must open it and run the 0→1 migration       |
+| `supported/store_schema1.raft.db`      | Populated current-schema store; HEAD must open it and decode every record         |
+| `supported/snapshot_state_schema1.bin` | Postcard bytes of a populated `ClusterState`; HEAD must re-encode identically     |
+| `supported/log_entries_schema1.bin`    | Postcard bytes of every `ClusterCommand` variant; HEAD must re-encode identically |
+| `unsupported_newer/`                   | Inversion artifacts HEAD **must** refuse                                          |
 
 ## Policy
 

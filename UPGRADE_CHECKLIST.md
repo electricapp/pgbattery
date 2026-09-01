@@ -77,11 +77,15 @@ and PG-major upgrade in the same release if avoidable.
 ### Orchestration (step 2)
 
 - [x] Preflight: `doctor --strict`; all nodes same current version; SYNC; backup or `--allow-no-backup`
-- [x] Followers in lag order; never bounce sole sync; transfer; upgrade former leader; postflight; idempotent
+- [x] Followers in lag order; never bounce sole sync (`safe_to_bounce` fails
+      closed on probe errors, an unknown leader, or an empty sync set);
+      transfer, trying each upgraded follower; upgrade former leader;
+      postflight; re-running after a mid-roll abort resumes (the preflight
+      accepts exactly the {starting, target} version mix)
 
 ### Tests
 
-- [x] Matrix: rolling upgrade under continuous writes — `rolling-upgrade` (W1/V1)
+- [x] Matrix: rolling upgrade under continuous writes — `rolling-upgrade` (W1/V1), on PR via `ha-parallel`
 - [x] Restart/transfer orientation soak — `leadership-orientation-soak`
 - [x] Frame/store compat in CI — `governor::compat_fixtures`, goldens committed
 
@@ -112,13 +116,23 @@ and PG-major upgrade in the same release if avoidable.
 ### Prerequisites / config / transfer mode / preflight / full flow / hold / docs
 
 - [x] All items in steps 4–6 (see prior commits): `pg_bin_dirs`, transfer modes, preflight, `--experimental` apply, confirm/rollback, gateway hold, STATE_MACHINE
+- [x] Retarget is durable: apply, standby rejoin, and rollback rewrite
+      `pg_bin_dir` / `pg_data_dir` in the node's own config file (atomic
+      `toml_edit` rewrite), so the active-PG pointer survives a pgbattery
+      restart; a failed apply restarts the old cluster before reporting
 
 ### Tests
 
 - [x] Happy path under continuous writes; bound pause — `pg-upgrade-hold-writes` + `testing/pg_upgrade_hold_chaos.py`
-- [x] Chaos: crash mid-freeze — `pg-upgrade-hold-chaos-mid-freeze`
+- [x] Chaos: crash mid-freeze — `pg-upgrade-hold-chaos-mid-freeze`, on PR via
+      `ha-parallel`: kills the derived leader (kill asserted landed), writers
+      on the surviving gateways, zero acks across the failover while frozen;
+      `mid-unfreeze` variant runs nightly
 - [x] Rollback before `--confirm` — live drill `pg-major-upgrade-rollback-drill`; probes from disk, not from a marker
-- [x] Write-loss watermark recorded at unfreeze; rollback refuses without `--accept-write-loss` when writes landed past it
+- [x] Write-loss watermark recorded as the last step before unfreeze; rollback
+      refuses without `--accept-write-loss` when WAL advanced past it (client
+      writes may be among that WAL — background activity advances it too, so
+      the gate is conservative, and the refusal says so)
 - [x] `--link` / `--accept-no-rollback` refuses `--allow-no-backup` — unit `link_forbids_allow_no_backup_at_cli`
 - [x] Extension/collation preflight abort cases by name — units `missing_extension_control_named`, `collation_mismatch_abort_message_names_count`
 - [x] Freeze is a committed log entry, not a per-node latched bit
@@ -129,7 +143,8 @@ and PG-major upgrade in the same release if avoidable.
 - [x] Runtime image installs **two** PostgreSQL majors (`17` + `18`); `pg_bin_dirs` maps both; refuse green if either `postgres` missing
 - [x] Compose that boots the cluster on major N (`config/pgupgrade/` + `docker-compose.pgupgrade.yml`)
 - [x] Live `--to N+1 --experimental` apply + standby re-basebackup + `--confirm` (`testing/pg_major_upgrade_proof.py`, matrix `pg-major-upgrade-proof`)
-- [x] Continuous writer with an acked-key ledger across the freeze (W1)
+- [x] Continuous writer with an acked-key ledger across the freeze (W1) — the
+      check is a key-set difference naming missing keys, never a row count
 - [x] Backup + verified-restore preflight actually runs (no `--allow-no-backup` in the proof)
 - [x] Post-upgrade `PG_VERSION` proves N+1 on every node (anti-vacuity: refuse if still on N)
 - [x] Chaos mid-`pg_upgrade` itself — `pg-major-upgrade-chaos-mid-upgrade`. Waits
@@ -142,7 +157,7 @@ and PG-major upgrade in the same release if avoidable.
 
 ### Contracts
 
-- [x] Register U1–U5 with inversions that **can go red** — `testing/test_bluegreen_oracles.py` (16 tests, each driving one oracle to its failing answer)
+- [x] Register U1–U5 with inversions that **can go red** — `testing/test_bluegreen_oracles.py` drives every U1–U5 oracle to its failing answer
 - [x] `lint_matrix` refuses an inversion that names an implementation file
 - [x] Extend `dual_writability_prober` to six internal ports (`--topology bluegreen`) + `--user` app-role path; the role is recorded in the result
 

@@ -135,6 +135,11 @@ pub struct ManagementApiState {
     /// for minutes. `None` on a witness, which has no `PostgreSQL`.
     /// Interior mutability so Track B can retarget after `pg_upgrade`.
     pub pg_paths: Mutex<Option<PgPaths>>,
+    /// The config file this process was started from. Track B retargets
+    /// rewrite its `pg_bin_dir` / `pg_data_dir` keys so the active-PG pointer
+    /// survives a restart; `None` means there is no file to rewrite and every
+    /// retarget site must warn the operator loudly instead.
+    pub config_path: Option<std::path::PathBuf>,
     /// Gateway/lease fence watch — Track B sets `upgrade_frozen` here so every
     /// gateway connection refuses queries without a second channel.
     pub fence_tx: watch::Sender<crate::governor::raft::FenceState>,
@@ -357,6 +362,12 @@ pub async fn start_management_api(
         // disk-I/O amplification vector. It is a diagnostic, not a discovery
         // endpoint, so it belongs behind the token like the debug endpoints.
         .route("/api/v1/backup/list", get(backup::list_backups))
+        // Token-gated like backup/list and for the same reasons: both leak
+        // absolute filesystem paths (recon) and the bins probe spawns a
+        // `postgres --version` per configured bindir per request — an
+        // unauthenticated subprocess-amplification vector.
+        .route("/api/v1/postgres/bins", get(upgrade::get_postgres_bins))
+        .route("/api/v1/postgres/status", get(upgrade::get_postgres_status))
         // Debug endpoints (for chaos testing and troubleshooting). GET-only
         // but still token-gated — see comment block above.
         .route("/debug/events", get(debug::get_events))
@@ -463,9 +474,6 @@ pub async fn start_management_api(
         .route("/health", get(health_check))
         // This node's binary + wire/store schema versions (Track A preflight SoT)
         .route("/api/v1/version", get(discovery::get_version))
-        // Track B: dual-bin-dir inventory (paths + postgres --version probe)
-        .route("/api/v1/postgres/bins", get(upgrade::get_postgres_bins))
-        .route("/api/v1/postgres/status", get(upgrade::get_postgres_status))
         .route("/api/v1/cutover/status", get(cutover::get_cutover_status))
         // Leader discovery
         .route("/api/v1/cluster/leader", get(discovery::get_leader))

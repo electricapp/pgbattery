@@ -52,7 +52,19 @@ pub struct SelfUpgradeResponse {
     pub backup_path: Option<String>,
 }
 
+/// Refuse a self-upgrade on the current Raft leader of a multi-voter
+/// cluster: the restart drops leadership mid-write-path. Transfer
+/// leadership first — the CLI cluster roll already does. A single-voter
+/// cluster has nowhere to transfer to and restarts into itself.
+const fn self_upgrade_refused_on_leader(is_leader: bool, voters: usize) -> bool {
+    is_leader && voters > 1
+}
+
 /// Replace this node's binary and request a graceful process restart.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one refusal ladder (locks, leader, task) plus one success path"
+)]
 pub(super) async fn self_upgrade(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<SelfUpgradeHttpRequest>,
@@ -67,6 +79,44 @@ pub(super) async fn self_upgrade(
             }),
         );
     };
+    // Mutually exclusive with backup/restore: a restart landing mid-restore
+    // leaves PGDATA half-written, and a restore starting mid-replace races
+    // the binary swap. Holding both locks covers both orders.
+    let Ok(_backup_guard) = state.backup_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(SelfUpgradeResponse {
+                success: false,
+                message: "A backup or restore is in progress on this node; retry after it \
+                          completes"
+                    .to_string(),
+                backup_path: None,
+            }),
+        );
+    };
+
+    let (is_leader, voters) = {
+        let metrics = state.raft.metrics();
+        let m = metrics.borrow();
+        (
+            m.current_leader == Some(state.node_id),
+            m.membership_config.membership().voter_ids().count(),
+        )
+    };
+    if self_upgrade_refused_on_leader(is_leader, voters) {
+        return (
+            StatusCode::CONFLICT,
+            Json(SelfUpgradeResponse {
+                success: false,
+                message: format!(
+                    "This node is the current Raft leader of a {voters}-voter cluster; \
+                     transfer leadership first \
+                     (POST /api/v1/cluster/transfer-leadership/{{target}}), then retry"
+                ),
+                backup_path: None,
+            }),
+        );
+    }
 
     info!(
         node_id = state.node_id,
@@ -83,7 +133,29 @@ pub(super) async fn self_upgrade(
         identity: body.identity,
     };
 
-    match perform_self_upgrade(req).await {
+    // A dedicated blocking thread, not a runtime worker: the
+    // download-verify-replace path writes a multi-hundred-MB binary with
+    // blocking I/O, and spawn_blocking tasks also cannot be cancelled by a
+    // dropped HTTP connection mid-replace.
+    let handle = tokio::runtime::Handle::current();
+    let outcome =
+        tokio::task::spawn_blocking(move || handle.block_on(perform_self_upgrade(req))).await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            error!(error = %e, "self-upgrade task failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SelfUpgradeResponse {
+                    success: false,
+                    message: format!("self-upgrade task panicked: {e}"),
+                    backup_path: None,
+                }),
+            );
+        }
+    };
+
+    match outcome {
         Ok(backup_path) => {
             info!(
                 node_id = state.node_id,
@@ -135,6 +207,63 @@ pub(super) async fn self_upgrade(
     }
 }
 
+/// Persist a retarget into the node's own config file (`STATE_MACHINE` 8c:
+/// `pg_bin_dir` in config is the durable active-PG pointer).
+///
+/// Returns an operator-facing note when the durable rewrite did not happen.
+/// The retarget on disk already succeeded, so the caller reports the note
+/// instead of failing — failing here would send the orchestrator down the
+/// destructive abort path over a config-file problem.
+fn persist_retarget(
+    state: &ManagementApiState,
+    bin_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> Option<String> {
+    let Some(config_path) = state.config_path.as_deref() else {
+        let note = format!(
+            "No config file is known to this process: persist pg_bin_dir = {} and \
+             pg_data_dir = {} yourself, or the next restart boots the previous \
+             major's paths",
+            bin_dir.display(),
+            data_dir.display()
+        );
+        error!(
+            node_id = state.node_id,
+            bin_dir = %bin_dir.display(),
+            data_dir = %data_dir.display(),
+            "Retarget is not durable: {note}"
+        );
+        return Some(note);
+    };
+    match crate::commands::upgrade::postgres::rewrite_config_pg_paths(
+        config_path,
+        bin_dir,
+        data_dir,
+    ) {
+        Ok(()) => {
+            info!(
+                config = %config_path.display(),
+                bin_dir = %bin_dir.display(),
+                data_dir = %data_dir.display(),
+                "Retarget persisted to config file"
+            );
+            None
+        }
+        Err(e) => {
+            let note = format!(
+                "Config rewrite of {} failed ({e:#}); persist pg_bin_dir = {} and \
+                 pg_data_dir = {} yourself, or the next restart boots the previous \
+                 major's paths",
+                config_path.display(),
+                bin_dir.display(),
+                data_dir.display()
+            );
+            error!(node_id = state.node_id, "Retarget is not durable: {note}");
+            Some(note)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresUpgradePreflightResponse {
     pub success: bool,
@@ -153,22 +282,42 @@ pub struct PostgresUpgradePreflightResponse {
 }
 
 /// Report configured `PostgreSQL` bindirs and whether `postgres` is executable.
+///
+/// The probe spawns one `postgres --version` per configured bindir, so it
+/// runs on the blocking pool rather than a runtime worker.
 pub(super) async fn get_postgres_bins(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
-    let paths_guard = state.pg_paths.lock();
-    let Some(paths) = paths_guard.as_ref() else {
+    let node_id = state.node_id;
+    let paths = state.pg_paths.lock().clone();
+    let Some(paths) = paths else {
         return (
             StatusCode::NOT_FOUND,
             Json(PostgresBinsResponse {
-                node_id: state.node_id,
+                node_id,
                 active_bin_dir: String::new(),
                 bin_dirs: std::collections::BTreeMap::new(),
             }),
         );
     };
-    let resp = probe_local_bins(state.node_id, &paths.bin_dir, &paths.bin_dirs);
-    (StatusCode::OK, Json(resp))
+    let probe = tokio::task::spawn_blocking(move || {
+        probe_local_bins(node_id, &paths.bin_dir, &paths.bin_dirs)
+    })
+    .await;
+    match probe {
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => {
+            error!(error = %e, "bindir probe task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PostgresBinsResponse {
+                    node_id,
+                    active_bin_dir: String::new(),
+                    bin_dirs: std::collections::BTreeMap::new(),
+                }),
+            )
+        }
+    }
 }
 
 /// Run Track B preflight on this node (must be primary).
@@ -369,6 +518,18 @@ pub struct UpgradeFreezeResponse {
     pub message: Option<String>,
 }
 
+/// Whether a freeze request must be proposed to the Raft log.
+///
+/// This node's APPLIED state lags commit: "already in the requested state"
+/// read locally can be a stale answer on a lagging node, and an unfreeze
+/// acked from that read may never commit — leaving every gateway holding
+/// while the CLI reports success. Applying the entry is idempotent, so the
+/// proposal costs one log entry.
+const fn freeze_needs_proposal(applied_frozen: bool, requested_frozen: bool) -> bool {
+    let _ = (applied_frozen, requested_frozen);
+    true
+}
+
 /// Set or clear the Track B upgrade freeze for the whole cluster.
 ///
 /// Committed to the Raft log, not latched per node: the gateways derive the
@@ -378,8 +539,8 @@ pub(super) async fn set_upgrade_freeze(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<UpgradeFreezeRequest>,
 ) -> impl IntoResponse {
-    let already = state.cluster_state.read().upgrade_frozen == body.frozen;
-    if already {
+    let applied = state.cluster_state.read().upgrade_frozen;
+    if !freeze_needs_proposal(applied, body.frozen) {
         return (
             StatusCode::OK,
             Json(UpgradeFreezeResponse {
@@ -470,14 +631,38 @@ pub struct PostgresUpgradeApplyResponse {
 }
 
 /// Run primary-side `pg_upgrade` (standbys must already be stopped; cluster frozen).
-#[allow(
-    clippy::too_many_lines,
-    reason = "apply handler is one refuse path + one success path"
-)]
+///
+/// The work runs in its own task: axum drops a handler future when the HTTP
+/// client disconnects, and `pg_upgrade` is `kill_on_drop`, so an unwrapped
+/// body would kill it mid-run on a dropped connection. The `upgrade_lock`
+/// inside the task still serializes re-entry; the handler awaits the task.
 pub(super) async fn postgres_upgrade_apply(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<PostgresUpgradeApplyRequest>,
 ) -> impl IntoResponse {
+    let to_major = body.to_major;
+    match tokio::spawn(postgres_upgrade_apply_inner(state, body)).await {
+        Ok(resp) => resp,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(PostgresUpgradeApplyResponse {
+                success: false,
+                message: Some(format!("apply task panicked or was cancelled: {e}")),
+                from_major: 0,
+                to_major,
+            }),
+        ),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "apply handler is one refuse path + one success path"
+)]
+async fn postgres_upgrade_apply_inner(
+    state: Arc<ManagementApiState>,
+    body: PostgresUpgradeApplyRequest,
+) -> (StatusCode, Json<PostgresUpgradeApplyResponse>) {
     let mut paths = {
         let guard = state.pg_paths.lock();
         let Some(paths) = guard.as_ref() else {
@@ -553,11 +738,12 @@ pub(super) async fn postgres_upgrade_apply(
             paths.bin_dir = guard.bin_dir().to_path_buf();
             paths.data_dir = guard.data_dir().to_path_buf();
             *state.pg_paths.lock() = Some(paths);
+            let persist_note = persist_retarget(&state, guard.bin_dir(), guard.data_dir());
             (
                 StatusCode::OK,
                 Json(PostgresUpgradeApplyResponse {
                     success: true,
-                    message: None,
+                    message: persist_note,
                     from_major: report.from_major,
                     to_major: report.to_major,
                 }),
@@ -611,15 +797,6 @@ pub(super) async fn postgres_upgrade_rejoin(
         };
         paths.clone()
     };
-    let Some(new_bindir) = paths.bin_dirs.get(&body.to_major.to_string()).cloned() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(PostgresUpgradeRejoinResponse {
-                success: false,
-                message: Some(format!("pg_bin_dirs missing major {}", body.to_major)),
-            }),
-        );
-    };
     let Some(pg) = state.postgres_manager.as_ref() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -641,7 +818,8 @@ pub(super) async fn postgres_upgrade_rejoin(
     let mut guard = pg.lock().await;
     match crate::commands::upgrade::postgres::run_standby_rebasebackup(
         &mut guard,
-        &new_bindir,
+        &paths.bin_dirs,
+        body.to_major,
         &body.leader_pg_host,
         body.leader_pg_port,
         &body.pg_user,
@@ -654,11 +832,12 @@ pub(super) async fn postgres_upgrade_rejoin(
             paths.bin_dir = guard.bin_dir().to_path_buf();
             paths.data_dir = guard.data_dir().to_path_buf();
             *state.pg_paths.lock() = Some(paths);
+            let persist_note = persist_retarget(&state, guard.bin_dir(), guard.data_dir());
             (
                 StatusCode::OK,
                 Json(PostgresUpgradeRejoinResponse {
                     success: true,
-                    message: None,
+                    message: persist_note,
                 }),
             )
         }
@@ -682,15 +861,19 @@ pub struct PostgresStatusResponse {
 }
 
 /// Probe active `PG_VERSION` / paths on this node.
+///
+/// The probe walks the data parent on disk, so it runs on the blocking pool
+/// rather than a runtime worker.
 pub(super) async fn get_postgres_status(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
+    let node_id = state.node_id;
     let paths = state.pg_paths.lock().clone();
     let Some(paths) = paths else {
         return (
             StatusCode::NOT_FOUND,
             Json(PostgresStatusResponse {
-                node_id: state.node_id,
+                node_id,
                 active_major: None,
                 active_bin_dir: String::new(),
                 active_data_dir: String::new(),
@@ -698,18 +881,14 @@ pub(super) async fn get_postgres_status(
             }),
         );
     };
-    let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
-    let rollback_available = match (major, paths.data_dir.parent()) {
-        (Some(m), Some(parent)) => {
-            crate::commands::upgrade::postgres::UpgradeSite::probe(parent, m)
+    let probe = tokio::task::spawn_blocking(move || {
+        let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
+        let rollback_available = major.is_some_and(|m| {
+            crate::commands::upgrade::postgres::UpgradeSite::probe(&paths.data_dir, m)
                 .is_ok_and(|s| s.rollback_available())
-        }
-        _ => false,
-    };
-    (
-        StatusCode::OK,
-        Json(PostgresStatusResponse {
-            node_id: state.node_id,
+        });
+        PostgresStatusResponse {
+            node_id,
             active_major: major,
             active_bin_dir: crate::commands::upgrade::postgres::bin_dir_for_major(
                 major,
@@ -720,8 +899,25 @@ pub(super) async fn get_postgres_status(
             .to_string(),
             active_data_dir: paths.data_dir.display().to_string(),
             rollback_available,
-        }),
-    )
+        }
+    })
+    .await;
+    match probe {
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => {
+            error!(error = %e, "postgres status probe task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PostgresStatusResponse {
+                    node_id,
+                    active_major: None,
+                    active_bin_dir: String::new(),
+                    active_data_dir: String::new(),
+                    rollback_available: false,
+                }),
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -748,6 +944,17 @@ pub(super) async fn postgres_upgrade_confirm(
             Json(PostgresUpgradeConfirmResponse {
                 success: false,
                 message: Some("No PostgreSQL paths".into()),
+            }),
+        );
+    };
+    // Same exclusion as apply/rejoin/rollback: a confirm racing a rollback
+    // deletes the datadir the rollback is restarting into.
+    let Ok(_lock) = state.upgrade_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(PostgresUpgradeConfirmResponse {
+                success: false,
+                message: Some("Upgrade in progress".into()),
             }),
         );
     };
@@ -838,17 +1045,21 @@ pub(super) async fn postgres_upgrade_rollback(
             if let Some(paths) = updated {
                 *state.pg_paths.lock() = Some(paths);
             }
+            let persist_note = persist_retarget(&state, guard.bin_dir(), guard.data_dir());
+            let mut message = format!(
+                "Rolled back to major {}; unfreeze watermark {:?}, new-cluster \
+                 final LSN {:?}",
+                report.from_major, report.unfreeze_watermark_lsn, report.new_cluster_final_lsn
+            );
+            if let Some(note) = persist_note {
+                message.push_str("; ");
+                message.push_str(&note);
+            }
             (
                 StatusCode::OK,
                 Json(PostgresUpgradeRollbackResponse {
                     success: true,
-                    message: Some(format!(
-                        "Rolled back to major {}; unfreeze watermark {:?}, new-cluster \
-                         final LSN {:?}",
-                        report.from_major,
-                        report.unfreeze_watermark_lsn,
-                        report.new_cluster_final_lsn
-                    )),
+                    message: Some(message),
                     from_major: report.from_major,
                 }),
             )
@@ -861,5 +1072,37 @@ pub(super) async fn postgres_upgrade_rollback(
                 from_major: 0,
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{freeze_needs_proposal, self_upgrade_refused_on_leader};
+
+    /// Restarting the current leader of a multi-voter cluster drops
+    /// leadership mid-write-path; a single-voter cluster has nowhere to
+    /// transfer to and restarts into itself.
+    #[test]
+    fn self_upgrade_refuses_only_a_multi_voter_leader() {
+        assert!(self_upgrade_refused_on_leader(true, 3));
+        assert!(self_upgrade_refused_on_leader(true, 2));
+
+        assert!(!self_upgrade_refused_on_leader(true, 1));
+        assert!(!self_upgrade_refused_on_leader(false, 3));
+    }
+
+    /// A node's APPLIED state lags commit, so a locally-matching freeze
+    /// state is no proof the cluster committed the requested one. An
+    /// unfreeze acked from that stale read may never commit, leaving every
+    /// gateway holding while the CLI reports success — so every request is
+    /// proposed (apply is idempotent).
+    #[test]
+    fn every_freeze_request_is_proposed_regardless_of_applied_state() {
+        for (applied, requested) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(
+                freeze_needs_proposal(applied, requested),
+                "applied={applied} requested={requested}"
+            );
+        }
     }
 }

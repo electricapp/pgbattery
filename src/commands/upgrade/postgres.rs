@@ -48,18 +48,41 @@ pub struct UpgradeSite {
     pub old_control_intact: bool,
 }
 
+/// The base the flow derives sibling datadir names from: the configured
+/// directory's name with a trailing `_<major>` stripped, so `data_18` and
+/// `data` share the base `data`.
+fn upgrade_site_base_name(data_dir_name: &str) -> &str {
+    match data_dir_name.rsplit_once('_') {
+        Some((base, suffix)) if suffix.parse::<u32>().is_ok() => base,
+        _ => data_dir_name,
+    }
+}
+
 impl UpgradeSite {
-    /// Probe `parent` for the data directories of a `from → to` upgrade.
+    /// Probe beside `data_dir` for the data directories of a `from → to`
+    /// upgrade.
+    ///
+    /// Candidates are only the configured `data_dir` itself and siblings
+    /// named by the convention this flow creates (`<base>_<major>`). An
+    /// operator's manual copy (`data_backup`, a snapshot) holds a parseable
+    /// `PG_VERSION` too, and trusting it would let `--rollback` start it or
+    /// `--confirm` delete it. Two candidates claiming the same major refuse
+    /// with both names.
     ///
     /// # Errors
-    /// When `parent` cannot be read.
-    pub fn probe(parent: &Path, to_major: u32) -> Result<Self> {
-        let mut site = Self {
-            old_data_dir: None,
-            old_major: None,
-            new_data_dir: None,
-            old_control_intact: false,
-        };
+    /// When the parent cannot be read, or candidates are ambiguous.
+    pub fn probe(data_dir: &Path, to_major: u32) -> Result<Self> {
+        let parent = data_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent", data_dir.display()))?;
+        let configured_name = data_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", data_dir.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let base = upgrade_site_base_name(&configured_name).to_string();
+
+        let mut by_major: BTreeMap<u32, Vec<PathBuf>> = BTreeMap::new();
         let entries = fs::read_dir(parent)
             .with_context(|| format!("reading data parent {}", parent.display()))?;
         for entry in entries {
@@ -69,7 +92,44 @@ impl UpgradeSite {
             if !path.is_dir() {
                 continue;
             }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let Some(name) = name else { continue };
+            let is_configured = name == configured_name;
+            // The bare base is the name the flow started from: after a
+            // retarget the config names `data_18` and the rollback anchor
+            // is still plain `data`.
+            let is_base = name == base;
+            let is_flow_sibling = name
+                .strip_prefix(&base)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|suffix| suffix.parse::<u32>().is_ok());
+            if !is_configured && !is_base && !is_flow_sibling {
+                continue;
+            }
             let Ok(major) = data_dir_major(&path) else {
+                continue;
+            };
+            by_major.entry(major).or_default().push(path);
+        }
+        for (major, paths) in &by_major {
+            if paths.len() > 1 {
+                let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                bail!(
+                    "multiple data directories claim major {major}: {}; move the \
+                     copies not in use out of the {base}_<major> naming convention",
+                    names.join(", ")
+                );
+            }
+        }
+
+        let mut site = Self {
+            old_data_dir: None,
+            old_major: None,
+            new_data_dir: None,
+            old_control_intact: false,
+        };
+        for (major, paths) in by_major {
+            let Some(path) = paths.into_iter().next() else {
                 continue;
             };
             if major == to_major {
@@ -226,13 +286,7 @@ pub async fn run_postgres_upgrade(params: PostgresUpgradeParams) -> Result<()> {
         );
     }
 
-    if params.accept_no_rollback && params.allow_no_backup {
-        bail!(
-            "Refusing: --accept-no-rollback (link mode / no rollback after new \
-             start) cannot be combined with --allow-no-backup; a verified backup \
-             is mandatory."
-        );
-    }
+    require_backup_when_no_rollback(params.accept_no_rollback, params.allow_no_backup)?;
 
     let discover = params.node.clone();
     require_doctor_strict(discover.clone(), params.config_path.clone())
@@ -335,8 +389,8 @@ async fn apply_experimental(
             "Stopping standby PostgreSQL for upgrade"
         );
         if let Err(e) = client.stop_postgres(&n.mgmt_addr).await {
-            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
-            unfreeze_all_logging(client, nodes).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
+            unfreeze_after_serving_primary_logging(client, nodes).await;
             bail!("Failed to stop standby {}: {e}", n.node_id);
         }
         stopped.push(n);
@@ -359,23 +413,25 @@ async fn apply_experimental(
             );
         }
         Ok(r) => {
-            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
-            unfreeze_all_logging(client, nodes).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
+            unfreeze_after_serving_primary_logging(client, nodes).await;
             bail!(
                 "Primary apply failed: {}",
                 r.message.unwrap_or_else(|| "no detail".into())
             );
         }
         Err(e) => {
-            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
-            unfreeze_all_logging(client, nodes).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
+            unfreeze_after_serving_primary_logging(client, nodes).await;
             return Err(e);
         }
     }
 
-    // The apply probes a write before returning, so unfreezing here releases
-    // clients into a primary that answers. Standbys are still stopped, so
-    // durability is briefly ASYNC and the status output says so.
+    // Probed, not assumed: the apply's own write probe ran inside the
+    // handler, and the unfreeze must not trust a response over a primary
+    // that has since died. Standbys are still stopped, so durability is
+    // briefly ASYNC and the status output says so.
+    wait_for_serving_primary(client, nodes).await?;
     unfreeze_all(client, nodes).await?;
     info!("Unfrozen after primary upgrade (standbys still stopped; durability briefly ASYNC)");
 
@@ -549,14 +605,14 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
     {
         Ok(resp) if resp.success => resp,
         Ok(resp) => {
-            unfreeze_all_logging(&client, &membership.nodes).await;
+            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
             bail!(
                 "Primary rollback failed: {}",
                 resp.message.unwrap_or_else(|| "no detail".into())
             );
         }
         Err(e) => {
-            unfreeze_all_logging(&client, &membership.nodes).await;
+            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
             return Err(e);
         }
     };
@@ -566,7 +622,7 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
 
     let leader_info = client.get_leader_info(&leader_mgmt).await?;
     let Some(leader_pg) = leader_info.leader_pg_addr else {
-        unfreeze_all_logging(&client, &membership.nodes).await;
+        unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
         bail!("No leader_pg_addr after rollback");
     };
     let (host, port) = split_host_port(&leader_pg)?;
@@ -588,11 +644,12 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
         }
         .await;
         if let Err(e) = rejoined {
-            unfreeze_all_logging(&client, &membership.nodes).await;
+            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
             return Err(e);
         }
     }
 
+    wait_for_serving_primary(&client, &membership.nodes).await?;
     unfreeze_all(&client, &membership.nodes).await?;
     require_doctor_strict(Some(leader_mgmt.clone()), params.config_path.clone()).await?;
     info!(from_major, "Rollback complete; cluster on old major");
@@ -637,6 +694,58 @@ async fn wait_standby_streaming(
     }
 }
 
+/// Confirm some primary answers SQL before releasing held clients.
+///
+/// `GET /api/v1/cluster/txid-status/{txid}` runs a real query on the
+/// leader's `PostgreSQL` under a 2 s budget, so a 200 is proof of a serving
+/// primary. Leader metadata alone only proves an election happened; after a
+/// failed apply the elected node's postmaster can be stopped.
+async fn wait_for_serving_primary(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(3);
+    loop {
+        'probe: for n in nodes {
+            let Ok(leader) = client.get_leader_info(&n.mgmt_addr).await else {
+                continue;
+            };
+            let Some(leader_mgmt) = leader.leader_mgmt_addr else {
+                continue;
+            };
+            let url = format!("http://{leader_mgmt}/api/v1/cluster/txid-status/1");
+            if let Ok(resp) = client.http_client().get(&url).send().await
+                && resp.status().is_success()
+            {
+                info!(leader = %leader_mgmt, "Primary confirmed serving");
+                return Ok(());
+            }
+            // One leader probe per round; re-resolve after the sleep.
+            break 'probe;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("no node's PostgreSQL answered a query as primary within 3 minutes");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Unfreeze only once a primary is confirmed serving; otherwise leave the
+/// cluster frozen and say so. Releasing held clients into a cluster with no
+/// primary turns a recoverable abort into an outage.
+async fn unfreeze_after_serving_primary_logging(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+) {
+    match wait_for_serving_primary(client, nodes).await {
+        Ok(()) => unfreeze_all_logging(client, nodes).await,
+        Err(e) => tracing::error!(
+            error = %e,
+            "Cluster left FROZEN: no serving primary to release held clients into"
+        ),
+    }
+}
+
 /// Clear the cluster-wide freeze.
 ///
 /// The freeze is one committed entry, so one node accepting the call clears
@@ -667,12 +776,13 @@ async fn unfreeze_all(
 ///
 /// Their data directories are still the old major and the primary never
 /// changed, so a plain rejoin against the unchanged primary is correct. Left
-/// out, an aborted upgrade leaves a single-copy cluster with no signal.
+/// out, an aborted upgrade leaves a single-copy cluster with no signal. The
+/// rejoin major is the primary's probed active major, never the upgrade's
+/// target: the abort means the primary did not upgrade.
 async fn restart_stopped_standbys(
     client: &ClusterClient,
     stopped: &[&crate::cluster::client::NodeInfo],
     leader_mgmt: &str,
-    to_major: u32,
 ) {
     if stopped.is_empty() {
         return;
@@ -689,9 +799,20 @@ async fn restart_stopped_standbys(
         tracing::error!(%leader_pg, "Unparseable leader PG address; standbys stay stopped");
         return;
     };
+    let primary_major = match client.get_postgres_status(leader_mgmt).await {
+        Ok(st) => st.active_major,
+        Err(e) => {
+            tracing::error!(error = %e, "Cannot probe primary major; standbys stay stopped");
+            return;
+        }
+    };
+    let Some(primary_major) = primary_major else {
+        tracing::error!("Primary reports no active major; standbys stay stopped");
+        return;
+    };
     for n in stopped {
         let body = crate::observability::management_api::PostgresUpgradeRejoinRequest {
-            to_major,
+            to_major: primary_major,
             leader_pg_host: host.clone(),
             leader_pg_port: port,
             pg_user: PG_SUPERUSER.into(),
@@ -715,6 +836,44 @@ async fn unfreeze_all_logging(client: &ClusterClient, nodes: &[crate::cluster::c
     if let Err(e) = unfreeze_all(client, nodes).await {
         tracing::error!(error = %e, "Cluster left frozen");
     }
+}
+
+/// Refuse `--accept-no-rollback` combined with `--allow-no-backup`: link
+/// mode (or any no-rollback path) makes the backup the only way back, so a
+/// verified backup is mandatory. One predicate for the CLI and the
+/// primary-side preflight, so the two cannot drift.
+///
+/// # Errors
+/// When both flags are set.
+pub(crate) fn require_backup_when_no_rollback(
+    accept_no_rollback: bool,
+    allow_no_backup: bool,
+) -> Result<()> {
+    if accept_no_rollback && allow_no_backup {
+        bail!(
+            "Refusing: --accept-no-rollback (link mode / no rollback after new \
+             start) cannot be combined with --allow-no-backup; a verified backup \
+             is mandatory."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a preflight over collation version mismatches: libc/ICU drift
+/// silently corrupts text indexes across `pg_upgrade`, which does not
+/// rebuild them.
+///
+/// # Errors
+/// When `count > 0`; the message names the count.
+pub(crate) fn refuse_collation_mismatches(count: usize) -> Result<()> {
+    if count > 0 {
+        bail!(
+            "Collation version mismatches on primary ({count} \
+             entries): libc/ICU drift would corrupt indexes across pg_upgrade. \
+             Rebuild affected collations before upgrading."
+        );
+    }
+    Ok(())
 }
 
 fn resolve_transfer_mode_cli(
@@ -963,6 +1122,39 @@ pub fn bin_dir_for_major<'a>(
         .map_or(configured, PathBuf::as_path)
 }
 
+/// The bindir a standby rejoin must use: the one matching the probed major
+/// of the primary it is joining, never the caller's requested major.
+///
+/// The abort path rejoins standbys against a primary that never upgraded;
+/// selecting binaries by the upgrade's target major re-basebackups them with
+/// new-major binaries against an old-major primary, and they cannot start.
+///
+/// # Errors
+/// No `pg_bin_dirs` entry for the primary's major.
+pub(crate) fn rejoin_bindir_for_primary(
+    probed_primary_major: u32,
+    requested_major: u32,
+    bin_dirs: &BTreeMap<String, PathBuf>,
+) -> Result<&Path> {
+    if probed_primary_major != requested_major {
+        tracing::warn!(
+            probed_primary_major,
+            requested_major,
+            "Rejoin request names a different major than the primary serves; \
+             following the primary"
+        );
+    }
+    bin_dirs
+        .get(&probed_primary_major.to_string())
+        .map(PathBuf::as_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pg_bin_dirs has no entry for major {probed_primary_major}, the major the \
+                 primary actually serves; refusing to wipe this standby"
+            )
+        })
+}
+
 /// Whether two paths share a filesystem (required for clone/link).
 ///
 /// # Errors
@@ -1193,9 +1385,7 @@ pub async fn run_local_preflight(
         );
     }
 
-    if req.accept_no_rollback && req.allow_no_backup {
-        bail!("--accept-no-rollback cannot combine with --allow-no-backup");
-    }
+    require_backup_when_no_rollback(req.accept_no_rollback, req.allow_no_backup)?;
 
     let requested = TransferMode::parse(&req.transfer_mode)?;
     if matches!(requested, TransferMode::Link) && !req.accept_no_rollback {
@@ -1220,7 +1410,10 @@ pub async fn run_local_preflight(
     let reflink_ok = probe_reflink(&work)?;
     let transfer_mode = resolve_transfer_mode(requested, reflink_ok, req.accept_no_rollback)?;
 
-    let data_bytes = dir_size_approx(data_dir).unwrap_or(0);
+    // Propagated, not defaulted: a failed walk reading as zero bytes would
+    // pass the disk-headroom gate on a full disk.
+    let data_bytes = dir_size_approx(data_dir)
+        .with_context(|| format!("sizing {} for the disk-headroom gate", data_dir.display()))?;
     let need = transfer_mode_headroom_hint(transfer_mode, data_bytes);
     let free = filesystem_free_bytes(parent)?;
     if free < need {
@@ -1254,14 +1447,7 @@ pub async fn run_local_preflight(
         );
     }
 
-    let collation_mismatches = count_collation_mismatches(supervisor).await?;
-    if collation_mismatches > 0 {
-        bail!(
-            "Collation version mismatches on primary ({collation_mismatches} \
-             entries): libc/ICU drift would corrupt indexes across pg_upgrade. \
-             Rebuild affected collations before upgrading."
-        );
-    }
+    refuse_collation_mismatches(count_collation_mismatches(supervisor).await?)?;
 
     let initdb = collect_initdb_params(supervisor, &old_bindir, data_dir).await?;
     info!(?initdb, "initdb parameters resolved from old cluster");
@@ -1315,14 +1501,23 @@ pub(crate) fn missing_extension_controls(
     extensions: &[String],
 ) -> Result<Vec<String>> {
     let sharedir = pg_config_sharedir(new_bindir)?;
-    let mut missing = Vec::new();
-    for ext in extensions {
-        let control = sharedir.join("extension").join(format!("{ext}.control"));
-        if !control.is_file() {
-            missing.push(ext.clone());
-        }
-    }
-    Ok(missing)
+    Ok(missing_controls_in_sharedir(&sharedir, extensions))
+}
+
+/// Extensions with no `.control` file under `sharedir` — the filesystem
+/// check behind [`missing_extension_controls`], split from the `pg_config`
+/// probe so it is testable against a fixture sharedir.
+fn missing_controls_in_sharedir(sharedir: &Path, extensions: &[String]) -> Vec<String> {
+    extensions
+        .iter()
+        .filter(|ext| {
+            !sharedir
+                .join("extension")
+                .join(format!("{ext}.control"))
+                .is_file()
+        })
+        .cloned()
+        .collect()
 }
 
 fn pg_config_sharedir(bindir: &Path) -> Result<PathBuf> {
@@ -1445,17 +1640,39 @@ async fn prove_backup_restore_and_start(
                     bail!("pg_verifybackup failed for {}", created.path.display());
                 }
             }
-            prove_full_backup_start(old_bindir, &scratch, &created.path).await?;
+            match prove_full_backup_start(old_bindir, &scratch, &created.path).await? {
+                BackupProof::RestoredAndStarted => {}
+                BackupProof::ExistenceOnly => {
+                    tracing::warn!(
+                        path = %created.path.display(),
+                        "Backup proof DEGRADED for non-directory format: the archive \
+                         exists and verified on create, but restore-and-start was NOT \
+                         proven — an unrestorable backup passes this gate"
+                    );
+                    info!("Backup existence proof passed (restore-and-start NOT proven)");
+                    return Ok(());
+                }
+            }
         }
     }
     info!("Backup restore-and-start proof passed");
     Ok(())
 }
 
+/// A free localhost TCP port for a throwaway scratch postmaster.
+///
+/// Probed, not fixed: a hardcoded port collides with whatever else runs on
+/// the host (a second preflight included) and fails the proof spuriously.
+fn free_local_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("probing for a free local port")?;
+    Ok(listener.local_addr()?.port())
+}
+
 async fn prove_dump_restore(bindir: &Path, scratch: &Path, dump_path: &Path) -> Result<()> {
     let data = scratch.join("data");
     initdb_simple(bindir, &data).await?;
-    let port = 55432_u16;
+    let port = free_local_port()?;
     start_postgres_temp(bindir, &data, port).await?;
     let psql = bindir.join("psql");
     // Compressed dumps: gunzip -c | psql. Plain: psql -f.
@@ -1537,16 +1754,30 @@ async fn prove_dump_restore(bindir: &Path, scratch: &Path, dump_path: &Path) -> 
     Ok(())
 }
 
-async fn prove_full_backup_start(bindir: &Path, scratch: &Path, backup_path: &Path) -> Result<()> {
-    // If it's a directory basebackup, copy PG_VERSION presence check + try start
-    // after copying tree. For tar.gz, skip extract in preflight and require
-    // pg_verifybackup already done by BackupManager on create.
+/// What [`prove_full_backup_start`] actually proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupProof {
+    /// A scratch postmaster started from the backup and answered a query.
+    RestoredAndStarted,
+    /// Only that the archive exists (verified on create); restore-and-start
+    /// was NOT proven.
+    ExistenceOnly,
+}
+
+async fn prove_full_backup_start(
+    bindir: &Path,
+    scratch: &Path,
+    backup_path: &Path,
+) -> Result<BackupProof> {
+    // A directory basebackup restores by copying the tree and starting a
+    // scratch postmaster. Compressed / opaque formats skip the extract in
+    // preflight; pg_verifybackup ran on create.
     if backup_path.is_dir() && backup_path.join("PG_VERSION").exists() {
         let data = scratch.join("data");
         copy_dir_recursive(backup_path, &data)?;
         // Remove standby.signal so we can start read-write briefly.
         drop(fs::remove_file(data.join("standby.signal")));
-        let port = 55433_u16;
+        let port = free_local_port()?;
         start_postgres_temp(bindir, &data, port).await?;
         let psql = bindir.join("psql");
         let write = Command::new(&psql)
@@ -1568,19 +1799,12 @@ async fn prove_full_backup_start(bindir: &Path, scratch: &Path, backup_path: &Pa
         if !write.success() {
             bail!("Restored full backup did not accept a query");
         }
-        return Ok(());
+        return Ok(BackupProof::RestoredAndStarted);
     }
-    // Compressed / opaque: BackupManager already ran pg_verifybackup on create.
-    // Refuse if the path is missing; otherwise accept inventory + verify as the
-    // floor and require WAL PITR matrix for archive depth.
     if !backup_path.exists() {
         bail!("Full backup path does not exist: {}", backup_path.display());
     }
-    info!(
-        path = %backup_path.display(),
-        "Full backup present (verify on create); scratch start skipped for non-dir format"
-    );
-    Ok(())
+    Ok(BackupProof::ExistenceOnly)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -1697,7 +1921,7 @@ async fn run_pg_upgrade_check(
 
     // Bring the copy up on an ephemeral port and stop cleanly so pg_control
     // reports "shut down" rather than "in production".
-    let check_port: u16 = 55432;
+    let check_port = free_local_port()?;
     let sock_dir = work.join("check_sockets");
     fs::create_dir_all(&sock_dir)?;
     let pg_ctl = old_bindir.join("pg_ctl");
@@ -1833,20 +2057,65 @@ fn dir_size_approx(path: &Path) -> Result<u64> {
         }
         Ok(())
     }
+    // Stat the root explicitly: `walk` skips anything that is neither file
+    // nor directory, which would silently read a missing root as zero bytes.
+    fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let mut total = 0_u64;
     walk(path, &mut total)?;
     Ok(total)
+}
+
+/// Whether the old cluster can restart in place after a failed apply step.
+///
+/// `pg_upgrade --link` renames the old cluster's `global/pg_control`;
+/// without it `PostgreSQL` cannot open the directory and the only recovery
+/// is the preflight backup.
+fn old_cluster_recoverable(old_data: &Path) -> bool {
+    old_data.join("global/pg_control").is_file()
+}
+
+/// Fold a failed post-stop apply step into an error that also reports what
+/// happened to the primary.
+///
+/// Pre-confirm the old bin/data dirs are intact, so a failed initdb,
+/// `pg_upgrade`, start, or post-upgrade script must not leave the primary
+/// stopped for the CLI to unfreeze clients into: restart the old cluster
+/// and say whether that worked.
+async fn recover_old_cluster_after_failed_apply(
+    supervisor: &mut crate::supervisor::Supervisor,
+    old_bindir: &Path,
+    old_data: &Path,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if !old_cluster_recoverable(old_data) {
+        return err.context(
+            "no in-place recovery: the old cluster's control file is gone \
+             (pg_upgrade --link); the primary is DOWN, restore from the \
+             preflight backup",
+        );
+    }
+    // The failed step may have left the new cluster running.
+    if supervisor.has_postmaster()
+        && let Err(stop) = supervisor.stop().await
+    {
+        tracing::warn!(error = %stop, "Stop before old-cluster recovery failed; continuing");
+    }
+    supervisor.retarget_paths(old_bindir.to_path_buf(), old_data.to_path_buf());
+    match supervisor.start().await {
+        Ok(()) => err.context("recovery: the old cluster restarted and is serving again"),
+        Err(start) => err.context(format!(
+            "recovery FAILED: the old cluster did not restart ({start}); the primary is DOWN"
+        )),
+    }
 }
 
 /// Apply `pg_upgrade` on this (primary) node. Caller must already have frozen
 /// the cluster and stopped standbys.
 ///
 /// # Errors
-/// Stop, initdb, `pg_upgrade`, retarget, or start failures.
-#[allow(
-    clippy::too_many_lines,
-    reason = "primary apply is one auditable sequence"
-)]
+/// Stop, initdb, `pg_upgrade`, retarget, or start failures. Any failure after
+/// the stop also attempts to restart the old cluster and reports the outcome
+/// in the error.
 pub async fn run_primary_pg_upgrade_apply(
     supervisor: &mut crate::supervisor::Supervisor,
     bin_dirs: &BTreeMap<String, PathBuf>,
@@ -1869,18 +2138,31 @@ pub async fn run_primary_pg_upgrade_apply(
 
     let parent = old_data
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?;
-    let new_data = parent.join(format!("data_{to_major}"));
+        .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?
+        .to_path_buf();
+    // The naming convention the whole flow probes by: `<base>_<major>`
+    // beside the configured datadir, base derived from its name.
+    let old_name = old_data
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("data dir has no name"))?
+        .to_string_lossy()
+        .into_owned();
+    let new_data = parent.join(format!("{}_{to_major}", upgrade_site_base_name(&old_name)));
     if new_data.exists() {
         // `pg_upgrade` has no restart point, so a leftover target is the
         // wreckage of an interrupted run, not progress. Discarding it is the
         // only way the flow can resume from the preserved old datadir.
-        let started = new_data.join("global/pg_control").is_file() && postmaster_has_run(&new_data);
-        if started {
+        if !interrupted_target_is_discardable(
+            old_cluster_recoverable(&old_data),
+            unfreeze_watermark_path(&parent).exists(),
+        ) {
             bail!(
-                "{} has been started as a cluster: refusing to discard it. \
-                 Roll back or confirm before re-running the upgrade.",
-                new_data.display()
+                "Refusing to discard {}: either {} has no intact control file \
+                 (the old cluster is not viable) or the unfreeze watermark exists \
+                 (clients resumed on the new cluster). Roll back or confirm \
+                 before re-running the upgrade.",
+                new_data.display(),
+                old_data.display()
             );
         }
         tracing::warn!(
@@ -1901,6 +2183,62 @@ pub async fn run_primary_pg_upgrade_apply(
         .stop()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match run_apply_after_stop(ApplyAfterStop {
+        supervisor,
+        old_bindir: &old_bindir,
+        new_bindir: &new_bindir,
+        old_data: &old_data,
+        new_data: &new_data,
+        parent: &parent,
+        initdb: &initdb,
+        from_major,
+        to_major,
+        transfer_mode,
+    })
+    .await
+    {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            Err(recover_old_cluster_after_failed_apply(supervisor, &old_bindir, &old_data, e).await)
+        }
+    }
+}
+
+/// Everything [`run_apply_after_stop`] needs; a struct so the recovery split
+/// does not turn into ten positional arguments.
+struct ApplyAfterStop<'a> {
+    supervisor: &'a mut crate::supervisor::Supervisor,
+    old_bindir: &'a Path,
+    new_bindir: &'a Path,
+    old_data: &'a Path,
+    new_data: &'a Path,
+    parent: &'a Path,
+    initdb: &'a InitdbParams,
+    from_major: u32,
+    to_major: u32,
+    transfer_mode: TransferMode,
+}
+
+/// The post-stop half of the primary apply. Every error returned here passes
+/// through [`recover_old_cluster_after_failed_apply`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "primary apply is one auditable sequence"
+)]
+async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport> {
+    let ApplyAfterStop {
+        supervisor,
+        old_bindir,
+        new_bindir,
+        old_data,
+        new_data,
+        parent,
+        initdb,
+        from_major,
+        to_major,
+        transfer_mode,
+    } = ctx;
 
     let mut init = Command::new(new_bindir.join("initdb"));
     init.args([
@@ -1954,7 +2292,7 @@ pub async fn run_primary_pg_upgrade_apply(
         // running detached, still writing into the target we are about to
         // report as failed.
         .kill_on_drop(true);
-    let output = tokio::time::timeout(pg_upgrade_budget(&old_data), upgrade.output())
+    let output = tokio::time::timeout(pg_upgrade_budget(old_data)?, upgrade.output())
         .await
         .map_err(|_| {
             anyhow::anyhow!(
@@ -1971,7 +2309,7 @@ pub async fn run_primary_pg_upgrade_apply(
         );
     }
 
-    supervisor.retarget_paths(new_bindir.clone(), new_data.clone());
+    supervisor.retarget_paths(new_bindir.to_path_buf(), new_data.to_path_buf());
     supervisor
         .start()
         .await
@@ -1986,18 +2324,12 @@ pub async fn run_primary_pg_upgrade_apply(
         .await
         .context("upgraded primary did not accept a write")?;
 
-    run_post_upgrade_scripts(parent).await?;
-
-    // The LSN clients resume writing at. Rollback compares against it to say
-    // whether anything would actually be discarded.
-    let watermark = crate::commands::upgrade::client_fence::flush_lsn_bytes(supervisor).await?;
-    write_unfreeze_watermark(parent, watermark)?;
-    info!(watermark, "Recorded unfreeze write-loss watermark");
+    run_post_upgrade_scripts(parent, new_bindir, read_postmaster_port(new_data)?).await?;
 
     // analyze-in-stages: gating for targets below 18; always run when vacuumdb exists.
     let vacuumdb = new_bindir.join("vacuumdb");
     if vacuumdb.is_file() {
-        let port = read_postmaster_port(&new_data)?;
+        let port = read_postmaster_port(new_data)?;
         let status = Command::new(&vacuumdb)
             .kill_on_drop(true)
             .args([
@@ -2035,12 +2367,20 @@ pub async fn run_primary_pg_upgrade_apply(
         );
     }
 
-    let site = UpgradeSite::probe(parent, to_major)?;
+    let site = UpgradeSite::probe(new_data, to_major)?;
     info!(
         old_data = ?site.old_data_dir,
         rollback_available = site.rollback_available(),
         "pg_upgrade complete"
     );
+
+    // Written LAST, immediately before the caller unfreezes clients: every
+    // step above (vacuumdb, the post-upgrade scripts) advances the flush
+    // LSN, and a watermark below their WAL makes every rollback demand
+    // --accept-write-loss even when no client ever wrote.
+    let watermark = crate::commands::upgrade::client_fence::flush_lsn_bytes(supervisor).await?;
+    write_unfreeze_watermark(parent, watermark)?;
+    info!(watermark, "Recorded unfreeze write-loss watermark");
 
     Ok(PreflightReport {
         from_major,
@@ -2059,10 +2399,7 @@ pub async fn run_primary_pg_upgrade_apply(
 /// # Errors
 /// Wrong major, or delete failure.
 pub fn confirm_local(data_dir: &Path, to_major: u32) -> Result<()> {
-    let parent = data_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve data parent"))?;
-    let site = UpgradeSite::probe(parent, to_major)?;
+    let site = UpgradeSite::probe(data_dir, to_major)?;
     let Some(old) = site.old_data_dir else {
         info!("No older data directory beside PGDATA — confirm is a no-op here");
         return Ok(());
@@ -2075,8 +2412,28 @@ pub fn confirm_local(data_dir: &Path, to_major: u32) -> Result<()> {
         );
     }
     fs::remove_dir_all(&old).with_context(|| format!("removing old datadir {}", old.display()))?;
+    // The watermark described a moment on the cluster whose anchor is now
+    // gone; left behind it would poison the next upgrade's crash-resume and
+    // rollback decisions.
+    if let Some(parent) = data_dir.parent() {
+        drop(fs::remove_file(unfreeze_watermark_path(parent)));
+    }
     info!(removed = %old.display(), "Rollback anchor deleted");
     Ok(())
+}
+
+/// Whether a rollback may discard client writes: the new cluster's flush
+/// LSN is past the unfreeze watermark, or either side is unknowable.
+///
+/// Background WAL (autovacuum, checkpoints) also advances the flush LSN,
+/// so `true` means writes MAY have landed, never that they did. The
+/// watermark is written as the apply's last step so an untouched cluster
+/// can actually sit at the mark and pass.
+const fn rollback_may_discard_writes(watermark: Option<u64>, final_lsn: Option<u64>) -> bool {
+    match (watermark, final_lsn) {
+        (Some(mark), Some(now)) => now > mark,
+        _ => true,
+    }
 }
 
 /// Result of a completed in-place rollback.
@@ -2108,7 +2465,7 @@ pub async fn rollback_local(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("data dir has no parent"))?
         .to_path_buf();
-    let site = UpgradeSite::probe(&parent, to_major)?;
+    let site = UpgradeSite::probe(supervisor.data_dir(), to_major)?;
     let (Some(old_data), Some(from_major)) = (site.old_data_dir.clone(), site.old_major) else {
         bail!(
             "No data directory below major {to_major} beside {}: there is \
@@ -2131,15 +2488,13 @@ pub async fn rollback_local(
         .await
         .ok();
     let watermark = read_unfreeze_watermark(&parent);
-    let wrote_past_watermark = match (watermark, new_cluster_final_lsn) {
-        (Some(mark), Some(now)) => now > mark,
-        _ => true,
-    };
-    if wrote_past_watermark && !accept_write_loss {
+    if rollback_may_discard_writes(watermark, new_cluster_final_lsn) && !accept_write_loss {
         bail!(
-            "Refusing rollback without --accept-write-loss: the new cluster is \
-             at LSN {new_cluster_final_lsn:?}, past the unfreeze watermark \
-             {watermark:?}, so client writes would be discarded."
+            "Refusing rollback without --accept-write-loss: the new cluster's \
+             flush LSN {new_cluster_final_lsn:?} is past the unfreeze watermark \
+             {watermark:?}. WAL advanced past the unfreeze point; background \
+             activity (autovacuum, checkpoints) also advances it, so client \
+             writes MAY have landed and would be discarded."
         );
     }
 
@@ -2179,6 +2534,16 @@ pub async fn rollback_local(
     if live != from_major {
         bail!("After rollback PG_VERSION is {live}, expected {from_major}");
     }
+    // The target the rollback abandoned would refuse every future apply as
+    // long as it sits there; the operator already chose to discard it.
+    if let Some(new_dir) = site.new_data_dir.as_ref() {
+        let aside = move_aside_discarded_target(new_dir)?;
+        info!(
+            from = %new_dir.display(),
+            to = %aside.display(),
+            "Discarded new-major datadir moved aside"
+        );
+    }
     drop(fs::remove_file(unfreeze_watermark_path(&parent)));
 
     Ok(RollbackReport {
@@ -2190,14 +2555,46 @@ pub async fn rollback_local(
     })
 }
 
-/// Whether a postmaster has ever started in `data_dir`.
+/// Move a rolled-back-from target directory aside so a re-apply is not
+/// refused forever by a leftover the operator already chose to discard.
 ///
-/// `pg_upgrade` leaves an initdb'd-but-never-started target behind when it is
-/// interrupted; one that has been started is a live cluster and must not be
-/// discarded. `pg_stat` and the WAL directory only exist after a start.
-fn postmaster_has_run(data_dir: &Path) -> bool {
-    data_dir.join("postmaster.pid").is_file()
-        || fs::read_dir(data_dir.join("pg_wal")).is_ok_and(|mut d| d.next().is_some())
+/// Renamed, not deleted: `--accept-write-loss` authorized discarding the
+/// writes, but the bytes stay inspectable until the operator removes them.
+/// The suffix takes the name out of the naming convention the probe
+/// recognises, so nothing mistakes it for a rollback anchor or a target.
+fn move_aside_discarded_target(new_data: &Path) -> Result<PathBuf> {
+    let name = new_data
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("target {} has no file name", new_data.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let aside = new_data.with_file_name(format!("{name}.discarded.{epoch_secs}"));
+    fs::rename(new_data, &aside).with_context(|| {
+        format!(
+            "moving discarded target {} aside to {}",
+            new_data.display(),
+            aside.display()
+        )
+    })?;
+    Ok(aside)
+}
+
+/// Whether a leftover `pg_upgrade` target directory is discardable wreckage.
+///
+/// Decided from on-disk facts (`STATE_MACHINE` 8c): the OLD datadir's control
+/// file intact means the old cluster is still the viable one, and no unfreeze
+/// watermark means clients never resumed on the new cluster — nothing in the
+/// target can be the only copy of anything. Anything about the target itself
+/// is no discriminator: initdb populates `pg_wal`, so "has WAL" is true for
+/// wreckage too.
+const fn interrupted_target_is_discardable(
+    old_control_intact: bool,
+    unfreeze_watermark_exists: bool,
+) -> bool {
+    old_control_intact && !unfreeze_watermark_exists
 }
 
 /// Wall-clock budget for one `pg_upgrade`, scaled to the data directory.
@@ -2205,29 +2602,79 @@ fn postmaster_has_run(data_dir: &Path) -> bool {
 /// A fixed budget is either too short for a real database or too long to
 /// catch a wedge. `--copy` reads and writes every relation file, so size is
 /// the term that matters; the floor covers catalog-only clone/link runs.
-fn pg_upgrade_budget(old_data: &Path) -> Duration {
+///
+/// # Errors
+/// When the size walk fails: a floor-sized fallback budget would kill a
+/// healthy large `pg_upgrade` partway through.
+fn pg_upgrade_budget(old_data: &Path) -> Result<Duration> {
     const FLOOR: Duration = Duration::from_mins(10);
     const BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
-    let Ok(bytes) = dir_size_approx(old_data) else {
-        return FLOOR;
-    };
-    FLOOR.max(Duration::from_secs(bytes / BYTES_PER_SEC))
+    let bytes = dir_size_approx(old_data)
+        .with_context(|| format!("sizing {} for the pg_upgrade budget", old_data.display()))?;
+    Ok(FLOOR.max(Duration::from_secs(bytes / BYTES_PER_SEC)))
+}
+
+/// How one `pg_upgrade`-emitted script runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostUpgradeScriptKind {
+    /// `psql -v ON_ERROR_STOP=1 -f` against the upgraded local primary.
+    Sql,
+    /// `bash <script>`.
+    Shell,
+}
+
+/// `pg_upgrade` emits both SQL files (`update_extensions.sql`) and shell
+/// scripts; feeding SQL to bash fails on the first statement.
+fn post_upgrade_script_kind(name: &str) -> PostUpgradeScriptKind {
+    if Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+    {
+        PostUpgradeScriptKind::Sql
+    } else {
+        PostUpgradeScriptKind::Shell
+    }
 }
 
 /// Run the scripts `pg_upgrade` emitted into its working directory.
 ///
 /// They land beside the data directories, not inside the new one — the
 /// distinction matters because looking in the wrong place silently runs
-/// nothing.
-async fn run_post_upgrade_scripts(work_dir: &Path) -> Result<()> {
+/// nothing. SQL files run through the new cluster's `psql` against the
+/// upgraded local primary; shell scripts run through bash.
+async fn run_post_upgrade_scripts(work_dir: &Path, new_bindir: &Path, port: u16) -> Result<()> {
     for name in ["update_extensions.sql", "analyze_new_cluster.sh"] {
         let script = work_dir.join(name);
         if !script.is_file() {
             continue;
         }
         info!(script = %script.display(), "Running pg_upgrade post-upgrade script");
-        let status = Command::new("bash")
-            .arg(&script)
+        let mut cmd = match post_upgrade_script_kind(name) {
+            PostUpgradeScriptKind::Sql => {
+                let mut c = Command::new(new_bindir.join("psql"));
+                c.args([
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-U",
+                    PG_SUPERUSER,
+                    "-d",
+                    "postgres",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-f",
+                    &script.display().to_string(),
+                ]);
+                c
+            }
+            PostUpgradeScriptKind::Shell => {
+                let mut c = Command::new("bash");
+                c.arg(&script);
+                c
+            }
+        };
+        let status = cmd
             .current_dir(work_dir)
             .kill_on_drop(true)
             .status()
@@ -2237,6 +2684,62 @@ async fn run_post_upgrade_scripts(work_dir: &Path) -> Result<()> {
             bail!("post-upgrade script {} failed: {status}", script.display());
         }
     }
+    Ok(())
+}
+
+/// Rewrite `pg_bin_dir` and `pg_data_dir` in the node's own config file.
+///
+/// `pg_bin_dir` (config) is the durable active-PG pointer (`STATE_MACHINE` 8c):
+/// the in-memory supervisor retarget dies with the process, so every retarget
+/// site must also rewrite the file or a restart boots the previous major's
+/// datadir. Keyed `toml_edit` rewrite preserves comments and every other key;
+/// the write is atomic (temp file in the same directory, fsync, rename, fsync
+/// of the directory).
+///
+/// # Errors
+/// Unreadable or unparseable config file, or I/O failure writing it back.
+pub fn rewrite_config_pg_paths(config_path: &Path, bin_dir: &Path, data_dir: &Path) -> Result<()> {
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("reading config {}", config_path.display()))?;
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing config {}", config_path.display()))?;
+    let root = doc.as_table_mut();
+    for (key, path) in [("pg_bin_dir", bin_dir), ("pg_data_dir", data_dir)] {
+        let value = toml_edit::value(path.display().to_string());
+        // In-place mutation for an existing key keeps its comment decor;
+        // `Table::insert` on an occupied key would discard it.
+        match root.get_mut(key) {
+            Some(item) => *item = value,
+            None => {
+                root.insert(key, value);
+            }
+        }
+    }
+
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("config path {} has no file name", config_path.display()))?;
+    let tmp = dir.join(format!(".{}.retarget-tmp", file_name.to_string_lossy()));
+    {
+        use std::io::Write as _;
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("creating temp config {}", tmp.display()))?;
+        f.write_all(doc.to_string().as_bytes())
+            .with_context(|| format!("writing temp config {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync temp config {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, config_path)
+        .with_context(|| format!("renaming {} over {}", tmp.display(), config_path.display()))?;
+    // Fsync the directory so the rename itself is durable.
+    fs::File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("fsync config directory {}", dir.display()))?;
     Ok(())
 }
 
@@ -2269,18 +2772,74 @@ pub fn probe_active_major(supervisor: &crate::supervisor::Supervisor) -> Option<
     data_dir_major(supervisor.data_dir()).ok()
 }
 
-/// Wipe local PGDATA and `pg_basebackup` from the upgraded primary (standby rejoin).
+/// The major a remote primary actually serves, probed over `SHOW server_version`.
 ///
 /// # Errors
-/// Stop, wipe, basebackup, or start failures.
+/// Unreachable primary or unparseable version.
+async fn probe_primary_major(
+    psql: &Path,
+    leader_host: &str,
+    leader_port: u16,
+    pg_user: &str,
+) -> Result<u32> {
+    let out = Command::new(psql)
+        .args([
+            "-h",
+            leader_host,
+            "-p",
+            &leader_port.to_string(),
+            "-U",
+            pg_user,
+            "-d",
+            "postgres",
+            "-t",
+            "-A",
+            "-c",
+            "SHOW server_version;",
+        ])
+        .output()
+        .await
+        .context("probing primary server_version")?;
+    if !out.status.success() {
+        bail!(
+            "primary version probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    parse_postgres_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Wipe local PGDATA and `pg_basebackup` from the primary (standby rejoin).
+///
+/// Binaries are selected by the major the primary actually serves, probed
+/// before anything is wiped — see [`rejoin_bindir_for_primary`].
+///
+/// # Errors
+/// Unprobeable primary, missing bindir for its major, stop, wipe,
+/// basebackup, or start failures.
 pub async fn run_standby_rebasebackup(
     supervisor: &mut crate::supervisor::Supervisor,
-    new_bindir: &Path,
+    bin_dirs: &BTreeMap<String, PathBuf>,
+    requested_major: u32,
     leader_host: &str,
     leader_port: u16,
     pg_user: &str,
     node_id: u64,
 ) -> Result<()> {
+    // Probe with the binaries this node is already running; psql speaks to
+    // every server major. The probe and bindir selection precede the stop and
+    // wipe so a refusal leaves the standby exactly as it was.
+    let primary_major = probe_primary_major(
+        &supervisor.bin_dir().join("psql"),
+        leader_host,
+        leader_port,
+        pg_user,
+    )
+    .await?;
+    let new_bindir =
+        rejoin_bindir_for_primary(primary_major, requested_major, bin_dirs)?.to_path_buf();
+    let new_bindir = new_bindir.as_path();
+
     supervisor
         .stop()
         .await
@@ -2420,7 +2979,7 @@ mod tests {
         let old = fake_datadir(dir.path(), "data", 17, true);
         let new = fake_datadir(dir.path(), "data_18", 18, true);
 
-        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        let site = UpgradeSite::probe(&old, 18).unwrap();
         assert_eq!(site.old_data_dir.as_deref(), Some(old.as_path()));
         assert_eq!(site.old_major, Some(17));
         assert_eq!(site.new_data_dir.as_deref(), Some(new.as_path()));
@@ -2432,10 +2991,10 @@ mod tests {
     #[test]
     fn a_renamed_old_control_file_means_no_in_place_rollback() {
         let dir = tempfile::tempdir().unwrap();
-        fake_datadir(dir.path(), "data", 17, false);
+        let old = fake_datadir(dir.path(), "data", 17, false);
         fake_datadir(dir.path(), "data_18", 18, true);
 
-        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        let site = UpgradeSite::probe(&old, 18).unwrap();
         assert_eq!(site.old_major, Some(17));
         assert!(!site.old_control_intact);
         assert!(!site.rollback_available());
@@ -2445,25 +3004,119 @@ mod tests {
     #[test]
     fn probe_on_an_unupgraded_cluster_finds_no_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        fake_datadir(dir.path(), "data", 18, true);
+        let data = fake_datadir(dir.path(), "data", 18, true);
 
-        let site = UpgradeSite::probe(dir.path(), 18).unwrap();
+        let site = UpgradeSite::probe(&data, 18).unwrap();
         assert!(site.old_data_dir.is_none());
         assert!(!site.rollback_available());
         assert!(site.new_data_dir.is_some());
     }
 
-    /// An initdb'd-but-never-started target is wreckage from an interrupted
-    /// run; one that has been started is a live cluster.
+    /// An operator's manual copy carries a parseable `PG_VERSION` too;
+    /// trusting it lets `--rollback` start it and `--confirm` delete it.
+    /// Only the configured datadir and the flow's own `<base>_<major>`
+    /// names are candidates.
     #[test]
-    fn a_started_datadir_is_distinguishable_from_an_abandoned_one() {
+    fn a_manual_copy_outside_the_naming_convention_is_never_a_candidate() {
         let dir = tempfile::tempdir().unwrap();
-        let data = fake_datadir(dir.path(), "data_18", 18, true);
-        fs::create_dir_all(data.join("pg_wal")).unwrap();
-        assert!(!postmaster_has_run(&data));
+        let configured = fake_datadir(dir.path(), "data_18", 18, true);
+        fake_datadir(dir.path(), "data_backup", 17, true);
+        fake_datadir(dir.path(), "snapshot", 17, true);
 
-        fs::write(data.join("pg_wal/000000010000000000000001"), b"w").unwrap();
-        assert!(postmaster_has_run(&data));
+        let site = UpgradeSite::probe(&configured, 18).unwrap();
+        assert!(
+            site.old_data_dir.is_none(),
+            "a manual copy must never become the rollback anchor: {site:?}"
+        );
+        assert_eq!(site.new_data_dir.as_deref(), Some(configured.as_path()));
+    }
+
+    /// Two directories claiming the same major cannot be tie-broken by
+    /// directory-listing order; the probe names both and refuses.
+    #[test]
+    fn duplicate_candidates_for_one_major_refuse_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = fake_datadir(dir.path(), "data", 17, true);
+        fake_datadir(dir.path(), "data_17", 17, true);
+
+        let err = UpgradeSite::probe(&configured, 18).unwrap_err().to_string();
+        assert!(err.contains("data"), "error names the dirs: {err}");
+        assert!(err.contains("data_17"), "error names the dirs: {err}");
+        assert!(err.contains("17"), "error names the major: {err}");
+    }
+
+    /// A second upgrade starts from `data_18`, whose base is still `data`:
+    /// its sibling names stay `data_19`, never `data_18_19`.
+    #[test]
+    fn the_base_name_strips_one_major_suffix() {
+        assert_eq!(upgrade_site_base_name("data"), "data");
+        assert_eq!(upgrade_site_base_name("data_18"), "data");
+        assert_eq!(upgrade_site_base_name("pgdata"), "pgdata");
+        assert_eq!(upgrade_site_base_name("pg_data"), "pg_data");
+        assert_eq!(upgrade_site_base_name("data_backup"), "data_backup");
+    }
+
+    /// The old discriminator counted a non-empty `pg_wal` as "a postmaster
+    /// has run", but initdb always populates `pg_wal` — so every interrupted
+    /// apply read as a live cluster and resume was refused forever. The
+    /// decision is now the two facts that matter: old cluster viable, and
+    /// clients never unfrozen onto the new one.
+    #[test]
+    fn an_interrupted_target_is_discardable_while_the_old_cluster_is_live() {
+        // Interrupted mid-pg_upgrade: old control intact, no watermark.
+        assert!(interrupted_target_is_discardable(true, false));
+
+        // Watermark written: clients resumed on the new cluster and the
+        // target may hold acked writes. Refuse.
+        assert!(!interrupted_target_is_discardable(true, true));
+
+        // Old control gone (--link ran): the target is the only viable
+        // cluster left. Refuse.
+        assert!(!interrupted_target_is_discardable(false, false));
+        assert!(!interrupted_target_is_discardable(false, true));
+    }
+
+    /// The world initdb actually produces: target with a populated `pg_wal`,
+    /// intact old cluster, no watermark. The old unit test manufactured an
+    /// empty `pg_wal` initdb never leaves behind.
+    #[test]
+    fn an_initdb_populated_pg_wal_does_not_block_crash_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = fake_datadir(dir.path(), "data", 17, true);
+        let new = fake_datadir(dir.path(), "data_18", 18, true);
+        fs::create_dir_all(new.join("pg_wal")).unwrap();
+        fs::write(new.join("pg_wal/000000010000000000000001"), b"w").unwrap();
+
+        assert!(interrupted_target_is_discardable(
+            old_cluster_recoverable(&old),
+            unfreeze_watermark_path(dir.path()).exists(),
+        ));
+
+        write_unfreeze_watermark(dir.path(), 42).unwrap();
+        assert!(!interrupted_target_is_discardable(
+            old_cluster_recoverable(&old),
+            unfreeze_watermark_path(dir.path()).exists(),
+        ));
+    }
+
+    /// A rollback abandons its target; left in place under the recognised
+    /// name it refuses every future apply.
+    #[test]
+    fn a_rolled_back_target_is_moved_out_of_the_probed_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = fake_datadir(dir.path(), "data_18", 18, true);
+
+        let aside = move_aside_discarded_target(&target).unwrap();
+        assert!(!target.exists(), "the original target name must be freed");
+        assert!(aside.exists(), "the bytes stay inspectable");
+        assert!(
+            aside
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("data_18.discarded."),
+            "moved-aside name leaves the data_<major> convention: {aside:?}"
+        );
     }
 
     /// A fixed budget is either too short for a real database or too long to
@@ -2472,11 +3125,49 @@ mod tests {
     fn the_pg_upgrade_budget_grows_with_the_data_directory() {
         let dir = tempfile::tempdir().unwrap();
         let small = fake_datadir(dir.path(), "data", 17, true);
-        assert_eq!(pg_upgrade_budget(&small), Duration::from_mins(10));
+        assert_eq!(pg_upgrade_budget(&small).unwrap(), Duration::from_mins(10));
+    }
+
+    /// A failed size walk must propagate: read as zero bytes it passes the
+    /// disk-headroom gate on a full disk, and it shrinks the `pg_upgrade`
+    /// budget to the floor, killing a healthy large run partway through.
+    #[test]
+    fn an_unreadable_data_dir_fails_the_size_walk_instead_of_reading_zero() {
+        let missing = Path::new("/nonexistent-pgbattery-size-probe");
+        assert!(dir_size_approx(missing).is_err());
+        assert!(pg_upgrade_budget(missing).is_err());
+    }
+
+    /// The gate must be passable: a cluster whose flush LSN still sits at
+    /// the watermark discards nothing, so no --accept-write-loss demand.
+    /// Unknowable values fail closed.
+    #[test]
+    fn a_rollback_at_the_watermark_does_not_demand_accept_write_loss() {
+        assert!(!rollback_may_discard_writes(Some(500), Some(500)));
+        assert!(!rollback_may_discard_writes(Some(500), Some(400)));
+
+        assert!(rollback_may_discard_writes(Some(500), Some(501)));
+        assert!(rollback_may_discard_writes(None, Some(500)));
+        assert!(rollback_may_discard_writes(Some(500), None));
+        assert!(rollback_may_discard_writes(None, None));
+    }
+
+    /// The watermark describes a moment on a cluster whose rollback anchor
+    /// confirm just deleted; left behind it would poison the next upgrade's
+    /// crash-resume and rollback decisions.
+    #[test]
+    fn confirm_removes_the_watermark_with_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = fake_datadir(dir.path(), "data", 17, true);
+        let new = fake_datadir(dir.path(), "data_18", 18, true);
+        write_unfreeze_watermark(dir.path(), 7).unwrap();
+
+        confirm_local(&new, 18).unwrap();
+        assert!(!old.exists(), "the rollback anchor is deleted");
         assert_eq!(
-            pg_upgrade_budget(Path::new("/nonexistent")),
-            Duration::from_mins(10),
-            "an unreadable directory falls back to the floor, not to zero"
+            read_unfreeze_watermark(dir.path()),
+            None,
+            "the watermark goes with it"
         );
     }
 
@@ -2488,6 +3179,80 @@ mod tests {
         assert_eq!(read_unfreeze_watermark(dir.path()), Some(987_654_321));
     }
 
+    const RETARGET_FIXTURE: &str = "\
+# pgbattery node config
+node_id = 1
+listen_addr = \"0.0.0.0:5432\"
+
+# Active PostgreSQL binaries (durable active-PG pointer).
+pg_bin_dir = \"/usr/lib/postgresql/17/bin\"
+pg_data_dir = \"/var/lib/pgbattery/data\"
+
+[backup]
+# Backups live outside PGDATA.
+backup_dir = \"/var/backups/pgbattery\"
+";
+
+    /// The retarget must survive a process restart: the config file's two
+    /// path keys are rewritten in place, everything else byte-identical.
+    #[test]
+    fn config_rewrite_changes_exactly_the_two_path_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pgbattery.toml");
+        fs::write(&path, RETARGET_FIXTURE).unwrap();
+
+        rewrite_config_pg_paths(
+            &path,
+            Path::new("/usr/lib/postgresql/18/bin"),
+            Path::new("/var/lib/pgbattery/data_18"),
+        )
+        .unwrap();
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("pg_bin_dir = \"/usr/lib/postgresql/18/bin\""));
+        assert!(rewritten.contains("pg_data_dir = \"/var/lib/pgbattery/data_18\""));
+        // Comments and every other key survive untouched.
+        assert!(rewritten.contains("# pgbattery node config"));
+        assert!(rewritten.contains("# Active PostgreSQL binaries (durable active-PG pointer)."));
+        assert!(rewritten.contains("# Backups live outside PGDATA."));
+        assert!(rewritten.contains("node_id = 1"));
+        assert!(rewritten.contains("listen_addr = \"0.0.0.0:5432\""));
+        assert!(rewritten.contains("backup_dir = \"/var/backups/pgbattery\""));
+        assert!(!rewritten.contains("/usr/lib/postgresql/17/bin"));
+        assert!(!rewritten.contains("\"/var/lib/pgbattery/data\""));
+    }
+
+    /// Keys the file relies on defaults for are inserted at the root, not
+    /// inside whatever `[section]` happens to be last.
+    #[test]
+    fn config_rewrite_inserts_missing_keys_at_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pgbattery.toml");
+        fs::write(&path, "node_id = 2\n\n[backup]\nbackup_dir = \"/b\"\n").unwrap();
+
+        rewrite_config_pg_paths(&path, Path::new("/bins/18"), Path::new("/data_18")).unwrap();
+
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc.get("pg_bin_dir").and_then(|v| v.as_str()),
+            Some("/bins/18")
+        );
+        assert_eq!(
+            doc.get("pg_data_dir").and_then(|v| v.as_str()),
+            Some("/data_18")
+        );
+        assert_eq!(
+            doc.get("backup")
+                .and_then(|t| t.get("backup_dir"))
+                .and_then(|v| v.as_str()),
+            Some("/b"),
+            "the [backup] section must not absorb the inserted root keys"
+        );
+    }
+
     #[test]
     fn parse_major_from_version_string() {
         assert_eq!(
@@ -2497,6 +3262,67 @@ mod tests {
         assert_eq!(
             parse_postgres_major("pg_config (PostgreSQL) 19.0").unwrap(),
             19
+        );
+    }
+
+    /// A failed apply step must restart the old cluster instead of leaving
+    /// the primary stopped — possible exactly while its control file is
+    /// intact, which `pg_upgrade --link` is what takes away.
+    #[test]
+    fn a_failed_apply_can_recover_in_place_only_with_an_intact_control_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let intact = fake_datadir(dir.path(), "data", 17, true);
+        assert!(old_cluster_recoverable(&intact));
+
+        let linked = fake_datadir(dir.path(), "data_linked", 17, false);
+        assert!(!old_cluster_recoverable(&linked));
+    }
+
+    /// A standby rejoin wipes PGDATA and basebackups from the primary, so
+    /// its binaries must match the primary that actually answers — on the
+    /// abort path that is the OLD major, whatever the upgrade requested.
+    #[test]
+    fn rejoin_selects_binaries_by_the_primary_probed_major() {
+        let dirs = dual_bin_dirs();
+        // Abort path: upgrade requested 18, primary still serves 17.
+        assert_eq!(
+            rejoin_bindir_for_primary(17, 18, &dirs).unwrap(),
+            Path::new("/usr/lib/postgresql/17/bin")
+        );
+        // Post-upgrade path: probe and request agree.
+        assert_eq!(
+            rejoin_bindir_for_primary(18, 18, &dirs).unwrap(),
+            Path::new("/usr/lib/postgresql/18/bin")
+        );
+        // No binaries for the primary's actual major: refuse before wiping.
+        let err = rejoin_bindir_for_primary(16, 18, &dirs).unwrap_err();
+        assert!(
+            err.to_string().contains("16"),
+            "error names the major: {err}"
+        );
+    }
+
+    /// `pg_upgrade` emits `update_extensions.sql` as SQL; running it with
+    /// bash fails the apply after the primary already upgraded, which then
+    /// falls into the destructive abort path.
+    #[test]
+    fn sql_scripts_dispatch_to_psql_and_shell_scripts_to_bash() {
+        assert_eq!(
+            post_upgrade_script_kind("update_extensions.sql"),
+            PostUpgradeScriptKind::Sql
+        );
+        assert_eq!(
+            post_upgrade_script_kind("analyze_new_cluster.sh"),
+            PostUpgradeScriptKind::Shell
+        );
+        assert_eq!(
+            post_upgrade_script_kind("delete_old_cluster.sh"),
+            PostUpgradeScriptKind::Shell
+        );
+        assert_eq!(
+            post_upgrade_script_kind("REINDEX_ALL.SQL"),
+            PostUpgradeScriptKind::Sql,
+            "extension match is case-insensitive"
         );
     }
 
@@ -2531,48 +3357,48 @@ Bytes per WAL segment:                16777216\n";
         assert_eq!(wal, Some(16));
     }
 
+    /// Drives the refusing function itself: the previous version of this
+    /// test asserted its own literals and kept passing with the production
+    /// check deleted.
     #[test]
     fn link_forbids_allow_no_backup_at_cli() {
-        let req = PostgresUpgradePreflightRequest {
-            to_major: 19,
-            transfer_mode: "link".into(),
-            allow_no_backup: true,
-            accept_no_rollback: true,
-            accept_write_loss: false,
-        };
-        // Same predicate run_postgres_upgrade / run_local_preflight refuse.
+        let err = require_backup_when_no_rollback(true, true).unwrap_err();
         assert!(
-            req.accept_no_rollback && req.allow_no_backup,
-            "link + allow_no_backup must be refused"
+            err.to_string().contains("--allow-no-backup"),
+            "refusal names the flag: {err}"
         );
+
+        assert!(require_backup_when_no_rollback(true, false).is_ok());
+        assert!(require_backup_when_no_rollback(false, true).is_ok());
+        assert!(require_backup_when_no_rollback(false, false).is_ok());
     }
 
+    /// Drives the real filesystem check (the previous version reimplemented
+    /// its loop inline, so the production check could rot unnoticed).
     #[test]
     fn missing_extension_control_named() {
-        let dir = std::env::temp_dir().join(format!("pgbattery-ext-probe-{}", std::process::id()));
-        let ext_dir = dir.join("extension");
-        drop(fs::remove_dir_all(&dir));
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("extension");
         fs::create_dir_all(&ext_dir).unwrap();
         fs::write(ext_dir.join("ok.control"), "comment = 'x'\n").unwrap();
-        let extensions = ["ok", "missing_ext"];
-        let mut missing = Vec::new();
-        for ext in extensions {
-            if !ext_dir.join(format!("{ext}.control")).is_file() {
-                missing.push(ext.to_string());
-            }
-        }
-        drop(fs::remove_dir_all(&dir));
-        assert_eq!(missing, vec!["missing_ext".to_string()]);
+
+        let extensions = vec!["ok".to_string(), "missing_ext".to_string()];
+        assert_eq!(
+            missing_controls_in_sharedir(dir.path(), &extensions),
+            vec!["missing_ext".to_string()]
+        );
+        let present_only = vec!["ok".to_string()];
+        assert!(missing_controls_in_sharedir(dir.path(), &present_only).is_empty());
     }
 
+    /// Drives the refusing function (the previous version formatted a copy
+    /// of the message and grepped it).
     #[test]
     fn collation_mismatch_abort_message_names_count() {
-        let n = 3usize;
-        let msg = format!(
-            "Collation version mismatches on primary ({n} \
-             entries): libc/ICU drift would corrupt indexes across pg_upgrade."
-        );
-        assert!(msg.contains("Collation version mismatches"));
-        assert!(msg.contains("(3 "));
+        let err = refuse_collation_mismatches(3).unwrap_err().to_string();
+        assert!(err.contains("Collation version mismatches"), "{err}");
+        assert!(err.contains("(3 "), "the count is named: {err}");
+
+        assert!(refuse_collation_mismatches(0).is_ok());
     }
 }
