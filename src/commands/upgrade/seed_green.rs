@@ -120,6 +120,105 @@ fn quote_schema_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Split `password` out of a libpq conninfo: (conninfo without it, password).
+///
+/// The password must never enter a child argv — `ps` shows argv to every
+/// local user — so subprocesses get the sanitized string plus PGPASSWORD in
+/// their environment. Handles quoted values (`password='se cret'`) and the
+/// `\'` / `\\` escapes libpq defines.
+pub(crate) fn split_conninfo_password(conninfo: &str) -> (String, Option<String>) {
+    let mut kept: Vec<String> = Vec::new();
+    let mut password = None;
+    let mut chars = conninfo.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            key.push(c);
+            chars.next();
+        }
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek() == Some(&'=') {
+            chars.next();
+        } else {
+            // Malformed fragment; keep it verbatim rather than dropping it.
+            kept.push(key);
+            continue;
+        }
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        // `raw` preserves the value as written (quotes and escapes) for the
+        // kept string; `value` is the unescaped password.
+        let mut raw = String::new();
+        let mut value = String::new();
+        if chars.peek() == Some(&'\'') {
+            raw.push('\'');
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    if let Some(n) = chars.next() {
+                        raw.push('\\');
+                        raw.push(n);
+                        value.push(n);
+                    }
+                } else if c == '\'' {
+                    raw.push('\'');
+                    break;
+                } else {
+                    raw.push(c);
+                    value.push(c);
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                if c == '\\' {
+                    chars.next();
+                    if let Some(&n) = chars.peek() {
+                        raw.push('\\');
+                        raw.push(n);
+                        value.push(n);
+                        chars.next();
+                    }
+                } else {
+                    raw.push(c);
+                    value.push(c);
+                    chars.next();
+                }
+            }
+        }
+        if key == "password" {
+            password = Some(value);
+        } else {
+            kept.push(format!("{key}={raw}"));
+        }
+    }
+    (kept.join(" "), password)
+}
+
+/// A conninfo safe to put in a log or error message.
+pub(crate) fn redact_conninfo(conninfo: &str) -> String {
+    let (sanitized, password) = split_conninfo_password(conninfo);
+    if password.is_some() {
+        format!("{sanitized} password=[redacted]")
+    } else {
+        sanitized
+    }
+}
+
 /// Run one statement against the donor over `donor_conninfo`, with the
 /// recipient's own psql binary.
 async fn donor_psql(
@@ -128,16 +227,26 @@ async fn donor_psql(
     sql: &str,
 ) -> Result<String> {
     let (psql, _port, _user) = supervisor.local_psql_probe_params();
-    let out = Command::new(&psql)
-        .args(["-w", "-tAXq", "-v", "ON_ERROR_STOP=1", "-c", sql, "-d"])
-        .arg(donor_conninfo)
-        .kill_on_drop(true)
+    // Password via the environment, never argv: ps shows argv to every
+    // local user.
+    let (sanitized, password) = split_conninfo_password(donor_conninfo);
+    let mut cmd = Command::new(&psql);
+    cmd.args(["-tAXq", "-v", "ON_ERROR_STOP=1", "-c", sql, "-d"])
+        .arg(&sanitized)
+        .kill_on_drop(true);
+    if let Some(p) = &password {
+        cmd.env("PGPASSWORD", p);
+    } else {
+        cmd.arg("-w");
+    }
+    let out = cmd
         .output()
         .await
         .context("running psql against the donor")?;
     if !out.status.success() {
         bail!(
-            "psql against the donor failed: {}",
+            "psql against the donor ({}) failed: {}",
+            redact_conninfo(donor_conninfo),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -252,16 +361,24 @@ pub(crate) async fn seed_from_donor(
     ensure_donor_publication(supervisor, donor_conninfo, publication).await?;
 
     let bin = supervisor.bin_dir();
-    let dump = Command::new(bin.join("pg_dump"))
+    // Password via the environment, never argv (world-readable in ps).
+    let (sanitized, password) = split_conninfo_password(donor_conninfo);
+    let mut dump_cmd = Command::new(bin.join("pg_dump"));
+    dump_cmd
         .args(schema_dump_args())
-        .arg(donor_conninfo)
-        .kill_on_drop(true)
+        .arg(&sanitized)
+        .kill_on_drop(true);
+    if let Some(p) = &password {
+        dump_cmd.env("PGPASSWORD", p);
+    }
+    let dump = dump_cmd
         .output()
         .await
         .context("running pg_dump against the donor")?;
     if !dump.status.success() {
         bail!(
-            "pg_dump from the donor failed: {}",
+            "pg_dump from the donor ({}) failed: {}",
+            redact_conninfo(donor_conninfo),
             String::from_utf8_lossy(&dump.stderr).trim()
         );
     }
@@ -297,7 +414,10 @@ pub(crate) async fn seed_from_donor(
     );
 
     // copy_data is the initial copy; without it the recipient starts empty and
-    // every row written before the subscription is lost.
+    // every row written before the subscription is lost. The FULL conninfo
+    // (password included) goes into the subscription: the apply worker
+    // authenticates with it at runtime, and it lives in pg_subscription, not
+    // in any argv.
     let sql = format!(
         "CREATE SUBSCRIPTION {} CONNECTION '{}' PUBLICATION {} \
          WITH (copy_data = true, streaming = true);",
@@ -447,5 +567,32 @@ mod tests {
         assert_eq!(missing_roles(&required, &present), vec!["reporter"]);
         assert!(missing_roles(&required, &required).is_empty());
         assert!(missing_roles(&[], &[]).is_empty());
+    }
+
+    /// The password never enters a child argv: ps shows argv to every local
+    /// user. It splits out for PGPASSWORD; the rest survives verbatim.
+    #[test]
+    fn the_password_splits_out_of_a_conninfo() {
+        let (kept, pw) = split_conninfo_password("host=blue1 password=s3cret user=postgres");
+        assert_eq!(kept, "host=blue1 user=postgres");
+        assert_eq!(pw.as_deref(), Some("s3cret"));
+
+        let (kept, pw) = split_conninfo_password("host=h password='se cr\\'et' dbname=postgres");
+        assert_eq!(kept, "host=h dbname=postgres");
+        assert_eq!(pw.as_deref(), Some("se cr'et"));
+
+        let (kept, pw) = split_conninfo_password("host=h user=u");
+        assert_eq!(kept, "host=h user=u");
+        assert_eq!(pw, None);
+    }
+
+    /// What lands in logs and errors names the donor without the secret.
+    #[test]
+    fn redaction_names_the_donor_and_hides_the_secret() {
+        let redacted = redact_conninfo("host=blue1 password=s3cret user=postgres");
+        assert!(!redacted.contains("s3cret"));
+        assert!(redacted.contains("host=blue1"));
+        assert!(redacted.contains("password=[redacted]"));
+        assert_eq!(redact_conninfo("host=h"), "host=h");
     }
 }
