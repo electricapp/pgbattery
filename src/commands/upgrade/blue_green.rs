@@ -624,6 +624,10 @@ async fn collect_fence_feasibility(
     for role in app_roles {
         check_one_app_role(supervisor, role, &mut failures, &mut secdef_paths).await?;
     }
+    let public_rows = sql_lines(supervisor, PUBLIC_WRITE_GRANTS_SQL).await?;
+    let quoted = quoted_role_literals(app_roles)?;
+    let inherited_rows = sql_lines(supervisor, &inherited_write_paths_sql(&quoted)).await?;
+    failures.extend(coverage_gap_failures(&public_rows, &inherited_rows));
     if !secdef_paths.is_empty() {
         failures.push(format!(
             "SECURITY DEFINER paths reachable from app roles (must be fenced or \
@@ -632,6 +636,133 @@ async fn collect_fence_feasibility(
         ));
     }
     Ok((failures, secdef_paths))
+}
+
+/// Write grants held by PUBLIC (grantee 0) on user tables and sequences.
+///
+/// The fence revokes only named roles, so any role — fenced or not — writes
+/// through a PUBLIC grant. `aclexplode` over a NULL `relacl` yields no rows,
+/// which is correct: NULL means owner-default privileges, under which PUBLIC
+/// holds nothing on tables or sequences.
+const PUBLIC_WRITE_GRANTS_SQL: &str = "SELECT format('%I.%I', n.nspname, c.relname) || '|' || a.privilege_type \
+     FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     CROSS JOIN LATERAL aclexplode(c.relacl) a \
+     WHERE a.grantee = 0 \
+       AND ( \
+         (c.relkind IN ('r','p') AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE')) \
+         OR (c.relkind = 'S' AND a.privilege_type IN ('UPDATE','USAGE')) \
+       ) \
+       AND n.nspname NOT IN ('pg_catalog','information_schema','pgbattery') \
+       AND n.nspname NOT LIKE 'pg_toast%' \
+       AND n.nspname NOT LIKE 'pg_temp%' \
+     ORDER BY 1;";
+
+/// Write privilege a fenced role reaches through membership in an unfenced
+/// role. Membership alone is the path — even without INHERIT the member can
+/// `SET ROLE` to the parent — so `pg_auth_members` is walked transitively and
+/// nothing filters on `rolinherit`. Three ways a parent carries writes: an
+/// explicit grant in `relacl`, owning the relation (implicit privilege that
+/// survives REVOKE), or being a superuser.
+fn inherited_write_paths_sql(quoted_fenced_roles: &str) -> String {
+    format!(
+        "WITH RECURSIVE reach AS ( \
+           SELECT r.rolname AS fenced, m.roleid AS parent \
+           FROM pg_auth_members m \
+           JOIN pg_roles r ON r.oid = m.member \
+           WHERE r.rolname IN ({quoted_fenced_roles}) \
+           UNION \
+           SELECT g.fenced, m.roleid \
+           FROM reach g \
+           JOIN pg_auth_members m ON m.member = g.parent \
+         ) \
+         SELECT DISTINCT g.fenced || '|' || p.rolname || '|' || rel || '|' || priv \
+         FROM reach g \
+         JOIN pg_roles p ON p.oid = g.parent \
+         CROSS JOIN LATERAL ( \
+           SELECT format('%I.%I', n.nspname, c.relname) AS rel, a.privilege_type AS priv \
+           FROM pg_class c \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+           CROSS JOIN LATERAL aclexplode(c.relacl) a \
+           WHERE a.grantee = g.parent \
+             AND ( \
+               (c.relkind IN ('r','p') AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE')) \
+               OR (c.relkind = 'S' AND a.privilege_type IN ('UPDATE','USAGE')) \
+             ) \
+             AND n.nspname NOT IN ('pg_catalog','information_schema','pgbattery') \
+             AND n.nspname NOT LIKE 'pg_toast%' \
+             AND n.nspname NOT LIKE 'pg_temp%' \
+           UNION ALL \
+           SELECT format('%I.%I', n.nspname, c.relname), 'OWNER' \
+           FROM pg_class c \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+           WHERE c.relowner = g.parent \
+             AND c.relkind IN ('r','p') \
+             AND n.nspname NOT IN ('pg_catalog','information_schema','pgbattery') \
+             AND n.nspname NOT LIKE 'pg_toast%' \
+             AND n.nspname NOT LIKE 'pg_temp%' \
+           UNION ALL \
+           SELECT '(all relations)', 'SUPERUSER' WHERE p.rolsuper \
+         ) w \
+         WHERE p.rolname NOT IN ({quoted_fenced_roles}) \
+         ORDER BY 1;"
+    )
+}
+
+/// The fenced roles as a quoted SQL literal list, each validated first.
+fn quoted_role_literals(app_roles: &[String]) -> Result<String> {
+    let mut quoted = Vec::with_capacity(app_roles.len());
+    for role in app_roles {
+        if role.trim().is_empty() {
+            bail!("empty app role");
+        }
+        if !role
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!("app role {role:?} must be a simple identifier");
+        }
+        quoted.push(format!("'{}'", role.replace('\'', "''")));
+    }
+    Ok(quoted.join(","))
+}
+
+/// Turn the two coverage catalog reads into refusals. Pure, and fail-closed:
+/// a row that does not parse is refused by name rather than dropped.
+///
+/// `public_rows` are `relation|privilege`; `inherited_rows` are
+/// `fenced_role|parent_role|relation|privilege`.
+pub(crate) fn coverage_gap_failures(
+    public_rows: &[String],
+    inherited_rows: &[String],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for row in public_rows {
+        match row.split_once('|') {
+            Some((rel, privilege)) => failures.push(format!(
+                "PUBLIC holds {privilege} on {rel} — the fence revokes only named \
+                 roles, so every role writes through it; \
+                 REVOKE {privilege} ON {rel} FROM PUBLIC before sealing"
+            )),
+            None => failures.push(format!(
+                "unparseable PUBLIC grant row {row:?}; refusing rather than ignoring it"
+            )),
+        }
+    }
+    for row in inherited_rows {
+        let parts: Vec<&str> = row.splitn(4, '|').collect();
+        match parts.as_slice() {
+            [fenced, parent, rel, privilege] => failures.push(format!(
+                "fenced role {fenced:?} reaches {privilege} on {rel} through role \
+                 {parent:?}, which is not in the fenced list — add {parent:?} \
+                 to app_roles or revoke the membership before sealing"
+            )),
+            _ => failures.push(format!(
+                "unparseable inherited-grant row {row:?}; refusing rather than ignoring it"
+            )),
+        }
+    }
+    failures
 }
 
 async fn check_one_app_role(
@@ -755,6 +886,11 @@ async fn sql_u64(supervisor: &crate::supervisor::Supervisor, sql: &str) -> Resul
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "test code asserts on known-good values and panics are the failure signal"
+)]
 mod tests {
     use super::*;
 
@@ -766,5 +902,92 @@ mod tests {
         };
         assert_eq!(r.sequence_count, 0);
         assert!(r.replica_identity_failures.is_empty());
+    }
+
+    /// `GRANT INSERT ON t TO PUBLIC` fences nobody: REVOKE on the named roles
+    /// leaves the PUBLIC grant standing and every role writes through it.
+    /// Coverage passed this world before the gap check existed.
+    #[test]
+    fn a_public_write_grant_is_a_fence_hole() {
+        let failures = coverage_gap_failures(&["public.orders|INSERT".into()], &[]);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("PUBLIC"));
+        assert!(failures[0].contains("public.orders"));
+        assert!(failures[0].contains("INSERT"));
+        assert!(failures[0].contains("REVOKE"));
+    }
+
+    /// An app role that is a member of an unfenced role with write grants
+    /// keeps writing after its own grants are revoked (SET ROLE, or INHERIT).
+    /// Coverage also passed this world before the gap check existed.
+    #[test]
+    fn an_unfenced_parent_roles_writes_are_a_fence_hole() {
+        let failures =
+            coverage_gap_failures(&[], &["bg_app|batch_writer|public.orders|UPDATE".into()]);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("bg_app"));
+        assert!(failures[0].contains("batch_writer"));
+        assert!(failures[0].contains("UPDATE"));
+        assert!(failures[0].contains("app_roles"));
+    }
+
+    /// Parent-through-ownership and parent-through-superuser rows use the
+    /// same refusal path as explicit grants.
+    #[test]
+    fn ownership_and_superuser_paths_are_fence_holes_too() {
+        let failures = coverage_gap_failures(
+            &[],
+            &[
+                "bg_app|dba|public.orders|OWNER".into(),
+                "bg_app|root|(all relations)|SUPERUSER".into(),
+            ],
+        );
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("OWNER"));
+        assert!(failures[1].contains("SUPERUSER"));
+    }
+
+    #[test]
+    fn a_clean_acl_world_passes_coverage() {
+        assert!(coverage_gap_failures(&[], &[]).is_empty());
+    }
+
+    /// A row the classifier cannot parse is a refusal, never silently dropped.
+    #[test]
+    fn an_unparseable_coverage_row_fails_closed() {
+        let failures = coverage_gap_failures(&["garbage".into()], &["also|garbage".into()]);
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("garbage"));
+        assert!(failures[1].contains("refusing"));
+    }
+
+    /// PUBLIC is grantee 0 and never joins `pg_roles`; the query must read
+    /// `aclexplode` directly. A NULL `relacl` is owner-default privileges
+    /// (PUBLIC holds nothing there), which the LATERAL drops correctly.
+    #[test]
+    fn the_public_grant_query_reads_grantee_zero_from_the_acl_itself() {
+        assert!(PUBLIC_WRITE_GRANTS_SQL.contains("aclexplode(c.relacl)"));
+        assert!(PUBLIC_WRITE_GRANTS_SQL.contains("a.grantee = 0"));
+        assert!(!PUBLIC_WRITE_GRANTS_SQL.contains("JOIN pg_roles"));
+    }
+
+    /// Membership is transitive and does not require INHERIT (`SET ROLE`),
+    /// so the walk is recursive and unfiltered by `rolinherit`.
+    #[test]
+    fn the_inherited_path_query_walks_memberships_transitively() {
+        let sql = inherited_write_paths_sql("'bg_app'");
+        assert!(sql.contains("WITH RECURSIVE"));
+        assert!(sql.contains("pg_auth_members"));
+        assert!(sql.contains("rolsuper"));
+        assert!(sql.contains("relowner"));
+        assert!(!sql.contains("rolinherit"));
+    }
+
+    #[test]
+    fn role_literals_are_quoted_and_validated() {
+        let quoted = quoted_role_literals(&["bg_app".into(), "other".into()]).unwrap();
+        assert_eq!(quoted, "'bg_app','other'");
+        assert!(quoted_role_literals(&["bad; DROP".into()]).is_err());
+        assert!(quoted_role_literals(&[String::new()]).is_err());
     }
 }
