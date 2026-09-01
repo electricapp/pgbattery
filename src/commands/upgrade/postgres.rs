@@ -2255,12 +2255,6 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
 
     run_post_upgrade_scripts(parent, new_bindir, read_postmaster_port(new_data)?).await?;
 
-    // The LSN clients resume writing at. Rollback compares against it to say
-    // whether anything would actually be discarded.
-    let watermark = crate::commands::upgrade::client_fence::flush_lsn_bytes(supervisor).await?;
-    write_unfreeze_watermark(parent, watermark)?;
-    info!(watermark, "Recorded unfreeze write-loss watermark");
-
     // analyze-in-stages: gating for targets below 18; always run when vacuumdb exists.
     let vacuumdb = new_bindir.join("vacuumdb");
     if vacuumdb.is_file() {
@@ -2309,6 +2303,14 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
         "pg_upgrade complete"
     );
 
+    // Written LAST, immediately before the caller unfreezes clients: every
+    // step above (vacuumdb, the post-upgrade scripts) advances the flush
+    // LSN, and a watermark below their WAL makes every rollback demand
+    // --accept-write-loss even when no client ever wrote.
+    let watermark = crate::commands::upgrade::client_fence::flush_lsn_bytes(supervisor).await?;
+    write_unfreeze_watermark(parent, watermark)?;
+    info!(watermark, "Recorded unfreeze write-loss watermark");
+
     Ok(PreflightReport {
         from_major,
         to_major,
@@ -2341,6 +2343,20 @@ pub fn confirm_local(data_dir: &Path, to_major: u32) -> Result<()> {
     fs::remove_dir_all(&old).with_context(|| format!("removing old datadir {}", old.display()))?;
     info!(removed = %old.display(), "Rollback anchor deleted");
     Ok(())
+}
+
+/// Whether a rollback may discard client writes: the new cluster's flush
+/// LSN is past the unfreeze watermark, or either side is unknowable.
+///
+/// Background WAL (autovacuum, checkpoints) also advances the flush LSN,
+/// so `true` means writes MAY have landed, never that they did. The
+/// watermark is written as the apply's last step so an untouched cluster
+/// can actually sit at the mark and pass.
+const fn rollback_may_discard_writes(watermark: Option<u64>, final_lsn: Option<u64>) -> bool {
+    match (watermark, final_lsn) {
+        (Some(mark), Some(now)) => now > mark,
+        _ => true,
+    }
 }
 
 /// Result of a completed in-place rollback.
@@ -2395,15 +2411,13 @@ pub async fn rollback_local(
         .await
         .ok();
     let watermark = read_unfreeze_watermark(&parent);
-    let wrote_past_watermark = match (watermark, new_cluster_final_lsn) {
-        (Some(mark), Some(now)) => now > mark,
-        _ => true,
-    };
-    if wrote_past_watermark && !accept_write_loss {
+    if rollback_may_discard_writes(watermark, new_cluster_final_lsn) && !accept_write_loss {
         bail!(
-            "Refusing rollback without --accept-write-loss: the new cluster is \
-             at LSN {new_cluster_final_lsn:?}, past the unfreeze watermark \
-             {watermark:?}, so client writes would be discarded."
+            "Refusing rollback without --accept-write-loss: the new cluster's \
+             flush LSN {new_cluster_final_lsn:?} is past the unfreeze watermark \
+             {watermark:?}. WAL advanced past the unfreeze point; background \
+             activity (autovacuum, checkpoints) also advances it, so client \
+             writes MAY have landed and would be discarded."
         );
     }
 
@@ -3037,6 +3051,20 @@ mod tests {
             Duration::from_mins(10),
             "an unreadable directory falls back to the floor, not to zero"
         );
+    }
+
+    /// The gate must be passable: a cluster whose flush LSN still sits at
+    /// the watermark discards nothing, so no --accept-write-loss demand.
+    /// Unknowable values fail closed.
+    #[test]
+    fn a_rollback_at_the_watermark_does_not_demand_accept_write_loss() {
+        assert!(!rollback_may_discard_writes(Some(500), Some(500)));
+        assert!(!rollback_may_discard_writes(Some(500), Some(400)));
+
+        assert!(rollback_may_discard_writes(Some(500), Some(501)));
+        assert!(rollback_may_discard_writes(None, Some(500)));
+        assert!(rollback_may_discard_writes(Some(500), None));
+        assert!(rollback_may_discard_writes(None, None));
     }
 
     #[test]
