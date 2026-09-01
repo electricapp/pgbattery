@@ -133,6 +133,30 @@ class DrainCompletenessTest(unittest.TestCase):
             bg._assert_drain_complete(_node(), set())
         self.assertIn("vacuous", str(caught.exception))
 
+    def test_a_lost_seal_boundary_key_is_caught(self) -> None:
+        """A key acked just before the seal response is part of the ledger."""
+        with (
+            mock.patch.object(bg, "_psql", return_value="pre-0\nseal-0"),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._assert_drain_complete(_node(), {"pre-0", "seal-0", "seal-1"})
+        self.assertIn("seal-1", str(caught.exception))
+
+    def test_the_fetch_covers_every_ledger_prefix(self) -> None:
+        """A prefix missing from the fetch would fail loudly, never pass; this
+        pins the fetch to the prefixes the writers actually use."""
+        sqls: list[str] = []
+
+        def record(_node: Any, sql: str, **_kw: Any) -> str:
+            sqls.append(sql)
+            return "pre-0\nstream-0\nseal-0"
+
+        with mock.patch.object(bg, "_psql", side_effect=record):
+            bg._assert_drain_complete(_node(), {"pre-0", "stream-0", "seal-0"})
+        self.assertEqual(len(sqls), 1)
+        for prefix in ("pre-%", "stream-%", "seal-%"):
+            self.assertIn(prefix, sqls[0])
+
 
 class SequenceNonCollisionTest(unittest.TestCase):
     """U3: green must not issue a value blue already used."""

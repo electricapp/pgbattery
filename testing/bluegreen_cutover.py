@@ -24,6 +24,7 @@ import contextlib
 import json
 import os
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -458,14 +459,20 @@ def _assert_no_sequence_collision(green_leader: Node, blue_max: int) -> None:
     console.print(f"U3 OK: green issued {issued} > blue max {blue_max}")
 
 
+# Key prefixes the U2 ledger writes under: the two superuser bursts and the
+# app-role writer that races the seal.
+PRE_SEAL_PREFIXES: Final[tuple[str, ...]] = ("pre", "stream", "seal")
+
+
 def _assert_drain_complete(green_leader: Node, acked: set[str]) -> None:
     """U2: every key blue acked before SEAL is present on green."""
     if not acked:
         raise ContractFailure("U2 check is vacuous: no pre-seal writes were acked")
+    like = " OR ".join(f"k LIKE '{prefix}-%'" for prefix in PRE_SEAL_PREFIXES)
     present = set(
         _psql(
             green_leader,
-            "SELECT string_agg(k, E'\\n') FROM bg_kv WHERE k LIKE 'pre-%' OR k LIKE 'stream-%';",
+            f"SELECT string_agg(k, E'\\n') FROM bg_kv WHERE {like};",
         ).splitlines()
     )
     missing = acked - present
@@ -486,12 +493,74 @@ def _post(node: Node, path: str, body: dict[str, Any] | None = None) -> httpx.Re
     )
 
 
-def _cutover(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
+class SealRaceWriter(threading.Thread):
+    """App-role writes racing ARM and SEAL, recording only what the server acked.
+
+    Connects as the app role because the seal fences that role: acks stop at
+    the fence, so every recorded key carries an LSN at or before the sealed
+    final LSN. A superuser writer would keep collecting acks past it and turn
+    the U2 drain gate into a race.
+    """
+
+    def __init__(self, gateway_port: int) -> None:
+        super().__init__(name="seal-race-writer", daemon=True)
+        self._port = gateway_port
+        # Not `_stop`: that is a Thread internal on CPython 3.12, and
+        # rebinding it makes join() raise at teardown.
+        self._stop_event = threading.Event()
+        self.acked: list[str] = []
+        self.errors = 0
+
+    def run(self) -> None:
+        i = 0
+        while not self._stop_event.is_set():
+            try:
+                with psycopg.connect(
+                    host="127.0.0.1",
+                    port=self._port,
+                    user=APP_ROLE,
+                    dbname="postgres",
+                    connect_timeout=3,
+                ) as conn:
+                    conn.autocommit = True
+                    with conn.cursor() as cur:
+                        while not self._stop_event.is_set():
+                            key = f"seal-{i}"
+                            cur.execute(
+                                "INSERT INTO bg_kv(k, v) VALUES (%s, %s) "
+                                "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
+                                (key, "race"),
+                            )
+                            self.acked.append(key)
+                            i += 1
+                            time.sleep(0.02)
+            except (psycopg.Error, OSError):
+                self.errors += 1
+                time.sleep(0.2)
+
+    def acked_now(self) -> set[str]:
+        return set(self.acked)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.join(timeout=10)
+
+
+def _cutover(
+    blue_leader: Node,
+    green_leader: Node,
+    blue: list[Node],
+    seal_writer: SealRaceWriter | None = None,
+) -> set[str]:
+    """Run the cutover; returns the keys acked before the seal response arrived."""
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
 
     # The server fences first and reads its own final LSN after; passing one
     # in from here would leave a window of acked writes past it.
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
+    # The U2 boundary, taken the moment the seal response arrives: every key
+    # acked before it must drain to green; a key acked later is not required.
+    sealed_acked: set[str] = seal_writer.acked_now() if seal_writer is not None else set()
 
     status = _cutover_status(blue_leader)
     final_lsn = status.get("sealed_final_lsn")
@@ -546,6 +615,7 @@ def _cutover(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
     _assert_minority_cannot_hand_over(green_leader, epoch, blue)
     _assert_authority_is_green_only(blue, green_leader, epoch)
     _assert_no_sequence_collision(green_leader, blue_max)
+    return sealed_acked
 
 
 def _mgmt_addrs(nodes: list[Node]) -> list[str]:
@@ -1026,8 +1096,27 @@ def main(
         console.print(f"chaos={chaos} passed")
         return
 
-    _cutover(blue_leader, green_leader, blue)
-    _assert_drain_complete(green_leader, acked)
+    # A writer keeps writing as the app role through ARM and SEAL, so the U2
+    # ledger includes keys acked at the seal boundary, not only a burst that
+    # finished long before it.
+    seal_writer = SealRaceWriter(blue_leader.gateway_port)
+    seal_writer.start()
+    try:
+        await_until(
+            lambda: True if seal_writer.acked else None,
+            budget=30.0,
+            describe="the seal-race writer's first acked key",
+        )
+        sealed_acked = _cutover(blue_leader, green_leader, blue, seal_writer)
+    finally:
+        seal_writer.stop()
+    if not sealed_acked:
+        raise ContractFailure(
+            "U2 seal race is vacuous: the app-role writer had no acked key "
+            "by the time the seal response arrived"
+        )
+    console.print(f"seal race: {len(sealed_acked)} app-role keys acked before the seal response")
+    _assert_drain_complete(green_leader, acked | sealed_acked)
 
     status = _cutover_status(blue_leader)
     console.print("cutover status:", json.dumps(status, indent=2))
