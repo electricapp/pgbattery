@@ -215,7 +215,14 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
         )
         .await?;
 
-    verify_single_authority(&client, &blue.nodes, &green.nodes, transferred.epoch).await?;
+    verify_single_authority(
+        &client,
+        &blue.nodes,
+        &green.nodes,
+        &green_cluster_id,
+        transferred.epoch,
+    )
+    .await?;
     info!(
         epoch = transferred.epoch,
         "Cutover complete: write authority is {green_cluster_id}"
@@ -455,37 +462,107 @@ async fn await_recipient_drain(
     }
 }
 
-/// Refuse unless exactly one cluster claims write authority afterwards (U1).
+/// One node's authority claim, as observed from its status endpoint.
+pub(crate) struct AuthorityObservation {
+    pub addr: String,
+    pub holds: bool,
+    pub epoch: u64,
+    pub authority_cluster_id: Option<String>,
+}
+
+/// Nodes not yet settled into the post-transfer world, by name (U1).
+///
+/// Identity, not arithmetic: counting claimants once passed a world where a
+/// donor node still claimed authority while a recipient follower lagged —
+/// the counts matched, the identities did not. Every recipient node must
+/// report authority == the recipient cluster at the transfer epoch; every
+/// donor node must report not holding. An empty return is settled.
+pub(crate) fn authority_mismatches(
+    donors: &[AuthorityObservation],
+    recipients: &[AuthorityObservation],
+    recipient_cluster: &str,
+    epoch: u64,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    for d in donors {
+        if d.holds {
+            mismatches.push(format!(
+                "donor node {} still claims write authority at epoch {}",
+                d.addr, d.epoch
+            ));
+        }
+    }
+    for r in recipients {
+        if !r.holds {
+            mismatches.push(format!(
+                "recipient node {} does not report holding authority",
+                r.addr
+            ));
+        } else if r.epoch != epoch {
+            mismatches.push(format!(
+                "recipient node {} holds authority at epoch {} but the transfer was {epoch}",
+                r.addr, r.epoch
+            ));
+        } else if r.authority_cluster_id.as_deref() != Some(recipient_cluster) {
+            mismatches.push(format!(
+                "recipient node {} names authority {:?}, not {recipient_cluster:?}",
+                r.addr, r.authority_cluster_id
+            ));
+        }
+    }
+    mismatches
+}
+
+/// How long lagging followers get to apply the transfer before U1 is called
+/// unverifiable, and the pause between polls.
+const AUTHORITY_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const AUTHORITY_VERIFY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Refuse unless every node settles into single-authority (U1): recipients
+/// holding at the transfer epoch, donors not holding. A follower applies the
+/// transfer after its leader, so mismatches retry within a bounded budget.
 async fn verify_single_authority(
     client: &crate::cluster::ClusterClient,
     blue: &[crate::cluster::client::NodeInfo],
     green: &[crate::cluster::client::NodeInfo],
+    green_cluster_id: &str,
     epoch: u64,
 ) -> Result<()> {
-    let mut claimants = Vec::new();
-    for n in blue.iter().chain(green) {
-        let status = client.get_cutover_status(&n.mgmt_addr).await?;
-        if status.holds_client_write_authority {
-            claimants.push(format!("{} ({})", n.mgmt_addr, status.cluster_id));
+    let deadline = std::time::Instant::now() + AUTHORITY_VERIFY_BUDGET;
+    loop {
+        let mut donors = Vec::with_capacity(blue.len());
+        for n in blue {
+            let status = client.get_cutover_status(&n.mgmt_addr).await?;
+            donors.push(AuthorityObservation {
+                addr: n.mgmt_addr.clone(),
+                holds: status.holds_client_write_authority,
+                epoch: status.epoch,
+                authority_cluster_id: status.authority_cluster_id,
+            });
         }
-        if status.holds_client_write_authority && status.epoch != epoch {
+        let mut recipients = Vec::with_capacity(green.len());
+        for n in green {
+            let status = client.get_cutover_status(&n.mgmt_addr).await?;
+            recipients.push(AuthorityObservation {
+                addr: n.mgmt_addr.clone(),
+                holds: status.holds_client_write_authority,
+                epoch: status.epoch,
+                authority_cluster_id: status.authority_cluster_id,
+            });
+        }
+        let mismatches = authority_mismatches(&donors, &recipients, green_cluster_id, epoch);
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
             bail!(
-                "U1: {} claims authority at epoch {} but the transfer was {epoch}",
-                n.mgmt_addr,
-                status.epoch
+                "U1: single authority did not settle within {}s: {}",
+                AUTHORITY_VERIFY_BUDGET.as_secs(),
+                mismatches.join("; ")
             );
         }
+        tokio::time::sleep(AUTHORITY_VERIFY_INTERVAL).await;
     }
-    if claimants.len() != green.len() {
-        bail!(
-            "U1: {} nodes claim write authority after the cutover ({}); expected \
-             exactly the {} recipient nodes",
-            claimants.len(),
-            claimants.join(", "),
-            green.len()
-        );
-    }
-    Ok(())
 }
 
 fn print_report(report: &BlueGreenPreflightReport) {
@@ -1279,6 +1356,57 @@ mod tests {
         assert!(!retention_failures_abort(2));
         assert!(retention_failures_abort(3));
         assert!(retention_failures_abort(4));
+    }
+
+    fn obs(addr: &str, holds: bool, epoch: u64, authority: Option<&str>) -> AuthorityObservation {
+        AuthorityObservation {
+            addr: addr.into(),
+            holds,
+            epoch,
+            authority_cluster_id: authority.map(str::to_string),
+        }
+    }
+
+    /// The claimant-count check passed this world: one donor node still
+    /// claiming while a recipient follower lagged — three claimants, three
+    /// recipients, counts equal, identities wrong.
+    #[test]
+    fn a_donor_claimant_is_never_counted_as_a_recipient() {
+        let donors = vec![
+            obs("blue1", true, 3, Some("blue")),
+            obs("blue2", false, 3, Some("green")),
+        ];
+        let recipients = vec![
+            obs("green1", true, 3, Some("green")),
+            obs("green2", false, 0, None),
+        ];
+        let mismatches = authority_mismatches(&donors, &recipients, "green", 3);
+        assert_eq!(mismatches.len(), 2);
+        assert!(mismatches[0].contains("blue1"));
+        assert!(mismatches[1].contains("green2"));
+    }
+
+    #[test]
+    fn a_settled_transfer_reports_no_mismatches() {
+        let donors = vec![obs("blue1", false, 3, Some("green"))];
+        let recipients = vec![
+            obs("green1", true, 3, Some("green")),
+            obs("green2", true, 3, Some("green")),
+        ];
+        assert!(authority_mismatches(&donors, &recipients, "green", 3).is_empty());
+    }
+
+    #[test]
+    fn a_recipient_at_the_wrong_epoch_or_naming_another_cluster_is_unsettled() {
+        let stale = vec![obs("green1", true, 2, Some("green"))];
+        let m = authority_mismatches(&[], &stale, "green", 3);
+        assert_eq!(m.len(), 1);
+        assert!(m[0].contains("epoch 2"));
+
+        let other = vec![obs("green1", true, 3, Some("blue"))];
+        let m = authority_mismatches(&[], &other, "green", 3);
+        assert_eq!(m.len(), 1);
+        assert!(m[0].contains("\"blue\""));
     }
 
     /// A second database with user tables cuts over unfenced and
