@@ -2240,6 +2240,62 @@ async fn run_post_upgrade_scripts(work_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite `pg_bin_dir` and `pg_data_dir` in the node's own config file.
+///
+/// `pg_bin_dir` (config) is the durable active-PG pointer (`STATE_MACHINE` 8c):
+/// the in-memory supervisor retarget dies with the process, so every retarget
+/// site must also rewrite the file or a restart boots the previous major's
+/// datadir. Keyed `toml_edit` rewrite preserves comments and every other key;
+/// the write is atomic (temp file in the same directory, fsync, rename, fsync
+/// of the directory).
+///
+/// # Errors
+/// Unreadable or unparseable config file, or I/O failure writing it back.
+pub fn rewrite_config_pg_paths(config_path: &Path, bin_dir: &Path, data_dir: &Path) -> Result<()> {
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("reading config {}", config_path.display()))?;
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing config {}", config_path.display()))?;
+    let root = doc.as_table_mut();
+    for (key, path) in [("pg_bin_dir", bin_dir), ("pg_data_dir", data_dir)] {
+        let value = toml_edit::value(path.display().to_string());
+        // In-place mutation for an existing key keeps its comment decor;
+        // `Table::insert` on an occupied key would discard it.
+        match root.get_mut(key) {
+            Some(item) => *item = value,
+            None => {
+                root.insert(key, value);
+            }
+        }
+    }
+
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("config path {} has no file name", config_path.display()))?;
+    let tmp = dir.join(format!(".{}.retarget-tmp", file_name.to_string_lossy()));
+    {
+        use std::io::Write as _;
+        let mut f = fs::File::create(&tmp)
+            .with_context(|| format!("creating temp config {}", tmp.display()))?;
+        f.write_all(doc.to_string().as_bytes())
+            .with_context(|| format!("writing temp config {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync temp config {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, config_path)
+        .with_context(|| format!("renaming {} over {}", tmp.display(), config_path.display()))?;
+    // Fsync the directory so the rename itself is durable.
+    fs::File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("fsync config directory {}", dir.display()))?;
+    Ok(())
+}
+
 fn unfreeze_watermark_path(parent: &Path) -> PathBuf {
     parent.join(".pgbattery_unfreeze_watermark")
 }
@@ -2486,6 +2542,80 @@ mod tests {
         assert_eq!(read_unfreeze_watermark(dir.path()), None);
         write_unfreeze_watermark(dir.path(), 987_654_321).unwrap();
         assert_eq!(read_unfreeze_watermark(dir.path()), Some(987_654_321));
+    }
+
+    const RETARGET_FIXTURE: &str = "\
+# pgbattery node config
+node_id = 1
+listen_addr = \"0.0.0.0:5432\"
+
+# Active PostgreSQL binaries (durable active-PG pointer).
+pg_bin_dir = \"/usr/lib/postgresql/17/bin\"
+pg_data_dir = \"/var/lib/pgbattery/data\"
+
+[backup]
+# Backups live outside PGDATA.
+backup_dir = \"/var/backups/pgbattery\"
+";
+
+    /// The retarget must survive a process restart: the config file's two
+    /// path keys are rewritten in place, everything else byte-identical.
+    #[test]
+    fn config_rewrite_changes_exactly_the_two_path_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pgbattery.toml");
+        fs::write(&path, RETARGET_FIXTURE).unwrap();
+
+        rewrite_config_pg_paths(
+            &path,
+            Path::new("/usr/lib/postgresql/18/bin"),
+            Path::new("/var/lib/pgbattery/data_18"),
+        )
+        .unwrap();
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("pg_bin_dir = \"/usr/lib/postgresql/18/bin\""));
+        assert!(rewritten.contains("pg_data_dir = \"/var/lib/pgbattery/data_18\""));
+        // Comments and every other key survive untouched.
+        assert!(rewritten.contains("# pgbattery node config"));
+        assert!(rewritten.contains("# Active PostgreSQL binaries (durable active-PG pointer)."));
+        assert!(rewritten.contains("# Backups live outside PGDATA."));
+        assert!(rewritten.contains("node_id = 1"));
+        assert!(rewritten.contains("listen_addr = \"0.0.0.0:5432\""));
+        assert!(rewritten.contains("backup_dir = \"/var/backups/pgbattery\""));
+        assert!(!rewritten.contains("/usr/lib/postgresql/17/bin"));
+        assert!(!rewritten.contains("\"/var/lib/pgbattery/data\""));
+    }
+
+    /// Keys the file relies on defaults for are inserted at the root, not
+    /// inside whatever `[section]` happens to be last.
+    #[test]
+    fn config_rewrite_inserts_missing_keys_at_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pgbattery.toml");
+        fs::write(&path, "node_id = 2\n\n[backup]\nbackup_dir = \"/b\"\n").unwrap();
+
+        rewrite_config_pg_paths(&path, Path::new("/bins/18"), Path::new("/data_18")).unwrap();
+
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            doc.get("pg_bin_dir").and_then(|v| v.as_str()),
+            Some("/bins/18")
+        );
+        assert_eq!(
+            doc.get("pg_data_dir").and_then(|v| v.as_str()),
+            Some("/data_18")
+        );
+        assert_eq!(
+            doc.get("backup")
+                .and_then(|t| t.get("backup_dir"))
+                .and_then(|v| v.as_str()),
+            Some("/b"),
+            "the [backup] section must not absorb the inserted root keys"
+        );
     }
 
     #[test]

@@ -134,6 +134,11 @@ pub struct ManagementApiState {
     /// for minutes. `None` on a witness, which has no `PostgreSQL`.
     /// Interior mutability so Track B can retarget after `pg_upgrade`.
     pub pg_paths: Mutex<Option<PgPaths>>,
+    /// The config file this process was started from. Track B retargets
+    /// rewrite its `pg_bin_dir` / `pg_data_dir` keys so the active-PG pointer
+    /// survives a restart; `None` means there is no file to rewrite and every
+    /// retarget site must warn the operator loudly instead.
+    pub config_path: Option<std::path::PathBuf>,
     /// Gateway/lease fence watch — Track B sets `upgrade_frozen` here so every
     /// gateway connection refuses queries without a second channel.
     pub fence_tx: watch::Sender<crate::governor::raft::FenceState>,

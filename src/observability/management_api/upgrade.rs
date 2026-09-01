@@ -135,6 +135,63 @@ pub(super) async fn self_upgrade(
     }
 }
 
+/// Persist a retarget into the node's own config file (`STATE_MACHINE` 8c:
+/// `pg_bin_dir` in config is the durable active-PG pointer).
+///
+/// Returns an operator-facing note when the durable rewrite did not happen.
+/// The retarget on disk already succeeded, so the caller reports the note
+/// instead of failing — failing here would send the orchestrator down the
+/// destructive abort path over a config-file problem.
+fn persist_retarget(
+    state: &ManagementApiState,
+    bin_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> Option<String> {
+    let Some(config_path) = state.config_path.as_deref() else {
+        let note = format!(
+            "No config file is known to this process: persist pg_bin_dir = {} and \
+             pg_data_dir = {} yourself, or the next restart boots the previous \
+             major's paths",
+            bin_dir.display(),
+            data_dir.display()
+        );
+        error!(
+            node_id = state.node_id,
+            bin_dir = %bin_dir.display(),
+            data_dir = %data_dir.display(),
+            "Retarget is not durable: {note}"
+        );
+        return Some(note);
+    };
+    match crate::commands::upgrade::postgres::rewrite_config_pg_paths(
+        config_path,
+        bin_dir,
+        data_dir,
+    ) {
+        Ok(()) => {
+            info!(
+                config = %config_path.display(),
+                bin_dir = %bin_dir.display(),
+                data_dir = %data_dir.display(),
+                "Retarget persisted to config file"
+            );
+            None
+        }
+        Err(e) => {
+            let note = format!(
+                "Config rewrite of {} failed ({e:#}); persist pg_bin_dir = {} and \
+                 pg_data_dir = {} yourself, or the next restart boots the previous \
+                 major's paths",
+                config_path.display(),
+                bin_dir.display(),
+                data_dir.display()
+            );
+            error!(node_id = state.node_id, "Retarget is not durable: {note}");
+            Some(note)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresUpgradePreflightResponse {
     pub success: bool,
@@ -553,11 +610,12 @@ pub(super) async fn postgres_upgrade_apply(
             paths.bin_dir = guard.bin_dir().to_path_buf();
             paths.data_dir = guard.data_dir().to_path_buf();
             *state.pg_paths.lock() = Some(paths);
+            let persist_note = persist_retarget(&state, guard.bin_dir(), guard.data_dir());
             (
                 StatusCode::OK,
                 Json(PostgresUpgradeApplyResponse {
                     success: true,
-                    message: None,
+                    message: persist_note,
                     from_major: report.from_major,
                     to_major: report.to_major,
                 }),
@@ -654,11 +712,12 @@ pub(super) async fn postgres_upgrade_rejoin(
             paths.bin_dir = guard.bin_dir().to_path_buf();
             paths.data_dir = guard.data_dir().to_path_buf();
             *state.pg_paths.lock() = Some(paths);
+            let persist_note = persist_retarget(&state, guard.bin_dir(), guard.data_dir());
             (
                 StatusCode::OK,
                 Json(PostgresUpgradeRejoinResponse {
                     success: true,
-                    message: None,
+                    message: persist_note,
                 }),
             )
         }
@@ -838,17 +897,21 @@ pub(super) async fn postgres_upgrade_rollback(
             if let Some(paths) = updated {
                 *state.pg_paths.lock() = Some(paths);
             }
+            let persist_note = persist_retarget(&state, guard.bin_dir(), guard.data_dir());
+            let mut message = format!(
+                "Rolled back to major {}; unfreeze watermark {:?}, new-cluster \
+                 final LSN {:?}",
+                report.from_major, report.unfreeze_watermark_lsn, report.new_cluster_final_lsn
+            );
+            if let Some(note) = persist_note {
+                message.push_str("; ");
+                message.push_str(&note);
+            }
             (
                 StatusCode::OK,
                 Json(PostgresUpgradeRollbackResponse {
                     success: true,
-                    message: Some(format!(
-                        "Rolled back to major {}; unfreeze watermark {:?}, new-cluster \
-                         final LSN {:?}",
-                        report.from_major,
-                        report.unfreeze_watermark_lsn,
-                        report.new_cluster_final_lsn
-                    )),
+                    message: Some(message),
                     from_major: report.from_major,
                 }),
             )

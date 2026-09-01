@@ -62,6 +62,10 @@ enum LeaseAction {
 #[derive(Debug)]
 pub struct App {
     config: Config,
+    /// Config file this process was started from; Track B retargets rewrite
+    /// its `pg_bin_dir` / `pg_data_dir` keys so the active-PG pointer
+    /// survives a restart.
+    config_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -190,7 +194,18 @@ impl App {
     /// Create a new App instance with the given configuration.
     #[must_use]
     pub const fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            config_path: None,
+        }
+    }
+
+    /// Record the config file this process was started from, so Track B
+    /// retargets can rewrite its path keys durably.
+    #[must_use]
+    pub fn with_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.config_path = path;
+        self
     }
 
     /// Run the application.
@@ -971,6 +986,7 @@ impl App {
                     wal_archive_dir: self.config.backup.wal_archive_dir.clone(),
                 },
             )),
+            config_path: self.config_path.clone(),
             fence_tx,
             cluster_id: Arc::from(self.config.cluster_id.as_str()),
             awaits_write_authority_from: self

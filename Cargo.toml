@@ -107,6 +107,9 @@ rustls-pemfile = "2"
 
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
+# Format/comment-preserving keyed edits of the node's own config file
+# (Track B durable retarget of pg_bin_dir / pg_data_dir).
+toml_edit = "0.22"
 
 # Observability
 tracing = "0.1"
