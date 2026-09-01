@@ -22,9 +22,10 @@ const DONOR_CLAIM_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the recipient waits for a donor majority before refusing.
 const DONOR_QUORUM_BUDGET: Duration = Duration::from_secs(20);
 
-/// The refusal explains which donors did not confirm. If the request timeout
-/// fires first the caller gets a bare 408 instead, and an operator debugging a
-/// stuck cutover learns nothing.
+/// The refusal explains which donors did not confirm. The cutover routes sit
+/// in the timeout-exempt router group today, so nothing races this budget —
+/// the assert keeps it below the general request timeout so that moving the
+/// routes back under it can never replace the named refusal with a bare 408.
 const _: () = assert!(
     DONOR_QUORUM_BUDGET.as_secs() < super::MGMT_API_REQUEST_TIMEOUT_SECS,
     "the donor quorum poll must refuse before the management API times it out"
@@ -815,18 +816,20 @@ async fn await_donor_quorum(
         .unwrap_or_default();
     let started = Instant::now();
     loop {
+        // Concurrent: serially, N silent donors would take N x
+        // DONOR_CLAIM_TIMEOUT and blow the whole quorum budget in one round.
+        let mut poll = tokio::task::JoinSet::new();
+        for addr in body.donor_mgmt_addrs.clone() {
+            let client = client.clone();
+            let epoch = body.epoch;
+            let donor = body.from_cluster_id.clone();
+            let recipient = state.cluster_id.to_string();
+            poll.spawn(async move { donor_claim(&client, &addr, epoch, &donor, &recipient).await });
+        }
         let mut claims = Vec::with_capacity(body.donor_mgmt_addrs.len());
-        for addr in &body.donor_mgmt_addrs {
-            claims.push(
-                donor_claim(
-                    &client,
-                    addr,
-                    body.epoch,
-                    &body.from_cluster_id,
-                    &state.cluster_id,
-                )
-                .await,
-            );
+        while let Some(joined) = poll.join_next().await {
+            // A panicked probe task told us nothing about the donor.
+            claims.push(joined.unwrap_or(DonorClaim::Silent));
         }
         let confirming = claims
             .iter()
