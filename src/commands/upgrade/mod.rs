@@ -81,15 +81,10 @@ pub async fn perform_self_upgrade(req: SelfUpgradeRequest) -> Result<std::path::
     let verifier = if req.insecure_no_verify {
         None
     } else {
+        // A verifier that cannot be configured is an error here, so a `None`
+        // below always means insecure_no_verify.
         Some(CosignVerifier::from_env(req.identity.as_deref(), &target)?)
     };
-
-    if verifier.is_none() && !req.insecure_no_verify {
-        anyhow::bail!(
-            "Release signature verification is not configured: the new binary's authenticity \
-             cannot be cryptographically verified. Pass insecure_no_verify to upgrade anyway."
-        );
-    }
 
     if verifier.is_none() {
         warn!(
@@ -125,27 +120,34 @@ pub async fn perform_self_upgrade(req: SelfUpgradeRequest) -> Result<std::path::
     Ok(backup_path)
 }
 
-/// Reject a target version older than the running one (anti-rollback).
+/// Reject a target that is not a semver upgrade (anti-rollback).
 ///
-/// Returns `Ok(())` when `target >= current`. Both are parsed as semver so the
-/// comparison is correct (`0.10.0 > 0.9.0`, unlike a string compare). An
-/// unparseable version fails **closed** (returns an error): if we cannot prove
-/// the target is not a downgrade, we refuse rather than risk installing a
+/// Precedence (`cmp_precedence`, which ignores build metadata) decides:
+/// lower-precedence targets are refused as potential rollbacks, and an
+/// equal-precedence target with a different version string (build metadata
+/// only) is refused as "not an upgrade" — `1.0.0+b2` and `1.0.0` are the same
+/// release. An unparseable version fails **closed**: if we cannot prove the
+/// target is not a downgrade, we refuse rather than risk installing a
 /// rollback. Callers may override with `--allow-downgrade` for an intentional
-/// rollback.
+/// replacement.
 fn ensure_not_downgrade(current: &str, target: &str) -> Result<()> {
     let cur = semver::Version::parse(current)
         .map_err(|e| anyhow::anyhow!("Cannot parse running version {current:?} as semver: {e}"))?;
     let tgt = semver::Version::parse(target)
         .map_err(|e| anyhow::anyhow!("Cannot parse target version {target:?} as semver: {e}"))?;
-    if tgt < cur {
-        anyhow::bail!(
+    match tgt.cmp_precedence(&cur) {
+        std::cmp::Ordering::Less => anyhow::bail!(
             "Refusing to downgrade pgbattery {current} -> {target}: a lower version may be a \
              rollback attack (an older, signed, vulnerable release served by a compromised \
              mirror). Pass --allow-downgrade to override for an intentional rollback."
-        );
+        ),
+        std::cmp::Ordering::Equal if target != current => anyhow::bail!(
+            "pgbattery {target} is the same release as the running {current} (only build \
+             metadata differs): already at this version, not an upgrade. Pass \
+             --allow-downgrade to replace the binary anyway."
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Run the upgrade command.
@@ -211,13 +213,19 @@ pub async fn run_upgrade(
         );
     }
 
-    // Fetch latest version
-    let latest = fetch_latest_version(base_url).await?;
-
-    info!(current = VERSION, latest = %latest, "Version check");
+    // An explicit --version fully specifies the roll; only consult the
+    // release server's /latest when no version was given, so a release-server
+    // outage cannot block an explicit roll.
+    let target = match version {
+        Some(v) if !needs_latest_fetch(Some(v.as_str())) => v,
+        _ => {
+            let latest = fetch_latest_version(base_url).await?;
+            info!(current = VERSION, latest = %latest, "Version check");
+            latest
+        }
+    };
 
     if cluster {
-        let target = version.unwrap_or_else(|| latest.clone());
         if check {
             let versions = cluster::run_cluster_version_preflight(
                 node,
@@ -251,8 +259,8 @@ pub async fn run_upgrade(
     }
 
     if check {
-        if latest == VERSION {
-            info!("Already running latest version.");
+        if target == VERSION {
+            info!("Already at version {VERSION}.");
             return Ok(());
         }
         info!("Update available. Run 'pgbattery upgrade' to install.");
@@ -260,9 +268,6 @@ pub async fn run_upgrade(
         // without parsing log output (documented in `--check`'s help text).
         std::process::exit(UPDATE_AVAILABLE_EXIT_CODE);
     }
-
-    // Determine target version
-    let target = version.unwrap_or_else(|| latest.clone());
 
     if target == VERSION {
         info!("Already at version {}", VERSION);
@@ -309,6 +314,13 @@ fn platform_binary_name() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     format!("pgbattery-{os}-{arch}")
+}
+
+/// Whether resolving the target version requires the release server's
+/// `/latest` endpoint. An explicit `--version` fully specifies the roll, so a
+/// release-server outage must not block it.
+const fn needs_latest_fetch(version: Option<&str>) -> bool {
+    version.is_none()
 }
 
 async fn fetch_latest_version(base_url: &str) -> Result<String> {
@@ -746,6 +758,36 @@ mod tests {
         // And the lexicographic trap the other direction: 0.9.0 < 0.10.0, so
         // installing 0.9.0 while running 0.10.0 is a downgrade.
         assert!(ensure_not_downgrade("0.10.0", "0.9.0").is_err());
+    }
+
+    #[test]
+    fn explicit_version_skips_latest_fetch() {
+        assert!(!needs_latest_fetch(Some("1.2.3")));
+        assert!(needs_latest_fetch(None));
+    }
+
+    #[test]
+    fn equal_precedence_different_build_is_not_an_upgrade() {
+        // Build metadata does not order versions: 1.0.0+b2 and 1.0.0 are the
+        // same release. Neither direction is an upgrade or a rollback attack.
+        let err = ensure_not_downgrade("1.0.0+b2", "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an upgrade"), "{err}");
+        let err = ensure_not_downgrade("1.0.0", "1.0.0+b2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an upgrade"), "{err}");
+    }
+
+    #[test]
+    fn prerelease_ordering_unchanged() {
+        // Pre-release precedence still orders: rc < release.
+        assert!(ensure_not_downgrade("1.0.0-rc.1", "1.0.0").is_ok());
+        let err = ensure_not_downgrade("1.0.0", "1.0.0-rc.1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Refusing to downgrade"), "{err}");
     }
 
     #[test]
