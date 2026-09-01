@@ -1986,7 +1986,7 @@ pub async fn run_primary_pg_upgrade_apply(
         .await
         .context("upgraded primary did not accept a write")?;
 
-    run_post_upgrade_scripts(parent).await?;
+    run_post_upgrade_scripts(parent, &new_bindir, read_postmaster_port(&new_data)?).await?;
 
     // The LSN clients resume writing at. Rollback compares against it to say
     // whether anything would actually be discarded.
@@ -2214,20 +2214,67 @@ fn pg_upgrade_budget(old_data: &Path) -> Duration {
     FLOOR.max(Duration::from_secs(bytes / BYTES_PER_SEC))
 }
 
+/// How one `pg_upgrade`-emitted script runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostUpgradeScriptKind {
+    /// `psql -v ON_ERROR_STOP=1 -f` against the upgraded local primary.
+    Sql,
+    /// `bash <script>`.
+    Shell,
+}
+
+/// `pg_upgrade` emits both SQL files (`update_extensions.sql`) and shell
+/// scripts; feeding SQL to bash fails on the first statement.
+fn post_upgrade_script_kind(name: &str) -> PostUpgradeScriptKind {
+    if Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("sql"))
+    {
+        PostUpgradeScriptKind::Sql
+    } else {
+        PostUpgradeScriptKind::Shell
+    }
+}
+
 /// Run the scripts `pg_upgrade` emitted into its working directory.
 ///
 /// They land beside the data directories, not inside the new one — the
 /// distinction matters because looking in the wrong place silently runs
-/// nothing.
-async fn run_post_upgrade_scripts(work_dir: &Path) -> Result<()> {
+/// nothing. SQL files run through the new cluster's `psql` against the
+/// upgraded local primary; shell scripts run through bash.
+async fn run_post_upgrade_scripts(work_dir: &Path, new_bindir: &Path, port: u16) -> Result<()> {
     for name in ["update_extensions.sql", "analyze_new_cluster.sh"] {
         let script = work_dir.join(name);
         if !script.is_file() {
             continue;
         }
         info!(script = %script.display(), "Running pg_upgrade post-upgrade script");
-        let status = Command::new("bash")
-            .arg(&script)
+        let mut cmd = match post_upgrade_script_kind(name) {
+            PostUpgradeScriptKind::Sql => {
+                let mut c = Command::new(new_bindir.join("psql"));
+                c.args([
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-U",
+                    PG_SUPERUSER,
+                    "-d",
+                    "postgres",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-f",
+                    &script.display().to_string(),
+                ]);
+                c
+            }
+            PostUpgradeScriptKind::Shell => {
+                let mut c = Command::new("bash");
+                c.arg(&script);
+                c
+            }
+        };
+        let status = cmd
             .current_dir(work_dir)
             .kill_on_drop(true)
             .status()
@@ -2627,6 +2674,30 @@ backup_dir = \"/var/backups/pgbattery\"
         assert_eq!(
             parse_postgres_major("pg_config (PostgreSQL) 19.0").unwrap(),
             19
+        );
+    }
+
+    /// `pg_upgrade` emits `update_extensions.sql` as SQL; running it with
+    /// bash fails the apply after the primary already upgraded, which then
+    /// falls into the destructive abort path.
+    #[test]
+    fn sql_scripts_dispatch_to_psql_and_shell_scripts_to_bash() {
+        assert_eq!(
+            post_upgrade_script_kind("update_extensions.sql"),
+            PostUpgradeScriptKind::Sql
+        );
+        assert_eq!(
+            post_upgrade_script_kind("analyze_new_cluster.sh"),
+            PostUpgradeScriptKind::Shell
+        );
+        assert_eq!(
+            post_upgrade_script_kind("delete_old_cluster.sh"),
+            PostUpgradeScriptKind::Shell
+        );
+        assert_eq!(
+            post_upgrade_script_kind("REINDEX_ALL.SQL"),
+            PostUpgradeScriptKind::Sql,
+            "extension match is case-insensitive"
         );
     }
 
