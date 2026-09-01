@@ -59,8 +59,9 @@ pub use backup::{
 };
 pub use cluster::{MemberInfo, MembershipResponse, TransferResponse};
 pub use cutover::{
-    CutoverActionResponse, CutoverStatusResponse, DonorRetentionResponse, DonorRisk,
-    SchemaDigestResponse, SubscriptionProgressResponse, donor_wal_risk,
+    AdvanceSequencesRequest, AdvanceSequencesResponse, CutoverActionResponse,
+    CutoverStatusResponse, DonorRetentionResponse, DonorRisk, SchemaDigestResponse, SequenceValue,
+    SequenceValuesResponse, SubscriptionProgressResponse, donor_wal_risk,
 };
 pub use discovery::{
     ClusterIdentityResponse, JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse,
@@ -419,6 +420,14 @@ pub async fn start_management_api(
         .route(
             "/api/v1/cutover/schema-digest",
             get(cutover::get_schema_digest),
+        )
+        .route(
+            "/api/v1/cutover/sequence-values",
+            get(cutover::get_sequence_values),
+        )
+        .route(
+            "/api/v1/admin/cutover/advance-sequences",
+            post(cutover::advance_sequences),
         )
         .route(
             "/api/v1/admin/postgres-upgrade/freeze",

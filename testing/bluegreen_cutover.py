@@ -422,20 +422,37 @@ def _await_slot_confirms(
         ) from exc
 
 
-def _advance_sequences(green_leader: Node, blue_leader: Node) -> int:
-    """Push green's sequence past every value blue issued (U3)."""
-    blue_max = int(_psql(blue_leader, "SELECT COALESCE(max(seq), 0)::text FROM bg_kv;") or "0")
-    target = blue_max + 1_000
-    seq_name = _psql(
-        green_leader,
-        "SELECT COALESCE(pg_get_serial_sequence('bg_kv', 'seq'), '');",
+def _sequence_values(node: Node) -> list[dict[str, Any]]:
+    """The donor's user sequences via its own endpoint (token-gated)."""
+    r = httpx.get(
+        f"{_mgmt(node)}/api/v1/cutover/sequence-values",
+        headers=_headers(),
+        timeout=30.0,
     )
-    if not seq_name:
+    r.raise_for_status()
+    return list(r.json().get("sequences", []))
+
+
+def _advance_sequences(green_leader: Node, blue_leader: Node) -> int:
+    """Push green's sequences past every value blue issued (U3).
+
+    Driven through the product's endpoints — donor read, recipient advance —
+    so the harness exercises the same path the CLI cutover runs.
+    `_assert_no_sequence_collision` stays the independent oracle.
+    """
+    blue_max = int(_psql(blue_leader, "SELECT COALESCE(max(seq), 0)::text FROM bg_kv;") or "0")
+    sequences = _sequence_values(blue_leader)
+    if not sequences:
         raise ContractFailure(
-            "U3: green's bg_kv.seq owns no sequence, so setval would be a no-op "
-            "and the sequence check would pass while blind"
+            "U3: the donor reports zero user sequences, but bg_kv.seq must own "
+            "one — the advance would be a no-op and the collision check would "
+            "run blind"
         )
-    _psql(green_leader, f"SELECT setval('{seq_name}', {target}, true);")
+    r = _post(green_leader, "advance-sequences", {"sequences": sequences, "margin": 10_000})
+    if not r.is_success:
+        raise ContractFailure(
+            f"U3: advance-sequences refused on green: {r.status_code} {r.text}"
+        )
     return blue_max
 
 

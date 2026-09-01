@@ -883,6 +883,162 @@ fn parse_lsn_strict(text: &str) -> Option<u64> {
     Some((hi << 32) | lo)
 }
 
+/// One user sequence and the last value the donor issued from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceValue {
+    pub schema: String,
+    pub name: String,
+    /// `pg_sequences.last_value`; NULL (never called) reads as 0.
+    pub last_value: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceValuesResponse {
+    pub sequences: Vec<SequenceValue>,
+}
+
+/// Sequences are not replicated (U3): the recipient must `setval` past every
+/// value the donor issued before it accepts writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvanceSequencesRequest {
+    pub sequences: Vec<SequenceValue>,
+    /// Headroom added over each donor `last_value`.
+    #[serde(default = "default_sequence_margin")]
+    pub margin: i64,
+}
+
+const fn default_sequence_margin() -> i64 {
+    10_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvanceSequencesResponse {
+    pub success: bool,
+    pub advanced: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The donor's user sequences with their last issued values. The fields are
+/// pipe-joined with `last_value` last, so parsing splits from the right and a
+/// separator inside a name cannot corrupt the number.
+const DONOR_SEQUENCE_VALUES_SQL: &str = "SELECT schemaname || '|' || sequencename || '|' || COALESCE(last_value, 0)::text \
+     FROM pg_sequences \
+     WHERE schemaname NOT IN ('pg_catalog','information_schema','pgbattery') \
+       AND schemaname NOT LIKE 'pg_toast%' \
+       AND schemaname NOT LIKE 'pg_temp%' \
+     ORDER BY 1;";
+
+/// Parse one `schema|name|last_value` line. `None` refuses a name containing
+/// the separator rather than mis-splitting it into the wrong sequence.
+fn parse_sequence_value_line(line: &str) -> Option<SequenceValue> {
+    let (rest, value) = line.rsplit_once('|')?;
+    let (schema, name) = rest.split_once('|')?;
+    if schema.contains('|') || name.contains('|') {
+        return None;
+    }
+    Some(SequenceValue {
+        schema: schema.to_string(),
+        name: name.to_string(),
+        last_value: value.trim().parse().ok()?,
+    })
+}
+
+/// Where the recipient's sequence must land: past everything the donor
+/// issued, with headroom, and never below 1 (setval's floor for a default
+/// ascending sequence).
+pub(crate) fn sequence_advance_target(last_value: i64, margin: i64) -> i64 {
+    last_value.saturating_add(margin).max(1)
+}
+
+/// One `setval`, qualified server-side with `format('%I.%I')::regclass` so a
+/// sequence MISSING on the recipient errors loudly. `pg_get_serial_sequence`
+/// is banned here: a NULL from it turns the advance into a silent no-op, the
+/// exact vacuity a direct regclass cast cannot produce.
+fn setval_statement(schema: &str, name: &str, target: i64) -> String {
+    let schema = schema.replace('\'', "''");
+    let name = name.replace('\'', "''");
+    format!("SELECT setval(format('%I.%I', '{schema}', '{name}')::regclass, {target}, true);")
+}
+
+pub(super) async fn get_sequence_values(
+    State(state): State<Arc<ManagementApiState>>,
+) -> axum::response::Response {
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return probe_failure("sequence values", "no PostgreSQL supervisor on this node");
+    };
+    let guard = pg.lock().await;
+    let raw = match guard.execute_sql(DONOR_SEQUENCE_VALUES_SQL).await {
+        Ok(raw) => raw,
+        Err(e) => return probe_failure("sequence values query failed", &e.to_string()),
+    };
+    drop(guard);
+    let mut sequences = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match parse_sequence_value_line(line) {
+            Some(seq) => sequences.push(seq),
+            None => return probe_failure("sequence values reply unparseable", line),
+        }
+    }
+    (StatusCode::OK, Json(SequenceValuesResponse { sequences })).into_response()
+}
+
+pub(super) async fn advance_sequences(
+    State(state): State<Arc<ManagementApiState>>,
+    Json(body): Json<AdvanceSequencesRequest>,
+) -> axum::response::Response {
+    let fail = |advanced: usize, message: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(AdvanceSequencesResponse {
+                success: false,
+                advanced,
+                message: Some(message),
+            }),
+        )
+            .into_response()
+    };
+    if body.margin < 0 {
+        return fail(
+            0,
+            format!("margin must be non-negative, got {}", body.margin),
+        );
+    }
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return fail(0, "no PostgreSQL supervisor on this node".into());
+    };
+    let guard = pg.lock().await;
+    for (advanced, seq) in body.sequences.iter().enumerate() {
+        let target = sequence_advance_target(seq.last_value, body.margin);
+        let sql = setval_statement(&seq.schema, &seq.name, target);
+        // One statement per sequence so an error names the sequence it hit.
+        // A sequence missing on the recipient errors at the regclass cast —
+        // wanted: silently skipping it is how U3 collides after cutover.
+        if let Err(e) = guard.execute_sql(&sql).await {
+            drop(guard);
+            return fail(
+                advanced,
+                format!(
+                    "advancing sequence {}.{} to {target} failed: {e}",
+                    seq.schema, seq.name
+                ),
+            );
+        }
+        info!(schema = %seq.schema, name = %seq.name, target, "Sequence advanced past the donor");
+    }
+    let advanced = body.sequences.len();
+    drop(guard);
+    (
+        StatusCode::OK,
+        Json(AdvanceSequencesResponse {
+            success: true,
+            advanced,
+            message: None,
+        }),
+    )
+        .into_response()
+}
+
 /// Ask one donor node what it has committed about this handoff.
 async fn donor_claim(
     client: &reqwest::Client,
@@ -1233,5 +1389,56 @@ mod tests {
         assert_eq!(parse_lsn_strict("0/16B3C90"), Some(0x016B_3C90));
         assert_eq!(parse_lsn_strict("16B3C90"), None);
         assert_eq!(parse_lsn_strict("zz/1"), None);
+    }
+
+    /// The advance must error on a sequence missing from the recipient: a
+    /// direct regclass cast does, while `pg_get_serial_sequence` returns NULL
+    /// and turns setval into a silent no-op — U3 passing while blind.
+    #[test]
+    fn setval_casts_the_qualified_name_and_never_uses_serial_lookup() {
+        let sql = setval_statement("public", "bg_kv_seq_seq", 42_000);
+        assert_eq!(
+            sql,
+            "SELECT setval(format('%I.%I', 'public', 'bg_kv_seq_seq')::regclass, 42000, true);"
+        );
+        assert!(!sql.contains("pg_get_serial_sequence"));
+        assert!(!DONOR_SEQUENCE_VALUES_SQL.contains("pg_get_serial_sequence"));
+    }
+
+    /// Literal quoting: an embedded quote in a catalog name must not break
+    /// out of the string the server-side `format()` receives.
+    #[test]
+    fn setval_escapes_embedded_quotes_in_names() {
+        let sql = setval_statement("we'ird", "na'me", 7);
+        assert!(sql.contains("'we''ird'"));
+        assert!(sql.contains("'na''me'"));
+    }
+
+    /// The donor read comes from `pg_sequences` with system schemas excluded;
+    /// a NULL `last_value` (never called) reads as 0.
+    #[test]
+    fn the_donor_sequence_read_covers_user_schemas_and_null_values() {
+        assert!(DONOR_SEQUENCE_VALUES_SQL.contains("pg_sequences"));
+        assert!(DONOR_SEQUENCE_VALUES_SQL.contains("COALESCE(last_value, 0)"));
+        assert!(DONOR_SEQUENCE_VALUES_SQL.contains("'pgbattery'"));
+    }
+
+    #[test]
+    fn sequence_value_lines_parse_from_the_right() {
+        let seq = parse_sequence_value_line("public|bg_kv_seq_seq|41").unwrap();
+        assert_eq!(seq.schema, "public");
+        assert_eq!(seq.name, "bg_kv_seq_seq");
+        assert_eq!(seq.last_value, 41);
+        assert!(parse_sequence_value_line("no-separators").is_none());
+        assert!(parse_sequence_value_line("a|b|c|41").is_none());
+    }
+
+    /// The target sits past the donor with headroom, and never below
+    /// setval's floor of 1.
+    #[test]
+    fn advance_targets_add_margin_and_clamp_at_one() {
+        assert_eq!(sequence_advance_target(41, 10_000), 10_041);
+        assert_eq!(sequence_advance_target(0, 0), 1);
+        assert_eq!(sequence_advance_target(i64::MAX, 10_000), i64::MAX);
     }
 }

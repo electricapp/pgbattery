@@ -945,6 +945,72 @@ impl ClusterClient {
         Ok(body.digest)
     }
 
+    /// The donor's user sequences with their last issued values (U3).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or a donor that could not read its own
+    /// sequences.
+    pub async fn get_sequence_values(
+        &self,
+        addr: &str,
+    ) -> Result<Vec<crate::observability::management_api::SequenceValue>> {
+        let url = format!("http://{addr}/api/v1/cutover/sequence-values");
+        let resp = self
+            .add_management_token(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "sequence values",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
+        }
+        let body: crate::observability::management_api::SequenceValuesResponse =
+            resp.json().await?;
+        Ok(body.sequences)
+    }
+
+    /// Advance the recipient's sequences past the donor's values (U3).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or any sequence missing on the recipient —
+    /// the error names it; a silent skip is exactly the vacuity refused here.
+    pub async fn advance_sequences(
+        &self,
+        addr: &str,
+        body: &crate::observability::management_api::AdvanceSequencesRequest,
+    ) -> Result<crate::observability::management_api::AdvanceSequencesResponse> {
+        let url = format!("http://{addr}/api/v1/admin/cutover/advance-sequences");
+        let resp = self
+            .add_management_token(self.client.post(&url).json(body))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = read_error_body(resp).await;
+            if let Ok(parsed) = serde_json::from_str::<
+                crate::observability::management_api::AdvanceSequencesResponse,
+            >(&err_body)
+                && let Some(msg) = parsed.message
+            {
+                anyhow::bail!("advance sequences at {addr}: {msg}");
+            }
+            anyhow::bail!(management_api_failure(
+                "advance sequences",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Drive one step of the cutover protocol on `addr`.
     ///
     /// `step` is the path segment under `/api/v1/admin/cutover/`. A 409 means

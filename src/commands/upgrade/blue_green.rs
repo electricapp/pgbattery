@@ -22,6 +22,11 @@ use crate::observability::management_api::{DonorRisk, donor_wal_risk};
 /// WAL the donor may hold for the cutover slot before the wait is abandoned.
 const DONOR_WAL_RETENTION_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Headroom over each donor sequence's `last_value` when advancing the
+/// recipient (U3), covering cached/discarded values a crashed donor never
+/// wrote back.
+const SEQUENCE_ADVANCE_MARGIN: i64 = 10_000;
+
 /// Body for primary-side Track C catalog preflight.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlueGreenPreflightRequest {
@@ -176,6 +181,8 @@ pub async fn run_blue_green_cutover(params: PostgresUpgradeParams) -> Result<()>
         .cutover_step(&blue_mgmt, "drain-observed", &serde_json::json!({}))
         .await?;
 
+    advance_recipient_sequences(&client, &blue_mgmt, &green_mgmt).await?;
+
     info!(recipient_pg = %green_pg, "Cutover: transferring");
     client
         .cutover_step(
@@ -285,6 +292,37 @@ impl CutoverPlan {
             green_cluster_id,
         })
     }
+}
+
+/// U3: sequences are not replicated. The donor is sealed and drained, so its
+/// `last_value` per sequence is final; the recipient must move past it before
+/// any client can call `nextval` there. A sequence missing on the recipient
+/// is an error from the endpoint, never a silent skip.
+async fn advance_recipient_sequences(
+    client: &crate::cluster::ClusterClient,
+    blue_mgmt: &str,
+    green_mgmt: &str,
+) -> Result<()> {
+    let sequences = client.get_sequence_values(blue_mgmt).await?;
+    if sequences.is_empty() {
+        info!("U3: donor reports no user sequences; nothing to advance");
+        return Ok(());
+    }
+    let advanced = client
+        .advance_sequences(
+            green_mgmt,
+            &crate::observability::management_api::AdvanceSequencesRequest {
+                sequences,
+                margin: SEQUENCE_ADVANCE_MARGIN,
+            },
+        )
+        .await?;
+    info!(
+        advanced = advanced.advanced,
+        margin = SEQUENCE_ADVANCE_MARGIN,
+        "U3: recipient sequences advanced past the donor"
+    );
+    Ok(())
 }
 
 /// Whether the drain is complete, or why it is not yet.

@@ -173,24 +173,67 @@ class SequenceNonCollisionTest(unittest.TestCase):
         with mock.patch.object(bg, "_psql", return_value="1042"):
             bg._assert_no_sequence_collision(_node(), blue_max=42)
 
-    def test_a_sequence_that_setval_cannot_reach_is_refused(self) -> None:
-        """A plain bigint column owns no sequence, so setval is a silent no-op."""
-        calls: list[str] = []
+    def test_a_donor_reporting_zero_sequences_is_refused(self) -> None:
+        """bg_kv.seq must own a sequence; an empty donor list means the
+        advance would be a no-op and the collision check would run blind."""
+        posts: list[str] = []
 
-        def fake_psql(_node: Any, sql: str, **_kw: Any) -> str:
-            calls.append(sql)
-            return "" if "pg_get_serial_sequence" in sql else "5"
+        def fake_post(_node: Any, path: str, body: Any = None) -> Any:
+            posts.append(path)
+            return mock.Mock(is_success=True, status_code=200, text="")
 
         with (
-            mock.patch.object(bg, "_psql", side_effect=fake_psql),
+            mock.patch.object(bg, "_psql", return_value="5"),
+            mock.patch.object(bg, "_sequence_values", return_value=[]),
+            mock.patch.object(bg, "_post", side_effect=fake_post),
             self.assertRaises(bg.ContractFailure) as caught,
         ):
             bg._advance_sequences(_node("green1"), _node("blue1"))
         self.assertIn("no-op", str(caught.exception))
-        self.assertFalse(
-            any("setval" in c for c in calls),
-            "must refuse before issuing a setval that would do nothing",
+        self.assertFalse(posts, "must refuse before asking green to advance nothing")
+
+    def test_a_recipient_refusing_the_advance_is_a_contract_failure(self) -> None:
+        """The endpoint errors on a sequence missing from green — a silent
+        skip is the vacuity the endpoint exists to refuse."""
+        refusal = mock.Mock(
+            is_success=False,
+            status_code=400,
+            text='{"message": "advancing sequence public.bg_kv_seq_seq failed"}',
         )
+        with (
+            mock.patch.object(bg, "_psql", return_value="5"),
+            mock.patch.object(
+                bg,
+                "_sequence_values",
+                return_value=[{"schema": "public", "name": "bg_kv_seq_seq", "last_value": 5}],
+            ),
+            mock.patch.object(bg, "_post", return_value=refusal),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._advance_sequences(_node("green1"), _node("blue1"))
+        self.assertIn("U3", str(caught.exception))
+        self.assertIn("bg_kv_seq_seq", str(caught.exception))
+
+    def test_the_advance_posts_the_donors_list_with_margin(self) -> None:
+        donor_list = [{"schema": "public", "name": "bg_kv_seq_seq", "last_value": 41}]
+        sent: list[tuple[str, Any]] = []
+
+        def fake_post(_node: Any, path: str, body: Any = None) -> Any:
+            sent.append((path, body))
+            return mock.Mock(is_success=True, status_code=200, text="")
+
+        with (
+            mock.patch.object(bg, "_psql", return_value="41"),
+            mock.patch.object(bg, "_sequence_values", return_value=donor_list),
+            mock.patch.object(bg, "_post", side_effect=fake_post),
+        ):
+            blue_max = bg._advance_sequences(_node("green1"), _node("blue1"))
+        self.assertEqual(blue_max, 41)
+        self.assertEqual(len(sent), 1)
+        path, body = sent[0]
+        self.assertEqual(path, "advance-sequences")
+        self.assertEqual(body["sequences"], donor_list)
+        self.assertGreater(body["margin"], 0)
 
 
 class SingleAuthorityTest(unittest.TestCase):

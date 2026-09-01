@@ -233,8 +233,10 @@ After cutover, no sequence on green issues a value blue already issued.
 **Violation**: green sequences not advanced past blue.
 
 **Inversions**: `test_an_unadvanced_sequence_is_caught`;
-`test_a_sequence_that_setval_cannot_reach_is_refused` (a column owning no
-sequence makes `setval` a silent no-op, so the check would pass while blind).
+`test_a_recipient_refusing_the_advance_is_a_contract_failure` (a sequence
+missing on the recipient errors at the advance endpoint's regclass cast —
+`pg_get_serial_sequence` would return NULL and make `setval` a silent no-op,
+so the check would pass while blind).
 
 ### U4 — Fail-Closed Cutover (FATAL)
 

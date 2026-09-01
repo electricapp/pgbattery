@@ -126,7 +126,7 @@ contracts:
     title: Sequence Non-Collision
     inversions:
       - test_an_unadvanced_sequence_is_caught
-      - test_a_sequence_that_setval_cannot_reach_is_refused
+      - test_a_recipient_refusing_the_advance_is_a_contract_failure
 
   U4:
     severity: FATAL
