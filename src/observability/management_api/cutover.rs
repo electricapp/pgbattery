@@ -553,6 +553,19 @@ pub(super) async fn cutover_abort(
     // or an in-flight seal's fence window.
     let _fence_guard = state.client_fence_apply_lock.lock().await;
     let guard = pg.lock().await;
+    // The freeze trigger fires on ddl_command_start and GRANT is DDL, so the
+    // lift's re-GRANTs would be refused by the very freeze the abort ends.
+    // Drop it first; the reconciler keeps it off once the phase is Aborted.
+    if let Err(e) = crate::commands::upgrade::ddl_freeze::remove_ddl_freeze(&guard).await {
+        return refuse(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Unsealed into a new epoch but removing the DDL freeze failed, \
+                 so the fence lift's GRANTs would be refused: {e}"
+            ),
+        );
+    }
     if let Err(e) = crate::commands::upgrade::client_fence::lift_client_write_fence(
         &guard,
         &body.app_roles,

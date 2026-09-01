@@ -3468,12 +3468,20 @@ async fn reconcile_ddl_and_fence(
 
     let want_freeze = ddl_freeze::ddl_should_freeze(phase);
     let frozen = ddl_freeze::ddl_freeze_installed(supervisor).await?;
-    if frozen {
+    let is_fenced = client_fence::fence_is_applied(supervisor, roles, cluster_id).await?;
+    let action = client_fence::fence_action(want_fenced, is_fenced);
+    // Idempotent: a steady pass moves nothing. Dropping and reinstalling the
+    // trigger every pass opened a DDL window inside SEALED on every reconcile.
+    let plan = ddl_freeze::ddl_freeze_plan(
+        want_freeze,
+        frozen,
+        action != client_fence::FenceAction::None,
+    );
+    if plan.unfreeze_first {
         ddl_freeze::remove_ddl_freeze(supervisor).await?;
     }
 
-    let is_fenced = client_fence::fence_is_applied(supervisor, roles, cluster_id).await?;
-    match client_fence::fence_action(want_fenced, is_fenced) {
+    match action {
         client_fence::FenceAction::Apply => {
             client_fence::apply_client_write_fence(supervisor, roles, cluster_id).await?;
         }
@@ -3483,7 +3491,7 @@ async fn reconcile_ddl_and_fence(
         client_fence::FenceAction::None => {}
     }
 
-    if want_freeze {
+    if plan.freeze_after {
         ddl_freeze::install_ddl_freeze(supervisor).await?;
     }
     Ok(())

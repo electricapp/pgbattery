@@ -43,6 +43,32 @@ pub(crate) const fn ddl_should_freeze(phase: CutoverPhase) -> bool {
     matches!(phase, CutoverPhase::Sealed | CutoverPhase::Draining)
 }
 
+/// What one reconcile pass does to the freeze trigger, around the fence work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DdlFreezePlan {
+    /// Drop the trigger before touching the fence (the fence's snapshot
+    /// table is DDL the freeze would refuse).
+    pub unfreeze_first: bool,
+    /// Install the trigger after the fence settles.
+    pub freeze_after: bool,
+}
+
+/// Decide the freeze moves for one pass. Idempotent: a steady state — the
+/// trigger already matching the wanted phase, no fence change — moves
+/// nothing. Dropping and reinstalling every pass opened a DDL window inside
+/// SEALED on every reconcile.
+#[must_use]
+pub(crate) const fn ddl_freeze_plan(
+    want_freeze: bool,
+    installed: bool,
+    fence_changes: bool,
+) -> DdlFreezePlan {
+    DdlFreezePlan {
+        unfreeze_first: installed && (fence_changes || !want_freeze),
+        freeze_after: want_freeze && (fence_changes || !installed),
+    }
+}
+
 /// Whether the freeze trigger is installed. Probed, not remembered.
 ///
 /// # Errors
@@ -181,6 +207,61 @@ mod tests {
                 "digest must cover {shape}"
             );
         }
+    }
+
+    /// SEALED steady state: the trigger is installed, the phase still wants
+    /// it, no fence move — the pass must not drop and reinstall it, because
+    /// that opens a DDL window inside SEALED on every reconcile.
+    #[test]
+    fn a_steady_sealed_reconcile_leaves_the_installed_freeze_alone() {
+        let plan = ddl_freeze_plan(true, true, false);
+        assert!(!plan.unfreeze_first);
+        assert!(!plan.freeze_after);
+    }
+
+    /// A fence move under an installed freeze needs the window: the snapshot
+    /// table is DDL, so unfreeze, move the fence, refreeze.
+    #[test]
+    fn a_fence_move_under_freeze_opens_and_closes_the_window() {
+        let plan = ddl_freeze_plan(true, true, true);
+        assert!(plan.unfreeze_first);
+        assert!(plan.freeze_after);
+    }
+
+    #[test]
+    fn missing_or_stale_triggers_converge_to_the_wanted_phase() {
+        // Wanted but missing: install, nothing to drop.
+        assert_eq!(
+            ddl_freeze_plan(true, false, false),
+            DdlFreezePlan {
+                unfreeze_first: false,
+                freeze_after: true
+            }
+        );
+        // Installed but no longer wanted: drop, never reinstall.
+        assert_eq!(
+            ddl_freeze_plan(false, true, false),
+            DdlFreezePlan {
+                unfreeze_first: true,
+                freeze_after: false
+            }
+        );
+        // Not wanted, not installed: nothing.
+        assert_eq!(
+            ddl_freeze_plan(false, false, false),
+            DdlFreezePlan {
+                unfreeze_first: false,
+                freeze_after: false
+            }
+        );
+    }
+
+    /// A fence move with no freeze wanted still never installs one.
+    #[test]
+    fn a_fence_move_without_a_wanted_freeze_installs_nothing() {
+        let plan = ddl_freeze_plan(false, false, true);
+        assert!(!plan.unfreeze_first);
+        assert!(!plan.freeze_after);
     }
 
     /// A dropped column leaves a permanent gap in `attnum`, so a donor that
