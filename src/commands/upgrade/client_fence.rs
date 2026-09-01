@@ -144,6 +144,81 @@ pub async fn lift_client_write_fence(
     Ok(())
 }
 
+/// Rounds of waiting for terminated backends to actually exit, and the pause
+/// between them. Bounded: a backend that survives every round fails the seal
+/// loudly instead of letting an in-flight transaction outlive the fence.
+const BACKEND_DRAIN_ATTEMPTS: u32 = 40;
+const BACKEND_DRAIN_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The fenced roles as one quoted SQL literal list, each validated first.
+fn quoted_role_list(app_roles: &[String]) -> Result<String> {
+    let mut quoted = Vec::with_capacity(app_roles.len());
+    for role in app_roles {
+        validate_role_ident(role)?;
+        quoted.push(format!("'{}'", role.replace('\'', "''")));
+    }
+    Ok(quoted.join(","))
+}
+
+fn terminate_backends_sql(quoted_roles: &str) -> String {
+    format!(
+        "SELECT count(pg_terminate_backend(pid))::text FROM pg_stat_activity \
+         WHERE usename IN ({quoted_roles}) AND pid <> pg_backend_pid();"
+    )
+}
+
+fn remaining_backends_sql(quoted_roles: &str) -> String {
+    format!(
+        "SELECT count(*)::text FROM pg_stat_activity \
+         WHERE usename IN ({quoted_roles}) AND pid <> pg_backend_pid();"
+    )
+}
+
+/// End every session of the fenced roles and wait until none remain.
+///
+/// The REVOKE fences new privilege checks only: a transaction that passed its
+/// check before the fence and commits after the LSN read is an acked write
+/// past `final_lsn` (U2). Termination closes that window; the bounded poll
+/// proves it closed rather than assuming the signal landed.
+///
+/// # Errors
+/// SQL failure, or fenced-role backends still alive after the wait.
+pub async fn terminate_fenced_role_backends(
+    supervisor: &crate::supervisor::Supervisor,
+    app_roles: &[String],
+) -> Result<()> {
+    let quoted = quoted_role_list(app_roles)?;
+    supervisor
+        .execute_sql(&terminate_backends_sql(&quoted))
+        .await
+        .context("terminating fenced-role backends")?;
+    for _ in 0..BACKEND_DRAIN_ATTEMPTS {
+        let raw = supervisor
+            .execute_sql(&remaining_backends_sql(&quoted))
+            .await
+            .context("counting fenced-role backends")?;
+        let remaining: u64 = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("expected a backend count, got {raw:?}"))?;
+        if remaining == 0 {
+            info!("No fenced-role backends remain");
+            return Ok(());
+        }
+        // Re-terminate each round: a fenced role can reconnect between polls,
+        // and a new backend must not survive to commit past the seal.
+        supervisor
+            .execute_sql(&terminate_backends_sql(&quoted))
+            .await
+            .context("re-terminating fenced-role backends")?;
+        tokio::time::sleep(BACKEND_DRAIN_PAUSE).await;
+    }
+    bail!(
+        "fenced-role backends survived {BACKEND_DRAIN_ATTEMPTS} termination rounds; \
+         refusing to read a final LSN their in-flight transactions could outrun"
+    )
+}
+
 /// What the reconciler must do to make `PostgreSQL` match the committed log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceAction {
@@ -198,11 +273,7 @@ pub async fn fence_is_applied(
     if app_roles.is_empty() {
         return Ok(false);
     }
-    let mut quoted = Vec::with_capacity(app_roles.len());
-    for role in app_roles {
-        validate_role_ident(role)?;
-        quoted.push(format!("'{}'", role.replace('\'', "''")));
-    }
+    let quoted = quoted_role_list(app_roles)?;
     // Asked separately because PostgreSQL plans both arms of a CASE: guarding
     // the table reference with to_regclass in one statement still fails to
     // parse before the first seal has created it.
@@ -215,8 +286,7 @@ pub async fn fence_is_applied(
     }
     let raw = supervisor
         .execute_sql(&format!(
-            "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} WHERE role_name IN ({}));",
-            quoted.join(",")
+            "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} WHERE role_name IN ({quoted}));"
         ))
         .await
         .context("reading client-fence snapshot state")?;
@@ -340,5 +410,41 @@ mod tests {
     fn fenced_privileges_cover_sequence_use() {
         assert!(FENCED_PRIVILEGES.contains("'USAGE'"));
         assert!(FENCED_PRIVILEGES.contains("'UPDATE'"));
+    }
+
+    /// The REVOKE fences only new privilege checks: a session already past its
+    /// check commits after the seal's LSN read, so the seal must end every
+    /// fenced-role backend — sparing only itself.
+    #[test]
+    fn the_seal_terminates_fenced_backends_by_role_and_spares_itself() {
+        let sql = terminate_backends_sql("'bg_app','other'");
+        assert_eq!(
+            sql,
+            "SELECT count(pg_terminate_backend(pid))::text FROM pg_stat_activity \
+             WHERE usename IN ('bg_app','other') AND pid <> pg_backend_pid();"
+        );
+    }
+
+    /// The wait polls what remains, with the same self-exclusion — otherwise
+    /// the seal's own session keeps the count at one forever.
+    #[test]
+    fn the_backend_drain_poll_counts_survivors_not_signals() {
+        let sql = remaining_backends_sql("'bg_app'");
+        assert_eq!(
+            sql,
+            "SELECT count(*)::text FROM pg_stat_activity \
+             WHERE usename IN ('bg_app') AND pid <> pg_backend_pid();"
+        );
+    }
+
+    /// Role quoting matches the fence's own conventions: validated idents,
+    /// single-quoted literals, embedded quotes doubled.
+    #[test]
+    fn backend_role_lists_are_quoted_like_the_fence() {
+        assert_eq!(
+            quoted_role_list(&["bg_app".into(), "b2".into()]).unwrap(),
+            "'bg_app','b2'"
+        );
+        assert!(quoted_role_list(&["app;drop".into()]).is_err());
     }
 }

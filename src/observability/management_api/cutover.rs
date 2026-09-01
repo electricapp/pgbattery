@@ -320,6 +320,31 @@ pub(super) async fn cutover_arm(
     .await
 }
 
+/// Undo the fence a failing SEAL applied, then refuse with `reason`.
+///
+/// Nothing committed, so the reconciler — which reads the committed log —
+/// would never lift this fence on its own.
+async fn lift_and_refuse(
+    state: &ManagementApiState,
+    guard: &crate::supervisor::Supervisor,
+    app_roles: &[String],
+    reason: &str,
+) -> (StatusCode, Json<CutoverActionResponse>) {
+    let lifted =
+        crate::commands::upgrade::client_fence::lift_client_write_fence(guard, app_roles).await;
+    let suffix = match lifted {
+        Ok(()) => "the fence was lifted",
+        Err(_) => {
+            "lifting the fence also failed — clients are fenced with no seal entry; retry SEAL or abort"
+        }
+    };
+    refuse(
+        state,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{reason}; {suffix}"),
+    )
+}
+
 /// SEAL: fence client writes, then record the LSN they stopped at.
 ///
 /// The order is the contract (U2). Committing SEAL first and revoking after
@@ -383,25 +408,34 @@ pub(super) async fn cutover_seal(
             format!("Refusing SEAL: client-write fence failed: {e}"),
         );
     }
+    // The REVOKE stops new privilege checks only. A transaction that passed
+    // its check before the fence and commits after the LSN read below is an
+    // acked write past final_lsn (U2) — so every fenced-role backend is ended
+    // and proven gone before the LSN is read.
+    if let Err(e) = crate::commands::upgrade::client_fence::terminate_fenced_role_backends(
+        &guard,
+        &body.app_roles,
+    )
+    .await
+    {
+        return lift_and_refuse(
+            &state,
+            &guard,
+            &body.app_roles,
+            &format!("Fenced-role sessions could not be drained, not sealing ({e})"),
+        )
+        .await;
+    }
     let final_lsn = match crate::commands::upgrade::client_fence::flush_lsn_bytes(&guard).await {
         Ok(lsn) => lsn,
         Err(e) => {
-            let lifted = crate::commands::upgrade::client_fence::lift_client_write_fence(
+            return lift_and_refuse(
+                &state,
                 &guard,
                 &body.app_roles,
+                &format!("Final LSN unreadable, not sealing ({e})"),
             )
             .await;
-            let suffix = match lifted {
-                Ok(()) => "the fence was lifted",
-                Err(_) => {
-                    "lifting the fence also failed — clients are fenced with no seal entry; retry SEAL or abort"
-                }
-            };
-            return refuse(
-                &state,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Final LSN unreadable, not sealing ({e}); {suffix}"),
-            );
         }
     };
     drop(guard);
