@@ -423,11 +423,7 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         .find(|n| n.node_id == leader_id)
         .ok_or_else(|| anyhow::anyhow!("Former leader {leader_id} missing from version probe"))?;
     if former.version != params.target {
-        let new_leader_mgmt = client
-            .get_leader_info(&entry)
-            .await?
-            .leader_mgmt_addr
-            .unwrap_or_else(|| leader_mgmt.clone());
+        let (_, new_leader_mgmt) = wait_for_new_leader(&client, &entry, leader_id).await?;
         info!(node_id = leader_id, "Upgrading former leader");
         wait_until_safe_to_bounce_follower(&client, &new_leader_mgmt, leader_id).await?;
         client
@@ -491,6 +487,52 @@ fn build_cluster_client(
             .ok_or_else(|| anyhow::anyhow!("Pass --node <host:port>"))?,
     };
     Ok((client, entry))
+}
+
+/// Identify the post-transfer leader, or `None` when it is not yet resolved.
+///
+/// Resolved means a known leader id that is not the former leader, with a
+/// management address. The former leader's address is never substituted:
+/// the safe-to-bounce and streaming guards would then interrogate the node
+/// being bounced.
+pub(crate) fn resolved_new_leader(
+    info: &crate::cluster::client::LeaderInfo,
+    former_id: u64,
+) -> Option<(u64, String)> {
+    match (info.leader_id, info.leader_mgmt_addr.as_ref()) {
+        (Some(id), Some(addr)) if id != former_id => Some((id, addr.clone())),
+        _ => None,
+    }
+}
+
+/// Poll until a new leader (not `former_id`) is resolved after a transfer.
+async fn wait_for_new_leader(
+    client: &ClusterClient,
+    entry: &str,
+    former_id: u64,
+) -> Result<(u64, String)> {
+    let deadline = tokio::time::Instant::now() + SYNC_WAIT_TIMEOUT;
+    loop {
+        match client.get_leader_info(entry).await {
+            Ok(info) => {
+                if let Some((id, addr)) = resolved_new_leader(&info, former_id) {
+                    info!(leader_id = id, mgmt_addr = %addr, "New leader after transfer");
+                    return Ok((id, addr));
+                }
+                info!("Waiting for a new leader after transfer-leadership");
+            }
+            Err(e) => {
+                info!(error = %e, "Waiting for leader endpoint after transfer-leadership");
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for a leader other than node {former_id} after \
+                 transfer-leadership. Re-running the same upgrade command resumes the roll."
+            );
+        }
+        tokio::time::sleep(NODE_POLL_INTERVAL).await;
+    }
 }
 
 /// Whether a follower may be restarted right now.
@@ -763,6 +805,45 @@ mod tests {
         assert_eq!(need.len(), 2);
         assert_eq!(need[0].node_id, 1);
         assert_eq!(need[1].node_id, 3);
+    }
+
+    fn leader_info(
+        leader_id: Option<u64>,
+        mgmt: Option<&str>,
+    ) -> crate::cluster::client::LeaderInfo {
+        crate::cluster::client::LeaderInfo {
+            leader_id,
+            leader_addr: None,
+            leader_pg_addr: None,
+            leader_mgmt_addr: mgmt.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn new_leader_resolves_when_distinct_with_addr() {
+        let info = leader_info(Some(2), Some("127.0.0.1:902"));
+        assert_eq!(
+            resolved_new_leader(&info, 1),
+            Some((2, "127.0.0.1:902".to_string()))
+        );
+    }
+
+    #[test]
+    fn new_leader_unresolved_while_former_still_leads() {
+        let info = leader_info(Some(1), Some("127.0.0.1:901"));
+        assert_eq!(resolved_new_leader(&info, 1), None);
+    }
+
+    #[test]
+    fn new_leader_unresolved_without_leader_id() {
+        let info = leader_info(None, Some("127.0.0.1:902"));
+        assert_eq!(resolved_new_leader(&info, 1), None);
+    }
+
+    #[test]
+    fn new_leader_unresolved_without_mgmt_addr() {
+        let info = leader_info(Some(2), None);
+        assert_eq!(resolved_new_leader(&info, 1), None);
     }
 
     fn wait_reason(d: &BounceDecision) -> &str {
