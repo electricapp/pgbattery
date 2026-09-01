@@ -20,6 +20,7 @@ Exit 0 on success; non-zero on contract failure or infra error.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -316,6 +317,33 @@ def _assert_green_boot_fenced(green_leader: Node, budget: float = 60.0) -> None:
     # state blue never issued; leave none behind.
     _psql(green_leader, "DELETE FROM bg_kv WHERE k = 'boot-fence-probe';")
     console.print("green is fenced from boot: the app role got an explicit denial")
+
+
+def _assert_arm_refused_without_authority(green_leader: Node) -> None:
+    """U1 inversion: a cluster without write authority must refuse to arm.
+
+    Arming claims authority for the local cluster, so one authenticated arm
+    call on a boot-fenced recipient would self-elect it into authority while
+    the donor still holds it. The refusal must be the authority guard's own,
+    not some earlier validation — a probe refused for the wrong reason has
+    not tested the guard.
+    """
+    r = _post(green_leader, "arm", {"target_cluster_id": BLUE_CLUSTER})
+    if r.is_success:
+        raise ContractFailure(
+            f"U1 violated: green armed a cutover while blue holds write authority ({r.text})"
+        )
+    body: dict[str, Any] = {}
+    with contextlib.suppress(ValueError):
+        body = dict(r.json())
+    if body.get("success") is True:
+        raise ContractFailure(f"U1 violated: arm on green reported success in the body: {body}")
+    message = str(body.get("message", r.text))
+    if "authority" not in message:
+        raise ContractFailure(
+            f"arm on green was refused, but not by the authority guard: {r.status_code} {message}"
+        )
+    console.print(f"arm-guard OK: green refused to arm without authority ({r.status_code})")
 
 
 def _seed_logical(blue_leader: Node, green_leader: Node) -> None:
@@ -987,6 +1015,7 @@ def main(
     # second Raft group electing itself into authority is the failure this
     # whole track is built to prevent.
     _assert_green_boot_fenced(green_leader)
+    _assert_arm_refused_without_authority(green_leader)
 
     acked = _write_burst(blue_leader.gateway_port, 20, "pre")
     _seed_logical(blue_leader, green_leader)

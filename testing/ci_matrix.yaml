@@ -2664,7 +2664,7 @@
     {
       "id": "bluegreen-cutover",
       "contracts": ["U1", "U2", "U3", "W1"],
-      "description": "Track C full cutover blue@17 to green@18. Asserts green is fenced from boot and after SEAL on its internal port, that every acked pre-seal key is on green (U2), that green issues no sequence value blue used (U3), that exactly one cluster claims authority and the six-port prober agrees as the app role (U1), and that writes through blue's gateway land on green and not on blue. U5 is claimed by bluegreen-rollback-drill, which runs the reverse protocol; this case only proves the reverse slot exists before the fence lifts.",
+      "description": "Track C full cutover blue@17 to green@18. Asserts green is fenced from boot (explicit permission denial, not any psql failure) and after SEAL on its internal port, that arming the boot-fenced green is refused by the server's authority guard (U1 inversion), that every acked pre-seal key is on green (U2), that green issues no sequence value blue used (U3), that exactly one cluster claims authority and the six-port prober agrees as the app role (U1), and that writes through blue's gateway land on green while blue grows by zero rows before the reverse subscription is wired. U5 is claimed by bluegreen-rollback-drill, which runs the reverse protocol; this case only proves the reverse slot exists before the fence lifts and that green's rows reach blue through it.",
       "actions": [
         {
           "type": "cmd",

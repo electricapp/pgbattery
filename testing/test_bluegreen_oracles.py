@@ -288,6 +288,55 @@ class FenceCoverageTest(unittest.TestCase):
         self.assertIn("still reports write authority", str(caught.exception))
 
 
+class ArmGuardInversionTest(unittest.TestCase):
+    """U1: a cluster without write authority must refuse to arm."""
+
+    @staticmethod
+    def _response(status_code: int, body: dict[str, Any]) -> Any:
+        return mock.Mock(
+            is_success=200 <= status_code < 300,
+            status_code=status_code,
+            text=str(body),
+            json=mock.Mock(return_value=body),
+        )
+
+    def test_a_green_that_arms_is_a_violation(self) -> None:
+        resp = self._response(200, {"success": True})
+        with (
+            mock.patch.object(bg, "_post", return_value=resp),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._assert_arm_refused_without_authority(_node("green1"))
+        self.assertIn("U1 violated", str(caught.exception))
+
+    def test_the_authority_guards_refusal_passes(self) -> None:
+        resp = self._response(
+            409,
+            {"success": False, "message": "this cluster does not hold client write authority"},
+        )
+        with mock.patch.object(bg, "_post", return_value=resp):
+            bg._assert_arm_refused_without_authority(_node("green1"))
+
+    def test_a_refusal_for_the_wrong_reason_is_not_a_pass(self) -> None:
+        """A 400 from target validation would leave the guard untested."""
+        resp = self._response(400, {"success": False, "message": "target_cluster_id is required"})
+        with (
+            mock.patch.object(bg, "_post", return_value=resp),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._assert_arm_refused_without_authority(_node("green1"))
+        self.assertIn("not by the authority guard", str(caught.exception))
+
+    def test_a_refusal_whose_body_claims_success_is_caught(self) -> None:
+        resp = self._response(409, {"success": True, "message": "authority"})
+        with (
+            mock.patch.object(bg, "_post", return_value=resp),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._assert_arm_refused_without_authority(_node("green1"))
+        self.assertIn("success", str(caught.exception))
+
+
 class ChaosEffectTest(unittest.TestCase):
     """The chaos faults assert their effect, never that they were requested."""
 
