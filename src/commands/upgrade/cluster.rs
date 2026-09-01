@@ -7,7 +7,7 @@
 
 use anyhow::{Result, bail};
 use semver::Version;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cluster::ClusterClient;
 use crate::observability::management_api::VersionResponse;
@@ -365,6 +365,12 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         return Ok(());
     }
 
+    warn!(
+        "Concurrent roll invocations are NOT serialized: nothing prevents a second \
+         `upgrade --cluster` (or a manual node upgrade) from interleaving with this one. \
+         Each bounce re-checks the node's version and refuses if it changed."
+    );
+
     let versions = run_cluster_version_preflight(
         params.node.clone(),
         &params.target,
@@ -419,6 +425,8 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
             "Upgrading follower"
         );
         wait_until_safe_to_bounce_follower(&client, &leader_mgmt, follower.node_id).await?;
+        let observed = client.get_version(&follower.mgmt_addr).await?;
+        expect_unchanged_before_bounce(follower.node_id, &follower.version, &observed.version)?;
         client
             .self_upgrade(&follower.mgmt_addr, &upgrade_body)
             .await?;
@@ -484,6 +492,8 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         let (_, new_leader_mgmt) = wait_for_new_leader(&client, &entry, leader_id).await?;
         info!(node_id = leader_id, "Upgrading former leader");
         wait_until_safe_to_bounce_follower(&client, &new_leader_mgmt, leader_id).await?;
+        let observed = client.get_version(&former.mgmt_addr).await?;
+        expect_unchanged_before_bounce(leader_id, &former.version, &observed.version)?;
         client
             .self_upgrade(&former.mgmt_addr, &upgrade_body)
             .await?;
@@ -545,6 +555,28 @@ fn build_cluster_client(
             .ok_or_else(|| anyhow::anyhow!("Pass --node <host:port>"))?,
     };
     Ok((client, entry))
+}
+
+/// Cheap concurrent-roll detector: refuse to bounce a node whose version no
+/// longer matches what this roll's preflight recorded. Not a lock — two rolls
+/// can still interleave between the check and the bounce — but it catches an
+/// operator or second roll that already changed the node.
+///
+/// # Errors
+/// Returns when the observed version differs from the expectation.
+pub(crate) fn expect_unchanged_before_bounce(
+    node_id: u64,
+    expected: &str,
+    observed: &str,
+) -> Result<()> {
+    if observed != expected {
+        bail!(
+            "Refusing to bounce node {node_id}: it reports version {observed} but this roll \
+             expected {expected} — another roll or operator changed this node. Verify no \
+             other upgrade is running, then re-run the same upgrade command to resume."
+        );
+    }
+    Ok(())
 }
 
 /// Error when every upgraded follower refused the leadership transfer,
@@ -889,6 +921,22 @@ mod tests {
             leader_pg_addr: None,
             leader_mgmt_addr: mgmt.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn changed_node_version_refuses_bounce() {
+        let err = expect_unchanged_before_bounce(2, "0.1.0", "0.2.0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("another roll or operator changed this node"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unchanged_node_version_allows_bounce() {
+        expect_unchanged_before_bounce(2, "0.1.0", "0.1.0").unwrap();
     }
 
     fn backup_list(
