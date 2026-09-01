@@ -669,15 +669,6 @@ pub(super) async fn postgres_upgrade_rejoin(
         };
         paths.clone()
     };
-    let Some(new_bindir) = paths.bin_dirs.get(&body.to_major.to_string()).cloned() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(PostgresUpgradeRejoinResponse {
-                success: false,
-                message: Some(format!("pg_bin_dirs missing major {}", body.to_major)),
-            }),
-        );
-    };
     let Some(pg) = state.postgres_manager.as_ref() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -699,7 +690,8 @@ pub(super) async fn postgres_upgrade_rejoin(
     let mut guard = pg.lock().await;
     match crate::commands::upgrade::postgres::run_standby_rebasebackup(
         &mut guard,
-        &new_bindir,
+        &paths.bin_dirs,
+        body.to_major,
         &body.leader_pg_host,
         body.leader_pg_port,
         &body.pg_user,

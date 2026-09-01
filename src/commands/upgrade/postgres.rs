@@ -335,7 +335,7 @@ async fn apply_experimental(
             "Stopping standby PostgreSQL for upgrade"
         );
         if let Err(e) = client.stop_postgres(&n.mgmt_addr).await {
-            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
             unfreeze_all_logging(client, nodes).await;
             bail!("Failed to stop standby {}: {e}", n.node_id);
         }
@@ -359,7 +359,7 @@ async fn apply_experimental(
             );
         }
         Ok(r) => {
-            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
             unfreeze_all_logging(client, nodes).await;
             bail!(
                 "Primary apply failed: {}",
@@ -367,7 +367,7 @@ async fn apply_experimental(
             );
         }
         Err(e) => {
-            restart_stopped_standbys(client, &stopped, leader_mgmt, to_major).await;
+            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
             unfreeze_all_logging(client, nodes).await;
             return Err(e);
         }
@@ -667,12 +667,13 @@ async fn unfreeze_all(
 ///
 /// Their data directories are still the old major and the primary never
 /// changed, so a plain rejoin against the unchanged primary is correct. Left
-/// out, an aborted upgrade leaves a single-copy cluster with no signal.
+/// out, an aborted upgrade leaves a single-copy cluster with no signal. The
+/// rejoin major is the primary's probed active major, never the upgrade's
+/// target: the abort means the primary did not upgrade.
 async fn restart_stopped_standbys(
     client: &ClusterClient,
     stopped: &[&crate::cluster::client::NodeInfo],
     leader_mgmt: &str,
-    to_major: u32,
 ) {
     if stopped.is_empty() {
         return;
@@ -689,9 +690,20 @@ async fn restart_stopped_standbys(
         tracing::error!(%leader_pg, "Unparseable leader PG address; standbys stay stopped");
         return;
     };
+    let primary_major = match client.get_postgres_status(leader_mgmt).await {
+        Ok(st) => st.active_major,
+        Err(e) => {
+            tracing::error!(error = %e, "Cannot probe primary major; standbys stay stopped");
+            return;
+        }
+    };
+    let Some(primary_major) = primary_major else {
+        tracing::error!("Primary reports no active major; standbys stay stopped");
+        return;
+    };
     for n in stopped {
         let body = crate::observability::management_api::PostgresUpgradeRejoinRequest {
-            to_major,
+            to_major: primary_major,
             leader_pg_host: host.clone(),
             leader_pg_port: port,
             pg_user: PG_SUPERUSER.into(),
@@ -961,6 +973,39 @@ pub fn bin_dir_for_major<'a>(
     major
         .and_then(|m| bin_dirs.get(&m.to_string()))
         .map_or(configured, PathBuf::as_path)
+}
+
+/// The bindir a standby rejoin must use: the one matching the probed major
+/// of the primary it is joining, never the caller's requested major.
+///
+/// The abort path rejoins standbys against a primary that never upgraded;
+/// selecting binaries by the upgrade's target major re-basebackups them with
+/// new-major binaries against an old-major primary, and they cannot start.
+///
+/// # Errors
+/// No `pg_bin_dirs` entry for the primary's major.
+pub(crate) fn rejoin_bindir_for_primary(
+    probed_primary_major: u32,
+    requested_major: u32,
+    bin_dirs: &BTreeMap<String, PathBuf>,
+) -> Result<&Path> {
+    if probed_primary_major != requested_major {
+        tracing::warn!(
+            probed_primary_major,
+            requested_major,
+            "Rejoin request names a different major than the primary serves; \
+             following the primary"
+        );
+    }
+    bin_dirs
+        .get(&probed_primary_major.to_string())
+        .map(PathBuf::as_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "pg_bin_dirs has no entry for major {probed_primary_major}, the major the \
+                 primary actually serves; refusing to wipe this standby"
+            )
+        })
 }
 
 /// Whether two paths share a filesystem (required for clone/link).
@@ -2372,18 +2417,74 @@ pub fn probe_active_major(supervisor: &crate::supervisor::Supervisor) -> Option<
     data_dir_major(supervisor.data_dir()).ok()
 }
 
-/// Wipe local PGDATA and `pg_basebackup` from the upgraded primary (standby rejoin).
+/// The major a remote primary actually serves, probed over `SHOW server_version`.
 ///
 /// # Errors
-/// Stop, wipe, basebackup, or start failures.
+/// Unreachable primary or unparseable version.
+async fn probe_primary_major(
+    psql: &Path,
+    leader_host: &str,
+    leader_port: u16,
+    pg_user: &str,
+) -> Result<u32> {
+    let out = Command::new(psql)
+        .args([
+            "-h",
+            leader_host,
+            "-p",
+            &leader_port.to_string(),
+            "-U",
+            pg_user,
+            "-d",
+            "postgres",
+            "-t",
+            "-A",
+            "-c",
+            "SHOW server_version;",
+        ])
+        .output()
+        .await
+        .context("probing primary server_version")?;
+    if !out.status.success() {
+        bail!(
+            "primary version probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    parse_postgres_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Wipe local PGDATA and `pg_basebackup` from the primary (standby rejoin).
+///
+/// Binaries are selected by the major the primary actually serves, probed
+/// before anything is wiped — see [`rejoin_bindir_for_primary`].
+///
+/// # Errors
+/// Unprobeable primary, missing bindir for its major, stop, wipe,
+/// basebackup, or start failures.
 pub async fn run_standby_rebasebackup(
     supervisor: &mut crate::supervisor::Supervisor,
-    new_bindir: &Path,
+    bin_dirs: &BTreeMap<String, PathBuf>,
+    requested_major: u32,
     leader_host: &str,
     leader_port: u16,
     pg_user: &str,
     node_id: u64,
 ) -> Result<()> {
+    // Probe with the binaries this node is already running; psql speaks to
+    // every server major. The probe and bindir selection precede the stop and
+    // wipe so a refusal leaves the standby exactly as it was.
+    let primary_major = probe_primary_major(
+        &supervisor.bin_dir().join("psql"),
+        leader_host,
+        leader_port,
+        pg_user,
+    )
+    .await?;
+    let new_bindir =
+        rejoin_bindir_for_primary(primary_major, requested_major, bin_dirs)?.to_path_buf();
+    let new_bindir = new_bindir.as_path();
+
     supervisor
         .stop()
         .await
@@ -2674,6 +2775,30 @@ backup_dir = \"/var/backups/pgbattery\"
         assert_eq!(
             parse_postgres_major("pg_config (PostgreSQL) 19.0").unwrap(),
             19
+        );
+    }
+
+    /// A standby rejoin wipes PGDATA and basebackups from the primary, so
+    /// its binaries must match the primary that actually answers — on the
+    /// abort path that is the OLD major, whatever the upgrade requested.
+    #[test]
+    fn rejoin_selects_binaries_by_the_primary_probed_major() {
+        let dirs = dual_bin_dirs();
+        // Abort path: upgrade requested 18, primary still serves 17.
+        assert_eq!(
+            rejoin_bindir_for_primary(17, 18, &dirs).unwrap(),
+            Path::new("/usr/lib/postgresql/17/bin")
+        );
+        // Post-upgrade path: probe and request agree.
+        assert_eq!(
+            rejoin_bindir_for_primary(18, 18, &dirs).unwrap(),
+            Path::new("/usr/lib/postgresql/18/bin")
+        );
+        // No binaries for the primary's actual major: refuse before wiping.
+        let err = rejoin_bindir_for_primary(16, 18, &dirs).unwrap_err();
+        assert!(
+            err.to_string().contains("16"),
+            "error names the major: {err}"
         );
     }
 
