@@ -915,6 +915,17 @@ impl ConnectionHandler {
                     self.handle_leader_change(backend, &mut backend_buf).await?;
                 }
 
+                result = self.fence_rx.changed() => {
+                    if result.is_err() {
+                        return Err(Error::ChannelClosed);
+                    }
+                    // No work here: the hold/fence checks at the top of the
+                    // loop act on the new state. Without this arm a truly
+                    // idle session learns of a freeze only when its backend
+                    // disconnects; with it, a frozen gateway parks the
+                    // session proactively.
+                }
+
                 result = self.client.read_buf(&mut client_buf) => {
                     let n = result?;
                     if self
@@ -932,6 +943,19 @@ impl ConnectionHandler {
                 }
             }
         }
+    }
+
+    /// Whether a session whose hold just lifted may resume on its existing
+    /// backend.
+    ///
+    /// A cutover TRANSFER commits mid-hold as authority moving to another
+    /// cluster plus a relay address — which clears `cutover_client_hold`,
+    /// but the parked session's backend is the local (donor) primary.
+    /// Resuming there sends writes to the cluster that just gave authority
+    /// away, so the session ends with the clean failover error and the
+    /// client's reconnect routes through the relay.
+    const fn hold_exit_resumes(fence: &FenceState) -> bool {
+        fence.client_write_authority
     }
 
     /// Why this connection must be held, if it must. Runs before every client
@@ -981,6 +1005,15 @@ impl ConnectionHandler {
                 .await;
                 return Err(Error::Fenced);
             }
+        }
+        let after = *self.fence_rx.borrow();
+        if !Self::hold_exit_resumes(&after) {
+            self.send_failover_error_response(
+                "pgbattery: write authority moved to another cluster during the \
+                 hold; reconnect to reach it",
+            )
+            .await;
+            return Err(Error::Fenced);
         }
         tracing::debug!(conn_id = self.id, "Upgrade/cutover hold lifted, resuming");
         Ok(())
@@ -1051,6 +1084,9 @@ impl ConnectionHandler {
     /// the client instead of waiting forever when cluster state never
     /// advances (e.g. the node is truly isolated).
     async fn wait_for_failover_signal(&mut self, stale_backend: Option<SocketAddr>) -> Result<()> {
+        if self.fence_rx.borrow().upgrade_frozen {
+            return self.hold_for_upgrade_freeze_after_disconnect().await;
+        }
         if self.has_failover_progress(stale_backend) {
             return Ok(());
         }
@@ -1087,10 +1123,43 @@ impl ConnectionHandler {
                 }
             }
 
+            if self.fence_rx.borrow().upgrade_frozen {
+                return self.hold_for_upgrade_freeze_after_disconnect().await;
+            }
             if self.has_failover_progress(stale_backend) {
                 return Ok(());
             }
         }
+    }
+
+    /// The backend vanished under a committed upgrade freeze: the primary is
+    /// being swapped, not failing over. Hold up to `upgrade_hold_timeout_ms`;
+    /// when the freeze lifts the caller migrates (the upgraded primary keeps
+    /// its address), and a timeout gets the clean upgrade-shaped error
+    /// instead of "cluster did not elect a new leader in time".
+    async fn hold_for_upgrade_freeze_after_disconnect(&mut self) -> Result<()> {
+        metrics::counter!("pgbattery_connections_held_during_upgrade").increment(1);
+        tracing::debug!(
+            conn_id = self.id,
+            timeout_ms = self.config.upgrade_hold_timeout_ms,
+            "Backend gone under upgrade freeze; holding for the swap to finish"
+        );
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(self.config.upgrade_hold_timeout_ms);
+        while self.fence_rx.borrow().upgrade_frozen {
+            if !matches!(
+                tokio::time::timeout_at(deadline, self.fence_rx.changed()).await,
+                Ok(Ok(()))
+            ) {
+                self.send_failover_error_response(
+                    "pgbattery: PostgreSQL major upgrade in progress; hold timed \
+                     out, reconnect shortly",
+                )
+                .await;
+                return Err(Error::Fenced);
+            }
+        }
+        Ok(())
     }
 
     /// True if cluster state has advanced past the given dead backend.
@@ -1236,6 +1305,11 @@ impl ConnectionHandler {
                 "Backend disconnected — waiting for cluster-state update"
             );
             if let Err(e) = self.wait_for_failover_signal(stale_backend).await {
+                if matches!(e, Error::Fenced) {
+                    // The upgrade-hold path already sent its own clean error;
+                    // a second, failover-shaped one would mislead.
+                    return Err(e);
+                }
                 tracing::warn!(
                     conn_id = self.id,
                     error = %e,
@@ -3478,6 +3552,26 @@ enum StartupOrCancel {
 )]
 mod tests {
     use super::*;
+
+    /// A cutover TRANSFER clears the hold by moving authority elsewhere and
+    /// publishing a relay — but the parked session's backend is the donor.
+    /// Resuming there sends writes into the cluster that gave authority
+    /// away; the session must end so the reconnect routes via the relay.
+    #[test]
+    fn a_hold_lifted_by_transfer_severs_instead_of_resuming_on_the_donor() {
+        let transferred = FenceState {
+            fenced: false,
+            has_quorum: true,
+            upgrade_frozen: false,
+            client_write_authority: false,
+            authority_pg_addr: Some("10.0.0.9:5432".parse().unwrap()),
+        };
+        assert!(!ConnectionHandler::hold_exit_resumes(&transferred));
+
+        // A hold lifted with authority still local (upgrade unfroze, or an
+        // aborted cutover) resumes on the existing backend.
+        assert!(ConnectionHandler::hold_exit_resumes(&FenceState::unfenced()));
+    }
 
     #[tokio::test]
     async fn test_fence_wait_resumes_when_lifted() {
