@@ -568,15 +568,11 @@ impl App {
         // Cloned before the gateway takes ownership of these receivers.
         let observer_leader_rx = leader_rx.clone();
         let observer_fence_rx = fence_rx.clone();
-        // Shared between the seal/abort handlers and the fence reconciler so
-        // neither can change the PG-side fence inside the other's window.
-        let client_fence_apply_lock = Arc::new(tokio::sync::Mutex::new(()));
         let fence_reconciler = self.client_fence_reconciler_inputs(
             &fence_rx,
             &cluster_state,
             &postgres_manager,
             &shutdown_rx,
-            &client_fence_apply_lock,
         );
 
         let rpc_server = RaftRpcServer::new_with_tls(
@@ -617,7 +613,7 @@ impl App {
             Arc::clone(&debug_events),
             shutdown_tx.clone(),
             fence_tx,
-            Arc::clone(&client_fence_apply_lock),
+            Arc::clone(&fence_reconciler.fence_apply_lock),
         );
         // Also clone the token into an owned String copy for the CLI-style
         // HTTP client used by the auto-promotion path, below.
@@ -712,7 +708,6 @@ impl App {
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         postgres: &Arc<tokio::sync::Mutex<Supervisor>>,
         shutdown_rx: &watch::Receiver<bool>,
-        fence_apply_lock: &Arc<tokio::sync::Mutex<()>>,
     ) -> ClientFenceReconcilerInputs {
         ClientFenceReconcilerInputs {
             fence_rx: fence_rx.clone(),
@@ -726,7 +721,9 @@ impl App {
                 .awaits_write_authority_from
                 .as_deref()
                 .map(Arc::from),
-            fence_apply_lock: Arc::clone(fence_apply_lock),
+            // Shared with the seal/abort handlers (via ManagementApiState) so
+            // neither side changes the PG fence inside the other's window.
+            fence_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

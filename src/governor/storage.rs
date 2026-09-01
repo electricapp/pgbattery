@@ -1103,11 +1103,15 @@ impl Clone for RedbLogStorage {
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
+    use super::super::state_machine::{
+        ClusterState, ClusterStateV0, CutoverAuthorityState, NodeInfo, NodeRole,
+    };
     use super::*;
     use tempfile::tempdir;
 
@@ -1115,9 +1119,7 @@ mod tests {
     /// no `schema_version` key, snapshot payload in the v0 `ClusterState`
     /// layout, plus a vote and one log entry to prove records survive.
     fn write_schema0_store(path: &Path) {
-        use super::super::state_machine::{ClusterStateV0, NodeInfo, NodeRole};
-
-        let db = redb::Database::create(path).unwrap();
+        let db = Database::create(path).unwrap();
         let txn = db.begin_write().unwrap();
         {
             let mut logs = txn.open_table(LOGS_TABLE).unwrap();
@@ -1176,8 +1178,6 @@ mod tests {
 
     #[test]
     fn schema0_snapshot_migrates_on_open() {
-        use super::super::state_machine::ClusterState;
-
         let dir = tempdir().unwrap();
         let path = dir.path().join("raft.db");
         write_schema0_store(&path);
@@ -1194,10 +1194,7 @@ mod tests {
         assert_eq!(state.sync_replication_active, Some(true));
         assert!(state.nodes.contains_key(&1));
         assert_eq!(state.voter_ids, std::collections::HashSet::from([1]));
-        assert_eq!(
-            state.cutover,
-            super::super::state_machine::CutoverAuthorityState::default()
-        );
+        assert_eq!(state.cutover, CutoverAuthorityState::default());
         assert!(!state.upgrade_frozen);
 
         // Records written by the old binary still decode, and the store is
@@ -1226,13 +1223,10 @@ mod tests {
         let path = dir.path().join("raft.db");
         write_schema0_store(&path);
 
-        {
-            let _ = RedbLogStorage::new(&path).expect("first open migrates");
-        }
+        drop(RedbLogStorage::new(&path).expect("first open migrates"));
         let storage = RedbLogStorage::new(&path).expect("second open is a no-op");
         let data = storage.load_snapshot_verified().unwrap().unwrap();
-        let state: super::super::state_machine::ClusterState =
-            postcard::from_bytes(&data).unwrap();
+        let state: ClusterState = postcard::from_bytes(&data).unwrap();
         assert_eq!(state.max_cluster_lsn, 4096);
     }
 

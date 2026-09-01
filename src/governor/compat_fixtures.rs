@@ -272,12 +272,13 @@ fn regenerate_raft_compat_fixtures() {
     drop(fs::remove_file(&store1_path));
     {
         let storage = RedbLogStorage::new(&store1_path).expect("create current-schema store");
-        storage.save_vote(&Vote {
-            term: 3,
-            voted_for: Some(1),
-            committed: true,
-        })
-        .expect("vote");
+        storage
+            .save_vote(&Vote {
+                term: 3,
+                voted_for: Some(1),
+                committed: true,
+            })
+            .expect("vote");
         storage
             .append_entries(&sample_log_entries())
             .expect("entries");

@@ -165,7 +165,7 @@ pub struct CutoverActionResponse {
     pub status: Option<CutoverStatusResponse>,
 }
 
-/// The one authority read (STATE_MACHINE 8d), config-aware and fresh.
+/// The one authority read (`STATE_MACHINE` 8d), config-aware and fresh.
 ///
 /// The raw log read reports a virgin recipient (`authority_cluster_id: None`)
 /// as holding authority; only the projection knows that a cluster configured
@@ -385,15 +385,16 @@ pub(super) async fn cutover_seal(
     let final_lsn = match crate::commands::upgrade::client_fence::flush_lsn_bytes(&guard).await {
         Ok(lsn) => lsn,
         Err(e) => {
-            let lifted =
-                crate::commands::upgrade::client_fence::lift_client_write_fence(
-                    &guard,
-                    &body.app_roles,
-                )
-                .await;
+            let lifted = crate::commands::upgrade::client_fence::lift_client_write_fence(
+                &guard,
+                &body.app_roles,
+            )
+            .await;
             let suffix = match lifted {
                 Ok(()) => "the fence was lifted",
-                Err(_) => "lifting the fence also failed — clients are fenced with no seal entry; retry SEAL or abort",
+                Err(_) => {
+                    "lifting the fence also failed — clients are fenced with no seal entry; retry SEAL or abort"
+                }
             };
             return refuse(
                 &state,
