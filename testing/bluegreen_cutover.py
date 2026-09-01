@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Final
 
@@ -694,29 +695,99 @@ def _run_prober() -> None:
     console.print("U1 prober PASS across six ports as the app role")
 
 
-def _chaos_arm_seal(blue_leader: Node, green_leader: Node) -> None:
+def _kill_and_await_down(node: Node, budget: float = 30.0) -> None:
+    """Kill a container and confirm the fault's effect: it is not running."""
+    _compose("kill", node.service, check=True)
+
+    def down() -> bool | None:
+        state = _compose("ps", "-a", "--format", "{{.Service}} {{.State}}").stdout
+        for line in state.splitlines():
+            service, _, status = line.partition(" ")
+            if service == node.service and status.strip().startswith("running"):
+                return None
+        return True
+
+    try:
+        await_until(down, budget=budget, describe=f"{node.service} to be down after the kill")
+    except WaitTimeout as exc:
+        raise ContractFailure(f"the kill did not land: {exc}") from exc
+
+
+def _await_survivor_leader(nodes: list[Node], dead: Node, budget: float = 90.0) -> Node:
+    """The survivors' own view has moved past the killed leader."""
+    survivors = [n for n in nodes if n.service != dead.service]
+
+    def elected() -> Node | None:
+        for n in survivors:
+            try:
+                r = httpx.get(f"{_mgmt(n)}/api/v1/cluster/leader", timeout=2.0)
+            except httpx.HTTPError:
+                continue
+            if r.status_code != 200:
+                continue
+            lid = r.json().get("leader_id")
+            if lid is None or int(lid) == dead.node_id:
+                continue
+            for cand in survivors:
+                if cand.node_id == int(lid):
+                    return cand
+        return None
+
+    try:
+        return await_until(
+            elected,
+            budget=budget,
+            describe=f"a leader among the survivors of {dead.service}",
+        )
+    except WaitTimeout as exc:
+        raise ContractFailure(f"no survivor took over after {dead.service} died: {exc}") from exc
+
+
+def _assert_green_stays_fenced(green_leader: Node, window_sec: float, why: str) -> None:
+    """U4: green refuses app-role writes across the whole window.
+
+    Elapsed time is the point here: green must not take authority on its own
+    at any moment while the donor is down, so this probes continuously
+    instead of once after a blind sleep.
+    """
+    deadline = time.monotonic() + window_sec
+    probes = 0
+    while time.monotonic() < deadline:
+        if _psql_allowed(
+            green_leader,
+            "INSERT INTO bg_kv(k, v) VALUES ('chaos', 'x') "
+            "ON CONFLICT (k) DO UPDATE SET v = excluded.v;",
+            APP_ROLE,
+        ):
+            raise ContractFailure(f"U4 violated: green accepted an app-role write {why}")
+        probes += 1
+        time.sleep(1.0)
+    console.print(f"green refused {probes} app-role writes over {window_sec:g}s {why}")
+
+
+def _chaos_arm_seal(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
-    _compose("kill", blue_leader.service)
-    time.sleep(10)
-    if _psql_allowed(green_leader, "INSERT INTO bg_kv(k,v) VALUES ('chaos','x');", APP_ROLE):
-        raise ContractFailure("U4 violated: green accepted a write with blue dead after ARM")
-    console.print("chaos arm-seal OK: green stayed read-only")
+    _kill_and_await_down(blue_leader)
+    survivor = _await_survivor_leader(blue, dead=blue_leader)
+    _assert_green_stays_fenced(green_leader, 10.0, "with blue's leader dead after ARM")
+    console.print(f"chaos arm-seal OK: kill landed, {survivor.service} took blue, green read-only")
 
 
-def _chaos_seal_transfer(blue_leader: Node, green_leader: Node) -> None:
+def _chaos_seal_transfer(blue_leader: Node, green_leader: Node, blue: list[Node]) -> None:
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
-    _compose("kill", blue_leader.service)
-    time.sleep(10)
-    if _psql_allowed(green_leader, "INSERT INTO bg_kv(k,v) VALUES ('chaos','x');", APP_ROLE):
-        raise ContractFailure("U4 violated: green took authority with blue dead after SEAL")
-    console.print("chaos seal-transfer OK: green stayed read-only")
+    _kill_and_await_down(blue_leader)
+    survivor = _await_survivor_leader(blue, dead=blue_leader)
+    _assert_green_stays_fenced(green_leader, 10.0, "with blue's leader dead after SEAL")
+    console.print(
+        f"chaos seal-transfer OK: kill landed, {survivor.service} took blue, green read-only"
+    )
 
 
-def _chaos_mid_drain(blue_leader: Node, green_leader: Node) -> None:
+def _chaos_mid_drain(blue_leader: Node, green_leader: Node, _blue: list[Node]) -> None:
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
-    _compose("kill", green_leader.service)
+    _kill_and_await_down(green_leader)
     r = _post(blue_leader, "abort", {"app_roles": [APP_ROLE]})
     r.raise_for_status()
     st = _cutover_status(blue_leader)
@@ -726,13 +797,25 @@ def _chaos_mid_drain(blue_leader: Node, green_leader: Node) -> None:
         raise ContractFailure(f"blue did not reclaim authority after abort: {st}")
     if int(st.get("epoch", 0)) < 1:
         raise ContractFailure(f"abort must unseal into a new epoch: {st}")
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if _psql_allowed(blue_leader, "INSERT INTO bg_kv(k,v) VALUES ('unsealed','x');", APP_ROLE):
-            console.print(f"chaos mid-drain OK: blue unsealed into epoch {st['epoch']}")
-            return
-        time.sleep(2)
-    raise ContractFailure("abort reported success but blue never accepted a write again")
+
+    def unsealed() -> bool | None:
+        allowed = _psql_allowed(
+            blue_leader,
+            "INSERT INTO bg_kv(k, v) VALUES ('unsealed', 'x') "
+            "ON CONFLICT (k) DO UPDATE SET v = excluded.v;",
+            APP_ROLE,
+        )
+        return True if allowed else None
+
+    try:
+        await_until(unsealed, budget=60.0, describe="blue to accept app-role writes again")
+    except WaitTimeout as exc:
+        raise ContractFailure(
+            f"abort reported success but blue never accepted a write again: {exc}"
+        ) from exc
+    console.print(
+        f"chaos mid-drain OK: green's leader confirmed dead, blue unsealed, epoch {st['epoch']}"
+    )
 
 
 def _voter_ids(node: Node) -> list[int]:
@@ -804,7 +887,7 @@ def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) 
     raise ContractFailure("force-transfer never succeeded after quorum returned")
 
 
-CHAOS: Final[dict[str, Any]] = {
+CHAOS: Final[dict[str, Callable[[Node, Node, list[Node]], None]]] = {
     "arm-seal": _chaos_arm_seal,
     "seal-transfer": _chaos_seal_transfer,
     "mid-drain": _chaos_mid_drain,
@@ -910,11 +993,7 @@ def main(
     acked |= _write_burst(blue_leader.gateway_port, 30, "stream")
 
     if chaos:
-        handler = CHAOS[chaos]
-        if chaos == "blue-quorum":
-            handler(blue_leader, green_leader, blue)
-        else:
-            handler(blue_leader, green_leader)
+        CHAOS[chaos](blue_leader, green_leader, blue)
         console.print(f"chaos={chaos} passed")
         return
 

@@ -288,6 +288,44 @@ class FenceCoverageTest(unittest.TestCase):
         self.assertIn("still reports write authority", str(caught.exception))
 
 
+class ChaosEffectTest(unittest.TestCase):
+    """The chaos faults assert their effect, never that they were requested."""
+
+    def test_a_kill_that_did_not_land_is_refused(self) -> None:
+        def fake_compose(*args: str, **_kw: Any) -> Any:
+            if args[0] == "kill":
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(stdout="blue1 running (healthy)\nblue2 running\n")
+
+        with (
+            mock.patch.object(bg, "_compose", side_effect=fake_compose),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._kill_and_await_down(_node("blue1"), budget=0.2)
+        self.assertIn("did not land", str(caught.exception))
+
+    def test_a_confirmed_dead_container_passes(self) -> None:
+        def fake_compose(*args: str, **_kw: Any) -> Any:
+            if args[0] == "kill":
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(stdout="blue1 exited (137)\nblue2 running\n")
+
+        with mock.patch.object(bg, "_compose", side_effect=fake_compose):
+            bg._kill_and_await_down(_node("blue1"), budget=1.0)
+
+    def test_a_green_that_accepts_mid_window_is_caught(self) -> None:
+        with (
+            mock.patch.object(bg, "_psql_allowed", return_value=True),
+            self.assertRaises(bg.ContractFailure) as caught,
+        ):
+            bg._assert_green_stays_fenced(_node("green1"), 5.0, "in the test window")
+        self.assertIn("U4 violated", str(caught.exception))
+
+    def test_a_green_that_refuses_throughout_passes(self) -> None:
+        with mock.patch.object(bg, "_psql_allowed", return_value=False):
+            bg._assert_green_stays_fenced(_node("green1"), 0.1, "in the test window")
+
+
 class RelayLocalGrowthTest(unittest.TestCase):
     """U1: before reverse wiring, relayed writes grow blue by exactly zero."""
 
