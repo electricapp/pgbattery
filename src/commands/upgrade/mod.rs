@@ -46,6 +46,12 @@ pub struct SelfUpgradeRequest {
     pub identity: Option<String>,
 }
 
+/// This binary's path, resolved once per process and before any rename: a
+/// failed replace leaves the running inode at `<exe>.old`, and
+/// /proc/self/exe follows the inode, so a retry that re-resolved would
+/// replace the backup instead of the real binary.
+static SELF_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// Download, verify, and replace the running binary with `req.version`.
 ///
 /// Does not restart the process — callers that need a restart (management API)
@@ -93,7 +99,12 @@ pub async fn perform_self_upgrade(req: SelfUpgradeRequest) -> Result<std::path::
         );
     }
 
-    let exe_path = std::env::current_exe()?;
+    let exe_path = if let Some(path) = SELF_EXE.get() {
+        path.clone()
+    } else {
+        let resolved = std::env::current_exe()?;
+        SELF_EXE.get_or_init(|| resolved).clone()
+    };
     check_write_permissions(&exe_path)?;
 
     let binary_name = platform_binary_name();

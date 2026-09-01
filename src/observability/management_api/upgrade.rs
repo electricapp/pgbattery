@@ -52,7 +52,19 @@ pub struct SelfUpgradeResponse {
     pub backup_path: Option<String>,
 }
 
+/// Refuse a self-upgrade on the current Raft leader of a multi-voter
+/// cluster: the restart drops leadership mid-write-path. Transfer
+/// leadership first — the CLI cluster roll already does. A single-voter
+/// cluster has nowhere to transfer to and restarts into itself.
+const fn self_upgrade_refused_on_leader(is_leader: bool, voters: usize) -> bool {
+    is_leader && voters > 1
+}
+
 /// Replace this node's binary and request a graceful process restart.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one refusal ladder (locks, leader, task) plus one success path"
+)]
 pub(super) async fn self_upgrade(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<SelfUpgradeHttpRequest>,
@@ -67,6 +79,44 @@ pub(super) async fn self_upgrade(
             }),
         );
     };
+    // Mutually exclusive with backup/restore: a restart landing mid-restore
+    // leaves PGDATA half-written, and a restore starting mid-replace races
+    // the binary swap. Holding both locks covers both orders.
+    let Ok(_backup_guard) = state.backup_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(SelfUpgradeResponse {
+                success: false,
+                message: "A backup or restore is in progress on this node; retry after it \
+                          completes"
+                    .to_string(),
+                backup_path: None,
+            }),
+        );
+    };
+
+    let (is_leader, voters) = {
+        let metrics = state.raft.metrics();
+        let m = metrics.borrow();
+        (
+            m.current_leader == Some(state.node_id),
+            m.membership_config.membership().voter_ids().count(),
+        )
+    };
+    if self_upgrade_refused_on_leader(is_leader, voters) {
+        return (
+            StatusCode::CONFLICT,
+            Json(SelfUpgradeResponse {
+                success: false,
+                message: format!(
+                    "This node is the current Raft leader of a {voters}-voter cluster; \
+                     transfer leadership first \
+                     (POST /api/v1/cluster/transfer-leadership/{{target}}), then retry"
+                ),
+                backup_path: None,
+            }),
+        );
+    }
 
     info!(
         node_id = state.node_id,
@@ -83,7 +133,29 @@ pub(super) async fn self_upgrade(
         identity: body.identity,
     };
 
-    match perform_self_upgrade(req).await {
+    // A dedicated blocking thread, not a runtime worker: the
+    // download-verify-replace path writes a multi-hundred-MB binary with
+    // blocking I/O, and spawn_blocking tasks also cannot be cancelled by a
+    // dropped HTTP connection mid-replace.
+    let handle = tokio::runtime::Handle::current();
+    let outcome =
+        tokio::task::spawn_blocking(move || handle.block_on(perform_self_upgrade(req))).await;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            error!(error = %e, "self-upgrade task failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SelfUpgradeResponse {
+                    success: false,
+                    message: format!("self-upgrade task panicked: {e}"),
+                    backup_path: None,
+                }),
+            );
+        }
+    };
+
+    match outcome {
         Ok(backup_path) => {
             info!(
                 node_id = state.node_id,
@@ -1005,7 +1077,19 @@ pub(super) async fn postgres_upgrade_rollback(
 
 #[cfg(test)]
 mod tests {
-    use super::freeze_needs_proposal;
+    use super::{freeze_needs_proposal, self_upgrade_refused_on_leader};
+
+    /// Restarting the current leader of a multi-voter cluster drops
+    /// leadership mid-write-path; a single-voter cluster has nowhere to
+    /// transfer to and restarts into itself.
+    #[test]
+    fn self_upgrade_refuses_only_a_multi_voter_leader() {
+        assert!(self_upgrade_refused_on_leader(true, 3));
+        assert!(self_upgrade_refused_on_leader(true, 2));
+
+        assert!(!self_upgrade_refused_on_leader(true, 1));
+        assert!(!self_upgrade_refused_on_leader(false, 3));
+    }
 
     /// A node's APPLIED state lags commit, so a locally-matching freeze
     /// state is no proof the cluster committed the requested one. An
