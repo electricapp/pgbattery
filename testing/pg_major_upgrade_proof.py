@@ -219,9 +219,11 @@ class Writer(threading.Thread):
 
 
 def _assert_acked_survived(node: Node, acked: list[str]) -> None:
+    """W1 by key identity, not count: the writer's own error path can commit a
+    row it never counted as acked, and that extra row offsets a lost one."""
     if not acked:
         raise ContractFailure("W1 check is vacuous: the writer acked nothing")
-    present = int(
+    present = set(
         _exec(
             node.service,
             "psql",
@@ -233,14 +235,15 @@ def _assert_acked_survived(node: Node, acked: list[str]) -> None:
             "postgres",
             "-At",
             "-c",
-            "SELECT count(*) FROM major_upgrade_probe WHERE k LIKE 'w-%';",
-        ).strip()
+            "SELECT k FROM major_upgrade_probe WHERE k LIKE 'w-%';",
+        ).split()
     )
-    if present < len(acked):
+    missing = sorted(set(acked) - present)
+    if missing:
         raise ContractFailure(
-            f"W1 violated: {len(acked)} writes acked, {present} present after upgrade"
+            f"W1 violated: {len(missing)} acked keys missing after the upgrade, e.g. {missing[:5]}"
         )
-    console.print(f"W1 OK: all {len(acked)} acked writes survived the upgrade")
+    console.print(f"W1 OK: all {len(set(acked))} acked keys survived the upgrade")
 
 
 def _seed(gateway_port: int) -> None:
@@ -281,7 +284,6 @@ def _require_dual_majors() -> None:
         )
 
 
-@app.command()
 def _unfreeze() -> None:
     """Leave no cluster frozen: the next case would wedge on the gateway hold."""
     for n in load().nodes:
@@ -333,6 +335,7 @@ def _chaos_mid_upgrade(service: str, entry: str, gateway: int) -> None:
     console.print(f"chaos mid-upgrade OK: primary intact on {FROM_MAJOR}, still accepting writes")
 
 
+@app.command()
 def main(
     no_up: bool = typer.Option(False, "--no-up", help="Skip docker compose up"),
     rollback_drill: bool = typer.Option(

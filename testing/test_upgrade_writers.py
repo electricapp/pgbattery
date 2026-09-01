@@ -23,6 +23,7 @@ import threading
 import unittest
 from pathlib import Path
 from typing import Final
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -30,6 +31,27 @@ os.environ.setdefault("PGBATTERY_MANAGEMENT_API_TOKEN", "self-test-token")
 
 import pg_major_upgrade_proof
 import pg_upgrade_hold_chaos
+from topology import Node
+
+
+def _node(service: str = "node1") -> Node:
+    """A real `Node` so the oracles are exercised through their real types."""
+    return Node(
+        service=service,
+        node_id=1,
+        ip="10.0.0.1",
+        gateway_port=5432,
+        metrics_port=9091,
+        mgmt_port=9081,
+        is_voter=True,
+        is_bootstrap=True,
+    )
+
+
+# One lost acked key (w-1) offset by one committed-but-unacked extra (w-99):
+# the world the count-based W1 ledger could not see.
+ACKED_KEYS: Final[list[str]] = ["w-0", "w-1", "w-2"]
+PRESENT_RAW: Final[str] = "w-0\nw-2\nw-99\n"
 
 # Names `threading.Thread` has relied on across the versions this repo
 # supports (3.10 through 3.13). Rebinding any of them breaks start/join.
@@ -73,6 +95,55 @@ class WriterThreadHygieneTest(unittest.TestCase):
 
     def test_the_major_upgrade_writer_leaves_thread_internals_alone(self) -> None:
         self._assert_no_collision(pg_major_upgrade_proof.Writer(gateway_port=1))
+
+
+class ProofEntrypointTest(unittest.TestCase):
+    """Running the script runs the proof, not a helper.
+
+    `@app.command()` sat on the `_unfreeze` helper instead of `main`, so the
+    whole pg-major-upgrade-proof case unfroze a healthy cluster and exited 0
+    without proving anything.
+    """
+
+    def test_the_major_upgrade_app_registers_main_alone(self) -> None:
+        commands = [
+            info.callback.__name__
+            for info in pg_major_upgrade_proof.app.registered_commands
+            if info.callback is not None
+        ]
+        self.assertEqual(commands, ["main"])
+
+
+class AckedKeySetTest(unittest.TestCase):
+    """W1 compares acked keys, not counts, against what survived."""
+
+    def test_the_count_logic_this_replaced_passed_the_offset_world(self) -> None:
+        present_count = len(PRESENT_RAW.split())
+        self.assertGreaterEqual(
+            present_count,
+            len(ACKED_KEYS),
+            "the offset world no longer documents the count defect",
+        )
+
+    def test_the_major_upgrade_oracle_names_the_lost_key(self) -> None:
+        with (
+            mock.patch.object(pg_major_upgrade_proof, "_exec", return_value=PRESENT_RAW),
+            self.assertRaises(pg_major_upgrade_proof.ContractFailure) as caught,
+        ):
+            pg_major_upgrade_proof._assert_acked_survived(_node(), list(ACKED_KEYS))
+        self.assertIn("w-1", str(caught.exception))
+        self.assertNotIn("w-99", str(caught.exception))
+
+    def test_every_acked_key_present_passes_despite_extras(self) -> None:
+        with mock.patch.object(
+            pg_major_upgrade_proof, "_exec", return_value="w-0\nw-1\nw-2\nw-99\n"
+        ):
+            pg_major_upgrade_proof._assert_acked_survived(_node(), list(ACKED_KEYS))
+
+    def test_no_acked_keys_is_vacuous(self) -> None:
+        with self.assertRaises(pg_major_upgrade_proof.ContractFailure) as caught:
+            pg_major_upgrade_proof._assert_acked_survived(_node(), [])
+        self.assertIn("vacuous", str(caught.exception))
 
 
 if __name__ == "__main__":
