@@ -107,10 +107,62 @@ pub(crate) fn require_adjacent_major_jump(current: &str, target: &str) -> Result
     Ok(())
 }
 
-/// Refuse when the cluster has no listed backup, unless the operator opts out.
+/// Maximum age of the newest backup accepted by the preflight gate.
+const MAX_BACKUP_AGE_HOURS: i64 = 24;
+
+/// Refuse an empty or stale backup inventory: the newest backup must be
+/// younger than [`MAX_BACKUP_AGE_HOURS`].
+///
+/// Timestamps are the node's local time without a zone (as listed by the
+/// backup API); `now` is the operator host's local time, so a large host/node
+/// zone skew can misjudge age by that skew — acceptable against a 24 h gate.
 ///
 /// # Errors
-/// Returns when the list call fails or the backup inventory is empty.
+/// Returns when the inventory is empty, no timestamp parses, or the newest
+/// backup is too old.
+pub(crate) fn require_fresh_backup(
+    list: &crate::observability::management_api::BackupListResponse,
+    mgmt_addr: &str,
+    now: chrono::NaiveDateTime,
+) -> Result<()> {
+    if list.backups.is_empty() {
+        bail!(
+            "Refusing cluster upgrade: no backups listed at {mgmt_addr} \
+             (backup_dir={}). Create a backup first, or pass --allow-no-backup.",
+            list.backup_dir
+        );
+    }
+    let newest = list
+        .backups
+        .iter()
+        .filter_map(|b| {
+            chrono::NaiveDateTime::parse_from_str(&b.timestamp, "%Y-%m-%d %H:%M:%S").ok()
+        })
+        .max();
+    let Some(newest) = newest else {
+        bail!(
+            "Refusing cluster upgrade: no backup at {mgmt_addr} (backup_dir={}) has a \
+             parseable timestamp, so freshness cannot be proven. Create a fresh backup, \
+             or pass --allow-no-backup.",
+            list.backup_dir
+        );
+    };
+    let age = now.signed_duration_since(newest);
+    if age > chrono::Duration::hours(MAX_BACKUP_AGE_HOURS) {
+        bail!(
+            "Refusing cluster upgrade: newest backup at {mgmt_addr} is from {newest} \
+             ({} hours old, max {MAX_BACKUP_AGE_HOURS}). Create a fresh backup, or pass \
+             --allow-no-backup.",
+            age.num_hours()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse when the cluster has no fresh backup, unless the operator opts out.
+///
+/// # Errors
+/// Returns when the list call fails or [`require_fresh_backup`] refuses.
 pub(crate) async fn require_backup_or_allow(
     client: &ClusterClient,
     mgmt_addr: &str,
@@ -121,17 +173,11 @@ pub(crate) async fn require_backup_or_allow(
         return Ok(());
     }
     let list = client.list_backups(mgmt_addr).await?;
-    if list.backups.is_empty() {
-        bail!(
-            "Refusing cluster upgrade: no backups listed at {mgmt_addr} \
-             (backup_dir={}). Create a backup first, or pass --allow-no-backup.",
-            list.backup_dir
-        );
-    }
+    require_fresh_backup(&list, mgmt_addr, chrono::Local::now().naive_local())?;
     info!(
         count = list.backups.len(),
         backup_dir = %list.backup_dir,
-        "Backup inventory present"
+        "Fresh backup inventory present"
     );
     Ok(())
 }
@@ -843,6 +889,70 @@ mod tests {
             leader_pg_addr: None,
             leader_mgmt_addr: mgmt.map(str::to_string),
         }
+    }
+
+    fn backup_list(
+        timestamps: &[&str],
+    ) -> crate::observability::management_api::BackupListResponse {
+        crate::observability::management_api::BackupListResponse {
+            backups: timestamps
+                .iter()
+                .map(
+                    |ts| crate::observability::management_api::BackupItemResponse {
+                        path: "/backups/full_backup".to_string(),
+                        timestamp: (*ts).to_string(),
+                        backup_type: pgbattery_core::BackupType::Full,
+                        size_bytes: Some(1_024),
+                        compressed: false,
+                    },
+                )
+                .collect(),
+            backup_dir: "/backups".to_string(),
+            retention_count: 3,
+        }
+    }
+
+    fn naive(ts: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn fresh_backup_accepted() {
+        let list = backup_list(&["2026-09-01 11:00:00"]);
+        require_fresh_backup(&list, "127.0.0.1:9081", naive("2026-09-01 12:00:00")).unwrap();
+    }
+
+    #[test]
+    fn newest_of_several_backups_decides() {
+        let list = backup_list(&["2025-01-01 00:00:00", "2026-09-01 11:00:00"]);
+        require_fresh_backup(&list, "127.0.0.1:9081", naive("2026-09-01 12:00:00")).unwrap();
+    }
+
+    #[test]
+    fn year_old_backup_refused() {
+        let list = backup_list(&["2025-09-01 12:00:00"]);
+        let err = require_fresh_backup(&list, "127.0.0.1:9081", naive("2026-09-01 12:00:00"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fresh backup"), "{err}");
+        assert!(err.contains("--allow-no-backup"), "{err}");
+    }
+
+    #[test]
+    fn unparseable_timestamps_refused() {
+        let list = backup_list(&["not-a-timestamp"]);
+        assert!(
+            require_fresh_backup(&list, "127.0.0.1:9081", naive("2026-09-01 12:00:00")).is_err()
+        );
+    }
+
+    #[test]
+    fn empty_backup_inventory_refused() {
+        let list = backup_list(&[]);
+        let err = require_fresh_backup(&list, "127.0.0.1:9081", naive("2026-09-01 12:00:00"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no backups listed"), "{err}");
     }
 
     #[test]
