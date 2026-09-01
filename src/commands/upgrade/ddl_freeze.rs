@@ -15,10 +15,15 @@ const DDL_TRIGGER: &str = "pgbattery_ddl_freeze";
 ///
 /// Compared between donor and recipient, so it must not include anything that
 /// legitimately differs across two clusters — no OIDs, no sizes, no stats.
+/// Column position is the ordinal over non-dropped columns, never raw
+/// `attnum`: a dropped column leaves a permanent gap in the donor's `attnum`
+/// sequence, so a donor that ever dropped one could never match a
+/// freshly-seeded recipient whose restore renumbers from 1.
 const SCHEMA_DIGEST_SQL: &str = "SELECT COALESCE(md5(string_agg(sig, E'\\n' ORDER BY sig)), '') \
      FROM ( \
-       SELECT n.nspname || '.' || c.relname || ':' || a.attnum || ':' || a.attname \
-              || ':' || t.typname || ':' || a.attnotnull AS sig \
+       SELECT n.nspname || '.' || c.relname || ':' \
+              || (row_number() OVER (PARTITION BY c.oid ORDER BY a.attnum)) || ':' \
+              || a.attname || ':' || t.typname || ':' || a.attnotnull AS sig \
        FROM pg_class c \
        JOIN pg_namespace n ON n.oid = c.relnamespace \
        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
@@ -176,5 +181,21 @@ mod tests {
                 "digest must cover {shape}"
             );
         }
+    }
+
+    /// A dropped column leaves a permanent gap in `attnum`, so a donor that
+    /// ever dropped one can never digest-match a freshly-seeded recipient.
+    /// Position must be the ordinal over non-dropped columns.
+    #[test]
+    fn the_digest_uses_ordinal_position_not_raw_attnum() {
+        assert!(
+            SCHEMA_DIGEST_SQL.contains("row_number() OVER (PARTITION BY c.oid ORDER BY a.attnum)"),
+            "position must be the ordinal over surviving columns"
+        );
+        assert!(
+            !SCHEMA_DIGEST_SQL.contains("|| a.attnum ||"),
+            "raw attnum must not enter the signature"
+        );
+        assert!(SCHEMA_DIGEST_SQL.contains("NOT a.attisdropped"));
     }
 }
