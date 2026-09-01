@@ -22,7 +22,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -91,7 +91,7 @@ class WriterThreadHygieneTest(unittest.TestCase):
         )
 
     def test_the_hold_chaos_writer_leaves_thread_internals_alone(self) -> None:
-        self._assert_no_collision(pg_upgrade_hold_chaos.Writer(gateway_port=1))
+        self._assert_no_collision(pg_upgrade_hold_chaos.Writer(gateway_port=1, prefix="w-test"))
 
     def test_the_major_upgrade_writer_leaves_thread_internals_alone(self) -> None:
         self._assert_no_collision(pg_major_upgrade_proof.Writer(gateway_port=1))
@@ -144,6 +144,51 @@ class AckedKeySetTest(unittest.TestCase):
         with self.assertRaises(pg_major_upgrade_proof.ContractFailure) as caught:
             pg_major_upgrade_proof._assert_acked_survived(_node(), [])
         self.assertIn("vacuous", str(caught.exception))
+
+    def test_the_hold_chaos_oracle_names_the_lost_key(self) -> None:
+        with (
+            mock.patch.object(
+                pg_upgrade_hold_chaos, "_present_keys", return_value=set(PRESENT_RAW.split())
+            ),
+            self.assertRaises(pg_upgrade_hold_chaos.ContractFailure) as caught,
+        ):
+            pg_upgrade_hold_chaos._assert_acked_survived(_node(), set(ACKED_KEYS))
+        self.assertIn("w-1", str(caught.exception))
+        self.assertNotIn("w-99", str(caught.exception))
+
+    def test_the_hold_chaos_oracle_passes_on_full_survival(self) -> None:
+        with mock.patch.object(
+            pg_upgrade_hold_chaos,
+            "_present_keys",
+            return_value={"w-0", "w-1", "w-2", "w-99"},
+        ):
+            pg_upgrade_hold_chaos._assert_acked_survived(_node(), set(ACKED_KEYS))
+
+
+class HoldChaosKillEffectTest(unittest.TestCase):
+    """The mid-freeze kill asserts its effect, never that it was requested."""
+
+    def test_a_kill_that_did_not_land_is_refused(self) -> None:
+        def fake_compose(*args: str, **_kw: Any) -> Any:
+            if args[0] == "kill":
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(stdout="node1 running (healthy)\nnode2 running\n")
+
+        with (
+            mock.patch.object(pg_upgrade_hold_chaos, "_compose", side_effect=fake_compose),
+            self.assertRaises(pg_upgrade_hold_chaos.ContractFailure) as caught,
+        ):
+            pg_upgrade_hold_chaos._kill_and_await_down(_node("node1"), budget=0.2)
+        self.assertIn("did not land", str(caught.exception))
+
+    def test_a_confirmed_dead_container_passes(self) -> None:
+        def fake_compose(*args: str, **_kw: Any) -> Any:
+            if args[0] == "kill":
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            return mock.Mock(stdout="node1 exited (137)\nnode2 running\n")
+
+        with mock.patch.object(pg_upgrade_hold_chaos, "_compose", side_effect=fake_compose):
+            pg_upgrade_hold_chaos._kill_and_await_down(_node("node1"), budget=1.0)
 
 
 if __name__ == "__main__":

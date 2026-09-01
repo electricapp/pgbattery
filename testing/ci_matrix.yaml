@@ -49,6 +49,8 @@
         "backup-restore-valid",
         "pitr-restore-proof",
         "pg-upgrade-hold-writes",
+        "pg-upgrade-hold-chaos-mid-freeze",
+        "rolling-upgrade",
         "leaderless-wedge-recovery",
         "restart-budget-sustained-pg-death",
         "unopenable-standby-rebuilt",
@@ -117,9 +119,8 @@
         "concurrent-backup-failover",
         "network-latency-stability",
         "follower-one-peer-partition",
-        "rolling-upgrade",
         "leadership-orientation-soak",
-        "pg-upgrade-hold-chaos-mid-freeze",
+        "pg-upgrade-hold-chaos-mid-unfreeze",
         "wal-hole-resync",
         "rogue-pg-promote",
         "correctness-lite-invariants",
@@ -2574,7 +2575,7 @@
     {
       "id": "pg-upgrade-hold-writes",
       "contracts": ["W1", "V1"],
-      "description": "Track B gateway hold under continuous writes: freeze → hold window → unfreeze; writers resume with zero lost completed acks (UPGRADE_CHECKLIST steps 5–6).",
+      "description": "Track B gateway hold under continuous writes: freeze → hold window → unfreeze; writers on the non-leader gateways resume with every acked key asserted present by set difference (UPGRADE_CHECKLIST steps 5–6).",
       "actions": [
         {
           "type": "cmd",
@@ -2603,13 +2604,24 @@
     {
       "id": "pg-upgrade-hold-chaos-mid-freeze",
       "contracts": ["L1", "V1"],
-      "description": "Track B chaos: kill leader while upgrade-frozen; cluster must not dual-accept.",
+      "description": "Track B chaos: kill the actual leader (derived from the management API) while upgrade-frozen, with writers on the two surviving nodes' gateways. The kill is confirmed down via compose ps, the survivors must elect a new leader, and zero acks may arrive through the surviving gateways for the whole hold window spanning that failover — the freeze is committed state and must outlive the node that proposed it. The harness restarts the node it killed and unfreezes on every exit path.",
       "actions": [
         {
           "type": "cmd",
           "cmd": "testing/pg_upgrade_hold_chaos.py --chaos mid-freeze"
         },
-        {"type": "cmd", "cmd": "docker compose start node1", "expect_exit": null},
+        {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 120}
+      ]
+    },
+    {
+      "id": "pg-upgrade-hold-chaos-mid-unfreeze",
+      "contracts": ["W1", "V1"],
+      "description": "Track B chaos: kill the leader inside the unfreeze window — after the unfreeze commits, before writers have observably resumed. The kill is confirmed down, the survivors must elect, writers on the surviving gateways must resume, and every key any writer was acked is asserted present by set difference on the new leader (W1). The harness restarts the node it killed and unfreezes on every exit path.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/pg_upgrade_hold_chaos.py --chaos mid-unfreeze"
+        },
         {"type": "wait_cluster", "nodes": 3, "leaders": 1, "timeout_sec": 120}
       ]
     },
