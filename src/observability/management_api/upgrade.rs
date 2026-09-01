@@ -210,22 +210,42 @@ pub struct PostgresUpgradePreflightResponse {
 }
 
 /// Report configured `PostgreSQL` bindirs and whether `postgres` is executable.
+///
+/// The probe spawns one `postgres --version` per configured bindir, so it
+/// runs on the blocking pool rather than a runtime worker.
 pub(super) async fn get_postgres_bins(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
-    let paths_guard = state.pg_paths.lock();
-    let Some(paths) = paths_guard.as_ref() else {
+    let node_id = state.node_id;
+    let paths = state.pg_paths.lock().clone();
+    let Some(paths) = paths else {
         return (
             StatusCode::NOT_FOUND,
             Json(PostgresBinsResponse {
-                node_id: state.node_id,
+                node_id,
                 active_bin_dir: String::new(),
                 bin_dirs: std::collections::BTreeMap::new(),
             }),
         );
     };
-    let resp = probe_local_bins(state.node_id, &paths.bin_dir, &paths.bin_dirs);
-    (StatusCode::OK, Json(resp))
+    let probe = tokio::task::spawn_blocking(move || {
+        probe_local_bins(node_id, &paths.bin_dir, &paths.bin_dirs)
+    })
+    .await;
+    match probe {
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => {
+            error!(error = %e, "bindir probe task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PostgresBinsResponse {
+                    node_id,
+                    active_bin_dir: String::new(),
+                    bin_dirs: std::collections::BTreeMap::new(),
+                }),
+            )
+        }
+    }
 }
 
 /// Run Track B preflight on this node (must be primary).
@@ -769,15 +789,19 @@ pub struct PostgresStatusResponse {
 }
 
 /// Probe active `PG_VERSION` / paths on this node.
+///
+/// The probe walks the data parent on disk, so it runs on the blocking pool
+/// rather than a runtime worker.
 pub(super) async fn get_postgres_status(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
+    let node_id = state.node_id;
     let paths = state.pg_paths.lock().clone();
     let Some(paths) = paths else {
         return (
             StatusCode::NOT_FOUND,
             Json(PostgresStatusResponse {
-                node_id: state.node_id,
+                node_id,
                 active_major: None,
                 active_bin_dir: String::new(),
                 active_data_dir: String::new(),
@@ -785,15 +809,14 @@ pub(super) async fn get_postgres_status(
             }),
         );
     };
-    let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
-    let rollback_available = major.is_some_and(|m| {
-        crate::commands::upgrade::postgres::UpgradeSite::probe(&paths.data_dir, m)
-            .is_ok_and(|s| s.rollback_available())
-    });
-    (
-        StatusCode::OK,
-        Json(PostgresStatusResponse {
-            node_id: state.node_id,
+    let probe = tokio::task::spawn_blocking(move || {
+        let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
+        let rollback_available = major.is_some_and(|m| {
+            crate::commands::upgrade::postgres::UpgradeSite::probe(&paths.data_dir, m)
+                .is_ok_and(|s| s.rollback_available())
+        });
+        PostgresStatusResponse {
+            node_id,
             active_major: major,
             active_bin_dir: crate::commands::upgrade::postgres::bin_dir_for_major(
                 major,
@@ -804,8 +827,25 @@ pub(super) async fn get_postgres_status(
             .to_string(),
             active_data_dir: paths.data_dir.display().to_string(),
             rollback_available,
-        }),
-    )
+        }
+    })
+    .await;
+    match probe {
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => {
+            error!(error = %e, "postgres status probe task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PostgresStatusResponse {
+                    node_id,
+                    active_major: None,
+                    active_bin_dir: String::new(),
+                    active_data_dir: String::new(),
+                    rollback_available: false,
+                }),
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

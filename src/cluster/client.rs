@@ -505,18 +505,17 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
-    /// Dual-bin-dir inventory (`GET /api/v1/postgres/bins`).
+    /// Dual-bin-dir inventory (`GET /api/v1/postgres/bins`, token-gated).
     ///
     /// # Errors
-    /// Unreachable node or non-success status.
+    /// Unreachable node, unauthorized, or non-success status.
     pub async fn get_postgres_bins(
         &self,
         addr: &str,
     ) -> Result<crate::observability::management_api::PostgresBinsResponse> {
         let url = format!("http://{addr}/api/v1/postgres/bins");
         let resp = self
-            .client
-            .get(&url)
+            .add_management_token(self.client.get(&url))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
@@ -528,7 +527,7 @@ impl ClusterClient {
                 "PostgreSQL bins request",
                 status,
                 &body,
-                false
+                self.management_api_token.is_some()
             ));
         }
 
@@ -791,18 +790,18 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
-    /// Active `PostgreSQL` major / paths (`GET /api/v1/postgres/status`).
+    /// Active `PostgreSQL` major / paths (`GET /api/v1/postgres/status`,
+    /// token-gated).
     ///
     /// # Errors
-    /// Unreachable or non-success.
+    /// Unreachable, unauthorized, or non-success.
     pub async fn get_postgres_status(
         &self,
         addr: &str,
     ) -> Result<crate::observability::management_api::PostgresStatusResponse> {
         let url = format!("http://{addr}/api/v1/postgres/status");
         let resp = self
-            .client
-            .get(&url)
+            .add_management_token(self.client.get(&url))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
@@ -813,7 +812,7 @@ impl ClusterClient {
                 "PostgreSQL status",
                 status,
                 &body,
-                false
+                self.management_api_token.is_some()
             ));
         }
         Ok(resp.json().await?)
