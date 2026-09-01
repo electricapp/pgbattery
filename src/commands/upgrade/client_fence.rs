@@ -21,6 +21,29 @@ const FENCED_PRIVILEGES: &str = "'INSERT','UPDATE','DELETE','TRUNCATE','USAGE'";
 const FENCE_SCHEMA: &str = "pgbattery";
 const FENCE_TABLE: &str = "pgbattery.client_fence_revoked";
 
+/// The snapshot INSERT for one role. Rows are keyed by `cluster_id` so a
+/// donor's snapshot rows and a recipient's can never collide, even under a
+/// hand-made FOR ALL TABLES publication that replicates this table.
+fn snapshot_insert_sql(escaped_cluster: &str, escaped_role: &str) -> String {
+    // Snapshot direct grants only: `aclexplode` on relacl is what REVOKE
+    // removes, unlike has_table_privilege, which also sees inherited ones.
+    format!(
+        "INSERT INTO {FENCE_TABLE} (cluster_id, role_name, schema_name, rel_name, rel_kind, privilege) \
+         SELECT '{escaped_cluster}', '{escaped_role}', n.nspname, c.relname, c.relkind, a.privilege_type \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         CROSS JOIN LATERAL aclexplode(c.relacl) a \
+         JOIN pg_roles g ON g.oid = a.grantee \
+         WHERE g.rolname = '{escaped_role}' \
+           AND c.relkind IN ('r','p','v','f','S') \
+           AND a.privilege_type IN ({FENCED_PRIVILEGES}) \
+           AND n.nspname NOT IN ('pg_catalog','information_schema','{FENCE_SCHEMA}') \
+           AND n.nspname NOT LIKE 'pg_toast%' \
+           AND n.nspname NOT LIKE 'pg_temp%' \
+         ON CONFLICT DO NOTHING;"
+    )
+}
+
 /// Revoke client DML from `app_roles`, recording exactly what was taken.
 ///
 /// The snapshot is the point: `REVOKE` destroys the only record of which
@@ -33,33 +56,18 @@ const FENCE_TABLE: &str = "pgbattery.client_fence_revoked";
 pub async fn apply_client_write_fence(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
+    cluster_id: &str,
 ) -> Result<()> {
     if app_roles.is_empty() {
         bail!("client-write fence requires at least one app role");
     }
     ensure_fence_table(supervisor).await?;
+    let escaped_cluster = cluster_id.replace('\'', "''");
     for role in app_roles {
         validate_role_ident(role)?;
         let escaped = role.replace('\'', "''");
-        // Snapshot direct grants only: `aclexplode` on relacl is what REVOKE
-        // removes, unlike has_table_privilege, which also sees inherited ones.
-        let sql = format!(
-            "INSERT INTO {FENCE_TABLE} (role_name, schema_name, rel_name, rel_kind, privilege) \
-             SELECT '{escaped}', n.nspname, c.relname, c.relkind, a.privilege_type \
-             FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             CROSS JOIN LATERAL aclexplode(c.relacl) a \
-             JOIN pg_roles g ON g.oid = a.grantee \
-             WHERE g.rolname = '{escaped}' \
-               AND c.relkind IN ('r','p','v','f','S') \
-               AND a.privilege_type IN ({FENCED_PRIVILEGES}) \
-               AND n.nspname NOT IN ('pg_catalog','information_schema','{FENCE_SCHEMA}') \
-               AND n.nspname NOT LIKE 'pg_toast%' \
-               AND n.nspname NOT LIKE 'pg_temp%' \
-             ON CONFLICT DO NOTHING;"
-        );
         supervisor
-            .execute_sql(&sql)
+            .execute_sql(&snapshot_insert_sql(&escaped_cluster, &escaped))
             .await
             .with_context(|| format!("snapshotting grants for app role {role}"))?;
 
@@ -102,6 +110,32 @@ pub async fn apply_client_write_fence(
     Ok(())
 }
 
+/// The restore-and-forget block for one role, filtered to this cluster's own
+/// snapshot rows — replicated rows from another cluster's fence must never
+/// grant anything here.
+fn lift_sql(escaped_cluster: &str, escaped_role: &str) -> String {
+    format!(
+        "DO $$ \
+         DECLARE r record; \
+         BEGIN \
+           FOR r IN \
+             SELECT schema_name, rel_name, rel_kind, privilege \
+             FROM {FENCE_TABLE} \
+             WHERE cluster_id = '{escaped_cluster}' AND role_name = '{escaped_role}' \
+           LOOP \
+             EXECUTE format( \
+               'GRANT %s ON %s %I.%I TO %I', \
+               r.privilege, \
+               CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, \
+               r.schema_name, r.rel_name, '{escaped_role}' \
+             ); \
+           END LOOP; \
+           DELETE FROM {FENCE_TABLE} \
+           WHERE cluster_id = '{escaped_cluster}' AND role_name = '{escaped_role}'; \
+         END $$;"
+    )
+}
+
 /// Restore exactly the grants [`apply_client_write_fence`] recorded.
 ///
 /// # Errors
@@ -109,34 +143,18 @@ pub async fn apply_client_write_fence(
 pub async fn lift_client_write_fence(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
+    cluster_id: &str,
 ) -> Result<()> {
     if app_roles.is_empty() {
         return Ok(());
     }
     ensure_fence_table(supervisor).await?;
+    let escaped_cluster = cluster_id.replace('\'', "''");
     for role in app_roles {
         validate_role_ident(role)?;
         let escaped = role.replace('\'', "''");
-        let sql = format!(
-            "DO $$ \
-             DECLARE r record; \
-             BEGIN \
-               FOR r IN \
-                 SELECT schema_name, rel_name, rel_kind, privilege \
-                 FROM {FENCE_TABLE} WHERE role_name = '{escaped}' \
-               LOOP \
-                 EXECUTE format( \
-                   'GRANT %s ON %s %I.%I TO %I', \
-                   r.privilege, \
-                   CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, \
-                   r.schema_name, r.rel_name, '{escaped}' \
-                 ); \
-               END LOOP; \
-               DELETE FROM {FENCE_TABLE} WHERE role_name = '{escaped}'; \
-             END $$;"
-        );
         supervisor
-            .execute_sql(&sql)
+            .execute_sql(&lift_sql(&escaped_cluster, &escaped))
             .await
             .with_context(|| format!("restoring recorded grants for app role {role}"))?;
         info!(%role, "Client-write fence lifted");
@@ -269,11 +287,13 @@ pub async fn node_is_primary(supervisor: &crate::supervisor::Supervisor) -> Resu
 pub async fn fence_is_applied(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
+    cluster_id: &str,
 ) -> Result<bool> {
     if app_roles.is_empty() {
         return Ok(false);
     }
     let quoted = quoted_role_list(app_roles)?;
+    let escaped_cluster = cluster_id.replace('\'', "''");
     // Asked separately because PostgreSQL plans both arms of a CASE: guarding
     // the table reference with to_regclass in one statement still fails to
     // parse before the first seal has created it.
@@ -284,9 +304,12 @@ pub async fn fence_is_applied(
     if !parse_pg_bool(&exists)? {
         return Ok(false);
     }
+    // Filtered by cluster: rows replicated from another cluster's snapshot
+    // must not make this one believe it is fenced.
     let raw = supervisor
         .execute_sql(&format!(
-            "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} WHERE role_name IN ({quoted}));"
+            "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} \
+             WHERE cluster_id = '{escaped_cluster}' AND role_name IN ({quoted}));"
         ))
         .await
         .context("reading client-fence snapshot state")?;
@@ -324,20 +347,27 @@ fn parse_lsn_bytes(text: &str) -> Result<u64> {
     Ok((hi << 32) | lo)
 }
 
-async fn ensure_fence_table(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
-    let sql = format!(
+/// The snapshot table DDL. `cluster_id` leads the primary key so donor and
+/// recipient rows can never collide, even when a hand-made FOR ALL TABLES
+/// publication replicates this table between them.
+fn fence_table_ddl() -> String {
+    format!(
         "CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}; \
          CREATE TABLE IF NOT EXISTS {FENCE_TABLE} ( \
+           cluster_id text NOT NULL, \
            role_name text NOT NULL, \
            schema_name text NOT NULL, \
            rel_name text NOT NULL, \
            rel_kind \"char\" NOT NULL, \
            privilege text NOT NULL, \
-           PRIMARY KEY (role_name, schema_name, rel_name, privilege) \
+           PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege) \
          );"
-    );
+    )
+}
+
+async fn ensure_fence_table(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
     supervisor
-        .execute_sql(&sql)
+        .execute_sql(&fence_table_ddl())
         .await
         .context("creating client-fence snapshot table")?;
     Ok(())
@@ -446,5 +476,38 @@ mod tests {
             "'bg_app','b2'"
         );
         assert!(quoted_role_list(&["app;drop".into()]).is_err());
+    }
+
+    /// Under a hand-made FOR ALL TABLES publication the snapshot table
+    /// replicates like any other; keying by cluster keeps donor and recipient
+    /// rows from ever colliding on apply.
+    #[test]
+    fn the_snapshot_table_keys_rows_by_cluster() {
+        let ddl = fence_table_ddl();
+        assert!(ddl.contains("cluster_id text NOT NULL"));
+        assert!(
+            ddl.contains("PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege)")
+        );
+    }
+
+    #[test]
+    fn the_snapshot_insert_records_this_cluster() {
+        let sql = snapshot_insert_sql("blue", "bg_app");
+        assert!(sql.contains("SELECT 'blue', 'bg_app'"));
+        assert!(sql.contains("(cluster_id, role_name"));
+    }
+
+    /// Rows replicated from another cluster's fence must never grant here,
+    /// and must never be deleted by this cluster's lift.
+    #[test]
+    fn the_lift_touches_only_this_clusters_rows() {
+        let sql = lift_sql("blue", "bg_app");
+        let filters = sql
+            .matches("cluster_id = 'blue' AND role_name = 'bg_app'")
+            .count();
+        assert_eq!(
+            filters, 2,
+            "both the SELECT and the DELETE must filter: {sql}"
+        );
     }
 }

@@ -330,8 +330,12 @@ async fn lift_and_refuse(
     app_roles: &[String],
     reason: &str,
 ) -> (StatusCode, Json<CutoverActionResponse>) {
-    let lifted =
-        crate::commands::upgrade::client_fence::lift_client_write_fence(guard, app_roles).await;
+    let lifted = crate::commands::upgrade::client_fence::lift_client_write_fence(
+        guard,
+        app_roles,
+        &state.cluster_id,
+    )
+    .await;
     let suffix = match lifted {
         Ok(()) => "the fence was lifted",
         Err(_) => {
@@ -401,7 +405,7 @@ pub(super) async fn cutover_seal(
             format!("Refusing SEAL: {e}"),
         );
     }
-    if let Err(e) = apply_client_write_fence(&guard, &body.app_roles).await {
+    if let Err(e) = apply_client_write_fence(&guard, &body.app_roles, &state.cluster_id).await {
         return refuse(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -455,9 +459,12 @@ pub(super) async fn cutover_seal(
         // committed state still Armed — and the reconciler, reading that
         // state, would never lift it. Undo what this handler did.
         let guard = pg.lock().await;
-        if let Err(e) =
-            crate::commands::upgrade::client_fence::lift_client_write_fence(&guard, &body.app_roles)
-                .await
+        if let Err(e) = crate::commands::upgrade::client_fence::lift_client_write_fence(
+            &guard,
+            &body.app_roles,
+            &state.cluster_id,
+        )
+        .await
         {
             warn!(error = %e, "SEAL did not commit and the fence lift failed; clients stay fenced until abort or a seal retry");
         }
@@ -546,9 +553,12 @@ pub(super) async fn cutover_abort(
     // or an in-flight seal's fence window.
     let _fence_guard = state.client_fence_apply_lock.lock().await;
     let guard = pg.lock().await;
-    if let Err(e) =
-        crate::commands::upgrade::client_fence::lift_client_write_fence(&guard, &body.app_roles)
-            .await
+    if let Err(e) = crate::commands::upgrade::client_fence::lift_client_write_fence(
+        &guard,
+        &body.app_roles,
+        &state.cluster_id,
+    )
+    .await
     {
         return refuse(
             &state,
@@ -740,6 +750,10 @@ pub struct SeedRecipientRequest {
     pub donor_conninfo: String,
     pub publication: String,
     pub subscription: String,
+    /// Fence/app roles that must already exist here: the dump keeps ACLs, so
+    /// a GRANT naming a missing role fails the restore. Named refusal first.
+    #[serde(default)]
+    pub required_roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -773,6 +787,7 @@ pub(super) async fn seed_recipient(
         &body.donor_conninfo,
         &body.publication,
         &body.subscription,
+        &body.required_roles,
     )
     .await;
     let states = seed_green::subscription_sync_states(&guard)

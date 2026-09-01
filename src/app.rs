@@ -786,8 +786,14 @@ impl App {
                         // Unfreeze before touching the fence and freeze after:
                         // applying the fence creates the snapshot table, which is
                         // DDL the freeze would refuse.
-                        let result =
-                            reconcile_ddl_and_fence(&guard, &roles, want_fenced, phase).await;
+                        let result = reconcile_ddl_and_fence(
+                            &guard,
+                            &roles,
+                            want_fenced,
+                            phase,
+                            &cluster_id,
+                        )
+                        .await;
                         drop(guard);
                         if let Err(e) = result {
                             // Waiting for the next fence change would strand the
@@ -3456,6 +3462,7 @@ async fn reconcile_ddl_and_fence(
     roles: &[String],
     want_fenced: bool,
     phase: crate::governor::state_machine::CutoverPhase,
+    cluster_id: &str,
 ) -> Result<()> {
     use crate::commands::upgrade::{client_fence, ddl_freeze};
 
@@ -3465,13 +3472,13 @@ async fn reconcile_ddl_and_fence(
         ddl_freeze::remove_ddl_freeze(supervisor).await?;
     }
 
-    let is_fenced = client_fence::fence_is_applied(supervisor, roles).await?;
+    let is_fenced = client_fence::fence_is_applied(supervisor, roles, cluster_id).await?;
     match client_fence::fence_action(want_fenced, is_fenced) {
         client_fence::FenceAction::Apply => {
-            client_fence::apply_client_write_fence(supervisor, roles).await?;
+            client_fence::apply_client_write_fence(supervisor, roles, cluster_id).await?;
         }
         client_fence::FenceAction::Lift => {
-            client_fence::lift_client_write_fence(supervisor, roles).await?;
+            client_fence::lift_client_write_fence(supervisor, roles, cluster_id).await?;
         }
         client_fence::FenceAction::None => {}
     }
