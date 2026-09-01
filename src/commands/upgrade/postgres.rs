@@ -2018,12 +2018,17 @@ pub async fn run_primary_pg_upgrade_apply(
         // `pg_upgrade` has no restart point, so a leftover target is the
         // wreckage of an interrupted run, not progress. Discarding it is the
         // only way the flow can resume from the preserved old datadir.
-        let started = new_data.join("global/pg_control").is_file() && postmaster_has_run(&new_data);
-        if started {
+        if !interrupted_target_is_discardable(
+            old_cluster_recoverable(&old_data),
+            unfreeze_watermark_path(&parent).exists(),
+        ) {
             bail!(
-                "{} has been started as a cluster: refusing to discard it. \
-                 Roll back or confirm before re-running the upgrade.",
-                new_data.display()
+                "Refusing to discard {}: either {} has no intact control file \
+                 (the old cluster is not viable) or the unfreeze watermark exists \
+                 (clients resumed on the new cluster). Roll back or confirm \
+                 before re-running the upgrade.",
+                new_data.display(),
+                old_data.display()
             );
         }
         tracing::warn!(
@@ -2378,6 +2383,16 @@ pub async fn rollback_local(
     if live != from_major {
         bail!("After rollback PG_VERSION is {live}, expected {from_major}");
     }
+    // The target the rollback abandoned would refuse every future apply as
+    // long as it sits there; the operator already chose to discard it.
+    if let Some(new_dir) = site.new_data_dir.as_ref() {
+        let aside = move_aside_discarded_target(new_dir)?;
+        info!(
+            from = %new_dir.display(),
+            to = %aside.display(),
+            "Discarded new-major datadir moved aside"
+        );
+    }
     drop(fs::remove_file(unfreeze_watermark_path(&parent)));
 
     Ok(RollbackReport {
@@ -2389,14 +2404,46 @@ pub async fn rollback_local(
     })
 }
 
-/// Whether a postmaster has ever started in `data_dir`.
+/// Move a rolled-back-from target directory aside so a re-apply is not
+/// refused forever by a leftover the operator already chose to discard.
 ///
-/// `pg_upgrade` leaves an initdb'd-but-never-started target behind when it is
-/// interrupted; one that has been started is a live cluster and must not be
-/// discarded. `pg_stat` and the WAL directory only exist after a start.
-fn postmaster_has_run(data_dir: &Path) -> bool {
-    data_dir.join("postmaster.pid").is_file()
-        || fs::read_dir(data_dir.join("pg_wal")).is_ok_and(|mut d| d.next().is_some())
+/// Renamed, not deleted: `--accept-write-loss` authorized discarding the
+/// writes, but the bytes stay inspectable until the operator removes them.
+/// The suffix takes the name out of the naming convention the probe
+/// recognises, so nothing mistakes it for a rollback anchor or a target.
+fn move_aside_discarded_target(new_data: &Path) -> Result<PathBuf> {
+    let name = new_data
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("target {} has no file name", new_data.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let aside = new_data.with_file_name(format!("{name}.discarded.{epoch_secs}"));
+    fs::rename(new_data, &aside).with_context(|| {
+        format!(
+            "moving discarded target {} aside to {}",
+            new_data.display(),
+            aside.display()
+        )
+    })?;
+    Ok(aside)
+}
+
+/// Whether a leftover `pg_upgrade` target directory is discardable wreckage.
+///
+/// Decided from on-disk facts (`STATE_MACHINE` 8c): the OLD datadir's control
+/// file intact means the old cluster is still the viable one, and no unfreeze
+/// watermark means clients never resumed on the new cluster — nothing in the
+/// target can be the only copy of anything. Anything about the target itself
+/// is no discriminator: initdb populates `pg_wal`, so "has WAL" is true for
+/// wreckage too.
+const fn interrupted_target_is_discardable(
+    old_control_intact: bool,
+    unfreeze_watermark_exists: bool,
+) -> bool {
+    old_control_intact && !unfreeze_watermark_exists
 }
 
 /// Wall-clock budget for one `pg_upgrade`, scaled to the data directory.
@@ -2811,17 +2858,67 @@ mod tests {
         assert!(site.new_data_dir.is_some());
     }
 
-    /// An initdb'd-but-never-started target is wreckage from an interrupted
-    /// run; one that has been started is a live cluster.
+    /// The old discriminator counted a non-empty `pg_wal` as "a postmaster
+    /// has run", but initdb always populates `pg_wal` — so every interrupted
+    /// apply read as a live cluster and resume was refused forever. The
+    /// decision is now the two facts that matter: old cluster viable, and
+    /// clients never unfrozen onto the new one.
     #[test]
-    fn a_started_datadir_is_distinguishable_from_an_abandoned_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = fake_datadir(dir.path(), "data_18", 18, true);
-        fs::create_dir_all(data.join("pg_wal")).unwrap();
-        assert!(!postmaster_has_run(&data));
+    fn an_interrupted_target_is_discardable_while_the_old_cluster_is_live() {
+        // Interrupted mid-pg_upgrade: old control intact, no watermark.
+        assert!(interrupted_target_is_discardable(true, false));
 
-        fs::write(data.join("pg_wal/000000010000000000000001"), b"w").unwrap();
-        assert!(postmaster_has_run(&data));
+        // Watermark written: clients resumed on the new cluster and the
+        // target may hold acked writes. Refuse.
+        assert!(!interrupted_target_is_discardable(true, true));
+
+        // Old control gone (--link ran): the target is the only viable
+        // cluster left. Refuse.
+        assert!(!interrupted_target_is_discardable(false, false));
+        assert!(!interrupted_target_is_discardable(false, true));
+    }
+
+    /// The world initdb actually produces: target with a populated `pg_wal`,
+    /// intact old cluster, no watermark. The old unit test manufactured an
+    /// empty `pg_wal` initdb never leaves behind.
+    #[test]
+    fn an_initdb_populated_pg_wal_does_not_block_crash_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = fake_datadir(dir.path(), "data", 17, true);
+        let new = fake_datadir(dir.path(), "data_18", 18, true);
+        fs::create_dir_all(new.join("pg_wal")).unwrap();
+        fs::write(new.join("pg_wal/000000010000000000000001"), b"w").unwrap();
+
+        assert!(interrupted_target_is_discardable(
+            old_cluster_recoverable(&old),
+            unfreeze_watermark_path(dir.path()).exists(),
+        ));
+
+        write_unfreeze_watermark(dir.path(), 42).unwrap();
+        assert!(!interrupted_target_is_discardable(
+            old_cluster_recoverable(&old),
+            unfreeze_watermark_path(dir.path()).exists(),
+        ));
+    }
+
+    /// A rollback abandons its target; left in place under the recognised
+    /// name it refuses every future apply.
+    #[test]
+    fn a_rolled_back_target_is_moved_out_of_the_probed_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = fake_datadir(dir.path(), "data_18", 18, true);
+
+        let aside = move_aside_discarded_target(&target).unwrap();
+        assert!(!target.exists(), "the original target name must be freed");
+        assert!(aside.exists(), "the bytes stay inspectable");
+        assert!(
+            aside
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("data_18.discarded."),
+            "moved-aside name leaves the data_<major> convention: {aside:?}"
+        );
     }
 
     /// A fixed budget is either too short for a real database or too long to
