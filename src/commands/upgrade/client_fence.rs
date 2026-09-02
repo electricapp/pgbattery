@@ -28,8 +28,8 @@ fn snapshot_insert_sql(escaped_cluster: &str, escaped_role: &str) -> String {
     // Snapshot direct grants only: `aclexplode` on relacl is what REVOKE
     // removes, unlike has_table_privilege, which also sees inherited ones.
     format!(
-        "INSERT INTO {FENCE_TABLE} (cluster_id, role_name, schema_name, rel_name, rel_kind, privilege) \
-         SELECT '{escaped_cluster}', '{escaped_role}', n.nspname, c.relname, c.relkind, a.privilege_type \
+        "INSERT INTO {FENCE_TABLE} (cluster_id, role_name, schema_name, rel_name, rel_kind, privilege, grant_kind) \
+         SELECT '{escaped_cluster}', '{escaped_role}', n.nspname, c.relname, c.relkind, a.privilege_type, 'r' \
          FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          CROSS JOIN LATERAL aclexplode(c.relacl) a \
@@ -41,6 +41,57 @@ fn snapshot_insert_sql(escaped_cluster: &str, escaped_role: &str) -> String {
            AND n.nspname NOT LIKE 'pg_toast%' \
            AND n.nspname NOT LIKE 'pg_temp%' \
          ON CONFLICT DO NOTHING;"
+    )
+}
+
+/// Snapshot the role's default-ACL grants (`pg_default_acl`) before the
+/// revoke destroys them. `rel_name` carries the owning `defaclrole`,
+/// `rel_kind` the `defaclobjtype` ('r' tables / 'S' sequences), and
+/// `schema_name` is empty for database-wide defaults.
+fn default_snapshot_insert_sql(escaped_cluster: &str, escaped_role: &str) -> String {
+    format!(
+        "INSERT INTO {FENCE_TABLE} (cluster_id, role_name, schema_name, rel_name, rel_kind, privilege, grant_kind) \
+         SELECT '{escaped_cluster}', '{escaped_role}', COALESCE(n.nspname, ''), dr.rolname, d.defaclobjtype, a.privilege_type, 'd' \
+         FROM pg_default_acl d \
+         JOIN pg_roles dr ON dr.oid = d.defaclrole \
+         LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace \
+         CROSS JOIN LATERAL aclexplode(d.defaclacl) a \
+         JOIN pg_roles g ON g.oid = a.grantee \
+         WHERE g.rolname = '{escaped_role}' \
+           AND d.defaclobjtype IN ('r','S') \
+           AND a.privilege_type IN ({FENCED_PRIVILEGES}) \
+         ON CONFLICT DO NOTHING;"
+    )
+}
+
+/// Revoke the role's default-ACL grants for EVERY owning role that granted
+/// them. A bare `ALTER DEFAULT PRIVILEGES` touches only the connecting role's
+/// own defaults, which leaves any other owner's future objects granting DML
+/// to the fenced role the moment they are created.
+fn default_revoke_sql(escaped_role: &str) -> String {
+    format!(
+        "DO $$ \
+         DECLARE r record; \
+         BEGIN \
+           FOR r IN \
+             SELECT DISTINCT dr.rolname AS owner, n.nspname AS schema, d.defaclobjtype AS objtype \
+             FROM pg_default_acl d \
+             JOIN pg_roles dr ON dr.oid = d.defaclrole \
+             LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace \
+             CROSS JOIN LATERAL aclexplode(d.defaclacl) a \
+             JOIN pg_roles g ON g.oid = a.grantee \
+             WHERE g.rolname = '{escaped_role}' AND d.defaclobjtype IN ('r','S') \
+           LOOP \
+             EXECUTE format( \
+               'ALTER DEFAULT PRIVILEGES FOR ROLE %I %s REVOKE %s ON %s FROM %I', \
+               r.owner, \
+               CASE WHEN r.schema IS NULL THEN '' ELSE format('IN SCHEMA %I', r.schema) END, \
+               CASE WHEN r.objtype = 'S' THEN 'USAGE, UPDATE' ELSE 'INSERT, UPDATE, DELETE, TRUNCATE' END, \
+               CASE WHEN r.objtype = 'S' THEN 'SEQUENCES' ELSE 'TABLES' END, \
+               '{escaped_role}' \
+             ); \
+           END LOOP; \
+         END $$;"
     )
 }
 
@@ -70,6 +121,10 @@ pub async fn apply_client_write_fence(
             .execute_sql(&snapshot_insert_sql(&escaped_cluster, &escaped))
             .await
             .with_context(|| format!("snapshotting grants for app role {role}"))?;
+        supervisor
+            .execute_sql(&default_snapshot_insert_sql(&escaped_cluster, &escaped))
+            .await
+            .with_context(|| format!("snapshotting default-ACL grants for app role {role}"))?;
 
         let revoke = format!(
             "DO $$ \
@@ -90,14 +145,6 @@ pub async fn apply_client_write_fence(
                    'REVOKE USAGE, UPDATE ON ALL SEQUENCES IN SCHEMA %I FROM %I', \
                    r.schema, '{escaped}' \
                  ); \
-                 EXECUTE format( \
-                   'ALTER DEFAULT PRIVILEGES IN SCHEMA %I REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLES FROM %I', \
-                   r.schema, '{escaped}' \
-                 ); \
-                 EXECUTE format( \
-                   'ALTER DEFAULT PRIVILEGES IN SCHEMA %I REVOKE USAGE, UPDATE ON SEQUENCES FROM %I', \
-                   r.schema, '{escaped}' \
-                 ); \
                END LOOP; \
              END $$;"
         );
@@ -105,6 +152,10 @@ pub async fn apply_client_write_fence(
             .execute_sql(&revoke)
             .await
             .with_context(|| format!("revoking DML from app role {role}"))?;
+        supervisor
+            .execute_sql(&default_revoke_sql(&escaped))
+            .await
+            .with_context(|| format!("revoking default-ACL grants from app role {role}"))?;
         info!(%role, "Client-write fence applied");
     }
     Ok(())
@@ -119,16 +170,34 @@ fn lift_sql(escaped_cluster: &str, escaped_role: &str) -> String {
          DECLARE r record; \
          BEGIN \
            FOR r IN \
-             SELECT schema_name, rel_name, rel_kind, privilege \
+             SELECT schema_name, rel_name, rel_kind, privilege, grant_kind \
              FROM {FENCE_TABLE} \
              WHERE cluster_id = '{escaped_cluster}' AND role_name = '{escaped_role}' \
            LOOP \
-             EXECUTE format( \
-               'GRANT %s ON %s %I.%I TO %I', \
-               r.privilege, \
-               CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, \
-               r.schema_name, r.rel_name, '{escaped_role}' \
-             ); \
+             IF r.grant_kind = 'd' THEN \
+               IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.rel_name) THEN \
+                 EXECUTE format( \
+                   'ALTER DEFAULT PRIVILEGES FOR ROLE %I %s GRANT %s ON %s TO %I', \
+                   r.rel_name, \
+                   CASE WHEN r.schema_name = '' THEN '' ELSE format('IN SCHEMA %I', r.schema_name) END, \
+                   r.privilege, \
+                   CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCES' ELSE 'TABLES' END, \
+                   '{escaped_role}' \
+                 ); \
+               ELSE \
+                 RAISE NOTICE 'client fence lift: defacl owner % no longer exists; skipping', r.rel_name; \
+               END IF; \
+             ELSIF to_regclass(format('%I.%I', r.schema_name, r.rel_name)) IS NOT NULL THEN \
+               EXECUTE format( \
+                 'GRANT %s ON %s %I.%I TO %I', \
+                 r.privilege, \
+                 CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, \
+                 r.schema_name, r.rel_name, '{escaped_role}' \
+               ); \
+             ELSE \
+               RAISE NOTICE 'client fence lift: %.% no longer exists; skipping its % grant', \
+                 r.schema_name, r.rel_name, r.privilege; \
+             END IF; \
            END LOOP; \
            DELETE FROM {FENCE_TABLE} \
            WHERE cluster_id = '{escaped_cluster}' AND role_name = '{escaped_role}'; \
@@ -349,7 +418,10 @@ fn parse_lsn_bytes(text: &str) -> Result<u64> {
 
 /// The snapshot table DDL. `cluster_id` leads the primary key so donor and
 /// recipient rows can never collide, even when a hand-made FOR ALL TABLES
-/// publication replicates this table between them.
+/// publication replicates this table between them. `grant_kind` tells a
+/// relation grant ('r', `rel_name` is the relation) from a default-ACL grant
+/// ('d', `rel_name` is the owning `defaclrole`), and is in the key because a
+/// role can share a name with a table.
 fn fence_table_ddl() -> String {
     format!(
         "CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}; \
@@ -360,7 +432,8 @@ fn fence_table_ddl() -> String {
            rel_name text NOT NULL, \
            rel_kind \"char\" NOT NULL, \
            privilege text NOT NULL, \
-           PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege) \
+           grant_kind \"char\" NOT NULL DEFAULT 'r', \
+           PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege, grant_kind) \
          );"
     )
 }
@@ -479,9 +552,7 @@ mod tests {
     fn the_snapshot_table_keys_rows_by_cluster() {
         let ddl = fence_table_ddl();
         assert!(ddl.contains("cluster_id text NOT NULL"));
-        assert!(
-            ddl.contains("PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege)")
-        );
+        assert!(ddl.contains("PRIMARY KEY (cluster_id,"));
     }
 
     #[test]
@@ -489,6 +560,56 @@ mod tests {
         let sql = snapshot_insert_sql("blue", "bg_app");
         assert!(sql.contains("SELECT 'blue', 'bg_app'"));
         assert!(sql.contains("(cluster_id, role_name"));
+    }
+
+    /// `ALTER DEFAULT PRIVILEGES ... REVOKE` destroys default-ACL grants the
+    /// role held; a lift that restores only relation grants is not an inverse.
+    /// The snapshot must record `pg_default_acl` rows (with their owning
+    /// `defaclrole` and object type) and the lift must re-issue them.
+    #[test]
+    fn default_privilege_grants_are_snapshotted_and_restored() {
+        let snap = default_snapshot_insert_sql("blue", "bg_app");
+        assert!(snap.contains("pg_default_acl"));
+        assert!(snap.contains("defaclobjtype"));
+        assert!(snap.contains("'d'"), "default rows must be marked: {snap}");
+        let lift = lift_sql("blue", "bg_app");
+        assert!(
+            lift.contains("ALTER DEFAULT PRIVILEGES FOR ROLE"),
+            "the lift must restore default-ACL grants: {lift}"
+        );
+    }
+
+    /// The apply must revoke default-ACL grants for EVERY owning role that
+    /// granted them, not only the connecting role's own defaults.
+    #[test]
+    fn default_privileges_are_revoked_for_every_granting_owner() {
+        let sql = default_revoke_sql("bg_app");
+        assert!(sql.contains("pg_default_acl"));
+        assert!(sql.contains("ALTER DEFAULT PRIVILEGES FOR ROLE"));
+    }
+
+    /// A relation dropped between seal and abort must not fail the whole
+    /// lift — the remaining grants still need restoring, and the reconciler
+    /// would otherwise retry the same failure forever.
+    #[test]
+    fn the_lift_skips_dropped_relations_instead_of_failing() {
+        let sql = lift_sql("blue", "bg_app");
+        assert!(
+            sql.contains("to_regclass"),
+            "each relation grant must be guarded: {sql}"
+        );
+        assert!(sql.contains("RAISE NOTICE"), "skips must be loud: {sql}");
+    }
+
+    /// Default-ACL rows share the snapshot table with relation rows; the key
+    /// must tell them apart or a defaclrole named like a table collides.
+    #[test]
+    fn the_snapshot_ddl_keys_grant_kind() {
+        let ddl = fence_table_ddl();
+        assert!(ddl.contains("grant_kind"));
+        assert!(ddl.contains(
+            "PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege, grant_kind)"
+        ));
     }
 
     /// Rows replicated from another cluster's fence must never grant here,
