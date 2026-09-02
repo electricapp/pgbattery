@@ -450,9 +450,7 @@ def _advance_sequences(green_leader: Node, blue_leader: Node) -> int:
         )
     r = _post(green_leader, "advance-sequences", {"sequences": sequences, "margin": 10_000})
     if not r.is_success:
-        raise ContractFailure(
-            f"U3: advance-sequences refused on green: {r.status_code} {r.text}"
-        )
+        raise ContractFailure(f"U3: advance-sequences refused on green: {r.status_code} {r.text}")
     return blue_max
 
 
