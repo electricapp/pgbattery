@@ -29,12 +29,14 @@ Shared spine before Track B/C is honest:
 | 8   | Track C cutover protocol — **TLA+ before code**            | C        | [x]    |
 | 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [~]    |
 
-Step 9 is `[~]`, not `[x]`. Every piece is now written — protocol, both fences,
-the epoch projection, provenance verification, seeding, the DDL freeze and
-digest, the retention monitor. What is missing is evidence: the seeding, the
-DDL trigger, the digest query and the retention query have never run, and the
-Track C matrix cases have not passed since those changes. `[x]` here means
-written, not proven.
+Step 9 is `[~]`, not `[x]`. Every piece is written, and after the audit pass
+every audited defect in it is fixed — the arm guard, the drain gate on donor
+slot confirmation, backend termination at SEAL, PUBLIC/inherited fence
+coverage, real sequence advancement, atomic seeding with the publication and
+ACLs, tokens on every call. What is still missing is live evidence: none of
+the Track C paths have run against a real cluster, and the Track C matrix
+cases have not passed since the rework. `[x]` below means written and
+unit/shape-tested, not live-proven.
 
 Do **not** parallelize 5, 6, and 8–9 in one branch. Do **not** ship wire-format
 and PG-major upgrade in the same release if avoidable.
@@ -163,23 +165,41 @@ and PG-major upgrade in the same release if avoidable.
 
 ### Authority model (step 8)
 
-- [x] TLA+ cutover spec + counterexample. Two clusters, **separate logs**, a delivery step between them, and monotonicity as an action property
+- [x] TLA+ cutover spec + two counterexamples: `inv-green-self-elect` (U4,
+      timeout self-election) and `inv-green-self-arm` (U1, arming without the
+      holds-authority guard). Two clusters, **separate logs**, a delivery step
+      between them, and monotonicity as an action property
 - [x] `(epoch, cluster_id)` identity from `Config::cluster_id`; no blue/green magic strings
-- [x] `holds_client_write_authority` is the single read; authority in transit belongs to nobody
-- [x] SEAL fences first, then reads its own final LSN, then commits (U2)
+- [x] `Governor::cutover_authority_projection` is the single read (raw log
+      state plus the `awaits_write_authority_from` boot fence); authority in
+      transit belongs to nobody, and every handler — status included — reads
+      through it
+- [x] Arming requires held authority in every phase: arming records authority
+      for the local cluster, so a boot-fenced recipient's arm is refused (U1)
+- [x] SEAL fences, terminates every fenced-role backend and waits them out,
+      then reads its own final LSN, then commits (U2); a seal whose commit
+      fails lifts the fence it applied
 - [x] Out-of-phase commands report `OutOfOrder`, not `success: true`
 - [x] Gateways relay to the committed recipient address; no fallback to the local leader
 - [x] Fail closed: no confirmed address means hold
 - [x] Force transfer records `forced: true` permanently; requires `accept_write_loss`; no timeout
-- [x] Abort unseal into a new epoch
+- [x] Abort unseal into a new epoch — from ARMED too, so a wrong-target arm
+      exits without fencing clients first
 
 ### Client-vs-apply fence
 
-- [x] Role-based revoke covering tables **and sequences** (`nextval` is a write)
-- [x] Lift restores exactly the recorded grants, so abort is a true inverse
+- [x] Role-based revoke covering tables **and sequences** (`nextval` is a
+      write), plus default-ACL grants for every granting owner; coverage
+      refuses a seal that PUBLIC grants or an unfenced parent role would
+      write through
+- [x] Lift restores exactly the recorded grants — relation and default-ACL
+      alike, filtered to this cluster's own snapshot rows — skipping loudly
+      over a relation dropped mid-fence instead of failing wholesale
 - [x] Fence coverage re-checked at SEAL, not only in a separate `--check` run
-- [x] Reconciler drives the fence from committed state, so a node promoted mid-cutover applies it
-- [x] Recipient fenced from boot via `awaits_write_authority_from` + `client_fence_roles`
+- [x] Reconciler drives the fence from committed state (read fresh, not the
+      tick-lagged projection), retries probe failures, and shares the fence
+      lock with the seal/abort handlers
+- [x] Recipient fenced from boot via `awaits_write_authority_from` + `client_fence_roles` (role names validated at load)
 
 ### Preflight (step 7)
 
@@ -188,43 +208,62 @@ and PG-major upgrade in the same release if avoidable.
 ### Orchestration / rollback (step 9)
 
 - [x] Seed via logical; catch up on a real LSN, not a sleep — `testing/bluegreen_cutover.py`
-- [x] Drain gate is subscriber-confirmed LSN vs the sealed final LSN, not row counts
-- [x] U2 ledger: every acked pre-seal key asserted present on green
-- [x] U3: green's sequence is a real identity column, advanced past blue, and the non-collision asserted
-- [x] Relay assertion: writes through the donor's gateway land on the recipient and not on the donor
+- [x] Drain gate is the donor's slot `confirmed_flush_lsn` (min across logical
+      slots, NULL fail-closed) vs the sealed final LSN — satisfiable across
+      nonpublishable WAL — plus every subscribed table `srsubstate` ready on
+      ≥1 enabled subscription; never row counts, never the plateauing origin
+- [x] U2 ledger: every acked pre-seal key asserted present on green by
+      set-difference, with a writer racing ARM and SEAL and the boundary
+      snapshot taken at the seal response
+- [x] U3: the product reads donor sequence values and advances the recipient's
+      by endpoint (a missing sequence errors by name); the harness drives
+      those endpoints and asserts non-collision independently
+- [x] Relay assertion probed before reverse wiring: writes through the donor's
+      gateway land on the recipient and grow the donor by exactly zero
 - [x] Post-cutover rollback drill runs the **reverse protocol**, not just a write check
 - [x] Six-node compose via `topology.py` — `docker-compose.bluegreen.yml`
-- [x] Chaos: arm-seal, seal-transfer, mid-drain, blue-quorum — each asserts an outcome, none use `expect_exit: null`, all four run in CI
+- [x] Chaos: arm-seal, seal-transfer, mid-drain, blue-quorum — each asserts the
+      kill actually landed and an outcome, none use `expect_exit: null`, all
+      four run in CI; plus the live arm-guard inversion (arming virgin green
+      must be refused)
 
 ### Orchestration command (step 9)
 
-- [x] `pgbattery upgrade postgres --to N --blue-green --experimental --green-node <addr> --green-cluster-id <id> --app-role <role>` runs the handoff
+- [x] `pgbattery upgrade postgres --to N --blue-green --experimental --green-node <addr> --green-cluster-id <id> --app-role <role>` runs the handoff; `--green-token` (env `PGBATTERY_GREEN_MANAGEMENT_API_TOKEN`) for a recipient with its own token; `--accept-security-definer <name>` for named SECURITY DEFINER acceptance
 - [x] Refuses a recipient that already claims authority, or whose `cluster_id` is not the one named
-- [x] Drain waits on the recipient's applied origin LSN vs the donor's sealed LSN, and refuses a recipient with no subscriptions
-- [x] Postflight refuses unless exactly the recipient's nodes claim authority (U1)
+- [x] Drain waits on the donor's slot confirmation vs the sealed LSN and the recipient's table-sync readiness, and refuses a recipient with no enabled subscriptions; three consecutive retention-read failures abort while the donor can still unseal
+- [x] Postflight refuses unless every recipient node claims authority for the recipient at the transfer epoch and every donor node reports not holding — identity, not a count, with bounded retry for lagging followers (U1)
 
 ### Verified provenance (step 8)
 
-- [x] The recipient confirms the handoff by reading the donor's committed state from a **strict majority of the donor's own nodes** — silence counts against
+- [x] The recipient confirms the handoff by reading the donor's committed state from a **strict majority of the donor's own nodes** — silence counts against, polled concurrently
+- [x] The denominator is bounded by the donor's own reported voter count, so an honest caller listing one node of a three-node donor is refused rather than granted a 1-of-1 "majority"
 - [x] `accept_unverified_provenance` narrowed to the unreachable-donor break-glass; it cannot be combined with `donor_mgmt_addrs`
-- [x] Unit inversions: minority, all-silent, contradicting, empty-set, and 5-node quorum
+- [x] Unit inversions: minority, all-silent, contradicting, empty-set, 5-node quorum, and short-denominator
 - [x] Live inversion: `bluegreen-cutover` asserts a single donor node cannot hand over
 
-### Not implemented (Track C)
+### Written, live-unproven (Track C)
 
 - [x] Green provisioning and logical seeding — `POST /api/v1/admin/cutover/seed`
-      dumps the donor schema, restores it, and creates a copying subscription.
-      Refuses a recipient that already has tables. The initial-copy gate reads
-      `pg_subscription_rel.srsubstate`, where no subscribed tables is not
-      completion. **Never executed.**
-- [x] DDL freeze event trigger and schema digest. The trigger rides the
-      committed cutover phase, so the reconciler removes it from state —
-      one left installed would block every DDL forever. Frozen SEALED through
-      DRAINING only: a recipient fenced from boot is IDLE, and freezing it
-      there would block the very DDL seeding needs. **Never executed.**
+      creates the donor publication over every user schema (pgbattery's own
+      excluded), dumps the donor schema with its ACLs, restores it in one
+      psql transaction (a failure rolls back and re-seed stays possible),
+      refuses a recipient that already has tables or is missing a required
+      role, and subscribes with copy. Table-copy state
+      (`pg_subscription_rel.srsubstate`) is enforced by the drain gate, where
+      no subscribed tables is not completion. **Never live-executed.**
+- [x] DDL freeze event trigger and schema digest (ordinal columns, not raw
+      `attnum`, so a donor that dropped a column can match a fresh recipient).
+      The trigger rides the committed cutover phase and the reconciler probes
+      it instead of churning it — one left installed would block every DDL
+      forever, and the abort drops it before lifting the fence. Frozen SEALED
+      through DRAINING only: a recipient fenced from boot is IDLE, and
+      freezing it there would block the very DDL seeding needs.
+      **Never live-executed.**
 - [x] WAL-retention / slot-lag monitor — the drain wait reads donor retention
-      each round and aborts while the donor can still be unsealed.
-      `donor_wal_risk` is unit-tested; **the query has never executed.**
+      each round, fails closed on a broken read (three consecutive failures
+      abort), and aborts while the donor can still be unsealed.
+      **Never live-executed.**
 - [x] Reverse cutover. What blocked it was the arm guard, not a missing command:
       a recipient sat in TRANSFERRED and `CutoverArmed` took only IDLE/ABORTED.
       With that fixed the existing command drives it by swapping `--node` and

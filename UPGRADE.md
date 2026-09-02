@@ -1,11 +1,12 @@
 # UPGRADE.md — Upgrade Design Spec
 
 Status: design. This document is the target, not a status report —
-`UPGRADE_CHECKLIST.md` tracks what has landed. Tracks A and B are implemented.
-Track C's authority protocol, both fences, verified provenance, and the
-cutover command are in; green provisioning, logical seeding, and the DDL
-freeze are not, so the cutover requires a green cluster that is already
-streaming. Three tracks, independently shippable:
+`UPGRADE_CHECKLIST.md` tracks what has landed. Tracks A and B are implemented
+and matrix-proven. Track C is fully written — authority protocol, both
+fences, verified provenance, seeding, the DDL freeze and digest, sequence
+advancement, and the cutover command — and unit/shape-tested throughout, but
+its paths have not yet run against a live cluster; the Track C matrix cases
+are the missing evidence. Three tracks, independently shippable:
 
 - Track A: rolling pgbattery self-upgrades (minor and major) with no cluster
   downtime.
