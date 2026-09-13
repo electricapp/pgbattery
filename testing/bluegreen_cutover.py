@@ -1000,9 +1000,13 @@ def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) 
     for f in followers[:2]:
         _compose("start", f.service)
     # Quorum loss made the lone node step down; when the two followers return,
-    # the election may seat a different blue node. Re-resolve the leader each
-    # round — a cutover write must go to the current leader, which the server
-    # now enforces with a clean refusal rather than a blocking write.
+    # the election may seat a different blue node, so re-resolve the leader
+    # each round. The forced transfer that blocked without quorum appended to
+    # the leader's log, so it commits once quorum returns — the contract is
+    # that the forced transfer completes, not that a fresh call returns 200.
+    # Check the committed state first; a fresh transfer is out-of-phase (409)
+    # once the original has landed. Fire one only while still not transferred,
+    # to drive the case where nothing was appended.
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         try:
@@ -1010,14 +1014,13 @@ def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) 
         except TimeoutError:
             time.sleep(3)
             continue
-        if _post(leader, "force-transfer", body).status_code == 200:
-            st = _cutover_status(leader)
-            if not st.get("transfer_forced"):
-                raise ContractFailure(f"forced transfer not recorded as forced: {st}")
+        st = _cutover_status(leader)
+        if st.get("transfer_forced") and st.get("phase") == "transferred":
             console.print("chaos blue-quorum OK: forced transfer recorded, write loss accepted")
             return
+        _post(leader, "force-transfer", body)
         time.sleep(3)
-    raise ContractFailure("force-transfer never succeeded after quorum returned")
+    raise ContractFailure("force-transfer never completed after quorum returned")
 
 
 CHAOS: Final[dict[str, Callable[[Node, Node, list[Node]], None]]] = {

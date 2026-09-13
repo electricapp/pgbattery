@@ -2513,28 +2513,21 @@ pub async fn rollback_local(
         .await
         .map_err(|e| anyhow::anyhow!("start old major: {e}"))?;
 
-    // The old primary persisted `synchronous_standby_names` via ALTER SYSTEM,
-    // so it restarts still waiting on standbys that are now on the new major
-    // and no longer streaming — the first write would block on
-    // synchronous_commit until they return. The rolled-back cluster is
-    // standalone until those standbys re-basebackup and rejoin, so relax the
-    // GUC to empty now; the replication manager re-establishes it from replica
-    // health once they are back.
-    supervisor
-        .set_sync_standby_names("")
-        .await
-        .context("relaxing synchronous_standby_names on the rolled-back primary")?;
-
     // Probe rather than assume: a rollback path that has never been exercised
     // is the same failure mode as an oracle that has never failed. The write
     // goes to a temp table so the drill leaves nothing in the user's schema.
-    supervisor
-        .execute_sql(
-            "CREATE TEMP TABLE pgbattery_rollback_probe(i int); \
-             INSERT INTO pgbattery_rollback_probe VALUES (1);",
-        )
-        .await
-        .context("rolled-back cluster did not accept a write")?;
+    //
+    // `synchronous_commit = local` proves local liveness without waiting on a
+    // standby ack: the rolled-back primary's former standbys were upgraded to
+    // the new major and diverged ahead, so they cannot stream to it, and the
+    // replication manager still lists them in `synchronous_standby_names` for
+    // RPO=0. Durable (synchronous_commit=on) client writes therefore block
+    // until those standbys are re-basebackup'd from this old-major primary,
+    // which the caller must drive after a rollback the way it does after a
+    // forward apply. This probe proves the node is alive, not that the
+    // cluster is durably writable. Retry briefly: the node needs a moment to
+    // finish promotion after `start()`.
+    probe_rollback_write(supervisor).await?;
     let catalog_ok = supervisor
         .execute_sql("SELECT count(*)::text FROM pg_class;")
         .await
@@ -2565,6 +2558,40 @@ pub async fn rollback_local(
         unfreeze_watermark_lsn: watermark,
         new_cluster_final_lsn,
     })
+}
+
+/// Prove the rolled-back primary accepts a write, retrying across the settle
+/// window after `start()`.
+///
+/// `synchronous_commit = local` proves local liveness without waiting on a
+/// standby ack: the rolled-back primary's former standbys were upgraded to the
+/// new major and diverged ahead, so they cannot stream to it, and the
+/// replication manager still lists them in `synchronous_standby_names` for
+/// RPO=0. Durable (`synchronous_commit=on`) client writes therefore block until
+/// those standbys are re-basebackup'd from this old-major primary, which the
+/// caller must drive after a rollback the way it does after a forward apply.
+/// The write goes to a temp table so the drill leaves nothing behind.
+async fn probe_rollback_write(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
+    let mut last_err: Option<String> = None;
+    for _ in 0..20 {
+        match supervisor
+            .execute_sql(
+                "SET synchronous_commit = local; \
+                 CREATE TEMP TABLE pgbattery_rollback_probe(i int); \
+                 INSERT INTO pgbattery_rollback_probe VALUES (1); \
+                 DROP TABLE pgbattery_rollback_probe;",
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = Some(e.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    bail!(
+        "rolled-back cluster did not accept a write within the settle window: {}",
+        last_err.unwrap_or_default()
+    );
 }
 
 /// Move a rolled-back-from target directory aside so a re-apply is not
