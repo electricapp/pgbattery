@@ -2513,6 +2513,18 @@ pub async fn rollback_local(
         .await
         .map_err(|e| anyhow::anyhow!("start old major: {e}"))?;
 
+    // The old primary persisted `synchronous_standby_names` via ALTER SYSTEM,
+    // so it restarts still waiting on standbys that are now on the new major
+    // and no longer streaming — the first write would block on
+    // synchronous_commit until they return. The rolled-back cluster is
+    // standalone until those standbys re-basebackup and rejoin, so relax the
+    // GUC to empty now; the replication manager re-establishes it from replica
+    // health once they are back.
+    supervisor
+        .set_sync_standby_names("")
+        .await
+        .context("relaxing synchronous_standby_names on the rolled-back primary")?;
+
     // Probe rather than assume: a rollback path that has never been exercised
     // is the same failure mode as an oracle that has never failed. The write
     // goes to a temp table so the drill leaves nothing in the user's schema.

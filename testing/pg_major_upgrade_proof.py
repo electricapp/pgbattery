@@ -305,10 +305,15 @@ def _seed(gateway_port: int) -> None:
 
 def _require_dual_majors() -> None:
     topo = load()
-    body = httpx.get(
+    # Token-gated: an auth error body parsed as "no majors" would fail this
+    # gate for the wrong reason, so refuse loudly on a non-2xx first.
+    r = httpx.get(
         f"http://127.0.0.1:{topo.nodes[0].mgmt_port}/api/v1/postgres/bins",
+        headers={"x-pgbattery-token": _token()},
         timeout=10.0,
-    ).json()
+    )
+    r.raise_for_status()
+    body = r.json()
     console.print("postgres-bins:", body)
     bin_dirs = body.get("bin_dirs") or {}
     majors = set(bin_dirs) if isinstance(bin_dirs, dict) else set()

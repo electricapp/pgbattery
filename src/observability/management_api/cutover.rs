@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use super::ManagementApiState;
 use crate::commands::upgrade::client_fence::apply_client_write_fence;
 use crate::governor::raft::ClusterRequest;
+use crate::governor::state_machine::NodeId;
 use crate::governor::state_machine::{ClusterCommand, CommandOutcome, CutoverPhase};
 
 /// Per-request budget for reading one donor node's status.
@@ -263,6 +264,44 @@ pub(super) async fn get_cutover_status(
     (StatusCode::OK, Json(status_from(&state)))
 }
 
+/// Whether this node can commit a Raft write right now: it is the leader and
+/// its lease projection still reports quorum.
+///
+/// `client_write` blocks until commit, so proposing without quorum hangs the
+/// caller until its HTTP timeout rather than failing closed — a forced
+/// transfer against a donor that lost quorum must return a bounded refusal,
+/// not a hung socket. A precheck (never a timeout wrapper) is the safe shape:
+/// timing out the write future would report failure on an entry that could
+/// still commit, which for a cutover authority record is a split-brain risk.
+fn can_commit_locally(state: &ManagementApiState) -> Result<(), String> {
+    let leader = state.raft.metrics().borrow().current_leader;
+    let has_quorum = state.fence_tx.borrow().has_quorum;
+    commit_precondition(leader == Some(state.node_id), has_quorum, leader)
+}
+
+/// Pure form of the commit precheck, so its two refusals can be tested without
+/// a Raft node.
+fn commit_precondition(
+    is_leader: bool,
+    has_quorum: bool,
+    current_leader: Option<NodeId>,
+) -> Result<(), String> {
+    if !is_leader {
+        return Err(format!(
+            "this node is not the Raft leader (current leader: {current_leader:?}); \
+             a cutover command must be issued to the leader"
+        ));
+    }
+    if !has_quorum {
+        return Err(
+            "this cluster has lost Raft quorum, so it cannot commit a cutover \
+             entry; it is write-unavailable until quorum returns"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Commit `cmd` and report whether it actually changed the state machine.
 ///
 /// A committed entry that no phase accepted is not a success: reporting it as
@@ -271,6 +310,9 @@ async fn apply_cutover(
     state: &ManagementApiState,
     cmd: ClusterCommand,
 ) -> (StatusCode, Json<CutoverActionResponse>) {
+    if let Err(why) = can_commit_locally(state) {
+        return refuse(state, StatusCode::SERVICE_UNAVAILABLE, why);
+    }
     let described = format!("{cmd:?}");
     match state
         .raft
@@ -1313,10 +1355,36 @@ pub(super) async fn cutover_receive_authority(
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "test code asserts on known-good values and panics are the failure signal"
 )]
 mod tests {
     use super::*;
+
+    /// A cutover write must fail closed without quorum: `client_write` blocks
+    /// until commit, so proposing a forced transfer on a quorum-less donor
+    /// would hang the caller until its HTTP timeout instead of refusing. The
+    /// precheck refuses first.
+    #[test]
+    fn a_cutover_write_without_quorum_is_refused_not_blocked() {
+        let err = commit_precondition(true, false, Some(1))
+            .expect_err("no quorum must refuse before proposing");
+        assert!(err.contains("quorum"), "{err}");
+    }
+
+    /// A cutover command reaching a non-leader is refused, not forwarded into a
+    /// blocking write it cannot commit.
+    #[test]
+    fn a_cutover_write_on_a_non_leader_is_refused() {
+        let err = commit_precondition(false, true, Some(2)).expect_err("a non-leader must refuse");
+        assert!(err.contains("not the Raft leader"), "{err}");
+    }
+
+    /// The leader with quorum proceeds to the write.
+    #[test]
+    fn the_leader_with_quorum_may_commit() {
+        assert!(commit_precondition(true, true, Some(1)).is_ok());
+    }
 
     /// A minority cannot hold a Raft commit, so a minority cannot prove one.
     #[test]
