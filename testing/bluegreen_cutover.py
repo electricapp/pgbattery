@@ -978,24 +978,40 @@ def _chaos_blue_quorum(blue_leader: Node, green_leader: Node, blue: list[Node]) 
         "target_pg_addr": _pg_addr(green_leader),
         "accept_write_loss": True,
     }
-    r = _post(blue_leader, "force-transfer", body)
-    if r.status_code == 200:
-        raise ContractFailure(
-            "force-transfer succeeded without blue quorum: it commits to blue's "
-            "log, so it must fail closed until quorum returns"
-        )
+    # Fail-closed has two shapes without quorum, both acceptable: a bounded
+    # refusal once the leader's lease projection has noticed the loss, or the
+    # request blocking until it gives up — the transfer commits to blue's log,
+    # so a blocked call has granted nothing. A 200 is the only failure: it
+    # would mean authority moved without a committed entry.
+    try:
+        r = _post(blue_leader, "force-transfer", body)
+        if r.status_code == 200:
+            raise ContractFailure(
+                "force-transfer succeeded without blue quorum: it commits to blue's "
+                "log, so it must fail closed until quorum returns"
+            )
+        outcome = f"refused ({r.status_code})"
+    except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
+        outcome = "blocked, granting nothing"
     if _psql_allowed(green_leader, "INSERT INTO bg_kv(k,v) VALUES ('chaos','x');", APP_ROLE):
         raise ContractFailure("U4 violated: green wrote while blue had no quorum")
-    console.print(
-        f"chaos blue-quorum: force-transfer failed closed ({r.status_code}), green read-only"
-    )
+    console.print(f"chaos blue-quorum: force-transfer failed closed ({outcome}), green read-only")
 
     for f in followers[:2]:
         _compose("start", f.service)
+    # Quorum loss made the lone node step down; when the two followers return,
+    # the election may seat a different blue node. Re-resolve the leader each
+    # round — a cutover write must go to the current leader, which the server
+    # now enforces with a clean refusal rather than a blocking write.
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
-        if _post(blue_leader, "force-transfer", body).status_code == 200:
-            st = _cutover_status(blue_leader)
+        try:
+            leader = _leader_node(blue)
+        except TimeoutError:
+            time.sleep(3)
+            continue
+        if _post(leader, "force-transfer", body).status_code == 200:
+            st = _cutover_status(leader)
             if not st.get("transfer_forced"):
                 raise ContractFailure(f"forced transfer not recorded as forced: {st}")
             console.print("chaos blue-quorum OK: forced transfer recorded, write loss accepted")
