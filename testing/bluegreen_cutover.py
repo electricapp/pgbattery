@@ -196,6 +196,10 @@ def _psql_allowed(node: Node, sql: str, user: str) -> bool:
         "psql",
         "-U",
         user,
+        # Explicit: psql defaults dbname to the user, and no "bg_app"
+        # database exists — the probe must fail only on the fence's denial.
+        "-d",
+        "postgres",
         "-h",
         "127.0.0.1",
         "-p",
