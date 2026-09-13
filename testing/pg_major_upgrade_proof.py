@@ -361,7 +361,10 @@ def _chaos_mid_upgrade(service: str, entry: str, gateway: int) -> None:
         return True if p.returncode == 0 else None
 
     try:
-        await_until(running, budget=600.0, describe="pg_upgrade to start", interval=1.0)
+        # Poll tightly: pg_upgrade on a small database can finish inside a
+        # one-second window, and a coarser interval would miss it entirely and
+        # fail this case on fast hardware for a timing reason, not a defect.
+        await_until(running, budget=600.0, describe="pg_upgrade to start", interval=0.02)
     except WaitTimeout as exc:
         raise ContractFailure(f"pg_upgrade never ran, so the kill proved nothing: {exc}") from exc
 
