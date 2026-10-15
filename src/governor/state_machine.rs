@@ -128,6 +128,11 @@ pub struct ClusterState {
     /// its recorded position converges: cutover commands are not idempotent.
     #[serde(default)]
     pub applied_index: Option<u64>,
+
+    /// Committed feature level: the newest command set every member decodes.
+    /// Commands above it are no-ops (`ClusterCommand::required_feature_level`).
+    #[serde(default)]
+    pub feature_level: u32,
 }
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
@@ -157,6 +162,7 @@ impl From<ClusterStateV0> for ClusterState {
             cutover: CutoverAuthorityState::default(),
             upgrade_frozen: false,
             applied_index: None,
+            feature_level: 0,
         }
     }
 }
@@ -381,6 +387,40 @@ pub enum ClusterCommand {
         from_cluster_id: String,
         local_cluster_id: String,
     },
+
+    /// Raise the committed feature level. Proposed only once every member
+    /// reports support for `level` (`governor::propose::finalize_feature_level`).
+    SetFeatureLevel { level: u32 },
+}
+
+/// Highest cluster feature level this binary decodes.
+///
+/// Level 0 is the original command set; level 1 adds cutover, the upgrade
+/// freeze, and `SetFeatureLevel` itself. A command is proposed and applied
+/// only once the cluster has committed a level that admits it, so no member
+/// is sent an entry it cannot decode.
+pub const FEATURE_LEVEL: u32 = 1;
+
+impl ClusterCommand {
+    /// The feature level whose decoders know this command.
+    #[must_use]
+    pub const fn required_feature_level(&self) -> u32 {
+        match self {
+            Self::AddNode(_)
+            | Self::RemoveNode(_)
+            | Self::UpdateNode { .. }
+            | Self::UpdateLsn { .. }
+            | Self::SetSyncMode { .. } => 0,
+            Self::CutoverArmed { .. }
+            | Self::CutoverSeal { .. }
+            | Self::SetUpgradeFreeze { .. }
+            | Self::CutoverDrainObserved
+            | Self::CutoverTransfer { .. }
+            | Self::CutoverAbortUnseal { .. }
+            | Self::CutoverAuthorityReceived { .. }
+            | Self::SetFeatureLevel { .. } => 1,
+        }
+    }
 }
 
 /// What applying a committed [`ClusterCommand`] did.
@@ -436,7 +476,16 @@ impl ClusterState {
     }
 
     /// Apply a command to the state machine.
+    ///
+    /// A command above the committed feature level is a no-op on every
+    /// replica, whatever the replica's binary could decode.
     pub fn apply(&mut self, cmd: ClusterCommand) -> CommandOutcome {
+        if let ClusterCommand::SetFeatureLevel { level } = cmd {
+            return self.raise_feature_level(level);
+        }
+        if cmd.required_feature_level() > self.feature_level {
+            return CommandOutcome::OutOfOrder;
+        }
         match cmd {
             ClusterCommand::AddNode(info) => {
                 self.nodes.insert(info.id, info);
@@ -497,6 +546,24 @@ impl ClusterState {
             }
             cutover => return self.apply_cutover(cutover),
         }
+        CommandOutcome::Applied
+    }
+
+    /// The level only rises. One above what this binary decodes is still
+    /// recorded, so every replica holds the same state; such a binary is about
+    /// to receive entries it cannot read, and says so.
+    fn raise_feature_level(&mut self, level: u32) -> CommandOutcome {
+        if level <= self.feature_level {
+            return CommandOutcome::OutOfOrder;
+        }
+        if level > FEATURE_LEVEL {
+            tracing::error!(
+                committed = level,
+                supported = FEATURE_LEVEL,
+                "Cluster committed a feature level this binary does not decode"
+            );
+        }
+        self.feature_level = level;
         CommandOutcome::Applied
     }
 
@@ -915,6 +982,14 @@ mod tests {
     const BLUE: &str = "blue-1";
     const GREEN: &str = "green-1";
 
+    /// A cluster that has committed this binary's feature level.
+    fn at_current_level() -> ClusterState {
+        ClusterState {
+            feature_level: FEATURE_LEVEL,
+            ..ClusterState::default()
+        }
+    }
+
     fn armed(state: &mut ClusterState) {
         state.apply(ClusterCommand::CutoverArmed {
             target_cluster_id: GREEN.into(),
@@ -922,10 +997,55 @@ mod tests {
         });
     }
 
+    /// A cluster that never committed a feature level is one a binary
+    /// without cutover support may still be replicating; the entry is a
+    /// no-op on every replica rather than a fork between those that decode
+    /// it and those that cannot.
+    #[test]
+    fn a_command_above_the_committed_feature_level_is_refused() {
+        let mut state = ClusterState::default();
+        let outcome = state.apply(ClusterCommand::CutoverArmed {
+            target_cluster_id: GREEN.into(),
+            local_cluster_id: BLUE.into(),
+        });
+        assert_eq!(outcome, CommandOutcome::OutOfOrder);
+        assert_eq!(state.cutover.phase, CutoverPhase::Idle);
+        assert_eq!(
+            state.apply(ClusterCommand::SetUpgradeFreeze { frozen: true }),
+            CommandOutcome::OutOfOrder
+        );
+        assert!(!state.upgrade_frozen);
+    }
+
+    /// Raising the level admits the command set it names, and the level
+    /// never moves backward.
+    #[test]
+    fn the_feature_level_only_rises_and_admits_what_it_names() {
+        let mut state = ClusterState::default();
+        assert_eq!(
+            state.apply(ClusterCommand::SetFeatureLevel { level: 1 }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.feature_level, 1);
+        assert_eq!(
+            state.apply(ClusterCommand::SetUpgradeFreeze { frozen: true }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(ClusterCommand::SetFeatureLevel { level: 1 }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(
+            state.apply(ClusterCommand::SetFeatureLevel { level: 0 }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(state.feature_level, 1);
+    }
+
     /// Happy-path cutover matches `tla/cutover_authority.tla` Transfer sequence.
     #[test]
     fn cutover_transfer_advances_epoch_to_the_named_cluster() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         assert_eq!(state.cutover.phase, CutoverPhase::Idle);
         assert!(state.cutover.holds_client_write_authority(BLUE));
         assert_eq!(state.cutover.epoch, 0);
@@ -963,7 +1083,7 @@ mod tests {
     /// made the whole reverse direction unreachable.
     #[test]
     fn the_cluster_holding_authority_can_arm_the_reverse_cutover() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let outcome = state.apply(ClusterCommand::CutoverAuthorityReceived {
             epoch: 1,
             from_cluster_id: BLUE.into(),
@@ -986,7 +1106,7 @@ mod tests {
     /// to itself with no handoff — both clusters writable at the same epoch.
     #[test]
     fn the_cluster_that_gave_authority_away_cannot_arm_itself_back() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         state.apply(ClusterCommand::CutoverSeal {
             final_lsn: 10,
@@ -1016,8 +1136,8 @@ mod tests {
     /// next handoff. `tla/cutover_authority.tla` models the donor side only.
     #[test]
     fn authority_survives_a_round_trip_with_both_epochs_rising() {
-        let mut blue = ClusterState::new();
-        let mut green = ClusterState::new();
+        let mut blue = at_current_level();
+        let mut green = at_current_level();
 
         armed(&mut blue);
         blue.apply(ClusterCommand::CutoverSeal {
@@ -1079,7 +1199,7 @@ mod tests {
     /// Abort unseals the donor into a new epoch; the recipient never held it.
     #[test]
     fn cutover_abort_unseal_returns_authority_in_a_new_epoch() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         state.apply(ClusterCommand::CutoverSeal {
             final_lsn: 50,
@@ -1099,7 +1219,7 @@ mod tests {
     /// abort applies from Armed directly, into a new epoch.
     #[test]
     fn an_armed_cutover_can_be_aborted_without_sealing() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         assert_eq!(
             state.apply(ClusterCommand::CutoverAbortUnseal {
@@ -1117,7 +1237,7 @@ mod tests {
     /// A command that cannot apply from the current phase says so.
     #[test]
     fn an_out_of_phase_command_reports_out_of_order() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         assert_eq!(
             state.apply(ClusterCommand::CutoverSeal {
                 final_lsn: 1,
@@ -1152,7 +1272,7 @@ mod tests {
     /// while SEALED is the only reason the recipient may ever take them.
     #[test]
     fn no_cluster_holds_authority_while_it_is_in_transit() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         assert!(state.cutover.holds_client_write_authority(BLUE));
 
@@ -1172,7 +1292,7 @@ mod tests {
     /// group thinks. Both the gateway and the PG-role fence read this.
     #[test]
     fn the_donor_stops_holding_authority_after_transfer() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         state.apply(ClusterCommand::CutoverSeal {
             final_lsn: 7,
@@ -1192,7 +1312,7 @@ mod tests {
     /// before SEAL may be missing from the recipient.
     #[test]
     fn a_forced_transfer_is_distinguishable_from_a_drained_one() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         state.apply(ClusterCommand::CutoverSeal {
             final_lsn: 7,
@@ -1214,7 +1334,7 @@ mod tests {
     /// An unforced transfer may not skip the drain proof.
     #[test]
     fn an_unforced_transfer_refuses_to_skip_drain() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         armed(&mut state);
         state.apply(ClusterCommand::CutoverSeal {
             final_lsn: 7,
@@ -1235,7 +1355,7 @@ mod tests {
     /// replayed attestation cannot lift it twice.
     #[test]
     fn a_recipient_refuses_a_non_increasing_authority_epoch() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let received = |epoch| ClusterCommand::CutoverAuthorityReceived {
             epoch,
             from_cluster_id: BLUE.into(),
@@ -1257,7 +1377,7 @@ mod tests {
     #[test]
     fn test_fresh_max_lsn_excludes_stale_entries() {
         use crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1300,7 +1420,7 @@ mod tests {
 
     #[test]
     fn test_lsn_acceptable_for_election() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1365,7 +1485,7 @@ mod tests {
     /// fresh data remains anywhere in the cluster.
     #[test]
     fn test_lsn_acceptable_leaderless_window_bootstrap_fallback() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1415,7 +1535,7 @@ mod tests {
     /// that once reported 100 MB has at least that much.
     #[test]
     fn test_stale_restored_node_loses_a_leaderless_election() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1454,7 +1574,7 @@ mod tests {
     /// compares against itself with a gap of zero, so it always passes.
     #[test]
     fn test_aged_tiebreak_always_leaves_someone_electable() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1491,7 +1611,7 @@ mod tests {
     /// split sat leaderless for four minutes.
     #[test]
     fn test_ordinary_lag_stays_electable_in_a_leaderless_window() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1523,7 +1643,7 @@ mod tests {
     /// nothing to compare against and a first leader has to be electable.
     #[test]
     fn test_true_bootstrap_stays_permissive() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         for id in 1..=3 {
             add_test_node(&mut state, id);
         }
@@ -1549,7 +1669,7 @@ mod tests {
         reason = "ok_sync/ok_async mirror the two replication modes under test"
     )]
     fn test_sync_mode_rejects_what_async_accepts() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1590,7 +1710,7 @@ mod tests {
     /// itself.
     #[test]
     fn test_sync_mode_accepts_within_one_wal_block() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1616,7 +1736,7 @@ mod tests {
     /// flag. Followers will see this via normal Raft apply.
     #[test]
     fn test_set_sync_mode_apply() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         assert_eq!(state.sync_replication_active, None);
 
         state.apply(ClusterCommand::SetSyncMode { active: true });
@@ -1634,7 +1754,7 @@ mod tests {
     /// silent-data-loss window the gate exists to close.
     #[test]
     fn test_unknown_sync_mode_fails_safe_to_tight_threshold() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1660,7 +1780,7 @@ mod tests {
 
     #[test]
     fn test_lsn_acceptable_l3_still_fires_with_fresh_peer() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1691,7 +1811,7 @@ mod tests {
 
     #[test]
     fn test_cluster_state_apply() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
 
         // Add nodes
         state.apply(ClusterCommand::AddNode(NodeInfo {
@@ -1727,7 +1847,7 @@ mod tests {
 
     #[test]
     fn test_update_lsn_tracks_max() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1770,7 +1890,7 @@ mod tests {
     /// brand the rewound node stale until it re-passed the old value.
     #[test]
     fn test_update_lsn_accepts_rewind_regression() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         add_test_node(&mut state, 1);
         add_test_node(&mut state, 2);
         let now = SystemTime::now()
@@ -1813,7 +1933,7 @@ mod tests {
 
     #[test]
     fn test_remove_node_cleans_lsn() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1842,7 +1962,7 @@ mod tests {
 
     #[test]
     fn test_stale_lsn_excluded_from_max() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1879,7 +1999,7 @@ mod tests {
 
     #[test]
     fn test_update_lsn_ignores_unknown_nodes() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         add_test_node(&mut state, 1);
 
         state.apply(ClusterCommand::UpdateLsn {
@@ -1894,7 +2014,7 @@ mod tests {
 
     #[test]
     fn test_update_lsn_uses_local_timestamp() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         add_test_node(&mut state, 1);
 
         state.apply(ClusterCommand::UpdateLsn {
@@ -1913,7 +2033,7 @@ mod tests {
 
     #[test]
     fn test_remove_node_drops_membership_and_lsn() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         add_test_node(&mut state, 1);
         add_test_node(&mut state, 2);
 
@@ -1974,7 +2094,7 @@ mod tests {
 
         fn state_from(rows: &[LsnRow], sync: Option<bool>) -> ClusterState {
             let now = i64::try_from(now_secs()).unwrap_or(i64::MAX);
-            let mut state = ClusterState::new();
+            let mut state = at_current_level();
             state.sync_replication_active = sync;
             for &(id, lsn, age) in rows {
                 let ts = u64::try_from(now.saturating_sub(age)).unwrap_or(0);
@@ -2038,7 +2158,7 @@ mod tests {
                 sync in sync_mode(),
             ) {
                 let now = now_secs();
-                let mut state = ClusterState::new();
+                let mut state = at_current_level();
                 state.sync_replication_active = sync;
                 for (i, &lsn) in lsns.iter().enumerate() {
                     let id = u64::try_from(i).unwrap_or(0).saturating_add(1);
@@ -2112,7 +2232,7 @@ mod tests {
                 sync in sync_mode(),
             ) {
                 let now = now_secs();
-                let mut state = ClusterState::new();
+                let mut state = at_current_level();
                 state.sync_replication_active = sync;
                 state.node_lsns.insert(PEER, (peers_max, now));
                 let threshold = state.lsn_catchup_threshold_bytes();
@@ -2223,7 +2343,7 @@ mod tests {
 
     #[test]
     fn test_lsn_election_threshold_boundary() {
-        let mut state = ClusterState::new();
+        let mut state = at_current_level();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

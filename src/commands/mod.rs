@@ -15,7 +15,7 @@ pub(crate) mod upgrade;
 
 // Re-export all command functions
 pub use backup::{run_backup_create, run_backup_list, run_backup_restore};
-pub use cluster::{run_leader, run_members, run_promote, run_remove};
+pub use cluster::{run_finalize_upgrade, run_leader, run_members, run_promote, run_remove};
 pub use doctor::run_doctor;
 pub use init::{InitParams, run_init};
 pub use join::run_join;

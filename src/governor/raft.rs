@@ -1067,20 +1067,6 @@ impl Governor {
         Ok(())
     }
 
-    /// Apply a cluster command.
-    ///
-    /// # Errors
-    /// Returns an error if the Raft client write fails (e.g. not the leader).
-    pub async fn apply(&self, command: ClusterCommand) -> Result<ClusterResponse> {
-        let request = ClusterRequest { command };
-        let response = self
-            .raft
-            .client_write(request)
-            .await
-            .map_err(|e| Error::Raft(e.to_string()))?;
-        Ok(response.data)
-    }
-
     /// Check if this node is the current leader.
     pub async fn is_leader(&self) -> bool {
         self.raft.current_leader().await == Some(self.node_id)
@@ -3458,10 +3444,14 @@ mod tests {
         assert!(state.node_lsns.is_empty());
     }
 
-    /// An arm and an abort: together they move the epoch once, and they are
-    /// not idempotent, because arming is legal again from ABORTED.
+    /// An arm and an abort, once the level admits them: together they move
+    /// the epoch once, and they are not idempotent, because arming is legal
+    /// again from ABORTED.
     fn arm_then_abort() -> Vec<ClusterCommand> {
         vec![
+            ClusterCommand::SetFeatureLevel {
+                level: crate::governor::state_machine::FEATURE_LEVEL,
+            },
             ClusterCommand::CutoverArmed {
                 target_cluster_id: "green".to_string(),
                 local_cluster_id: "blue".to_string(),
@@ -3492,6 +3482,11 @@ mod tests {
         let mut sm = StateMachineStore::new(Arc::new(RwLock::new(ClusterState::new())), storage);
         sm.applied_state().await.unwrap();
         sm.apply(normal_entries(&arm_then_abort())).await.unwrap();
+        assert_eq!(
+            sm.state.read().cutover.epoch,
+            1,
+            "the abort must move the epoch"
+        );
         sm.storage
             .save_last_applied(&LastAppliedState::default())
             .unwrap();

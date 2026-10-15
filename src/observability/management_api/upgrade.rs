@@ -550,14 +550,14 @@ pub(super) async fn set_upgrade_freeze(
             }),
         );
     }
-    match state
-        .raft
-        .client_write(crate::governor::raft::ClusterRequest {
-            command: crate::governor::state_machine::ClusterCommand::SetUpgradeFreeze {
-                frozen: body.frozen,
-            },
-        })
-        .await
+    match crate::governor::propose::propose(
+        &state.raft,
+        &state.cluster_state,
+        crate::governor::state_machine::ClusterCommand::SetUpgradeFreeze {
+            frozen: body.frozen,
+        },
+    )
+    .await
     {
         Ok(_) => {
             info!(upgrade_frozen = body.frozen, "Upgrade freeze committed");

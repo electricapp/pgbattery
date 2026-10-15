@@ -171,7 +171,6 @@ pub(super) async fn report_lsn(
     State(state): State<Arc<ManagementApiState>>,
     Json(req): Json<ReportLsnRequest>,
 ) -> impl IntoResponse {
-    use crate::governor::raft::ClusterRequest;
     use crate::governor::state_machine::ClusterCommand;
 
     // Check if we're the leader. `current_leader` is `Copy`; no need to
@@ -260,15 +259,13 @@ pub(super) async fn report_lsn(
     // Commit the LSN update to Raft.
     // Never trust client timestamp at this boundary.
     let observed_at = unix_now_secs();
-    let raft_req = ClusterRequest {
-        command: ClusterCommand::UpdateLsn {
-            node_id: req.node_id,
-            lsn_bytes: req.lsn_bytes,
-            timestamp: observed_at,
-        },
+    let command = ClusterCommand::UpdateLsn {
+        node_id: req.node_id,
+        lsn_bytes: req.lsn_bytes,
+        timestamp: observed_at,
     };
 
-    match state.raft.client_write(raft_req).await {
+    match crate::governor::propose::propose(&state.raft, &state.cluster_state, command).await {
         Ok(_) => (
             StatusCode::OK,
             Json(ReportLsnResponse {

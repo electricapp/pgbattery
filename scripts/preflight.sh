@@ -81,6 +81,8 @@ gate "mypy strict" uv run --project testing mypy testing/ --strict
 gate "harness lint" uv run --python 3.14 --script testing/lint_matrix.py
 # mirrors: ha-ci.yml:lint-test-harness
 gate "clock injection lint" uv run --python 3.14 --script testing/lint_clock_injection.py
+# mirrors: ha-ci.yml:lint-test-harness
+gate "proposal lint" uv run --python 3.14 --script testing/lint_propose.py
 
 # The harness self-tests gate CI as one job; a single failure there is a
 # checker that can no longer fail, so they are not optional here either. CI runs

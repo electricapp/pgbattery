@@ -6,8 +6,8 @@ use pgbattery::app::App;
 use pgbattery::cli::{BackupCommands, ClusterCommands, Commands, OutputFormat};
 use pgbattery::commands::{
     GlobalFlags, InitParams, init_globals, run_backup_create, run_backup_list, run_backup_restore,
-    run_doctor, run_init, run_join, run_leader, run_members, run_promote, run_remove, run_status,
-    run_upgrade,
+    run_doctor, run_finalize_upgrade, run_init, run_join, run_leader, run_members, run_promote,
+    run_remove, run_status, run_upgrade,
 };
 
 /// Default config path searched when `--config` is not given (see `Config::load`).
@@ -121,6 +121,9 @@ async fn main() -> Result<()> {
             ClusterCommands::Leader { node, json } => run_leader(node, json, cli.config).await,
             ClusterCommands::Promote { node_id, leader } => {
                 run_promote(node_id, leader, cli.config).await
+            }
+            ClusterCommands::FinalizeUpgrade { leader } => {
+                run_finalize_upgrade(leader, cli.config).await
             }
             ClusterCommands::Remove {
                 node_id,

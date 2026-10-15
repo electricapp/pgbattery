@@ -59,6 +59,17 @@ impl AdvertisedAddresses {
     }
 }
 
+/// Result of `POST /api/v1/cluster/finalize-upgrade`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizeUpgradeResponse {
+    pub success: bool,
+    pub committed_feature_level: u32,
+    /// Whether this call raised the level, rather than finding it already there.
+    pub raised: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Join request payload for cluster membership.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
@@ -72,6 +83,10 @@ pub struct JoinRequest {
     pub mgmt_addr: String,
     /// Metrics endpoint address
     pub metrics_addr: String,
+    /// Feature level the joining binary decodes; absent from binaries that
+    /// predate feature levels, which decode level 0.
+    #[serde(default)]
+    pub feature_level: u32,
 }
 
 impl JoinRequest {
@@ -85,7 +100,21 @@ impl JoinRequest {
             pg_addr: addrs.pg_addr.to_string(),
             mgmt_addr: addrs.mgmt_addr.to_string(),
             metrics_addr: addrs.metrics_addr.to_string(),
+            feature_level: crate::governor::state_machine::FEATURE_LEVEL,
         }
+    }
+
+    /// Why this joiner cannot be admitted at the `committed` feature level:
+    /// it would be sent entries its binary cannot decode.
+    #[must_use]
+    pub fn feature_level_refusal(&self, committed: u32) -> Option<String> {
+        (self.feature_level < committed).then(|| {
+            format!(
+                "Node {} decodes feature level {} but the cluster has committed {committed}; \
+                 join it with a binary that decodes that level",
+                self.node_id, self.feature_level
+            )
+        })
     }
 
     /// Convert to [`AdvertisedAddresses`].
@@ -131,6 +160,7 @@ mod tests {
             pg_addr: "10.0.0.1:5434".to_string(),
             mgmt_addr: "10.0.0.1:9091".to_string(),
             metrics_addr: "10.0.0.1:9090".to_string(),
+            feature_level: 0,
         };
 
         let addrs = req.to_advertised();
@@ -151,6 +181,7 @@ mod tests {
             pg_addr: "10.0.0.1:5434".to_string(),
             mgmt_addr: "10.0.0.1:9091".to_string(),
             metrics_addr: "10.0.0.1:9090".to_string(),
+            feature_level: 0,
         };
 
         assert!(req.to_advertised().is_none());
@@ -208,7 +239,28 @@ mod tests {
             pg_addr: "not-an-address".to_string(),
             mgmt_addr: "10.0.0.2:9091".to_string(),
             metrics_addr: "10.0.0.2:9090".to_string(),
+            feature_level: 0,
         };
         assert!(req.to_advertised().is_none());
+    }
+
+    /// A joiner below the committed level would be sent entries it cannot
+    /// decode; one at or above it is admitted. A request from a binary that
+    /// predates the field reads as level 0.
+    #[test]
+    fn a_joiner_below_the_committed_feature_level_is_refused() {
+        let old: JoinRequest = serde_json::from_str(
+            r#"{"node_id":4,"raft_addr":"10.0.0.4:5433","pg_addr":"10.0.0.4:5434",
+                "mgmt_addr":"10.0.0.4:9091","metrics_addr":"10.0.0.4:9090"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.feature_level, 0);
+        assert!(old.feature_level_refusal(0).is_none());
+        assert!(old.feature_level_refusal(1).is_some());
+        let current = JoinRequest {
+            feature_level: 1,
+            ..old
+        };
+        assert!(current.feature_level_refusal(1).is_none());
     }
 }

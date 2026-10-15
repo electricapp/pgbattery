@@ -349,6 +349,36 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
+    /// Raise the committed feature level to the highest every member decodes.
+    ///
+    /// # Errors
+    /// Returns an error if the leader is unreachable or refuses the raise, for
+    /// example because a member did not report its level.
+    pub async fn finalize_upgrade(
+        &self,
+        leader_addr: &str,
+    ) -> Result<super::FinalizeUpgradeResponse> {
+        let url = format!("http://{leader_addr}/api/v1/cluster/finalize-upgrade");
+        let resp = self
+            .add_management_token(self.client.post(&url))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact leader {leader_addr}: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "Finalize-upgrade request",
+                status,
+                &body,
+                self.management_api_token.is_some()
+            ));
+        }
+
+        Ok(resp.json().await?)
+    }
+
     /// Remove a node from the cluster.
     ///
     /// # Errors

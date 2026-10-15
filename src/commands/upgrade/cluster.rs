@@ -23,6 +23,8 @@ pub(crate) struct NodeVersion {
     pub version: String,
     pub raft_rpc_frame_version: u8,
     pub store_schema_version: u32,
+    pub feature_level: u32,
+    pub committed_feature_level: u32,
 }
 
 impl NodeVersion {
@@ -34,8 +36,20 @@ impl NodeVersion {
             version: resp.version,
             raft_rpc_frame_version: resp.raft_rpc_frame_version,
             store_schema_version: resp.store_schema_version,
+            feature_level: resp.feature_level,
+            committed_feature_level: resp.committed_feature_level,
         }
     }
+}
+
+/// `(committed, decodable)` when every node decodes a feature level the
+/// cluster has not committed: the roll's binaries are in place, and finalize
+/// is the step that enables them and closes the binary-rollback window.
+#[must_use]
+pub(crate) fn finalize_pending(nodes: &[NodeVersion]) -> Option<(u32, u32)> {
+    let decodable = nodes.iter().map(|n| n.feature_level).min()?;
+    let committed = nodes.iter().map(|n| n.committed_feature_level).max()?;
+    (decodable > committed).then_some((committed, decodable))
 }
 
 /// Resolve the roll's starting version, accepting a resumable mix.
@@ -531,6 +545,15 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         }
     }
     info!(target = %params.target, "Cluster rolling upgrade complete");
+    if let Some((committed, decodable)) = finalize_pending(&final_versions) {
+        info!(
+            committed,
+            decodable,
+            "Every node decodes a newer feature level. A binary rollback is still \
+             possible; run `pgbattery cluster finalize-upgrade` to enable the new \
+             level, after which it is not"
+        );
+    }
     Ok(())
 }
 
@@ -833,7 +856,27 @@ mod tests {
             version: version.to_string(),
             raft_rpc_frame_version: 0,
             store_schema_version: 0,
+            feature_level: 0,
+            committed_feature_level: 0,
         }
+    }
+
+    fn at_levels(id: u64, decodes: u32, committed: u32) -> NodeVersion {
+        NodeVersion {
+            feature_level: decodes,
+            committed_feature_level: committed,
+            ..node(id, "0.2.0")
+        }
+    }
+
+    #[test]
+    fn finalize_is_pending_only_once_every_node_decodes_the_newer_level() {
+        let rolled = [at_levels(1, 1, 0), at_levels(2, 1, 0), at_levels(3, 1, 0)];
+        assert_eq!(finalize_pending(&rolled), Some((0, 1)));
+        let mid_roll = [at_levels(1, 1, 0), at_levels(2, 0, 0), at_levels(3, 1, 0)];
+        assert_eq!(finalize_pending(&mid_roll), None);
+        let finalized = [at_levels(1, 1, 1), at_levels(2, 1, 1), at_levels(3, 1, 1)];
+        assert_eq!(finalize_pending(&finalized), None);
     }
 
     #[test]

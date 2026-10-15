@@ -86,6 +86,7 @@ fn sample_state_current() -> ClusterState {
         },
         upgrade_frozen: true,
         applied_index: Some(42),
+        feature_level: 1,
         ..ClusterState::from(sample_state_v0())
     }
 }
@@ -131,6 +132,7 @@ fn sample_log_entries() -> Vec<LogEntry> {
             from_cluster_id: "blue".to_string(),
             local_cluster_id: "green".to_string(),
         }),
+        LogEntryPayload::Normal(ClusterCommand::SetFeatureLevel { level: 1 }),
     ];
     commands
         .into_iter()

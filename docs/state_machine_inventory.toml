@@ -21,6 +21,7 @@ enums.ClusterCommand = [
   "CutoverAbortUnseal",
   "CutoverAuthorityReceived",
   "SetUpgradeFreeze",
+  "SetFeatureLevel",
 ]
 enums.CutoverPhase = ["Idle", "Armed", "Sealed", "Draining", "Transferred", "Aborted"]
 enums.CommandOutcome = ["Applied", "OutOfOrder"]

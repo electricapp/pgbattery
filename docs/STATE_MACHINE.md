@@ -127,6 +127,9 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
   - `UpdateNode` — change recorded `NodeRole` (`Leader` | `Follower`). **Never issued in production**; kept for postcard layout / fuzz only. Not live leadership.
   - `UpdateLsn` — WAL position stamped with leader commit time (reporter clock ignored).
   - `SetSyncMode` — whether sync replication is in force.
+  - `SetFeatureLevel` — raise the committed feature level (below).
+  - Cutover and freeze commands: §8b, §8d.
+- **Feature level**: `ClusterState.feature_level`, the newest command set every member decodes. Each command names the level whose decoders know it (`ClusterCommand::required_feature_level`); `governor::propose` is the only caller of `client_write` (`testing/lint_propose.py`) and refuses a command above the committed level, and `apply` treats one as a no-op on every replica. A refusal at apply alone would not protect a member on the previous binary, which cannot parse the entry at all. The level only rises, through `finalize_feature_level`: the leader surveys every member's `/api/v1/version`, learners included, under the membership lock, and a silent member blocks the raise. A joiner below the committed level is refused. A bootstrapped one-member cluster commits its binary's level on every bootstrap start until it lands. Finalize is the point of no return for a binary rollback, so `upgrade --cluster` reports it pending and leaves it to the operator (`pgbattery cluster finalize-upgrade`).
 - **Trigger**: openraft applying a committed entry.
 - **Membership ≠ this map**: `change_membership` does not touch `nodes`/`node_lsns`; also commit `ClusterCommand::RemoveNode` (`forget_removed_node`) or a removed peer's LSN keeps inflating `max_cluster_lsn` / `evaluate_lsn_acceptable`. Best-effort after membership commits.
 - **Code**: `src/governor/state_machine.rs`, `management_api::cluster::remove_node`.

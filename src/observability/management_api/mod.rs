@@ -393,6 +393,10 @@ pub async fn start_management_api(
         // same timeout exemption as backup restore.
         .route("/api/v1/admin/self-upgrade", post(upgrade::self_upgrade))
         .route(
+            "/api/v1/cluster/finalize-upgrade",
+            post(cluster::finalize_upgrade),
+        )
+        .route(
             "/api/v1/admin/postgres-upgrade/preflight",
             post(upgrade::postgres_upgrade_preflight),
         )

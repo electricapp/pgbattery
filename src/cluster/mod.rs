@@ -9,4 +9,4 @@ pub mod client;
 pub mod membership;
 
 pub use client::ClusterClient;
-pub use membership::{AdvertisedAddresses, JoinRequest, MemberRole};
+pub use membership::{AdvertisedAddresses, FinalizeUpgradeResponse, JoinRequest, MemberRole};

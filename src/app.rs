@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::config::constants;
 use crate::gateway::Gateway;
 use crate::governor::network::RaftRpcServer;
-use crate::governor::raft::{ClusterRequest, FenceState};
+use crate::governor::raft::FenceState;
 use crate::governor::replication_manager::ReplicationManager;
 use crate::governor::state_machine::{ClusterCommand, NodeId};
 use crate::governor::storage::RedbLogStorage;
@@ -293,6 +293,13 @@ impl App {
             listen_addr = %self.config.listen_addr,
             "pgbattery DATA node is running (lease fencing enabled)"
         );
+        if bootstrap {
+            tokio::spawn(Self::commit_genesis_feature_level(
+                raft.clone(),
+                cluster_state.clone(),
+                self.config.node_id,
+            ));
+        }
 
         let reason = self.wait_for_shutdown(shutdown_rx.clone()).await;
         self.shutdown_data_node(shutdown_tx, handles).await?;
@@ -307,6 +314,55 @@ impl App {
                     "pgbattery exiting after internal failure — expecting process supervisor to restart"
                 ))
             }
+        }
+    }
+
+    /// A cluster this node bootstraps starts at this binary's feature level.
+    ///
+    /// Provable locally only while this node is the sole member; every later
+    /// joiner is admitted at or above the committed level, and a cluster that
+    /// already has other members raises its level through finalize. Runs on
+    /// every bootstrap start, so a crash before the first commit is retried.
+    async fn commit_genesis_feature_level(
+        raft: Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
+        cluster_state: Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        node_id: NodeId,
+    ) {
+        use crate::governor::propose::{Finalized, finalize_feature_level};
+        use crate::governor::state_machine::FEATURE_LEVEL;
+
+        let leading = raft
+            .wait(Some(GENESIS_LEADERSHIP_WAIT))
+            .metrics(
+                |m| m.current_leader == Some(node_id),
+                "bootstrap leadership",
+            )
+            .await;
+        let Ok(metrics) = leading else {
+            warn!(
+                "Bootstrap node did not lead within the genesis window; its feature level \
+                 stays uncommitted until `pgbattery cluster finalize-upgrade`"
+            );
+            return;
+        };
+        let sole_member = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .eq([node_id]);
+        if !sole_member {
+            return;
+        }
+        match finalize_feature_level(&raft, &cluster_state, &[(node_id, Some(FEATURE_LEVEL))]).await
+        {
+            Ok(Finalized::Raised(level)) => info!(level, "Bootstrapped cluster feature level"),
+            Ok(Finalized::AlreadyAt(_)) => {}
+            Err(e) => warn!(
+                error = %e,
+                "Could not commit the bootstrap feature level; run \
+                 `pgbattery cluster finalize-upgrade`"
+            ),
         }
     }
 
@@ -1945,14 +2001,12 @@ impl App {
         }
 
         let reported = if Self::is_local_leader(raft_client, node_id) {
-            let req = ClusterRequest {
-                command: ClusterCommand::UpdateLsn {
-                    node_id,
-                    lsn_bytes,
-                    timestamp: 0,
-                },
+            let command = ClusterCommand::UpdateLsn {
+                node_id,
+                lsn_bytes,
+                timestamp: 0,
             };
-            match raft_client.client_write(req).await {
+            match crate::governor::propose::propose(raft_client, cluster_state, command).await {
                 Ok(_) => true,
                 Err(e) => {
                     error!(error = %e, lsn_bytes = lsn_bytes, "Failed to update LSN in Raft");
@@ -3497,6 +3551,10 @@ fn clear_dir_contents(data_dir: &std::path::Path) -> Result<()> {
 /// the container runtime, which pays for a fresh `initdb` and a fresh
 /// filesystem mount every time and spaces its restarts further apart at each
 /// one.
+/// How long a bootstrap node waits to lead its own one-member cluster before
+/// leaving the genesis feature level to an explicit finalize.
+const GENESIS_LEADERSHIP_WAIT: Duration = Duration::from_secs(30);
+
 const JOIN_CLONE_ATTEMPTS: u32 = 12;
 const JOIN_CLONE_RETRY: Duration = Duration::from_secs(2);
 

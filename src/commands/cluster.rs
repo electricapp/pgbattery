@@ -189,6 +189,37 @@ pub async fn run_promote(
     Ok(())
 }
 
+/// Commit the newest feature level every member decodes.
+///
+/// # Errors
+/// Returns an error if the leader cannot be resolved or refuses the raise.
+pub async fn run_finalize_upgrade(
+    leader: Option<String>,
+    config_path: Option<String>,
+) -> Result<()> {
+    let config = try_load_config(config_path.as_deref())?;
+    let explicit_addr = leader.as_deref().is_some_and(is_explicit_addr);
+    let client = build_client(config.as_ref(), config_path.as_deref(), explicit_addr, 30)?;
+    let leader_addr = match leader {
+        Some(s) => resolve_node_or_id(Some(s), &client, config.as_ref()).await?,
+        None => client.discover_leader().await?,
+    };
+
+    let response = client.finalize_upgrade(&leader_addr).await?;
+    if response.raised {
+        cprintln!(
+            "+ Committed feature level {}",
+            response.committed_feature_level
+        );
+    } else {
+        cprintln!(
+            "Feature level {} is already the newest every member decodes",
+            response.committed_feature_level
+        );
+    }
+    Ok(())
+}
+
 /// Remove a node from cluster membership.
 ///
 /// # Errors

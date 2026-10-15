@@ -22,7 +22,7 @@ use openraft::{BasicNode, ChangeMembers};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::cluster::{AdvertisedAddresses, JoinRequest, MemberRole};
+use crate::cluster::{AdvertisedAddresses, FinalizeUpgradeResponse, JoinRequest, MemberRole};
 use crate::config::constants::{
     ELECT_READINESS_CLIENT_TIMEOUT_SECS, ELECT_READINESS_SUPERVISOR_WAIT_SECS,
     LEADERSHIP_TRANSFER_CATCHUP_TOLERANCE, LEADERSHIP_TRANSFER_LEASE_SAFETY_MS,
@@ -252,6 +252,16 @@ fn validate_join_request(
         ));
     };
 
+    let committed = state.cluster_state.read().feature_level;
+    if let Some(why) = req.feature_level_refusal(committed) {
+        return Err(membership_response(
+            StatusCode::CONFLICT,
+            false,
+            why,
+            vec![],
+        ));
+    }
+
     match classify_join(membership_config.membership(), req.node_id, &req.raft_addr) {
         JoinDisposition::New => Ok((addrs, false)),
         JoinDisposition::ResumeLearner => Ok((addrs, true)),
@@ -320,7 +330,6 @@ async fn replicate_node_info(
     req: &JoinRequest,
     addrs: &AdvertisedAddresses,
 ) -> Result<(), String> {
-    use crate::governor::raft::ClusterRequest;
     use crate::governor::state_machine::{ClusterCommand, NodeInfo, NodeRole};
 
     let node_info = NodeInfo {
@@ -335,15 +344,13 @@ async fn replicate_node_info(
             .unwrap_or_default()
             .as_secs(),
     };
-    let request = ClusterRequest {
-        command: ClusterCommand::AddNode(node_info),
-    };
-
-    state
-        .raft
-        .client_write(request)
-        .await
-        .map_err(|err| err.to_string())?;
+    crate::governor::propose::propose(
+        &state.raft,
+        &state.cluster_state,
+        ClusterCommand::AddNode(node_info),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
 
     tracing::info!(
         node_id = req.node_id,
@@ -366,6 +373,120 @@ async fn create_replication_slot_for_joined_node(state: &ManagementApiState, nod
             tracing::info!(node_id = node_id, "Created replication slot for new node");
         }
     }
+}
+
+/// How long one member has to report its feature level to a finalize survey.
+const FEATURE_SURVEY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Raise the committed feature level to the highest every member decodes.
+///
+/// Each member reports its own support at `/api/v1/version`; one that does
+/// not answer blocks the raise. The membership lock is held across survey and
+/// commit, so no node joins in between with a lower level.
+pub(super) async fn finalize_upgrade(
+    State(state): State<Arc<ManagementApiState>>,
+) -> impl IntoResponse {
+    use crate::governor::propose::{Finalized, ProposeError, finalize_feature_level};
+
+    let _membership_guard = state.membership_lock.lock().await;
+    let (current_leader, member_ids) = {
+        let metrics = state.raft.metrics();
+        let m = metrics.borrow();
+        let ids: Vec<NodeId> = m
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        (m.current_leader, ids)
+    };
+    let respond = |status: StatusCode, raised: bool, message: Option<String>| {
+        (
+            status,
+            Json(FinalizeUpgradeResponse {
+                success: status == StatusCode::OK,
+                committed_feature_level: state.cluster_state.read().feature_level,
+                raised,
+                message,
+            }),
+        )
+    };
+    if current_leader != Some(state.node_id) {
+        return respond(
+            StatusCode::MISDIRECTED_REQUEST,
+            false,
+            Some(format!(
+                "Not the leader. Current leader: {current_leader:?}"
+            )),
+        );
+    }
+
+    let members = survey_feature_levels(&state, &member_ids).await;
+    match finalize_feature_level(&state.raft, &state.cluster_state, &members).await {
+        Ok(Finalized::Raised(level)) => {
+            info!(level, "Committed cluster feature level");
+            respond(StatusCode::OK, true, None)
+        }
+        Ok(Finalized::AlreadyAt(_)) => respond(StatusCode::OK, false, None),
+        Err(e @ ProposeError::MembersNotReady(_)) => {
+            respond(StatusCode::CONFLICT, false, Some(e.to_string()))
+        }
+        Err(e) => respond(StatusCode::SERVICE_UNAVAILABLE, false, Some(e.to_string())),
+    }
+}
+
+/// Each member's reported feature level; `None` for one that did not answer
+/// or has no known management address.
+async fn survey_feature_levels(
+    state: &ManagementApiState,
+    member_ids: &[NodeId],
+) -> Vec<(NodeId, Option<u32>)> {
+    let client = reqwest::Client::builder()
+        .timeout(FEATURE_SURVEY_TIMEOUT)
+        .build()
+        .unwrap_or_default();
+    let addrs: Vec<(NodeId, Option<std::net::SocketAddr>)> = {
+        let cluster = state.cluster_state.read();
+        member_ids
+            .iter()
+            .map(|id| (*id, cluster.nodes.get(id).map(|n| n.mgmt_addr)))
+            .collect()
+    };
+    let mut pending = Vec::with_capacity(addrs.len());
+    for (id, addr) in addrs {
+        if id == state.node_id {
+            pending.push((id, None));
+            continue;
+        }
+        let client = client.clone();
+        pending.push((
+            id,
+            addr.map(|addr| tokio::spawn(member_feature_level(client, addr))),
+        ));
+    }
+    let mut levels = Vec::with_capacity(pending.len());
+    for (id, task) in pending {
+        let level = if id == state.node_id {
+            Some(crate::governor::state_machine::FEATURE_LEVEL)
+        } else {
+            match task {
+                Some(task) => task.await.ok().flatten(),
+                None => None,
+            }
+        };
+        levels.push((id, level));
+    }
+    levels
+}
+
+async fn member_feature_level(client: reqwest::Client, addr: std::net::SocketAddr) -> Option<u32> {
+    let url = format!("http://{addr}/api/v1/version");
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let version: super::discovery::VersionResponse = response.json().await.ok()?;
+    Some(version.feature_level)
 }
 
 /// List cluster members
@@ -728,10 +849,8 @@ async fn drop_replication_slot_for_removed(state: &Arc<ManagementApiState>, node
 /// time this runs, so failing here must not turn a completed removal into an
 /// error. The next removal attempt re-issues it.
 async fn forget_removed_node(state: &Arc<ManagementApiState>, node_id: NodeId) {
-    let req = crate::governor::raft::ClusterRequest {
-        command: crate::governor::state_machine::ClusterCommand::RemoveNode(node_id),
-    };
-    match state.raft.client_write(req).await {
+    let command = crate::governor::state_machine::ClusterCommand::RemoveNode(node_id);
+    match crate::governor::propose::propose(&state.raft, &state.cluster_state, command).await {
         Ok(_) => tracing::info!(node_id, "Dropped replicated record for removed node"),
         Err(e) => tracing::warn!(
             node_id,

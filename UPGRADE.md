@@ -96,11 +96,22 @@ must become explicit and tested:
    error. The binary's semver anti-rollback already refuses downgrades at
    install time; the store check is defense in depth for hand-copied
    binaries.
+3. Replicated command set. Appending a `ClusterCommand` variant changes
+   neither frame nor store format, yet a node one release behind cannot
+   decode the entry, and its replication stalls there for good. The cluster
+   commits a feature level (`ClusterState.feature_level`): `governor::propose`
+   admits a command only at or below it (`testing/lint_propose.py` keeps
+   every proposal behind it), and the state machine applies nothing above
+   it. The level rises only through `pgbattery cluster finalize-upgrade`,
+   which requires every member, learners included, to report it decodes the
+   level; a joiner below the committed level is refused. A bootstrapped
+   cluster starts at its binary's level.
 
 Policy: patch/minor releases must not change frame format or store schema
 (CI-enforced by a compat test that runs current HEAD against the previous
 release's serialized frames and store fixtures). Major releases may change
-either, with migrations, and support exactly the N-1 to N window.
+either, with migrations, and support exactly the N-1 to N window. A new
+`ClusterCommand` variant raises `FEATURE_LEVEL` in the same release.
 
 ### Failure handling
 
@@ -117,8 +128,11 @@ either, with migrations, and support exactly the N-1 to N window.
 - Rollback of a follower = install the previous release with an explicit
   `--force-downgrade`. The semver anti-rollback refuses the install
   otherwise, and without the override this rollback path would not exist.
-  Allowed while store schema is unchanged, i.e. always within a minor line;
-  documented as unsupported across majors — restore from backup instead.
+  Allowed while store schema is unchanged, i.e. always within a minor line,
+  and until the roll's feature level is finalized: the finalize entry is
+  itself one an older binary cannot decode. The roll reports when finalize
+  is pending and leaves it to the operator. Documented as unsupported across
+  majors — restore from backup instead.
 
 ### Testing
 

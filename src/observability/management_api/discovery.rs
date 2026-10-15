@@ -58,6 +58,13 @@ pub struct VersionResponse {
     /// [`crate::governor::storage::STORE_SCHEMA_VERSION`] this process writes.
     pub store_schema_version: u32,
     pub node_id: u64,
+    /// [`crate::governor::state_machine::FEATURE_LEVEL`] this binary decodes.
+    /// Absent from binaries that predate feature levels, which decode level 0.
+    #[serde(default)]
+    pub feature_level: u32,
+    /// The level this node's applied log has committed.
+    #[serde(default)]
+    pub committed_feature_level: u32,
 }
 
 /// Report this node's binary and compatibility versions.
@@ -69,6 +76,8 @@ pub(super) async fn get_version(
         raft_rpc_frame_version: crate::governor::network::RAFT_RPC_FRAME_VERSION,
         store_schema_version: crate::governor::storage::STORE_SCHEMA_VERSION,
         node_id: state.node_id,
+        feature_level: crate::governor::state_machine::FEATURE_LEVEL,
+        committed_feature_level: state.cluster_state.read().feature_level,
     })
 }
 
@@ -253,6 +262,17 @@ mod tests {
     use crate::governor::network::RAFT_RPC_FRAME_VERSION;
     use crate::governor::storage::STORE_SCHEMA_VERSION;
 
+    /// A binary from before feature levels sends no level, and decodes only
+    /// the original command set: its silence must read as 0, never as "any".
+    #[test]
+    fn a_version_without_a_feature_level_is_level_zero() {
+        let back: VersionResponse = serde_json::from_str(
+            r#"{"version":"0.1.0","raft_rpc_frame_version":0,"store_schema_version":0,"node_id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(back.feature_level, 0);
+    }
+
     #[test]
     fn version_response_matches_binary_constants() {
         let resp = VersionResponse {
@@ -260,6 +280,8 @@ mod tests {
             raft_rpc_frame_version: RAFT_RPC_FRAME_VERSION,
             store_schema_version: STORE_SCHEMA_VERSION,
             node_id: 7,
+            feature_level: crate::governor::state_machine::FEATURE_LEVEL,
+            committed_feature_level: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: VersionResponse = serde_json::from_str(&json).unwrap();

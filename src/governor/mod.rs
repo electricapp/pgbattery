@@ -11,6 +11,7 @@ pub mod lease;
 pub mod network;
 pub mod pg_control;
 pub mod promotion_watchdog;
+pub mod propose;
 pub mod raft;
 pub mod replication_manager;
 pub mod state_machine;

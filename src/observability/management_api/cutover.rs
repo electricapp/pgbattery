@@ -14,7 +14,6 @@ use tracing::{info, warn};
 
 use super::ManagementApiState;
 use crate::commands::upgrade::client_fence::apply_client_write_fence;
-use crate::governor::raft::ClusterRequest;
 use crate::governor::state_machine::NodeId;
 use crate::governor::state_machine::{ClusterCommand, CommandOutcome, CutoverPhase};
 
@@ -314,12 +313,8 @@ async fn apply_cutover(
         return refuse(state, StatusCode::SERVICE_UNAVAILABLE, why);
     }
     let described = format!("{cmd:?}");
-    match state
-        .raft
-        .client_write(ClusterRequest { command: cmd })
-        .await
-    {
-        Ok(resp) if resp.data.outcome == CommandOutcome::Applied => (
+    match crate::governor::propose::propose(&state.raft, &state.cluster_state, cmd).await {
+        Ok(resp) if resp.outcome == CommandOutcome::Applied => (
             StatusCode::OK,
             Json(CutoverActionResponse {
                 success: true,

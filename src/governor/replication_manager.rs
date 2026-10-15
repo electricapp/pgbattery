@@ -797,10 +797,9 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         // standby sync. Commit only on transitions (empty ↔ non-empty) so the
         // Raft log isn't churned every second.
         if self.last_committed_sync_mode != Some(now_active) {
-            let req = crate::governor::raft::ClusterRequest {
-                command: ClusterCommand::SetSyncMode { active: now_active },
-            };
-            match self.raft.client_write(req).await {
+            let command = ClusterCommand::SetSyncMode { active: now_active };
+            match crate::governor::propose::propose(&self.raft, &self.cluster_state, command).await
+            {
                 Ok(_) => {
                     self.last_committed_sync_mode = Some(now_active);
                     tracing::info!(

@@ -472,6 +472,13 @@ pub enum ClusterCommands {
         leader: Option<String>,
     },
 
+    /// Commit the newest feature level every member decodes, after a rolling upgrade
+    FinalizeUpgrade {
+        /// Address of cluster leader (host:port, or node ID to resolve)
+        #[arg(long)]
+        leader: Option<String>,
+    },
+
     /// Remove a node from the cluster (reduces quorum requirement)
     Remove {
         /// Node ID to remove (required unless --self is used)

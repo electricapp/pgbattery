@@ -72,6 +72,12 @@ jobs:
       - name: Lint clock injection in safety modules
         run: uv run --python 3.14 --script testing/lint_clock_injection.py
 
+      # Every Raft proposal is admitted against the committed feature level, or
+      # a member still on the previous binary can be sent an entry it cannot
+      # decode and stall on it for good.
+      - name: Lint Raft proposals go through governor::propose
+        run: uv run --python 3.14 --script testing/lint_propose.py
+
       # Offline unit tests for the harness itself: checker sanity (proves the
       # consistency checkers can fail), invariant classification, runner
       # plumbing, fault-primitive parsing. No cluster or Docker required.
