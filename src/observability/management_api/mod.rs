@@ -154,6 +154,9 @@ pub struct ManagementApiState {
     /// entry; handlers must read authority through
     /// `Governor::cutover_authority_projection`, never the raw log state.
     pub awaits_write_authority_from: Option<Arc<str>>,
+    /// `Config::client_fence_roles`, for the seed to fence in its own
+    /// transaction what its restore grants.
+    pub client_fence_roles: Vec<String>,
     /// `Config::accept_unverified_self_upgrade`.
     pub accept_unverified_self_upgrade: bool,
 }

@@ -353,6 +353,7 @@ jobs:
           - pg-major-upgrade-rollback-drill
           - pg-major-upgrade-chaos-mid-upgrade
           - bluegreen-cutover
+          - bluegreen-cutover-cli
           - bluegreen-rollback-drill
           - bluegreen-chaos-arm-seal
           - bluegreen-chaos-seal-transfer

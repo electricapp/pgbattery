@@ -85,7 +85,7 @@ impl WantedClientFence {
     /// The fence the committed log plus boot-fence config asks for. A
     /// recipient fenced before any cutover entry has only its configured
     /// roles; a donor sealing gets them from the log.
-    fn derive(state: &ClusterState, config: &ClientFenceConfig) -> Self {
+    pub(crate) fn derive(state: &ClusterState, config: &ClientFenceConfig) -> Self {
         let (holds, _) = Governor::cutover_authority_projection(
             &state.cutover,
             &config.cluster_id,

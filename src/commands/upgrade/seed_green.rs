@@ -324,6 +324,22 @@ async fn require_roles_present(
     Ok(())
 }
 
+/// The restore script: the donor's schema, then `fence`'s statements.
+///
+/// The dump keeps ACLs, so it grants the fenced roles their privileges; with
+/// the fence in the same `psql -1` transaction those grants are revoked
+/// before any other session can see them, leaving no window in which a
+/// fenced role writes to the recipient.
+fn restore_script(dump: &[u8], fence: &[String]) -> Vec<u8> {
+    let mut script = dump.to_vec();
+    script.push(b'\n');
+    for statement in fence {
+        script.extend_from_slice(statement.trim_end().trim_end_matches(';').as_bytes());
+        script.extend_from_slice(b";\n");
+    }
+    script
+}
+
 /// Where the schema dump lands before the restore reads it back.
 fn dump_file_path() -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -337,6 +353,9 @@ fn dump_file_path() -> PathBuf {
 
 /// Copy the donor's schema onto this node and subscribe to its publication.
 ///
+/// `fence` is the client-write fence this node holds (empty when it is not
+/// fenced); it commits with the restore ([`restore_script`]).
+///
 /// # Errors
 /// The recipient already has a schema, a required role is missing here,
 /// `pg_dump`/`psql` failed, or the subscription could not be created.
@@ -346,6 +365,7 @@ pub(crate) async fn seed_from_donor(
     publication: &str,
     subscription: &str,
     required_roles: &[String],
+    fence: &[String],
 ) -> Result<()> {
     if !super::client_fence::node_is_primary(supervisor).await? {
         bail!("Seeding writes a schema and a subscription; run it on the recipient's primary");
@@ -387,7 +407,7 @@ pub(crate) async fn seed_from_donor(
     }
 
     let dump_path = dump_file_path();
-    tokio::fs::write(&dump_path, &dump.stdout)
+    tokio::fs::write(&dump_path, restore_script(&dump.stdout, fence))
         .await
         .with_context(|| format!("writing the schema dump to {}", dump_path.display()))?;
     let (psql, port, user) = supervisor.local_psql_params();
@@ -410,6 +430,7 @@ pub(crate) async fn seed_from_donor(
     }
     info!(
         bytes = dump.stdout.len(),
+        fenced = !fence.is_empty(),
         "Donor schema restored on the recipient (single transaction, ACLs kept)"
     );
 
@@ -528,6 +549,27 @@ fn quote_ident(name: &str) -> Result<String> {
 )]
 mod tests {
     use super::*;
+
+    /// The live run found the restore's grants writable on a boot-fenced
+    /// recipient until the next reconcile revoked them. The fence now rides
+    /// the restore's own transaction, after the grants it revokes.
+    #[test]
+    fn the_fence_commits_with_the_restore_after_its_grants() {
+        let dump = b"CREATE TABLE public.t (i int);\nGRANT INSERT ON public.t TO app;\n";
+        let fence =
+            crate::commands::upgrade::client_fence::fence_statements(&["app".to_string()], "green")
+                .unwrap();
+        let script = String::from_utf8(restore_script(dump, &fence)).unwrap();
+        let grant = script.find("GRANT INSERT").unwrap();
+        let revoke = script.find("REVOKE").unwrap();
+        assert!(grant < revoke, "{script}");
+        assert!(script.contains("SET LOCAL pgbattery.ddl_freeze_exempt"));
+        for statement in fence {
+            let terminated = format!("{};", statement.trim_end().trim_end_matches(';'));
+            assert!(script.contains(&terminated), "unterminated: {statement}");
+        }
+        assert_eq!(restore_script(dump, &[]), [&dump[..], b"\n"].concat());
+    }
 
     #[test]
     fn a_recipient_with_tables_is_refused() {

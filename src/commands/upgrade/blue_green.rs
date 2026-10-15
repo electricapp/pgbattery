@@ -164,9 +164,9 @@ async fn dispatch(params: BlueGreenParams) -> Result<()> {
 /// Drive the cutover protocol from the donor to an already-seeded recipient.
 ///
 /// Scope: this runs the handoff, not the migration. Green must already be a
-/// healthy cluster at the new major with logical replication caught up —
-/// provisioning and seeding are not implemented, and this refuses rather than
-/// pretending otherwise (`UPGRADE_CHECKLIST.md`, Track C "Not implemented").
+/// healthy cluster at the new major, seeded from the donor
+/// (`POST /api/v1/admin/cutover/seed`) with its initial copy finished; the
+/// drain wait refuses a recipient with no subscription rather than pretend.
 ///
 /// # Errors
 /// Preflight failure, a refused protocol step, or a drain that does not reach

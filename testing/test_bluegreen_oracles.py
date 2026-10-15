@@ -99,6 +99,42 @@ class BootFenceTest(unittest.TestCase):
             bg._assert_green_boot_fenced(_node("green1"), budget=0.2)
 
 
+class DdlFreezeTest(unittest.TestCase):
+    """The sealed donor refuses DDL, and the freeze lifts when the window ends."""
+
+    def test_only_the_freezes_refusal_reads_as_frozen(self) -> None:
+        self.assertTrue(bg._classify_ddl_probe(0, "CREATE TABLE", ""))
+        self.assertFalse(
+            bg._classify_ddl_probe(
+                3, "", "ERROR:  DDL is frozen: a pgbattery cutover is in progress"
+            )
+        )
+        with self.assertRaises(RuntimeError):
+            bg._classify_ddl_probe(3, "", 'ERROR:  relation "bg_ddl_freeze_probe" already exists')
+
+    def test_ddl_that_runs_on_the_sealed_donor_is_a_contract_failure(self) -> None:
+        drops: list[str] = []
+
+        def record(_node: Any, sql: str, **_kw: Any) -> str:
+            drops.append(sql)
+            return ""
+
+        with (
+            mock.patch.object(bg, "_ddl_runs", return_value=True),
+            mock.patch.object(bg, "_psql", side_effect=record),
+            self.assertRaises(bg.ContractFailure),
+        ):
+            bg._assert_ddl_frozen(_node())
+        self.assertTrue(any("DROP TABLE" in sql for sql in drops), "the probe table is left behind")
+
+    def test_a_freeze_that_never_lifts_is_a_contract_failure(self) -> None:
+        with (
+            mock.patch.object(bg, "_ddl_runs", return_value=False),
+            self.assertRaises(bg.ContractFailure),
+        ):
+            bg._assert_ddl_thawed(_node(), "TRANSFER", budget=0.2)
+
+
 class DrainCompletenessTest(unittest.TestCase):
     """U2: every write blue acked before SEAL is present on green."""
 

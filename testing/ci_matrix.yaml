@@ -154,6 +154,7 @@
         "cluster-binary-upgrade-proof",
         "pg-major-upgrade-proof",
         "bluegreen-cutover",
+        "bluegreen-cutover-cli",
         "bluegreen-rollback-drill",
         "bluegreen-chaos-arm-seal",
         "bluegreen-chaos-seal-transfer",
@@ -2809,6 +2810,18 @@
         {
           "type": "cmd",
           "cmd": "testing/bluegreen_cutover.py",
+          "timeout_sec": 900
+        }
+      ]
+    },
+    {
+      "id": "bluegreen-cutover-cli",
+      "contracts": ["U1", "U2", "U3", "U5"],
+      "description": "Track C through the product's own paths: green is seeded by POST /api/v1/admin/cutover/seed (donor schema restored with its ACLs in one transaction, then a copying subscription) and the handoff runs as `pgbattery upgrade postgres --blue-green --experimental` from a donor node, so the command's drain wait, its majority read of the donor and its single-authority postflight run for real. Asserts the seed leaves the app role fenced on green with no window (U1), every key the racing app-role writer was acked reaches green (U2), green issues no sequence value blue used (U3), green holds the default reverse slot before its fence lifted (U5), blue runs DDL again once transferred, and the relay and reverse stream hold as in bluegreen-cutover.",
+      "actions": [
+        {
+          "type": "cmd",
+          "cmd": "testing/bluegreen_cutover.py --via-cli",
           "timeout_sec": 900
         }
       ]

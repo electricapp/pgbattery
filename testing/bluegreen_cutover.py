@@ -14,6 +14,9 @@ Phases:
      U1 (six-port prober as the app role)
   6. Optional --chaos {arm-seal,seal-transfer,mid-drain,blue-quorum}
   7. Optional --rollback-drill: reverse protocol, green -> blue
+  8. Optional --via-cli: seed green through the product's seed endpoint and
+     hand off with `pgbattery upgrade postgres --blue-green` instead of
+     driving each step from here
 
 Exit 0 on success; non-zero on contract failure or infra error.
 """
@@ -183,6 +186,76 @@ def _classify_write_probe(returncode: int, stdout: str, stderr: str) -> bool:
     if any(denial in detail for denial in FENCE_DENIALS):
         return False
     raise RuntimeError(f"fence probe broken, not fenced (rc={returncode}): {detail}")
+
+
+# The cutover's DDL freeze refuses with exactly this; any other DDL failure
+# says nothing about the freeze.
+DDL_FREEZE_REFUSAL: Final[str] = "DDL is frozen"
+DDL_PROBE_TABLE: Final[str] = "bg_ddl_freeze_probe"
+
+
+def _classify_ddl_probe(returncode: int, stdout: str, stderr: str) -> bool:
+    """True: the DDL ran. False: the cutover's DDL freeze refused it.
+
+    Raises on any other failure, so a broken probe never reads as frozen.
+    """
+    if returncode == 0:
+        return True
+    detail = f"{stderr}\n{stdout}".strip()
+    if DDL_FREEZE_REFUSAL in detail:
+        return False
+    raise RuntimeError(f"DDL probe broken, not frozen (rc={returncode}): {detail}")
+
+
+def _ddl_runs(node: Node) -> bool:
+    """Whether a superuser `CREATE TABLE` runs on `node` right now."""
+    proc = _compose(
+        "exec",
+        "-T",
+        node.service,
+        "psql",
+        "-U",
+        SUB_OWNER,
+        "-h",
+        "127.0.0.1",
+        "-p",
+        str(topology.PG_INTERNAL_PORT),
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-At",
+        "-c",
+        f"CREATE TABLE {DDL_PROBE_TABLE} (i int);",
+    )
+    return _classify_ddl_probe(proc.returncode, proc.stdout, proc.stderr)
+
+
+def _assert_ddl_frozen(donor_leader: Node) -> None:
+    """While sealed, DDL on the donor is refused, superuser included.
+
+    Logical replication carries no DDL, and the schema digest was compared
+    before ARM: a column added now is one the cutover silently drops.
+    """
+    if _ddl_runs(donor_leader):
+        _psql(donor_leader, f"DROP TABLE {DDL_PROBE_TABLE};")
+        raise ContractFailure(
+            f"the DDL freeze let a superuser CREATE TABLE through on sealed {donor_leader.service}"
+        )
+    console.print(f"DDL freeze OK: sealed {donor_leader.service} refused a superuser CREATE TABLE")
+
+
+def _assert_ddl_thawed(donor_leader: Node, why: str, budget: float = 30.0) -> None:
+    """The freeze comes down once the cutover leaves the sealed window: one
+    left installed would refuse every DDL forever."""
+
+    def ran() -> bool | None:
+        return True if _ddl_runs(donor_leader) else None
+
+    try:
+        await_until(ran, budget=budget, describe=f"the DDL freeze to come down after {why}")
+    except WaitTimeout as exc:
+        raise ContractFailure(f"DDL still frozen on {donor_leader.service} after {why}") from exc
+    _psql(donor_leader, f"DROP TABLE {DDL_PROBE_TABLE};")
+    console.print(f"DDL thaw OK: {donor_leader.service} runs DDL again after {why}")
 
 
 def _psql_allowed(node: Node, sql: str, user: str) -> bool:
@@ -385,6 +458,107 @@ def _seed_logical(blue_leader: Node, green_leader: Node) -> None:
         """,
     )
     _await_slot_confirms(blue_leader, _blue_flush_lsn(blue_leader), timeout=120.0)
+
+
+SEED_PUBLICATION: Final[str] = "bg_seed_pub"
+SEED_SUBSCRIPTION: Final[str] = "bg_seed_sub"
+# What `receive-authority` names the reverse publication and slot when the
+# caller names none, as the CLI does.
+PRODUCT_REVERSE: Final[str] = "pgbattery_reverse"
+
+
+def _create_green_role(green_leader: Node) -> None:
+    """The app role alone: the seed restores the donor's schema with its ACLs,
+    so the role those GRANTs name must exist before it runs."""
+    _psql(
+        green_leader,
+        f"""
+        DO $$ BEGIN
+          CREATE ROLE {APP_ROLE} LOGIN;
+        EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+        GRANT CONNECT ON DATABASE postgres TO {APP_ROLE};
+        """,
+    )
+
+
+def _seed_through_product(blue_leader: Node, green_leader: Node) -> None:
+    """Seed green with the product's own endpoint: the donor's schema restored
+    in one transaction, then a subscription that copies the existing rows."""
+    donor = (
+        f"host={blue_leader.ip} port={topology.PG_INTERNAL_PORT} user={SUB_OWNER} dbname=postgres"
+    )
+    r = _post(
+        green_leader,
+        "seed",
+        {
+            "donor_conninfo": donor,
+            "publication": SEED_PUBLICATION,
+            "subscription": SEED_SUBSCRIPTION,
+            "required_roles": [APP_ROLE],
+        },
+    )
+    body: dict[str, Any] = {}
+    with contextlib.suppress(ValueError):
+        body = dict(r.json())
+    if not r.is_success or body.get("success") is not True:
+        raise ContractFailure(f"seed refused on {green_leader.service}: {r.status_code} {r.text}")
+    console.print(f"seed OK: {green_leader.service} restored blue's schema and subscribed")
+
+
+def _await_initial_copy(green_leader: Node, timeout: float = 180.0) -> None:
+    """Every table the seed subscribed has finished its initial copy, read
+    from the product's own progress endpoint."""
+
+    def copied() -> dict[str, Any] | None:
+        r = httpx.get(
+            f"{_mgmt(green_leader)}/api/v1/cutover/subscription-progress",
+            headers=_headers(),
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        progress = dict(r.json())
+        total = int(progress.get("tables_total", 0))
+        ready = int(progress.get("tables_ready", 0))
+        return progress if total > 0 and ready == total else None
+
+    try:
+        progress = await_until(copied, budget=timeout, describe="the seed's initial copy")
+    except WaitTimeout as exc:
+        raise ContractFailure(f"the seed's initial copy never finished: {exc}") from exc
+    console.print(f"initial copy OK: {progress['tables_ready']} tables ready on green")
+
+
+def _run_cli_cutover(blue_leader: Node, green_leader: Node) -> None:
+    """Hand off with the product's own command, run from a donor node: its
+    drain wait, its majority read of the donor, and its single-authority
+    postflight all run for real."""
+    proc = _compose(
+        "exec",
+        "-T",
+        blue_leader.service,
+        "pgbattery",
+        "upgrade",
+        "postgres",
+        "--to",
+        str(GREEN_MAJOR),
+        "--blue-green",
+        "--experimental",
+        "--node",
+        f"{blue_leader.ip}:{topology.MGMT_CONTAINER_PORT}",
+        "--green-node",
+        f"{green_leader.ip}:{topology.MGMT_CONTAINER_PORT}",
+        "--green-cluster-id",
+        GREEN_CLUSTER,
+        "--app-role",
+        APP_ROLE,
+        timeout=COMPOSE_TIMEOUT_SEC,
+    )
+    output = f"{proc.stdout}\n{proc.stderr}".strip()
+    if proc.returncode != 0:
+        raise ContractFailure(f"`pgbattery upgrade postgres --blue-green` failed: {output}")
+    if "Cutover complete" not in output:
+        raise ContractFailure(f"the CLI exited 0 without reporting the handoff: {output}")
+    console.print("CLI handoff OK: `pgbattery upgrade postgres --blue-green` completed")
 
 
 def _blue_flush_lsn(blue_leader: Node) -> int:
@@ -594,6 +768,7 @@ def _cutover(
     if _psql_allowed(blue_leader, "INSERT INTO bg_kv(k,v) VALUES ('fence-probe','x');", APP_ROLE):
         raise ContractFailure("U1: app role still writes to blue's internal port after SEAL")
     console.print(f"SEAL OK: final_lsn={final_lsn}, app role fenced on the internal port")
+    _assert_ddl_frozen(blue_leader)
 
     _await_slot_confirms(blue_leader, final_lsn, timeout=180.0)
     _post(blue_leader, "drain-observed").raise_for_status()
@@ -633,7 +808,47 @@ def _cutover(
     _assert_minority_cannot_hand_over(green_leader, epoch, blue)
     _assert_authority_is_green_only(blue, green_leader, epoch)
     _assert_no_sequence_collision(green_leader, blue_max)
+    _assert_ddl_thawed(blue_leader, "TRANSFER")
     return sealed_acked
+
+
+def _cutover_through_cli(blue_leader: Node, green_leader: Node, blue: list[Node]) -> set[str]:
+    """Run the handoff with `pgbattery upgrade postgres --blue-green` while an
+    app-role writer races it; returns every key that writer had acked.
+
+    The command's own seal boundary is not visible from here, so the U2
+    ledger is stricter than the endpoint path's: every acked key must reach
+    green. Before the seal a write is drained; after it the fence refuses the
+    app role until the transfer, after which the gateway relays it to green.
+    """
+    writer = SealRaceWriter(blue_leader.gateway_port)
+    writer.start()
+    try:
+        await_until(
+            lambda: True if writer.acked else None,
+            budget=30.0,
+            describe="the racing writer's first acked key",
+        )
+        _run_cli_cutover(blue_leader, green_leader)
+    finally:
+        writer.stop()
+    acked = writer.acked_now()
+
+    status = _cutover_status(blue_leader)
+    if status.get("phase") != "transferred":
+        raise ContractFailure(f"the CLI reported success but blue is not transferred: {status}")
+    epoch = int(status["epoch"])
+    slot = _psql(
+        green_leader,
+        f"SELECT slot_type FROM pg_replication_slots WHERE slot_name = '{PRODUCT_REVERSE}';",
+    ).strip()
+    if slot != "logical":
+        raise ContractFailure(f"U5: green took authority without its reverse slot ({slot!r})")
+    _assert_authority_is_green_only(blue, green_leader, epoch)
+    blue_max = int(_psql(blue_leader, "SELECT COALESCE(max(seq), 0)::text FROM bg_kv;") or "0")
+    _assert_no_sequence_collision(green_leader, blue_max)
+    _assert_ddl_thawed(blue_leader, "TRANSFER")
+    return acked
 
 
 def _mgmt_addrs(nodes: list[Node]) -> list[str]:
@@ -745,7 +960,12 @@ def _await_reverse_arrival(blue_leader: Node, relayed: set[str], timeout: float 
         ) from exc
 
 
-def _wire_reverse(blue_leader: Node, green_leader: Node) -> None:
+def _wire_reverse(
+    blue_leader: Node,
+    green_leader: Node,
+    publication: str = "bg_reverse",
+    slot: str = "bg_reverse_slot",
+) -> None:
     green_conn = (
         f"host={green_leader.ip} port={topology.PG_INTERNAL_PORT} user={SUB_OWNER} dbname=postgres"
     )
@@ -755,9 +975,9 @@ def _wire_reverse(blue_leader: Node, green_leader: Node) -> None:
         DO $$ BEGIN
           CREATE SUBSCRIPTION bg_reverse_sub
             CONNECTION '{green_conn}'
-            PUBLICATION bg_reverse
+            PUBLICATION {publication}
             WITH (copy_data = false, create_slot = false,
-                  slot_name = 'bg_reverse_slot');
+                  slot_name = '{slot}');
         EXCEPTION WHEN duplicate_object THEN NULL; END $$;
         """,
     )
@@ -917,6 +1137,7 @@ def _chaos_seal_transfer(blue_leader: Node, green_leader: Node, blue: list[Node]
 def _chaos_mid_drain(blue_leader: Node, green_leader: Node, _blue: list[Node]) -> None:
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
+    _assert_ddl_frozen(blue_leader)
     _kill_and_await_down(green_leader)
     r = _post(blue_leader, "abort")
     r.raise_for_status()
@@ -943,6 +1164,7 @@ def _chaos_mid_drain(blue_leader: Node, green_leader: Node, _blue: list[Node]) -
         raise ContractFailure(
             f"abort reported success but blue never accepted a write again: {exc}"
         ) from exc
+    _assert_ddl_thawed(blue_leader, "ABORT")
     console.print(
         f"chaos mid-drain OK: green's leader confirmed dead, blue unsealed, epoch {st['epoch']}"
     )
@@ -1102,10 +1324,18 @@ def _rollback_drill(
 def main(
     chaos: str | None = typer.Option(None, help=" | ".join(CHAOS)),
     rollback_drill: bool = typer.Option(False, "--rollback-drill"),
+    via_cli: bool = typer.Option(
+        False,
+        "--via-cli",
+        help="Seed green with the product's seed endpoint and hand off with "
+        "`pgbattery upgrade postgres --blue-green`, instead of driving each step from here",
+    ),
     no_up: bool = typer.Option(False, "--no-up", help="Skip docker compose up"),
 ) -> None:
     if chaos is not None and chaos not in CHAOS:
         raise SystemExit(f"unknown --chaos {chaos!r}; expected one of {sorted(CHAOS)}")
+    if via_cli and (chaos is not None or rollback_drill):
+        raise SystemExit("--via-cli runs the forward handoff alone")
 
     os.environ["COMPOSE_FILE"] = "docker-compose.bluegreen.yml"
     if not no_up:
@@ -1133,16 +1363,24 @@ def main(
     console.print(f"leaders: blue={blue_leader.service}@{bm} green={green_leader.service}@{gm}")
 
     _setup_schema(blue_leader)
-    _setup_green_schema(green_leader)
-
-    # Green must refuse client writes before any cutover entry exists: a
-    # second Raft group electing itself into authority is the failure this
-    # whole track is built to prevent.
-    _assert_green_boot_fenced(green_leader)
-    _assert_arm_refused_without_authority(green_leader)
-
     acked = _write_burst(blue_leader.gateway_port, 20, "pre")
-    _seed_logical(blue_leader, green_leader)
+    if via_cli:
+        _create_green_role(green_leader)
+        _assert_arm_refused_without_authority(green_leader)
+        _seed_through_product(blue_leader, green_leader)
+        # The seed's restore granted the app role its privileges; the fence
+        # must refuse them the moment the seed answers, with no window for a
+        # direct writer before a later reconcile.
+        _assert_green_boot_fenced(green_leader, budget=0.0)
+        _await_initial_copy(green_leader)
+    else:
+        _setup_green_schema(green_leader)
+        # Green must refuse client writes before any cutover entry exists: a
+        # second Raft group electing itself into authority is the failure
+        # this whole track is built to prevent.
+        _assert_green_boot_fenced(green_leader)
+        _assert_arm_refused_without_authority(green_leader)
+        _seed_logical(blue_leader, green_leader)
     acked |= _write_burst(blue_leader.gateway_port, 30, "stream")
 
     if chaos:
@@ -1150,27 +1388,38 @@ def main(
         console.print(f"chaos={chaos} passed")
         return
 
-    # A writer keeps writing as the app role through ARM and SEAL, so the U2
-    # ledger includes keys acked at the seal boundary, not only a burst that
-    # finished long before it.
-    seal_writer = SealRaceWriter(blue_leader.gateway_port)
-    seal_writer.start()
-    try:
-        await_until(
-            lambda: True if seal_writer.acked else None,
-            budget=30.0,
-            describe="the seal-race writer's first acked key",
+    if via_cli:
+        raced = _cutover_through_cli(blue_leader, green_leader, blue)
+        if not raced:
+            raise ContractFailure("U2 is vacuous: the racing writer had no acked key")
+        console.print(f"CLI race: {len(raced)} app-role keys acked across the handoff")
+        _assert_drain_complete(green_leader, acked | raced)
+        reverse_publication, reverse_slot = PRODUCT_REVERSE, PRODUCT_REVERSE
+    else:
+        # A writer keeps writing as the app role through ARM and SEAL, so the
+        # U2 ledger includes keys acked at the seal boundary, not only a burst
+        # that finished long before it.
+        seal_writer = SealRaceWriter(blue_leader.gateway_port)
+        seal_writer.start()
+        try:
+            await_until(
+                lambda: True if seal_writer.acked else None,
+                budget=30.0,
+                describe="the seal-race writer's first acked key",
+            )
+            sealed_acked = _cutover(blue_leader, green_leader, blue, seal_writer)
+        finally:
+            seal_writer.stop()
+        if not sealed_acked:
+            raise ContractFailure(
+                "U2 seal race is vacuous: the app-role writer had no acked key "
+                "by the time the seal response arrived"
+            )
+        console.print(
+            f"seal race: {len(sealed_acked)} app-role keys acked before the seal response"
         )
-        sealed_acked = _cutover(blue_leader, green_leader, blue, seal_writer)
-    finally:
-        seal_writer.stop()
-    if not sealed_acked:
-        raise ContractFailure(
-            "U2 seal race is vacuous: the app-role writer had no acked key "
-            "by the time the seal response arrived"
-        )
-    console.print(f"seal race: {len(sealed_acked)} app-role keys acked before the seal response")
-    _assert_drain_complete(green_leader, acked | sealed_acked)
+        _assert_drain_complete(green_leader, acked | sealed_acked)
+        reverse_publication, reverse_slot = "bg_reverse", "bg_reverse_slot"
 
     status = _cutover_status(blue_leader)
     console.print("cutover status:", json.dumps(status, indent=2))
@@ -1200,7 +1449,7 @@ def main(
     _assert_relay_wrote_nothing_local(blue_rows_before, blue_rows_after, len(relayed))
     console.print(f"relay OK: {on_green} writes through blue's gateway landed on green only")
 
-    _wire_reverse(blue_leader, green_leader)
+    _wire_reverse(blue_leader, green_leader, reverse_publication, reverse_slot)
     if not _rollback_available(blue_leader):
         raise ContractFailure("reverse subscription not active — rollback unavailable")
     _await_reverse_arrival(blue_leader, relayed)

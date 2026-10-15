@@ -410,8 +410,8 @@ pub enum UpgradeSubcommand {
         resume: bool,
 
         /// Track C: logical blue/green major upgrade. --check runs catalog
-        /// preflight; --experimental runs the cutover against an already
-        /// seeded green cluster (provisioning and seeding are not implemented)
+        /// preflight; --experimental runs the handoff to a recipient already
+        /// seeded through POST /api/v1/admin/cutover/seed
         #[arg(long)]
         blue_green: bool,
 
@@ -423,12 +423,13 @@ pub enum UpgradeSubcommand {
         #[arg(long)]
         accept_empty_unlogged: bool,
 
-        /// Track C: management host:port on the green cluster
-        #[arg(long)]
+        /// Track C: management host:port on the cluster receiving write
+        /// authority (green going forward, blue when rolling back)
+        #[arg(long, visible_alias = "recipient-node")]
         green_node: Option<String>,
 
-        /// Track C: green's cluster_id, checked against what green reports
-        #[arg(long)]
+        /// Track C: the receiving cluster's cluster_id, checked against what it reports
+        #[arg(long, visible_alias = "recipient-cluster-id")]
         green_cluster_id: Option<String>,
 
         /// Track C: accept a SECURITY DEFINER function by name (schema.func; repeatable).
@@ -436,9 +437,10 @@ pub enum UpgradeSubcommand {
         #[arg(long = "accept-security-definer", value_name = "NAME")]
         accept_security_definer: Vec<String>,
 
-        /// Track C: management API token for the green cluster (defaults to the donor token)
+        /// Track C: management API token for the receiving cluster (defaults to the donor token)
         #[arg(
             long = "green-token",
+            visible_alias = "recipient-token",
             value_name = "TOKEN",
             env = "PGBATTERY_GREEN_MANAGEMENT_API_TOKEN",
             hide_env_values = true
@@ -973,5 +975,45 @@ mod tests {
             "tok",
         ]);
         assert!(parsed.is_ok(), "{parsed:?}");
+    }
+
+    /// A rollback hands authority back to blue, so naming blue with
+    /// `--green-node` read backwards; the recipient names read either way.
+    #[test]
+    fn a_rollback_names_its_recipient_without_calling_it_green() {
+        let parsed = Cli::try_parse_from([
+            "pgbattery",
+            "upgrade",
+            "postgres",
+            "--to",
+            "17",
+            "--blue-green",
+            "--experimental",
+            "--app-role",
+            "bg_app",
+            "--recipient-node",
+            "172.30.0.11:9091",
+            "--recipient-cluster-id",
+            "blue",
+            "--recipient-token",
+            "tok",
+        ])
+        .unwrap();
+        let Commands::Upgrade {
+            command:
+                Some(UpgradeSubcommand::Postgres {
+                    green_node,
+                    green_cluster_id,
+                    green_token,
+                    ..
+                }),
+            ..
+        } = parsed.command
+        else {
+            panic!("not an upgrade postgres command");
+        };
+        assert_eq!(green_node.as_deref(), Some("172.30.0.11:9091"));
+        assert_eq!(green_cluster_id.as_deref(), Some("blue"));
+        assert_eq!(green_token.as_deref(), Some("tok"));
     }
 }

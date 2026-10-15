@@ -158,6 +158,20 @@ pub async fn apply_client_write_fence(
     app_roles: &[String],
     cluster_id: &str,
 ) -> Result<()> {
+    supervisor
+        .execute_transaction(&fence_statements(app_roles, cluster_id)?)
+        .await
+        .with_context(|| format!("fencing app roles {app_roles:?}"))?;
+    info!(roles = ?app_roles, "Client-write fence applied");
+    Ok(())
+}
+
+/// The statements that fence `app_roles`, for a caller that must commit them
+/// in its own transaction: one that creates the grants they revoke.
+///
+/// # Errors
+/// Empty roles, or a role name rejected as an identifier.
+pub(crate) fn fence_statements(app_roles: &[String], cluster_id: &str) -> Result<Vec<String>> {
     if app_roles.is_empty() {
         bail!("client-write fence requires at least one app role");
     }
@@ -166,12 +180,7 @@ pub async fn apply_client_write_fence(
         validate_role_ident(role)?;
         escaped.push(role.replace('\'', "''"));
     }
-    supervisor
-        .execute_transaction(&apply_sql(&cluster_id.replace('\'', "''"), &escaped))
-        .await
-        .with_context(|| format!("fencing app roles {app_roles:?}"))?;
-    info!(roles = ?app_roles, "Client-write fence applied");
-    Ok(())
+    Ok(apply_sql(&cluster_id.replace('\'', "''"), &escaped))
 }
 
 /// Restore and forget every grant this cluster recorded, whichever role it

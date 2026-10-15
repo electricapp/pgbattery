@@ -860,6 +860,34 @@ pub(super) async fn seed_recipient(
             }),
         );
     };
+    // The fence the reconciler would level here, committed with the restore
+    // that grants what it revokes: a boot-fenced recipient never exposes the
+    // restored grants to a fenced role, not even until the next pass.
+    let wanted = crate::governor::reconciler::WantedClientFence::derive(
+        &state.cluster_state.read(),
+        &crate::governor::reconciler::ClientFenceConfig {
+            roles: state.client_fence_roles.clone(),
+            cluster_id: Arc::clone(&state.cluster_id),
+            awaits_write_authority_from: state.awaits_write_authority_from.clone(),
+        },
+    );
+    let fence = if wanted.fenced && !wanted.roles.is_empty() {
+        match client_fence::fence_statements(&wanted.roles, &state.cluster_id) {
+            Ok(statements) => statements,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(SeedRecipientResponse {
+                        success: false,
+                        message: Some(format!("{e:#}")),
+                        initial_sync_complete: false,
+                    }),
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let guard = pg.lock().await;
     let seeded = seed_green::seed_from_donor(
         &guard,
@@ -867,6 +895,7 @@ pub(super) async fn seed_recipient(
         &body.publication,
         &body.subscription,
         &body.required_roles,
+        &fence,
     )
     .await;
     let states = seed_green::subscription_sync_states(&guard)

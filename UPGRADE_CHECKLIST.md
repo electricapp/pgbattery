@@ -27,16 +27,11 @@ Shared spine before Track B/C is honest:
 | 6   | Track B gateway hold mode                                  | B        | [x]    |
 | 7   | Track C preflight (`--blue-green --check`)                 | C        | [x]    |
 | 8   | Track C cutover protocol — **TLA+ before code**            | C        | [x]    |
-| 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [~]    |
+| 9   | Track C e2e + reverse replication + post-cutover rollback  | C        | [x]    |
 
-Step 9 is `[~]`, not `[x]`. Every piece is written, and after the audit pass
-every audited defect in it is fixed — the arm guard, the drain gate on donor
-slot confirmation, backend termination at SEAL, PUBLIC/inherited fence
-coverage, real sequence advancement, atomic seeding with the publication and
-ACLs, tokens on every call. What is still missing is live evidence: none of
-the Track C paths have run against a real cluster, and the Track C matrix
-cases have not passed since the rework. `[x]` below means written and
-unit/shape-tested, not live-proven.
+Every Track C path runs live in the `upgrade-proof` suite: the step-by-step
+cutover, the product's own seed endpoint and `upgrade postgres --blue-green`
+handoff (`bluegreen-cutover-cli`), the reverse cutover, and four chaos cases.
 
 Do **not** parallelize 5, 6, and 8–9 in one branch. Do **not** ship wire-format
 and PG-major upgrade in the same release if avoidable.
@@ -247,38 +242,45 @@ and PG-major upgrade in the same release if avoidable.
 - [x] Unit inversions: minority, all-silent, contradicting, empty-set, 5-node quorum, and short-denominator
 - [x] Live inversion: `bluegreen-cutover` asserts a single donor node cannot hand over
 
-### Written, live-unproven (Track C)
+### Seeding, freeze and drain monitor (Track C, live)
 
 - [x] Green provisioning and logical seeding — `POST /api/v1/admin/cutover/seed`
       creates the donor publication over every user schema (pgbattery's own
       excluded), dumps the donor schema with its ACLs, restores it in one
       psql transaction (a failure rolls back and re-seed stays possible),
       refuses a recipient that already has tables or is missing a required
-      role, and subscribes with copy. Table-copy state
-      (`pg_subscription_rel.srsubstate`) is enforced by the drain gate, where
-      no subscribed tables is not completion. **Never live-executed.**
+      role, and subscribes with copy. A boot-fenced recipient's fence commits
+      in that same transaction, so the restored grants are never writable;
+      the first live run caught them writable until the next reconcile.
+      Table-copy state (`pg_subscription_rel.srsubstate`) is enforced by the
+      drain gate, where no subscribed tables is not completion. Live:
+      `bluegreen-cutover-cli`, which asserts the fence the moment the seed
+      answers.
 - [x] DDL freeze event trigger and schema digest (ordinal columns, not raw
       `attnum`, so a donor that dropped a column can match a fresh recipient).
       The trigger rides the committed cutover phase and the reconciler probes
       it instead of churning it — one left installed would block every DDL
       forever, and the abort drops it before lifting the fence. Frozen SEALED
       through DRAINING only: a recipient fenced from boot is IDLE, and
-      freezing it there would block the very DDL seeding needs.
-      **Never live-executed.**
+      freezing it there would block the very DDL seeding needs. Live:
+      `bluegreen-cutover` asserts a superuser `CREATE TABLE` is refused once
+      sealed and runs again after TRANSFER; `bluegreen-chaos-mid-drain`, again
+      after ABORT.
 - [x] WAL-retention / slot-lag monitor — the drain wait reads donor retention
       each round, fails closed on a broken read (three consecutive failures
-      abort), and aborts while the donor can still be unsealed.
-      **Never live-executed.**
+      abort), and aborts while the donor can still be unsealed. Live: the
+      drain wait of `upgrade postgres --blue-green` in `bluegreen-cutover-cli`;
+      the abort paths are unit-tested.
 - [x] Reverse cutover. What blocked it was the arm guard, not a missing command:
       a recipient sat in TRANSFERRED and `CutoverArmed` took only IDLE/ABORTED.
       With that fixed the existing command drives it by swapping `--node` and
       `--green-node`, since neither the plan nor the protocol is
       direction-specific. `bluegreen-rollback-drill` runs it.
-- [ ] Operator-facing naming for that reverse run. Rolling back means passing
-      `--green-node`/`--green-cluster-id` for the cluster being rolled back
-      _to_, which reads backwards. Sugar, not capability.
+- [x] Operator-facing naming for that reverse run: `--recipient-node`,
+      `--recipient-cluster-id` and `--recipient-token` name the cluster
+      receiving authority in either direction (`--green-*` remain).
 
-Matrix case IDs: `bluegreen-cutover`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`.
+Matrix case IDs: `bluegreen-cutover`, `bluegreen-cutover-cli`, `bluegreen-rollback-drill`, `bluegreen-chaos-*`.
 
 ---
 
