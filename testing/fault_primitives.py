@@ -33,19 +33,21 @@ three.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
@@ -1431,10 +1433,16 @@ class FilterMatch:
 
 
 def parse_tc_filters(text: str) -> list[FilterMatch]:
-    """Parse every u32 address match, with its counters, out of a filter dump."""
+    """Parse every u32 address match, with its counters, out of a filter dump.
+
+    The per-key ``(success N)`` counter exists only on a kernel built with
+    ``CONFIG_CLS_U32_PERF``. Without it, the match's own action statistics
+    (``Sent B bytes P pkt``) count the same packets.
+    """
     matches: list[FilterMatch] = []
     prio = 0
     rule_hits = 0
+    counted_by_key = False
     for line in text.splitlines():
         pref = re.search(r"\bpref\s+(\d+)\b", line)
         if pref is not None:
@@ -1447,15 +1455,20 @@ def parse_tc_filters(text: str) -> list[FilterMatch]:
             line,
         )
         if key is not None:
+            counted_by_key = key.group(3) is not None
             matches.append(
                 FilterMatch(
                     hex_key=key.group(1),
                     offset=int(key.group(2)),
                     prio=prio,
                     rule_hits=rule_hits,
-                    match_success=int(key.group(3)) if key.group(3) is not None else 0,
+                    match_success=int(key.group(3)) if counted_by_key else 0,
                 )
             )
+            continue
+        sent = re.search(r"\bSent\s+\d+\s+bytes\s+(\d+)\s+pkt\b", line)
+        if sent is not None and matches and not counted_by_key:
+            matches[-1] = replace(matches[-1], match_success=int(sent.group(1)))
     return matches
 
 
@@ -2326,35 +2339,77 @@ def network_detached(
     address than it had. Both the detach and the reattach are verified, and a
     failed reattach raises: leaving a node off the network would poison every
     later case in the run.
+
+    One detach per node at a time, across threads and processes: an attack and
+    an overlapping fault wave both detaching the leader collided, and the
+    second found it already detached. The second waits its turn instead.
     """
-    net = network if network is not None else cluster_network()
-    cid = container_id(service)
-    before = read_container_networks(service)
-    restore_ip = before.get(net, "")
-    if not restore_ip:
-        raise FaultPreconditionError(
-            f"{service} is not attached to {net} (attached: {sorted(before)}), so "
-            "detaching it would inject nothing. Check the cluster is up and "
-            f"COMPOSE_PROJECT_NAME ({compose_project()!r}) matches it."
-        )
-
-    _emit("inject", "network_detached", service, {"network": net, "ip": restore_ip})
-    detach = run(f"docker network disconnect {net} {cid}")
-    if not detach.ok:
-        raise FaultInjectionError(f"could not detach {service} from {net}: {detach.stderr.strip()}")
-    verify_detached(read_container_networks(service), target=service, network=net)
-
-    handle = NetworkDetachHandle(service=service, container=cid, network=net, restore_ip=restore_ip)
-    try:
-        yield handle
-    finally:
-        reattach = run(f"docker network connect --ip {restore_ip} {net} {cid}")
-        if not reattach.ok:
-            raise FaultInjectionError(
-                f"could not reattach {service} to {net} at {restore_ip}: {reattach.stderr.strip()}"
+    with _network_fault_turn(service):
+        net = network if network is not None else cluster_network()
+        cid = container_id(service)
+        before = read_container_networks(service)
+        restore_ip = before.get(net, "")
+        if not restore_ip:
+            raise FaultPreconditionError(
+                f"{service} is not attached to {net} (attached: {sorted(before)}), so "
+                "detaching it would inject nothing. Check the cluster is up and "
+                f"COMPOSE_PROJECT_NAME ({compose_project()!r}) matches it."
             )
-        verify_attached(read_container_networks(service), target=service, network=net)
-        _emit("heal", "network_detached", service, {"network": net, "ip": restore_ip})
+
+        _emit("inject", "network_detached", service, {"network": net, "ip": restore_ip})
+        detach = run(f"docker network disconnect {net} {cid}")
+        if not detach.ok:
+            raise FaultInjectionError(
+                f"could not detach {service} from {net}: {detach.stderr.strip()}"
+            )
+        verify_detached(read_container_networks(service), target=service, network=net)
+
+        handle = NetworkDetachHandle(
+            service=service, container=cid, network=net, restore_ip=restore_ip
+        )
+        try:
+            yield handle
+        finally:
+            reattach = run(f"docker network connect --ip {restore_ip} {net} {cid}")
+            if not reattach.ok:
+                raise FaultInjectionError(
+                    f"could not reattach {service} to {net} at {restore_ip}: "
+                    f"{reattach.stderr.strip()}"
+                )
+            verify_attached(read_container_networks(service), target=service, network=net)
+            _emit("heal", "network_detached", service, {"network": net, "ip": restore_ip})
+
+
+NETWORK_FAULT_TURN_TIMEOUT_S: Final[float] = 120.0
+"""How long a detach waits for another driver's detach of the same node."""
+
+
+@contextmanager
+def _network_fault_turn(service: str) -> Iterator[None]:
+    """Exclusive turn at detaching `service`, held for the whole window.
+
+    An ``flock`` on a file per compose project and node, so threads (one open
+    per caller) and separate processes exclude each other alike.
+    """
+    path = Path(tempfile.gettempdir()) / "pgbattery-fault-turns" / f"{compose_project()}-{service}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as turn:
+        deadline = time.monotonic() + NETWORK_FAULT_TURN_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(turn, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise FaultPreconditionError(
+                        f"another driver held {service} detached for over "
+                        f"{NETWORK_FAULT_TURN_TIMEOUT_S:.0f}s"
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(turn, fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -3558,8 +3613,9 @@ def clock_skew_at_lease_boundary(
     ``checked_duration_since(...).unwrap_or(ZERO)``
     (``promotion_lease_holddown``, ``src/governor/reconciler/follow.rs``), and
     the lease's failover anchor is an ``Instant`` too — so a wall-clock step of
-    either sign cannot shorten it. It was not always so: the guard once compared ``unix_now_ms()`` against
-    a wall-clock anchor while the lease it stood in for was monotonic, and a
+    either sign cannot shorten it. It was not always so: the guard once
+    compared ``unix_now_ms()`` against a wall-clock anchor while the lease it
+    stood in for was monotonic, and a
     forward step of one lease duration applied to the election winner inside
     that window satisfied the guard while the deposed leader's lease was still
     genuinely valid — two writable primaries. This primitive is what keeps that

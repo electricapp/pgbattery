@@ -28,6 +28,7 @@ import unittest
 from collections.abc import Sequence
 from contextlib import suppress
 from pathlib import Path
+from typing import TypeVar
 from unittest import mock
 
 import fault_primitives as fp
@@ -144,6 +145,22 @@ terminal flowid not_in_hw (rule hit 50 success 25)
   match ac1c000c/ffffffff at 12 (success 25 )
 \taction order 1: gact action drop
 """
+
+INGRESS_DROP_FILTER_NO_U32_PERF = """\
+filter parent ffff: protocol ip pref 111 u32 chain 0
+filter parent ffff: protocol ip pref 111 u32 chain 0 fh 800: ht divisor 1
+filter parent ffff: protocol ip pref 111 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 \
+terminal flowid not_in_hw
+  match ac1c000b/ffffffff at 12
+\taction order 1: gact action drop
+\t random type none pass val 0
+\t index 1 ref 1 bind 1 installed 4 sec used 0 sec
+\tAction statistics:
+\tSent 1380 bytes 23 pkt (dropped 23, overlimits 0 requeues 0)
+\tbacklog 0b 0p requeues 0
+"""
+"""A kernel built without ``CONFIG_CLS_U32_PERF`` prints no per-key
+``(success N)``; the action's own statistics still count every packet."""
 
 EGRESS_DROP_FILTER_HOT = """\
 filter protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 \
@@ -473,6 +490,15 @@ class FilterParsingTests(unittest.TestCase):
 
     def test_empty_dump_yields_nothing(self) -> None:
         self.assertEqual(parse_tc_filters(""), [])
+
+    def test_counts_from_action_statistics_without_u32_perf_counters(self) -> None:
+        # GitHub's runner kernel prints no `(success N)`, so a working drop
+        # read as matching nothing and the Elle asymmetric attack never ran.
+        matches = parse_tc_filters(INGRESS_DROP_FILTER_NO_U32_PERF)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].hex_key, "ac1c000b")
+        self.assertEqual(matches[0].prio, 111)
+        self.assertEqual(matches[0].match_success, 23)
 
 
 class ProcessParsingTests(unittest.TestCase):
@@ -1385,6 +1411,38 @@ class NetworkRunner:
         return [c for c in self.calls if needle in c]
 
 
+class StatefulNetworkRunner:
+    """A network whose `docker inspect` answers follow the disconnects and
+    connects issued, for drivers that interleave."""
+
+    def __init__(self, network: str, ip: str = "172.28.0.11") -> None:
+        self.network = network
+        self.ip = ip
+        self.attached = True
+        self.calls: list[str] = []
+        self.lock = threading.Lock()
+
+    def __call__(self, cmd: str, timeout_s: float) -> CommandResult:
+        with self.lock:
+            self.calls.append(cmd)
+            if "docker compose ps -aq" in cmd:
+                return CommandResult(0, "c0ffee123456\n", "")
+            if "docker inspect" in cmd:
+                return CommandResult(0, f"{self.network}={self.ip} " if self.attached else "", "")
+            if "docker network disconnect" in cmd:
+                self.attached = False
+            elif "docker network connect" in cmd:
+                self.attached = True
+            return CommandResult(0, "", "")
+
+    def matching(self, needle: str) -> list[str]:
+        with self.lock:
+            return [c for c in self.calls if needle in c]
+
+
+_Runner = TypeVar("_Runner", NetworkRunner, StatefulNetworkRunner)
+
+
 class NetworkDetachedTests(unittest.TestCase):
     PROJECT = "pgbha_elle_99_1"
 
@@ -1397,7 +1455,7 @@ class NetworkDetachedTests(unittest.TestCase):
         previous_sink = set_event_sink(self.events.append)
         self.addCleanup(set_event_sink, previous_sink)
 
-    def install(self, runner: NetworkRunner) -> NetworkRunner:
+    def install(self, runner: _Runner) -> _Runner:
         previous = set_command_runner(runner)
         self.addCleanup(set_command_runner, previous)
         return runner
@@ -1476,6 +1534,40 @@ class NetworkDetachedTests(unittest.TestCase):
         kinds = [(e.get("event"), e.get("primitive")) for e in self.events]
         self.assertIn(("inject", "network_detached"), kinds)
         self.assertIn(("heal", "network_detached"), kinds)
+
+    def test_two_drivers_detaching_one_node_take_turns(self) -> None:
+        """An attack and an overlapping fault wave detached the same leader at
+        once; the second found it already detached and refused the run. The
+        second detach waits for the first to reattach instead."""
+        runner = self.install(StatefulNetworkRunner(self.network))
+        holding = threading.Event()
+        release = threading.Event()
+
+        def first() -> None:
+            with network_detached("node1"):
+                holding.set()
+                release.wait(5)
+
+        def second() -> None:
+            with network_detached("node1"):
+                pass
+
+        a = threading.Thread(target=first)
+        a.start()
+        self.assertTrue(holding.wait(5))
+        b = threading.Thread(target=second)
+        b.start()
+        b.join(0.3)
+        self.assertEqual(
+            len(runner.matching("docker network disconnect")),
+            1,
+            "a second driver detached a node another still held detached",
+        )
+        release.set()
+        a.join(5)
+        b.join(5)
+        order = [c.split()[2] for c in runner.calls if "docker network" in c]
+        self.assertEqual(order, ["disconnect", "connect", "disconnect", "connect"])
 
     def test_a_stopped_container_still_resolves(self) -> None:
         """`start_container` has to name a container that is not running.
