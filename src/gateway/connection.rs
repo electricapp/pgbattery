@@ -6,13 +6,14 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use super::protocol::TransactionStatus;
+use super::session_replay::Awaited;
 
 /// Cache-line padded atomic to prevent false sharing.
 /// On `x86_64`, cache lines are 64 bytes. When multiple atomics share
@@ -157,29 +158,27 @@ pub struct ConnectionState {
     /// LISTEN/NOTIFY subscriptions - rare feature
     pub subscriptions: NotifySubscriptions,
 
-    /// Session state to replay on a new backend after failover.
-    /// Populated as the client issues PARSE / SET messages.
+    /// Session state to replay on a new backend after failover, committed as
+    /// the backend acknowledges each Parse, Close or query (`awaiting`).
     pub replay: SessionReplay,
 
     /// Backend key data (PID, secret) received from `PostgreSQL`.
     /// Used for routing cancel requests to the correct backend.
     pub backend_key: Option<BackendKey>,
 
-    /// Number of forwarded client messages whose `ReadyForQuery` has not yet
-    /// arrived: +1 per `Query`/`Sync`/`FunctionCall` forwarded, -1 per full
-    /// `ReadyForQuery` observed. A pipelining client (libpq pipeline mode,
-    /// JDBC batching) can have several outstanding at once, and every one of
-    /// them must land before the session is safe to migrate — a lone bool
-    /// would read "response arrived" off the *first* RFQ while later
-    /// responses are still owed.
+    /// Forwarded requests whose backend answer is still owed, in send order
+    /// (`session_replay::acknowledge`): each Query, Sync and `FunctionCall`
+    /// until its `ReadyForQuery`, each Parse and Close until its completion.
+    /// A pipelining client (libpq pipeline mode, JDBC batching) can have
+    /// several outstanding at once, and every one must land before the
+    /// session is safe to migrate. Replay changes ride on the entries, so
+    /// they commit on the backend's acknowledgement, never on the send.
     ///
-    /// This is the "requests in flight?" count, distinct from `tx_status`
-    /// (the *transaction* status as of the last `ReadyForQuery`). On backend
-    /// disconnect with responses outstanding, their outcomes are unknown —
-    /// silently migrating would leave the client waiting forever, so the
-    /// gateway emits `ErrorResponse` (SQLSTATE `08006`) and the driver's
-    /// transport-retry logic takes over.
-    pub responses_outstanding: u32,
+    /// Distinct from `tx_status` (the *transaction* status as of the last
+    /// `ReadyForQuery`). On backend disconnect with answers owed, their
+    /// outcomes are unknown, so the gateway emits `ErrorResponse` (SQLSTATE
+    /// `08006`) and the driver's transport-retry logic takes over.
+    pub awaiting: VecDeque<Awaited>,
 
     /// True when extended-protocol work (`Parse`/`Bind`/`Describe`/`Execute`/
     /// `Close`) has been forwarded with no `Sync` after it. Those messages
@@ -187,7 +186,7 @@ pub struct ConnectionState {
     /// `responses_outstanding` cannot see them — yet the backend holds
     /// prepared-but-unsynced state (an unnamed statement, an open portal)
     /// that a migrated backend would not have. Cleared when a `Sync` is
-    /// forwarded: the Sync's own RFQ (counted above) then covers the whole
+    /// forwarded: the Sync's own RFQ (awaited above) then covers the whole
     /// pipeline.
     pub extended_unsynced: bool,
 
@@ -219,19 +218,19 @@ impl ConnectionState {
             subscriptions: NotifySubscriptions::default(),
             replay: SessionReplay::default(),
             backend_key: None,
-            responses_outstanding: 0,
+            awaiting: VecDeque::new(),
             extended_unsynced: false,
             not_migratable: false,
         }
     }
 
-    /// True when any backend response is still owed to the client — either a
-    /// counted `ReadyForQuery` (`responses_outstanding`) or an unsynced
-    /// extended-protocol pipeline (`extended_unsynced`).
+    /// True when any backend response is still owed to the client — an
+    /// awaited answer (`awaiting`) or an unsynced extended-protocol pipeline
+    /// (`extended_unsynced`).
     #[inline]
     #[must_use]
-    pub const fn response_pending(&self) -> bool {
-        self.responses_outstanding > 0 || self.extended_unsynced
+    pub fn response_pending(&self) -> bool {
+        !self.awaiting.is_empty() || self.extended_unsynced
     }
 
     /// Check if this connection can be migrated during failover.
@@ -245,7 +244,7 @@ impl ConnectionState {
     ///   backend (`LISTEN "*"`, or any session-scoped `SET`)
     #[inline]
     #[must_use]
-    pub const fn is_migratable(&self) -> bool {
+    pub fn is_migratable(&self) -> bool {
         self.tx_status.is_migratable()
             && self.proxy_mode.is_migratable()
             && !self.response_pending()
@@ -570,10 +569,10 @@ mod tests {
 
         // Idle + normal, but a request is in flight — not migratable
         // (outcome of the in-flight query would be unknown on the new backend)
-        state.responses_outstanding = 1;
+        state.awaiting.push_back(Awaited::ready());
         assert!(!state.is_migratable());
 
-        state.responses_outstanding = 0;
+        state.awaiting.clear();
         assert!(state.is_migratable());
 
         // An extended-protocol pipeline open without a Sync also blocks

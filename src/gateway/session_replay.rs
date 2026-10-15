@@ -7,7 +7,183 @@
 //! temp tables, and advisory locks.  This module parses the subset of wire
 //! messages needed to reconstruct the important bits on the new backend.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
+
+use crate::gateway::connection::ConnectionState;
+use crate::gateway::protocol::TransactionStatus;
+
+/// Cap on named prepared statements tracked for replay, per connection.
+///
+/// A client that issues many named `Parse`s without `Close`/`DEALLOCATE`
+/// would otherwise grow the map (each value up to `MAX_GATEWAY_BUFFER_SIZE`)
+/// without bound, across every connection.
+pub const MAX_TRACKED_PREPARED_STATEMENTS: usize = 1024;
+
+/// A change a simple query makes to the replayed session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayChange {
+    Listen(String),
+    Unlisten(String),
+    UnlistenAll,
+    Deallocate(String),
+    DeallocateAll,
+    /// Server-side it deallocates every statement and unlistens every channel.
+    DiscardAll,
+}
+
+/// A forwarded client request whose backend answer is still owed.
+///
+/// Kept in send order. What it would change in the replayed state rides on
+/// it and commits only when the backend acknowledges it, never on the send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Awaited {
+    /// Parse; `Some` carries a named statement's capture.
+    Parse(Option<(String, Bytes)>),
+    /// Close; `Some` names a statement to forget.
+    Close(Option<String>),
+    /// Query, Sync or `FunctionCall`, answered by one `ReadyForQuery`.
+    /// `controls_transaction`: the query's own text begins or ends one.
+    Ready {
+        changes: Vec<ReplayChange>,
+        controls_transaction: bool,
+    },
+}
+
+impl Awaited {
+    /// A Sync or `FunctionCall`: one `ReadyForQuery`, nothing to commit.
+    #[must_use]
+    pub const fn ready() -> Self {
+        Self::Ready {
+            changes: Vec::new(),
+            controls_transaction: false,
+        }
+    }
+}
+
+/// A backend message that answers an [`Awaited`], in stream order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ack {
+    ParseComplete,
+    CloseComplete,
+    Error,
+    Ready(TransactionStatus),
+}
+
+/// Fold one backend answer into the replayed state.
+///
+/// A query's changes commit at its `ReadyForQuery` only when it ended outside
+/// a transaction block, without an error, and without beginning or ending
+/// one itself: inside a block a LISTEN lands at a COMMIT the gateway does not
+/// track, and before an error a DEALLOCATE may already have run. Any other
+/// outcome marks the session non-migratable instead of guessing.
+pub fn acknowledge(state: &mut ConnectionState, ack: Ack) {
+    match ack {
+        Ack::ParseComplete => match state.awaiting.pop_front() {
+            Some(Awaited::Parse(capture)) => {
+                if let Some((name, bytes)) = capture {
+                    commit_capture(state, name, bytes);
+                }
+            }
+            other => out_of_step(state, other.as_ref()),
+        },
+        Ack::CloseComplete => match state.awaiting.pop_front() {
+            Some(Awaited::Close(name)) => {
+                if let Some(name) = name {
+                    state.replay.prepared.remove(&name);
+                }
+            }
+            other => out_of_step(state, other.as_ref()),
+        },
+        Ack::Error => {
+            // The backend skips the rest of an extended batch up to its Sync,
+            // so no Parse or Close still awaited before it ever ran.
+            while matches!(
+                state.awaiting.front(),
+                Some(Awaited::Parse(_) | Awaited::Close(_))
+            ) {
+                state.awaiting.pop_front();
+            }
+            if let Some(Awaited::Ready { changes, .. }) = state.awaiting.front_mut()
+                && !changes.is_empty()
+            {
+                changes.clear();
+                mark_unknowable(state, "a tracked change in a query that failed");
+            }
+        }
+        Ack::Ready(status) => match state.awaiting.pop_front() {
+            Some(Awaited::Ready {
+                changes,
+                controls_transaction,
+            }) if !changes.is_empty() => {
+                if status == TransactionStatus::Idle && !controls_transaction {
+                    apply_changes(state, changes);
+                } else {
+                    mark_unknowable(state, "a tracked change inside a transaction block");
+                }
+            }
+            // The startup's ReadyForQuery answers no forwarded request.
+            Some(Awaited::Ready { .. }) | None => {}
+            Some(other) => out_of_step(state, Some(&other)),
+        },
+    }
+}
+
+fn commit_capture(state: &mut ConnectionState, name: String, bytes: Bytes) {
+    if !state.replay.prepared.contains_key(&name)
+        && state.replay.prepared.len() >= MAX_TRACKED_PREPARED_STATEMENTS
+    {
+        mark_unknowable(state, "prepared-statement replay set at its cap");
+        return;
+    }
+    state.replay.prepared.insert(name, bytes);
+}
+
+fn apply_changes(state: &mut ConnectionState, changes: Vec<ReplayChange>) {
+    for change in changes {
+        match change {
+            ReplayChange::Listen(channel) => {
+                state.subscriptions.channels.insert(channel);
+            }
+            ReplayChange::Unlisten(channel) => {
+                state.subscriptions.channels.remove(&channel);
+            }
+            ReplayChange::UnlistenAll => state.subscriptions.channels.clear(),
+            ReplayChange::Deallocate(name) => {
+                state.replay.prepared.remove(&name);
+            }
+            ReplayChange::DeallocateAll => state.replay.prepared.clear(),
+            ReplayChange::DiscardAll => {
+                state.replay.prepared.clear();
+                state.subscriptions.channels.clear();
+            }
+        }
+    }
+}
+
+/// An answer that matches no awaited request: the gateway's model of the
+/// stream is wrong, so nothing it tracked can be trusted.
+fn out_of_step(state: &mut ConnectionState, front: Option<&Awaited>) {
+    tracing::warn!(
+        conn_id = state.id,
+        ?front,
+        "Backend answer out of step with the requests forwarded"
+    );
+    state.awaiting = VecDeque::new();
+    mark_unknowable(state, "backend answers out of step");
+}
+
+fn mark_unknowable(state: &mut ConnectionState, reason: &'static str) {
+    if !state.not_migratable {
+        tracing::debug!(
+            conn_id = state.id,
+            reason,
+            "Replayed state unknowable; connection will be severed on next leader change"
+        );
+        state.not_migratable = true;
+    }
+}
 
 /// Target of a `Close` message ('C' byte in client->server direction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,5 +324,98 @@ mod tests {
     #[test]
     fn sync_format() {
         assert_eq!(build_sync(), [b'S', 0, 0, 0, 4]);
+    }
+
+    fn capture(name: &str, query: &str) -> Awaited {
+        Awaited::Parse(Some((
+            name.to_string(),
+            Bytes::from(build_parse(name, query)),
+        )))
+    }
+
+    fn settled(awaited: Vec<Awaited>, acks: &[Ack]) -> ConnectionState {
+        let mut state = ConnectionState::new(0);
+        state.awaiting.extend(awaited);
+        for &ack in acks {
+            acknowledge(&mut state, ack);
+        }
+        state
+    }
+
+    /// After an error the backend skips every message up to the Sync, so a
+    /// later Parse in that batch never ran and is never replayed.
+    #[test]
+    fn an_error_drops_what_the_backend_skipped() {
+        let state = settled(
+            vec![
+                capture("a", "SELECT 1"),
+                capture("b", "SELECT 2"),
+                Awaited::ready(),
+            ],
+            &[
+                Ack::ParseComplete,
+                Ack::Error,
+                Ack::Ready(TransactionStatus::Idle),
+            ],
+        );
+        assert!(state.replay.prepared.contains_key("a"));
+        assert!(!state.replay.prepared.contains_key("b"));
+        assert!(state.awaiting.is_empty());
+        assert!(state.is_migratable());
+    }
+
+    /// Close then re-Parse of one name in a pipeline commits in send order.
+    #[test]
+    fn a_close_and_re_parse_commit_in_order() {
+        let mut state = ConnectionState::new(0);
+        state
+            .replay
+            .prepared
+            .insert("s".to_string(), Bytes::from_static(b"old"));
+        state.awaiting.extend([
+            Awaited::Close(Some("s".to_string())),
+            capture("s", "SELECT 2"),
+            Awaited::ready(),
+        ]);
+        for ack in [
+            Ack::CloseComplete,
+            Ack::ParseComplete,
+            Ack::Ready(TransactionStatus::Idle),
+        ] {
+            acknowledge(&mut state, ack);
+        }
+        assert_eq!(
+            state.replay.prepared.get("s").map(|b| &b[..]),
+            Some(&build_parse("s", "SELECT 2")[..])
+        );
+    }
+
+    #[test]
+    fn a_capture_past_the_cap_fails_closed() {
+        let mut state = ConnectionState::new(0);
+        for i in 0..MAX_TRACKED_PREPARED_STATEMENTS {
+            state
+                .replay
+                .prepared
+                .insert(format!("s{i}"), Bytes::from_static(b"x"));
+        }
+        state.awaiting.push_back(capture("one_more", "SELECT 1"));
+        acknowledge(&mut state, Ack::ParseComplete);
+        assert!(!state.replay.prepared.contains_key("one_more"));
+        assert!(state.not_migratable);
+    }
+
+    #[test]
+    fn an_answer_out_of_step_fails_closed() {
+        let state = settled(vec![Awaited::ready()], &[Ack::ParseComplete]);
+        assert!(state.not_migratable);
+        assert!(state.awaiting.is_empty());
+    }
+
+    /// The startup's `ReadyForQuery` arrives with nothing awaited.
+    #[test]
+    fn an_unprompted_ready_changes_nothing() {
+        let state = settled(Vec::new(), &[Ack::Ready(TransactionStatus::Idle)]);
+        assert!(state.is_migratable());
     }
 }

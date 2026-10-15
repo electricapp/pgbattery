@@ -30,6 +30,10 @@ pub enum MessageType {
     // ===== Backend (Server → Client) =====
     /// 'Z' - Transaction status indicator (`ReadyForQuery`)
     ReadyForQuery,
+    /// '1' - A Parse succeeded
+    ParseComplete,
+    /// '3' - A Close succeeded
+    CloseComplete,
     /// 'G' - COPY IN started (client sends data)
     CopyInResponse,
     /// 'H' - COPY OUT started (server sends data)
@@ -77,6 +81,8 @@ impl MessageType {
 
             // Backend messages
             b'Z' => Self::ReadyForQuery,
+            b'1' => Self::ParseComplete,
+            b'3' => Self::CloseComplete,
             b'G' => Self::CopyInResponse,
             b'H' => Self::CopyOutResponse,
             b'W' => Self::CopyBothResponse,

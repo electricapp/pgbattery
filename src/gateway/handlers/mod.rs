@@ -21,7 +21,7 @@ use crate::gateway::protocol::{
     is_cancel_request, is_gssenc_request, is_ssl_request, startup_has_replication_option,
 };
 use crate::gateway::proxy::GatewayConfig;
-use crate::gateway::session_replay::{self, CloseTarget};
+use crate::gateway::session_replay::{self, Ack, Awaited, CloseTarget, ReplayChange};
 use crate::gateway::ssl::MaybeTlsStream;
 use crate::governor::raft::FenceState;
 
@@ -191,6 +191,8 @@ struct BackendDataBatch {
     bytes_received: u64,
     final_tx_status: Option<TransactionStatus>,
     queries_completed: u64,
+    /// Answers to awaited requests, in stream order.
+    acks: Vec<Ack>,
     /// Last proxy-mode transition observed in this batch, in stream order:
     /// a Copy*Response puts the session in COPY, a `ReadyForQuery` ends it.
     /// One read chunk can carry both (a pipelined statement's RFQ followed
@@ -482,6 +484,9 @@ struct QueryAnalysis {
     /// `SET x=1; DISCARD ALL` and `DISCARD ALL; SET x=1` leave different
     /// session state behind.
     session_changes: Vec<SessionChange>,
+    /// The text begins or ends a transaction itself, so whether its tracked
+    /// changes took effect is not decided by the `ReadyForQuery` alone.
+    controls_transaction: bool,
 }
 
 impl ConnectionHandler {
@@ -1244,25 +1249,19 @@ impl ConnectionHandler {
         }
     }
 
-    /// In-flight accounting for one forwarded client message, in stream
-    /// order. The `MessageType` enum is named from the server-to-client
-    /// perspective, so several client wire bytes land on server-named
-    /// variants: 'D' Describe → `DataRow`, 'E' Execute → `ErrorResponse`,
-    /// 'C' Close → `CommandComplete`, 'F' `FunctionCall` → `Unknown(b'F')`.
+    /// Whether one forwarded client message opens or closes an extended
+    /// pipeline, in stream order. The `MessageType` enum is named from the
+    /// server-to-client perspective, so several client wire bytes land on
+    /// server-named variants: 'D' Describe → `DataRow`, 'E' Execute →
+    /// `ErrorResponse`, 'C' Close → `CommandComplete`.
     const fn account_forwarded_message(
         msg_type: MessageType,
-        rfq_eliciting: &mut u32,
         extended_unsynced: &mut Option<bool>,
     ) {
         match msg_type {
-            // Each of these owes the client exactly one ReadyForQuery.
-            MessageType::Query | MessageType::Unknown(b'F') => *rfq_eliciting += 1,
-            // Sync also closes any open extended-protocol pipeline: its
-            // RFQ (counted here) covers everything queued before it.
-            MessageType::Sync => {
-                *rfq_eliciting += 1;
-                *extended_unsynced = Some(false);
-            }
+            // Sync closes any open extended-protocol pipeline: its awaited
+            // ReadyForQuery covers everything queued before it.
+            MessageType::Sync => *extended_unsynced = Some(false),
             // Extended-protocol work that produces no RFQ until a Sync.
             MessageType::Parse
             | MessageType::Bind
@@ -1326,12 +1325,11 @@ impl ConnectionHandler {
         let mut bytes_sent: u64 = 0;
         // In-flight accounting for this batch, committed under the same write
         // lock as `bytes_sent` to keep the hot path at a single lock
-        // acquisition per batch: `rfq_eliciting` counts forwarded messages
-        // that each owe the client one ReadyForQuery (Query / Sync /
-        // FunctionCall), and `extended_unsynced` tracks — in stream order —
+        // acquisition per batch: `awaited` holds, in stream order, each
+        // forwarded request the backend will answer, and `extended_unsynced`
         // whether the batch leaves an extended-protocol pipeline open
         // (Parse/Bind/Describe/Execute/Close with no Sync after them).
-        let mut rfq_eliciting: u32 = 0;
+        let mut awaited: Vec<Awaited> = Vec::new();
         let mut extended_unsynced: Option<bool> = None;
         // Messages approved for forwarding accumulate here and go out as one
         // write (one syscall / one TLS record) per batch. The chunks are
@@ -1402,7 +1400,7 @@ impl ConnectionHandler {
                 }
             }
 
-            self.handle_query_message(header.msg_type, &msg).await?;
+            let answer = self.handle_query_message(header.msg_type, &msg).await?;
 
             // Check for termination
             if header.msg_type == MessageType::Terminate {
@@ -1413,16 +1411,13 @@ impl ConnectionHandler {
                     write_all_within_deadline(backend, &pending, self.id).await?;
                 }
                 // Flush any pending state updates before the task exits.
-                self.commit_client_batch(bytes_sent, rfq_eliciting, extended_unsynced);
+                self.commit_client_batch(bytes_sent, awaited, extended_unsynced);
                 tracing::debug!(conn_id = self.id, "Client sent Terminate");
                 return Ok(());
             }
 
-            Self::account_forwarded_message(
-                header.msg_type,
-                &mut rfq_eliciting,
-                &mut extended_unsynced,
-            );
+            awaited.extend(answer);
+            Self::account_forwarded_message(header.msg_type, &mut extended_unsynced);
 
             bytes_sent += msg.len() as u64;
             if pending.is_empty() {
@@ -1450,30 +1445,29 @@ impl ConnectionHandler {
             return Err(Error::Fenced);
         }
 
-        self.commit_client_batch(bytes_sent, rfq_eliciting, extended_unsynced);
+        self.commit_client_batch(bytes_sent, awaited, extended_unsynced);
 
         Ok(())
     }
 
     /// Commit accumulated byte-count and in-flight state under one write lock.
     ///
-    /// `rfq_eliciting` adds to the outstanding-response count (each such
-    /// message owes one `ReadyForQuery`; the backend side subtracts as they
-    /// arrive). `extended_unsynced` carries the batch's final
+    /// `awaited` joins the requests owed an answer (the backend side settles
+    /// them as they arrive). `extended_unsynced` carries the batch's final
     /// pipeline-open/closed state in stream order, or `None` when the batch
     /// contained no extended-protocol messages.
     fn commit_client_batch(
         &self,
         bytes_sent: u64,
-        rfq_eliciting: u32,
+        awaited: Vec<Awaited>,
         extended_unsynced: Option<bool>,
     ) {
-        if bytes_sent == 0 && rfq_eliciting == 0 && extended_unsynced.is_none() {
+        if bytes_sent == 0 && awaited.is_empty() && extended_unsynced.is_none() {
             return;
         }
         let mut state = self.state.write();
         state.bytes_sent += bytes_sent;
-        state.responses_outstanding = state.responses_outstanding.saturating_add(rfq_eliciting);
+        state.awaiting.extend(awaited);
         if let Some(unsynced) = extended_unsynced {
             state.extended_unsynced = unsynced;
         }
@@ -1499,13 +1493,18 @@ impl ConnectionHandler {
         Err(Error::Fenced)
     }
 
-    /// Inspect a client message for session state the gateway must track.
-    /// Every message is forwarded verbatim; nothing is injected.
-    async fn handle_query_message(&self, msg_type: MessageType, msg: &BytesMut) -> Result<()> {
+    /// Inspect a client message for session state the gateway must track,
+    /// returning the answer the backend owes it, if any. Every message is
+    /// forwarded verbatim; nothing is injected.
+    async fn handle_query_message(
+        &self,
+        msg_type: MessageType,
+        msg: &BytesMut,
+    ) -> Result<Option<Awaited>> {
         match msg_type {
             MessageType::Query => {
                 if msg.len() <= 5 {
-                    return Ok(());
+                    return Ok(Some(Awaited::ready()));
                 }
                 let query_bytes = msg.get(5..msg.len().saturating_sub(1)).unwrap_or_default();
                 let query_text = String::from_utf8_lossy(query_bytes);
@@ -1530,7 +1529,7 @@ impl ConnectionHandler {
                 }
 
                 if !needs_subscription_analysis && !needs_session_state_analysis {
-                    return Ok(());
+                    return Ok(Some(Awaited::ready()));
                 }
 
                 // Offload the C parser (libpg_query) to a blocking thread so it
@@ -1541,23 +1540,25 @@ impl ConnectionHandler {
                         .await
                         .map_err(|e| Error::Protocol(format!("query analysis task failed: {e}")))?;
 
-                self.apply_session_changes(query_analysis.session_changes);
+                Ok(Some(Awaited::Ready {
+                    changes: self.apply_session_changes(query_analysis.session_changes),
+                    controls_transaction: query_analysis.controls_transaction,
+                }))
             }
             MessageType::Parse => {
                 self.observe_parse_message(msg).await?;
-                self.capture_parse_for_replay(msg);
+                Ok(Some(Awaited::Parse(self.capture_parse_for_replay(msg))))
             }
             // The `MessageType` enum is named from the server-to-client
             // perspective: wire byte `C` is Close in the client-to-server
             // direction, whereas the variant is named after the server-side
             // CommandComplete. Clients send Close to deallocate a prepared
             // statement or portal.
-            MessageType::CommandComplete => {
-                self.handle_close_for_replay(msg);
-            }
-            _ => {}
+            MessageType::CommandComplete => Ok(Some(Awaited::Close(Self::closed_statement(msg)))),
+            // Sync and FunctionCall ('F') each owe one ReadyForQuery.
+            MessageType::Sync | MessageType::Unknown(b'F') => Ok(Some(Awaited::ready())),
+            _ => Ok(None),
         }
-        Ok(())
     }
 
     /// Observe a Parse message for session-state migratability.
@@ -1617,54 +1618,23 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    /// Capture a Parse message so we can replay it on a new backend after
-    /// failover.  Only named statements are captured — the unnamed statement
-    /// is transient by protocol definition.
-    /// Cap on distinct named prepared statements tracked for failover replay,
-    /// per connection. A client that issues many named `Parse`s without
-    /// `Close`/`DEALLOCATE` would otherwise grow this map (each value up to
-    /// `MAX_GATEWAY_BUFFER_SIZE`) without bound, across every connection.
-    const MAX_TRACKED_PREPARED_STATEMENTS: usize = 1024;
-
-    fn capture_parse_for_replay(&self, msg: &BytesMut) {
-        let Some(name) = session_replay::parse_statement_name(msg) else {
-            return;
-        };
-        let mut state = self.state.write();
-        // Re-preparing an existing name just replaces it (no growth). Only a
-        // *new* name over the cap is a problem: stop tracking and mark the
-        // connection non-migratable so failover severs (08006) rather than
-        // silently under-replaying a statement we chose not to record. The
-        // cap decision runs before the full-message copy so a capped
-        // connection pays no memcpy per Parse.
-        if !state.replay.prepared.contains_key(name)
-            && state.replay.prepared.len() >= Self::MAX_TRACKED_PREPARED_STATEMENTS
-        {
-            if !state.not_migratable {
-                tracing::warn!(
-                    conn_id = self.id,
-                    cap = Self::MAX_TRACKED_PREPARED_STATEMENTS,
-                    "Prepared-statement replay set hit its cap; marking connection non-migratable"
-                );
-                state.not_migratable = true;
-            }
-            return;
+    /// A named Parse's capture, to replay on a new backend once its
+    /// `ParseComplete` commits it. The unnamed statement is transient by
+    /// protocol definition, and a session already severed on failover
+    /// replays nothing, so neither pays for the copy.
+    fn capture_parse_for_replay(&self, msg: &BytesMut) -> Option<(String, Bytes)> {
+        let name = session_replay::parse_statement_name(msg)?;
+        if self.state.read().not_migratable {
+            return None;
         }
-        let bytes = session_replay::capture_parse_message(msg);
-        state.replay.prepared.insert(name.to_owned(), bytes);
+        Some((name.to_owned(), session_replay::capture_parse_message(msg)))
     }
 
-    /// Handle a Close ('C') message in the client→server direction.
-    /// Removes the named statement/portal from the replay set so we don't
-    /// resurrect it on the next failover.
-    fn handle_close_for_replay(&self, msg: &BytesMut) {
-        let Some((target, name)) = session_replay::close_target(msg) else {
-            return;
-        };
-        if target == CloseTarget::Statement && !name.is_empty() {
-            let mut state = self.state.write();
-            state.replay.prepared.remove(name);
-        }
+    /// The statement a client Close ('C') forgets once its `CloseComplete`
+    /// arrives, so failover does not resurrect it.
+    fn closed_statement(msg: &BytesMut) -> Option<String> {
+        let (target, name) = session_replay::close_target(msg)?;
+        (target == CloseTarget::Statement && !name.is_empty()).then(|| name.to_owned())
     }
 
     /// Word-boundary, case-insensitive token search over raw bytes.
@@ -1905,6 +1875,9 @@ impl ConnectionHandler {
     ) {
         match msg_type {
             MessageType::ReadyForQuery => Self::handle_ready_for_query_message(msg, batch),
+            MessageType::ParseComplete => batch.acks.push(Ack::ParseComplete),
+            MessageType::CloseComplete => batch.acks.push(Ack::CloseComplete),
+            MessageType::ErrorResponse => batch.acks.push(Ack::Error),
             MessageType::BackendKeyData => self.handle_backend_key_data_message(msg),
             MessageType::CopyInResponse
             | MessageType::CopyOutResponse
@@ -1925,6 +1898,9 @@ impl ConnectionHandler {
 
         batch.final_tx_status = msg.get(5..).and_then(extract_transaction_status);
         batch.queries_completed += 1;
+        batch
+            .acks
+            .push(Ack::Ready(batch.final_tx_status.unwrap_or_default()));
         // ReadyForQuery only arrives outside COPY, so it marks the session
         // back in Normal mode as of this point in the stream.
         batch.mode_transition = Some(ProxyMode::Normal);
@@ -1961,17 +1937,16 @@ impl ConnectionHandler {
     }
 
     fn apply_backend_data_batch(&self, batch: &BackendDataBatch) {
-        // Each full ReadyForQuery answers exactly one outstanding
-        // RFQ-eliciting client message (`handle_ready_for_query_message` is
-        // the sole path that increments `queries_completed`), so the batch
-        // subtracts from — never clears — the outstanding count: a pipelined
-        // client may still be owed responses this batch didn't carry.
-        if batch.bytes_received > 0 || batch.queries_completed > 0 {
-            let completed = u32::try_from(batch.queries_completed).unwrap_or(u32::MAX);
+        // Each answer settles the oldest awaited request, in stream order: a
+        // pipelined client may still be owed answers this batch didn't carry.
+        if batch.bytes_received > 0 || !batch.acks.is_empty() {
             let mut state = self.state.write();
             state.bytes_received += batch.bytes_received;
             state.queries_processed += batch.queries_completed;
-            state.responses_outstanding = state.responses_outstanding.saturating_sub(completed);
+            for &ack in &batch.acks {
+                session_replay::acknowledge(&mut state, ack);
+            }
+            drop(state);
         }
 
         // The handler already holds an Arc to its own state — route counter
@@ -2444,9 +2419,12 @@ impl ConnectionHandler {
         }
     }
 
-    fn apply_session_changes(&self, changes: Vec<SessionChange>) {
+    /// Ratchet the session for what a simple query leaves unreconstructable,
+    /// and return the replay changes that wait for its acknowledgement.
+    fn apply_session_changes(&self, changes: Vec<SessionChange>) -> Vec<ReplayChange> {
+        let mut replayed = Vec::new();
         if changes.is_empty() {
-            return;
+            return replayed;
         }
 
         let mut state = self.state.write();
@@ -2466,20 +2444,11 @@ impl ConnectionHandler {
                              connection will be severed on next leader change"
                         );
                         state.not_migratable = true;
-                        state.subscriptions.channels.insert(channel);
-                        continue;
                     }
-                    tracing::debug!(conn_id = self.id, channel = %channel, "Tracking LISTEN");
-                    state.subscriptions.channels.insert(channel);
+                    replayed.push(ReplayChange::Listen(channel));
                 }
-                SessionChange::UnlistenAll => {
-                    tracing::debug!(conn_id = self.id, "Cleared all LISTEN subscriptions");
-                    state.subscriptions.channels.clear();
-                }
-                SessionChange::Unlisten(channel) => {
-                    tracing::debug!(conn_id = self.id, channel = %channel, "Removed LISTEN");
-                    state.subscriptions.channels.remove(&channel);
-                }
+                SessionChange::UnlistenAll => replayed.push(ReplayChange::UnlistenAll),
+                SessionChange::Unlisten(channel) => replayed.push(ReplayChange::Unlisten(channel)),
                 SessionChange::SetSessionVar => {
                     // Session GUCs are not reconstructed on a new backend; on
                     // the next leader change the gateway severs this session
@@ -2493,24 +2462,12 @@ impl ConnectionHandler {
                         state.not_migratable = true;
                     }
                 }
-                SessionChange::Deallocate(name) => {
-                    state.replay.prepared.remove(&name);
-                }
-                SessionChange::DeallocateAll => {
-                    state.replay.prepared.clear();
-                }
-                SessionChange::DiscardAll => {
-                    // DISCARD ALL deallocates every prepared statement and
-                    // unlistens every channel server-side; clear the replay
-                    // sets so failover doesn't resurrect them (a client
-                    // re-preparing the same name would hit "prepared
-                    // statement already exists"). `not_migratable` stays
-                    // set: it's a one-way ratchet — DISCARD ALL fails inside
-                    // a transaction block, and severing a clean session is
-                    // safe while migrating a dirty one is not.
-                    state.replay.prepared.clear();
-                    state.subscriptions.channels.clear();
-                }
+                SessionChange::Deallocate(name) => replayed.push(ReplayChange::Deallocate(name)),
+                SessionChange::DeallocateAll => replayed.push(ReplayChange::DeallocateAll),
+                // `not_migratable` stays set if it was: a one-way ratchet,
+                // since severing a clean session is safe and migrating a
+                // dirty one is not.
+                SessionChange::DiscardAll => replayed.push(ReplayChange::DiscardAll),
                 SessionChange::NonMigratable(reason) => {
                     if !state.not_migratable {
                         tracing::debug!(
@@ -2524,6 +2481,7 @@ impl ConnectionHandler {
                 }
             }
         }
+        replayed
     }
 
     fn analyze_query(query: &str) -> QueryAnalysis {
@@ -2586,6 +2544,12 @@ impl ConnectionHandler {
             let Some(stmt_node) = raw_stmt.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) else {
                 continue;
             };
+            if matches!(
+                stmt_node,
+                pg_query::protobuf::node::Node::TransactionStmt(_)
+            ) {
+                analysis.controls_transaction = true;
+            }
 
             match Self::classify_statement(stmt_node) {
                 StatementClass::Modeled(Some(change)) => analysis.session_changes.push(change),
@@ -3686,6 +3650,165 @@ mod tests {
         assert!(!state.read().not_migratable);
     }
 
+    /// A handler with a live backend socket, for driving whole client and
+    /// backend batches through the proxy paths. Returns the handler, its end
+    /// of the backend socket, and the client and backend peers, which must
+    /// stay open while the test writes through them.
+    async fn proxied(
+        state: SharedConnectionState,
+    ) -> (ConnectionHandler, TcpStream, TcpStream, TcpStream) {
+        let (handler, client_peer) = test_handler_with_peer(state).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (backend, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        (handler, backend.unwrap(), client_peer, accepted.unwrap().0)
+    }
+
+    fn message(kind: u8, body: &[u8]) -> BytesMut {
+        let mut m = BytesMut::new();
+        m.put_u8(kind);
+        m.put_u32(u32::try_from(4 + body.len()).unwrap());
+        m.extend_from_slice(body);
+        m
+    }
+
+    fn framed_parse(stmt_name: &str, query: &str) -> BytesMut {
+        let mut body = Vec::new();
+        body.extend_from_slice(stmt_name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(query.as_bytes());
+        body.extend_from_slice(&[0, 0, 0]);
+        message(b'P', &body)
+    }
+
+    fn framed_query(sql: &str) -> BytesMut {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        message(b'Q', &body)
+    }
+
+    fn error_response(sqlstate: &str) -> BytesMut {
+        let mut body = vec![b'C'];
+        body.extend_from_slice(sqlstate.as_bytes());
+        body.extend_from_slice(&[0, 0]);
+        message(b'E', &body)
+    }
+
+    fn ready(status: u8) -> BytesMut {
+        message(b'Z', &[status])
+    }
+
+    async fn client_sends(
+        handler: &mut ConnectionHandler,
+        backend: &mut TcpStream,
+        parts: &[BytesMut],
+    ) {
+        let mut buf = BytesMut::new();
+        for part in parts {
+            buf.extend_from_slice(part);
+        }
+        handler
+            .process_client_data(&mut buf, backend)
+            .await
+            .unwrap();
+    }
+
+    async fn backend_answers(handler: &mut ConnectionHandler, parts: &[BytesMut]) {
+        let mut buf = BytesMut::new();
+        for part in parts {
+            buf.extend_from_slice(part);
+        }
+        handler.process_backend_data(&mut buf).await.unwrap();
+    }
+
+    /// M16: replay state was recorded when the client sent a Parse, so a
+    /// duplicate name the backend refused (42P05) replaced the statement it
+    /// kept, and a migrated session ran the refused query under that name.
+    #[tokio::test]
+    async fn a_refused_parse_does_not_replace_the_statement_the_backend_kept() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state.clone()).await;
+        let kept = framed_parse("s1", "SELECT 1");
+        client_sends(
+            &mut handler,
+            &mut backend,
+            &[kept.clone(), message(b'S', &[])],
+        )
+        .await;
+        backend_answers(&mut handler, &[message(b'1', &[]), ready(b'I')]).await;
+
+        let refused = framed_parse("s1", "SELECT 2");
+        client_sends(&mut handler, &mut backend, &[refused, message(b'S', &[])]).await;
+        backend_answers(&mut handler, &[error_response("42P05"), ready(b'I')]).await;
+
+        assert_eq!(
+            state.read().replay.prepared.get("s1").map(|b| &b[..]),
+            Some(&kept[..])
+        );
+        assert!(state.read().is_migratable());
+    }
+
+    /// A tracked change commits at its acknowledgement: a LISTEN is not a
+    /// subscription until its `ReadyForQuery` says the statement ran.
+    #[tokio::test]
+    async fn a_listen_is_tracked_once_the_backend_ran_it() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state.clone()).await;
+        client_sends(&mut handler, &mut backend, &[framed_query("LISTEN jobs")]).await;
+        assert!(state.read().subscriptions.channels.is_empty());
+        backend_answers(&mut handler, &[message(b'C', b"LISTEN\0"), ready(b'I')]).await;
+        assert!(state.read().subscriptions.channels.contains("jobs"));
+        assert!(state.read().is_migratable());
+    }
+
+    /// A tracked change whose outcome the gateway cannot know fails closed:
+    /// a DISCARD ALL refused inside a transaction block, and a LISTEN its own
+    /// query rolled back.
+    #[tokio::test]
+    async fn an_unknowable_change_fails_closed() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        state
+            .write()
+            .replay
+            .prepared
+            .insert("s1".to_string(), Bytes::from_static(b"parse-bytes"));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state.clone()).await;
+        client_sends(&mut handler, &mut backend, &[framed_query("DISCARD ALL")]).await;
+        backend_answers(&mut handler, &[error_response("25001"), ready(b'T')]).await;
+        assert!(
+            state.read().replay.prepared.contains_key("s1") || state.read().not_migratable,
+            "a refused DISCARD ALL dropped the statements it left in place"
+        );
+        assert!(state.read().not_migratable);
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state.clone()).await;
+        client_sends(
+            &mut handler,
+            &mut backend,
+            &[framed_query("BEGIN; LISTEN jobs; ROLLBACK")],
+        )
+        .await;
+        backend_answers(
+            &mut handler,
+            &[
+                message(b'C', b"BEGIN\0"),
+                message(b'C', b"LISTEN\0"),
+                message(b'C', b"ROLLBACK\0"),
+                ready(b'I'),
+            ],
+        )
+        .await;
+        assert!(!state.read().subscriptions.channels.contains("jobs"));
+        assert!(state.read().not_migratable);
+    }
+
     #[tokio::test]
     async fn pipelined_queries_stay_unmigratable_until_all_responses_arrive() {
         use crate::gateway::connection::ConnectionState;
@@ -3695,8 +3818,8 @@ mod tests {
 
         // Two pipelined simple queries, each forwarded in its own client
         // batch before any backend response arrives.
-        handler.commit_client_batch(10, 1, None);
-        handler.commit_client_batch(10, 1, None);
+        handler.commit_client_batch(10, vec![Awaited::ready()], None);
+        handler.commit_client_batch(10, vec![Awaited::ready()], None);
         assert!(!state.read().is_migratable());
 
         // The first query's ReadyForQuery lands alone in one backend batch.
@@ -3705,6 +3828,7 @@ mod tests {
         let one_rfq = BackendDataBatch {
             bytes_received: 6,
             queries_completed: 1,
+            acks: vec![Ack::Ready(TransactionStatus::Idle)],
             ..Default::default()
         };
         handler.apply_backend_data_batch(&one_rfq);

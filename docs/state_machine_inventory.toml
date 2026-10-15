@@ -54,6 +54,16 @@ enums.SessionChange = [
   "UnlistenAll",
 ]
 enums.StatementClass = ["Modeled", "Unmodeled"]
+enums.Awaited = ["Parse", "Close", "Ready"]
+enums.Ack = ["ParseComplete", "CloseComplete", "Error", "Ready"]
+enums.ReplayChange = [
+  "Listen",
+  "Unlisten",
+  "UnlistenAll",
+  "Deallocate",
+  "DeallocateAll",
+  "DiscardAll",
+]
 
 types = [
   "ClusterState",
@@ -88,6 +98,9 @@ types = [
   "TimelineCheck",
   "SessionChange",
   "StatementClass",
+  "Awaited",
+  "Ack",
+  "ReplayChange",
 ]
 
 [foreign]
