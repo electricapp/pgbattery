@@ -515,12 +515,22 @@ pub(crate) async fn run_cluster_upgrade(params: ClusterUpgradeParams<'_>) -> Res
         wait_for_streaming(&client, &new_leader_mgmt, leader_id).await?;
     }
 
-    // Postflight: doctor + every node on target.
-    super::super::doctor::require_doctor_strict(
+    // Postflight: doctor + every node on target. Waited for, not sampled: the
+    // transfer above leaves the new leader unpromoted through the hold-down,
+    // and no standby is `sync` until it is.
+    super::super::doctor::await_doctor_strict(
         Some(entry.clone()),
         params.config_path.map(str::to_string),
+        SYNC_WAIT_TIMEOUT,
+        NODE_POLL_INTERVAL,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Postflight: {e:#}. Every node is upgraded; re-running the same upgrade \
+             command re-checks it."
+        )
+    })?;
     let final_versions = {
         let membership = client.get_nodes(&entry).await?;
         let mut out = Vec::new();

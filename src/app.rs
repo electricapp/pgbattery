@@ -2263,6 +2263,7 @@ impl App {
             crate::governor::replication_manager::required_sync_standbys(peers)
         };
         let sync_in_force = Self::sync_durability_in_force(sync_observation, required_sync);
+        Self::publish_sync_durability(sync_observation, required_sync);
 
         // Read the lease AFTER the lock wait and the probes, immediately
         // before choosing a path. Acquiring the supervisor lock can block
@@ -2404,6 +2405,20 @@ impl App {
             None => false,
             Some((true, _)) => true,
             Some((false, sync_standbys)) => sync_standbys >= required,
+        }
+    }
+
+    /// Publish the write gate's evidence for `doctor` and the harness settle
+    /// barrier. An unanswered probe publishes zero confirmed standbys: no
+    /// evidence is not evidence of durability.
+    fn publish_sync_durability(observation: Option<(bool, usize)>, required: usize) {
+        let confirmed = observation.map_or(0, |(_, sync_standbys)| sync_standbys);
+        #[allow(clippy::cast_precision_loss, reason = "standby counts fit in f64")]
+        {
+            metrics::gauge!(crate::observability::metrics::SYNC_STANDBYS_CONFIRMED_GAUGE)
+                .set(confirmed as f64);
+            metrics::gauge!(crate::observability::metrics::SYNC_STANDBYS_REQUIRED_GAUGE)
+                .set(required as f64);
         }
     }
 

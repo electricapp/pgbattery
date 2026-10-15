@@ -11,6 +11,7 @@ use super::common::{
 };
 use super::render::format_size;
 use crate::cli::OutputFormat;
+use crate::observability::metrics::{SYNC_STANDBYS_CONFIRMED_GAUGE, SYNC_STANDBYS_REQUIRED_GAUGE};
 
 /// Check result status.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -163,6 +164,63 @@ pub(crate) async fn require_doctor_strict(
         violations.len(),
         violations.join("; ")
     );
+}
+
+/// Wait for `doctor --strict` to go green, for a caller whose own action
+/// disturbed the cluster. After a roll's leadership transfer the new leader's
+/// `PostgreSQL` stays a standby through the promotion hold-down, so one sample
+/// there reads a gap the roll caused as a degraded cluster.
+///
+/// # Errors
+/// Returns the last gating checks (or probe failure) once `budget` runs out.
+pub(crate) async fn await_doctor_strict(
+    discover: Option<String>,
+    config_path: Option<String>,
+    budget: Duration,
+    interval: Duration,
+) -> Result<()> {
+    retry_until_green(
+        || {
+            let discover = discover.clone();
+            let config_path = config_path.clone();
+            async move {
+                let report =
+                    collect_doctor_report(None, discover, false, false, config_path).await?;
+                Ok(strict_gate_violations(&report.checks))
+            }
+        },
+        budget,
+        interval,
+    )
+    .await
+}
+
+/// Re-run `probe` until it reports no gating checks or `budget` runs out. A
+/// failed probe is retried like a red one: the node it reached may be the one
+/// that just restarted.
+async fn retry_until_green<F, Fut>(mut probe: F, budget: Duration, interval: Duration) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let violations = match probe().await {
+            Ok(violations) if violations.is_empty() => return Ok(()),
+            Ok(violations) => violations,
+            Err(e) => vec![format!("doctor probe failed: {e:#}")],
+        };
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "doctor --strict still not green after {}s ({} gating checks). {}",
+                budget.as_secs(),
+                violations.len(),
+                violations.join("; ")
+            );
+        }
+        tracing::info!(violations = %violations.join("; "), "Waiting for doctor --strict");
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Fail/warn checks that gate the upgrade preflight, formatted for the
@@ -526,26 +584,15 @@ fn check_replication(probes: &[NodeProbe]) -> Vec<CheckResult> {
             .unwrap_or(0.0)
             > 0.5
         {
-            // Check sync replication
-            let has_sync = data
-                .metrics
-                .get("pgbattery_replication_sync")
-                .copied()
-                .unwrap_or(0.0)
-                > 0.5;
-
+            let gauge = |name: &str| data.metrics.get(name).map(|v| metric_to_u64(*v));
+            let (status, message) = sync_durability_verdict(
+                gauge(SYNC_STANDBYS_CONFIRMED_GAUGE),
+                gauge(SYNC_STANDBYS_REQUIRED_GAUGE),
+            );
             results.push(CheckResult {
                 name: "replication:sync".to_string(),
-                status: if has_sync {
-                    CheckStatus::Pass
-                } else {
-                    CheckStatus::Warn
-                },
-                message: if has_sync {
-                    "Synchronous replication active (zero data loss)".to_string()
-                } else {
-                    "No synchronous replica - potential data loss on failover".to_string()
-                },
+                status,
+                message,
                 details: None,
             });
 
@@ -586,6 +633,42 @@ fn check_replication(probes: &[NodeProbe]) -> Vec<CheckResult> {
     }
 
     results
+}
+
+/// The `replication:sync` verdict from the leader's write-gate evidence:
+/// standbys `PostgreSQL` reports `sync` against what the voter count requires.
+/// The replication manager's plan gauge is intent, not evidence: it reads
+/// "sync" through leader grace while no standby is `sync`.
+fn sync_durability_verdict(confirmed: Option<u64>, required: Option<u64>) -> (CheckStatus, String) {
+    match (confirmed, required) {
+        (_, Some(0)) => (
+            CheckStatus::Pass,
+            "Replication is asynchronous by design: one or two voters require no \
+             synchronous standby"
+                .to_string(),
+        ),
+        (Some(confirmed), Some(required)) if confirmed >= required => (
+            CheckStatus::Pass,
+            format!(
+                "Synchronous replication in force: {confirmed} of {required} required \
+                 standbys report sync (zero data loss)"
+            ),
+        ),
+        (Some(confirmed), Some(required)) => (
+            CheckStatus::Warn,
+            format!(
+                "Only {confirmed} of {required} required standbys report sync - \
+                 potential data loss on failover"
+            ),
+        ),
+        _ => (
+            CheckStatus::Warn,
+            format!(
+                "Cannot verify synchronous replication: the leader does not publish \
+                 {SYNC_STANDBYS_CONFIRMED_GAUGE} and {SYNC_STANDBYS_REQUIRED_GAUGE}"
+            ),
+        ),
+    }
 }
 
 fn check_network_latency(probes: &[NodeProbe]) -> Vec<CheckResult> {
@@ -934,6 +1017,164 @@ mod tests {
             details: None,
         };
         assert_eq!(strict_gate_violations(&[check]), Vec::<String>::new());
+    }
+
+    fn sync_check(pairs: &[(&str, f64)]) -> CheckResult {
+        let mut metrics = vec![("pgbattery_raft_is_leader", 1.0)];
+        metrics.extend_from_slice(pairs);
+        check_replication(&[probe_with_metrics("leader", &metrics)])
+            .into_iter()
+            .find(|c| c.name == "replication:sync")
+            .unwrap()
+    }
+
+    #[test]
+    fn sync_check_warns_when_the_plan_says_sync_but_no_standby_confirms() {
+        // Leader grace: the plan keeps the full list while followers re-point,
+        // and PostgreSQL has not designated any standby `sync` yet.
+        let check = sync_check(&[
+            ("pgbattery_replication_sync", 1.0),
+            ("pgbattery_sync_standbys_confirmed", 0.0),
+            ("pgbattery_sync_standbys_required", 1.0),
+        ]);
+        assert_eq!(check.status, CheckStatus::Warn, "{}", check.message);
+        assert!(
+            !check.message.contains("zero data loss"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn sync_check_passes_two_voters_as_async_by_design() {
+        // Two voters require no sync standby, so the plan gauge reads 0 forever.
+        let check = sync_check(&[
+            ("pgbattery_replication_sync", 0.0),
+            ("pgbattery_sync_standbys_confirmed", 0.0),
+            ("pgbattery_sync_standbys_required", 0.0),
+        ]);
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("asynchronous by design"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn sync_check_passes_when_confirmed_standbys_meet_the_requirement() {
+        let check = sync_check(&[
+            ("pgbattery_replication_sync", 1.0),
+            ("pgbattery_sync_standbys_confirmed", 1.0),
+            ("pgbattery_sync_standbys_required", 1.0),
+        ]);
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("zero data loss"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn sync_check_warns_when_the_leader_publishes_no_evidence() {
+        // The plan gauge alone is intent, not a standby PostgreSQL calls `sync`.
+        let check = sync_check(&[("pgbattery_replication_sync", 1.0)]);
+        assert_eq!(check.status, CheckStatus::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("pgbattery_sync_standbys_confirmed"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_until_green_waits_out_a_transient_gap() {
+        let mut rounds = vec![
+            vec!["replication:sync: Only 0 of 1 required standbys report sync".to_string()],
+            Vec::new(),
+        ]
+        .into_iter();
+        retry_until_green(
+            || {
+                let next = rounds.next().unwrap_or_default();
+                async move { Ok(next) }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_until_green_retries_a_failed_probe() {
+        let mut calls = 0_u32;
+        retry_until_green(
+            || {
+                calls += 1;
+                let first = calls == 1;
+                async move {
+                    if first {
+                        bail!("node restarting");
+                    }
+                    Ok(Vec::new())
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_until_green_fails_with_the_last_gating_checks() {
+        let err = retry_until_green(
+            || async { Ok(vec!["replication:sync: Only 0 of 1 (warn)".to_string()]) },
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("replication:sync"), "{err:#}");
+    }
+
+    #[test]
+    fn sync_verdict_needs_every_required_standby() {
+        // Five voters require two: one sync standby is not RPO=0.
+        assert_eq!(
+            sync_durability_verdict(Some(1), Some(2)).0,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            sync_durability_verdict(Some(2), Some(2)).0,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            sync_durability_verdict(Some(3), Some(2)).0,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn sync_verdict_requires_both_gauges_unless_nothing_is_required() {
+        assert_eq!(sync_durability_verdict(None, Some(1)).0, CheckStatus::Warn);
+        assert_eq!(sync_durability_verdict(Some(1), None).0, CheckStatus::Warn);
+        assert_eq!(sync_durability_verdict(None, None).0, CheckStatus::Warn);
+        assert_eq!(sync_durability_verdict(None, Some(0)).0, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn sync_verdict_never_claims_zero_loss_below_the_requirement() {
+        for required in 1..=3 {
+            for confirmed in 0..required {
+                let (status, message) = sync_durability_verdict(Some(confirmed), Some(required));
+                assert_eq!(status, CheckStatus::Warn, "{message}");
+                assert!(!message.contains("zero data loss"), "{message}");
+            }
+        }
     }
 
     #[test]

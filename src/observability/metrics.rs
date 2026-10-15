@@ -8,6 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Standbys `PostgreSQL` reports `sync_state = 'sync'`, read by the lease
+/// tick's write-gate probe. The evidence `doctor` gates `replication:sync` on.
+pub(crate) const SYNC_STANDBYS_CONFIRMED_GAUGE: &str = "pgbattery_sync_standbys_confirmed";
+
+/// Sync standbys this voter set requires (`required_sync_standbys`), from the
+/// same lease tick as [`SYNC_STANDBYS_CONFIRMED_GAUGE`].
+pub(crate) const SYNC_STANDBYS_REQUIRED_GAUGE: &str = "pgbattery_sync_standbys_required";
+
 /// Initialize the metrics system with a Prometheus exporter.
 ///
 /// Safe to call multiple times — subsequent calls are no-ops.
@@ -153,7 +161,15 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     );
     describe_gauge!(
         "pgbattery_replication_sync",
-        "1.0 if synchronous_standby_names is set to a non-empty value, else 0.0"
+        "1.0 if the replication manager's plan installs a non-empty synchronous_standby_names, else 0.0. Intent, not evidence: see pgbattery_sync_standbys_confirmed"
+    );
+    describe_gauge!(
+        SYNC_STANDBYS_CONFIRMED_GAUGE,
+        "Standbys PostgreSQL reports sync_state=sync, from the lease tick's write-gate probe (0 when the probe did not answer)"
+    );
+    describe_gauge!(
+        SYNC_STANDBYS_REQUIRED_GAUGE,
+        "Sync standbys this voter set requires for a commit to survive any majority (0 for one or two voters)"
     );
     describe_gauge!(
         "pgbattery_sync_standbys",

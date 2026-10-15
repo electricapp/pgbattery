@@ -172,6 +172,8 @@ pgbattery_leader_elections
 
 # Replication (per-replica, labelled by node)
 pgbattery_sync_replicas
+pgbattery_sync_standbys_confirmed    # standbys PG reports sync (write-gate evidence)
+pgbattery_sync_standbys_required     # sync standbys this voter set requires
 pgbattery_sync_quorum                # 1 if leader has a sync quorum
 pgbattery_replica_lag_bytes{node="2"}
 pgbattery_replica_lag_seconds{node="2"}

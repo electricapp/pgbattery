@@ -116,6 +116,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 - **Trigger**: leader-only ticker `REPLICA_CHECK_INTERVAL_MS` (PG has no event hook).
 - **Leadership grace**: suppress async fallback / `SetSyncMode{active:false}` until `disconnect_timeout` after not-leader→leader (`leader_since` from `RaftMetrics`). Avoids every failover dropping to async while followers re-point.
 - **Memoization**: peer-name list may be cached; `Supervisor::set_sync_standby_names` still reads the live GUC and short-circuits on match.
+- **Plan, not evidence**: `pgbattery_replication_sync` publishes the tick's plan (full list, non-empty). It reads 1 through leader grace with no standby `sync` and 0 forever on one or two voters, so nothing gates on it; the evidence is §8's published pair.
 
 ### 5. Cluster Raft state machine (replicated)
 
@@ -172,6 +173,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
   - `lease.is_valid()` immediately before fence/recover (after supervisor-lock wait / probes — not a stale pre-lock snapshot).
   - `Supervisor::probe_role_and_readonly()` — recovery, read-only GUC, empty sync list?, sync standby count — one round trip.
 - **Write gate** (`sync_durability_in_force`): evidence is a standby with `sync_state = 'sync'`, not GUC text. Unreadable probe → not in force. Empty list → in force (no ack required / deliberate async). Else need `≥ required_sync_standbys(peers)` sync. Gate on recovery only; never delays a fence.
+- **Published evidence**: each probed tick sets `pgbattery_sync_standbys_confirmed` (standbys PG reports `sync`; 0 when the probe did not answer) and `pgbattery_sync_standbys_required` from the same read. `doctor`'s `replication:sync` applies one rule to the leader's pair: required 0 passes as async by design, otherwise confirmed ≥ required. Unlike the write gate, an empty list does not pass: the async fallback is RPO>0.
 - **Availability**: with a non-empty list and no sync standby, commits block in PG anyway; the gate turns that into read-only refusal. `Supervisor::promote` arms fence settings **before** `pg_ctl promote` so the primary exists fenced.
 - **Trigger**: 100 ms (`LEASE_CHECK_INTERVAL`). SQL budget `LEASE_TICK_SQL_BUDGET = 1 s` → fail-closed fence on overrun.
 - **Fence escalation**: `default_transaction_read_only` alone is bypassable (`BEGIN READ WRITE`, existing sessions). After GUC apply, terminate client backends (`pg_terminate_backend`, `backend_type = 'client backend'`) — **only on verified fence**. `set_readonly` polls `pg_settings` up to `READONLY_RELOAD_SETTLE` (300 ms). Still-false after settle → real `FAILED TO FENCE`. Non-answering PG is not split-brain risk (`fence_failure_is_split_brain_risk`) → `Fence not applied`.
