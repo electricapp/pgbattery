@@ -706,7 +706,6 @@ class SystemTimings:
     heartbeat_interval_ms: int
     quorum_timeout_ms: int
     metrics_watchdog_timeout_ms: int
-    lsn_staleness_threshold_ms: int
     leadership_transfer_lease_safety_ms: int
     slot_ensure_interval_ms: int
     replica_check_interval_ms: int
@@ -751,7 +750,6 @@ class SystemTimings:
             "heartbeat_interval_ms": self.heartbeat_interval_ms,
             "quorum_timeout_ms": self.quorum_timeout_ms,
             "metrics_watchdog_timeout_ms": self.metrics_watchdog_timeout_ms,
-            "lsn_staleness_threshold_ms": self.lsn_staleness_threshold_ms,
             "leadership_transfer_lease_safety_ms": self.leadership_transfer_lease_safety_ms,
             "promotion_holddown_ms": self.promotion_holddown_ms,
             "worst_case_election_ms": self.worst_case_election_ms,
@@ -880,8 +878,6 @@ def read_system_timings(repo_root: Path | None = None) -> SystemTimings:
         heartbeat_interval_ms=heartbeat_ms,
         quorum_timeout_ms=parse_rust_u64_const(constants, "QUORUM_TIMEOUT_MS"),
         metrics_watchdog_timeout_ms=parse_rust_u64_const(constants, "METRICS_WATCHDOG_TIMEOUT_MS"),
-        lsn_staleness_threshold_ms=parse_rust_u64_const(constants, "LSN_STALENESS_THRESHOLD_SECS")
-        * 1000,
         leadership_transfer_lease_safety_ms=parse_rust_u64_const(
             constants, "LEADERSHIP_TRANSFER_LEASE_SAFETY_MS"
         ),
@@ -3622,13 +3618,8 @@ def clock_skew_at_lease_boundary(
     conversion honest, so it is a regression guard rather than a live exploit.
 
     libfaketime is ``LD_PRELOAD``ed into pgbattery, so the step reaches every
-    wall-clock read the process makes. The path that still reads the wall clock
-    is the LSN staleness filter (``unix_now_secs`` in ``state_machine.rs``): a
-    backward step makes every recorded LSN timestamp look future-dated, and the
-    filter caps those at age 0 rather than dropping them, which keeps the
-    election gate strict instead of collapsing it to the bootstrap-permissive
-    fallback. ``pgbattery_lsn_future_skew_total`` is how that path reports it
-    was reached.
+    wall-clock read the process makes. None of them decides write authority:
+    elections compare WAL positions read at vote time, not stamped reports.
 
     ``skew_ms`` defaults to exactly one lease duration, the magnitude that used
     to be sufficient; sweep it — both signs — with
@@ -3665,13 +3656,10 @@ def clock_skew_at_lease_boundary(
         trigger: optional failover trigger, run in a daemon thread on entry so
             one call performs the whole experiment.
         settle_ms: delay from the lease edge before skewing a named container,
-            defaulting to one election timeout. Load-bearing: the guard compares
-            ``unix_now_ms()`` against ``failover_started_at_unix_ms``, which the
-            governor writes on its own leader-loss edge. A skew applied *before*
-            that write is baked into the recorded value too and cancels out, so
-            the injection has to follow it. One election timeout is the derived
-            upper bound on how long a voter takes to observe leader loss, and it
-            still leaves most of the lease-length window.
+            defaulting to one election timeout: the derived upper bound on how
+            long a voter takes to observe leader loss and anchor its hold-down,
+            which still leaves most of the lease-length window. A skew applied
+            before the anchor would not land inside the hold-down it targets.
         timeout_s: how long to wait for the failover window to open.
 
     Raises:

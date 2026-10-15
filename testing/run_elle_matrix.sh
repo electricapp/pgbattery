@@ -226,11 +226,11 @@ TIMEOUT="${ELLE_TIMEOUT:-600}"
 #   (5 + 8) = 13 election timeouts = 13 s, plus the election window (2 s) plus
 #   the lease grant (2 s) = 17 s, rounded up to 20 s. A fault this far after
 #   the previous one hits a genuinely recovered cluster.
-# SYNC_DROP_GAP — 34 s, past both REPLICA_DISCONNECT_TIMEOUT_MS and
-#   LSN_STALENESS_THRESHOLD_SECS (30 s each). A node still down from the
-#   previous fault has by now been dropped from synchronous_standby_names and
-#   its LSN has gone stale, so this wave lands on a cluster that has degraded
-#   from SYNC to ASYNC durability — a regime one fault at t=8 never reaches.
+# SYNC_DROP_GAP — 34 s, past REPLICA_DISCONNECT_TIMEOUT_MS (30 s). A node
+#   still down from the previous fault has by now been dropped from
+#   synchronous_standby_names, so this wave lands on a cluster that has
+#   degraded from SYNC to ASYNC durability — a regime one fault at t=8 never
+#   reaches.
 # TAIL_MARGIN — one RECOVER_GAP of workload after the last fault, so the
 #   history ends with recovered, committed operations. Elle needs those to
 #   close cycles that opened inside a fault window.

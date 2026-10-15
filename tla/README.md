@@ -123,22 +123,24 @@ the donor does not hold authority, so it still cannot arm.
 
 **`raft_lsn.tla`** — passes (33,957 distinct states tight, 112,053 loose)
 
+- The gate is Raft's up-to-date rule applied to PostgreSQL: a voter grants only
+  a candidate within the threshold of its own WAL position, both read at vote
+  time (`network::vote_lsn_gate`). Nothing is sampled, so there is no staleness
+  to model.
 - `ElectionSafety` (≤1 leader), `NoLSNDeadlock` / `SomeNodeCanWin` (the LSN gate
-  never wedges elections), `TypeOK`. `raft_lsn.inv-double-vote-per-term.cfg` is
-  the checked config in which `ElectionSafety` breaks, which matters here more
-  than elsewhere: the gate below is advisory, so this is the property safety
-  actually rests on.
+  never wedges elections: the node holding the most WAL passes every voter),
+  `TypeOK`. `raft_lsn.inv-double-vote-per-term.cfg` is the checked config in
+  which `ElectionSafety` breaks.
 - Checked at **both** ends of the gate. `raft_lsn.cfg` is the tight threshold,
   where `NoLSNDeadlock` and `SomeNodeCanWin` bite because a narrow gate admits
   fewer candidates; `raft_lsn.alt-loose-lsn-gate.cfg` is the loose one, which
   reaches leaders further behind than the tight gate would ever have admitted
   and where `ElectionSafety` still has to hold.
 - **TLC actively DISPROVES** `LeaderHasAcceptableLSN` and `LeaderLSNNotBelowVoters`
-  (defined in the spec, deliberately not in the cfg): a candidate self-votes past
-  the gate — the self-vote is not LSN-checked — and reaches quorum via an
-  under-informed voter, so a node can lead while behind on LSN. The LSN gate is
-  **advisory**; Raft log-matching (abstracted here) is the real safety net, exactly
-  as the implementation comments state.
+  (defined in the spec, deliberately not in the cfg): each vote holds when it is
+  cast, but the spec has no lease, so a deposed leader can still replicate to a
+  voter after it voted. Stopping that is the lease fence's job
+  (`lease_fencing.tla`).
 
 **`timeline_verification.tla`** — passes (3,208 distinct states)
 

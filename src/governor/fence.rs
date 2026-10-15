@@ -8,7 +8,7 @@
 //!
 //! Re-probes live state every tick and keeps no cache of it (per
 //! `docs/STATE_MACHINE.md` §8). If `PostgreSQL` refuses to go read-only for
-//! [`FENCE_FAILURE_SHUTDOWN_THRESHOLD`] consecutive ticks the process shuts
+//! `FENCE_FAILURE_SHUTDOWN_THRESHOLD` consecutive ticks the process shuts
 //! down: a node that lost its lease and cannot fence itself is the worst state
 //! there is.
 

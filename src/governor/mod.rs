@@ -5,7 +5,7 @@
 //! - Cluster membership management
 //! - Split-brain prevention (fencing via leader lease)
 //! - Dynamic quorum replication management
-//! - LSN-aware elections (Kukushkin safety)
+//! - LSN-aware elections: each vote compares WAL positions read at vote time
 
 pub mod fence;
 pub mod lease;
@@ -18,6 +18,7 @@ pub mod reconciler;
 pub mod state_machine;
 pub mod storage;
 pub mod tls;
+pub mod wal_positions;
 
 #[cfg(test)]
 mod compat_fixtures;

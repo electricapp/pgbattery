@@ -62,6 +62,7 @@
         "faketime-shift-active",
         "stale-sync-metric-after-kill",
         "lsn-leaderless-livelock-recovery",
+        "standby-elected-after-leader-dies-mid-load",
         "vote-rejection-progresses",
         "rewind-refused-on-data-loss-risk"
       ]
@@ -4296,11 +4297,95 @@
       ]
     },
     {
+      "id": "standby-elected-after-leader-dies-mid-load",
+      "contracts": [
+        "L3",
+        "V1"
+      ],
+      "description": "H15: the leader dies while far ahead of both standbys in WAL that no client was acknowledged for. A sampled election gate compared candidates with the dead leader's last report, which no standby could ever reach, and never elected anyone; voters comparing positions read at vote time elect the standby holding the most WAL. Both walreceivers are paused so the gap is deterministic and the bulk load's commit can never be acknowledged; the case asserts the gap (over the 16 MB async bound) before the kill.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "min_healthy_replicas": 2
+        },
+        {
+          "type": "record_leader",
+          "var": "leader_before_load"
+        },
+        {
+          "type": "cmd",
+          "comment": "Pause both standbys' walreceivers, and assert each is stopped rather than that the signal was sent. The bracket keeps pgrep from matching the shell that runs it.",
+          "cmd": "for n in node2 node3; do P=$(docker compose exec -T $n pgrep -f '[w]alreceiver' | tr -d '[:space:]'); [ -n \"$P\" ] || { echo \"FAIL: $n has no walreceiver\"; exit 1; }; docker compose exec -T $n kill -STOP \"$P\" || exit 1; S=$(docker compose exec -T $n ps -o stat= -p \"$P\" | tr -d '[:space:]'); echo \"$n walreceiver $P state: $S\"; case \"$S\" in T*) ;; *) echo \"FAIL: $n walreceiver is not stopped\"; exit 1;; esac; done"
+        },
+        {
+          "type": "cmd",
+          "comment": "Bulk load on node1's internal port. Its commit waits for a standby that cannot ack, so nothing it writes is ever acknowledged.",
+          "cmd": "docker compose exec -T -d node1 psql -h 127.0.0.1 -p 5434 -U postgres -c \"CREATE TABLE h15_bulk AS SELECT g AS id, repeat('x', 500) AS pad FROM generate_series(1, 200000) g\""
+        },
+        {
+          "type": "cmd",
+          "comment": "Wait until node1's WAL leads both standbys by more than even the async bound, then long enough for a report of it to land.",
+          "cmd": "for i in $(seq 1 60); do L=$(docker compose exec -T node1 psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SELECT pg_current_wal_lsn()' | tr -d '[:space:]'); AHEAD=1; for n in node2 node3; do R=$(docker compose exec -T $n psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SELECT pg_last_wal_receive_lsn()' | tr -d '[:space:]'); D=$(docker compose exec -T node1 psql -h 127.0.0.1 -p 5434 -U postgres -tAc \"SELECT pg_wal_lsn_diff('$L', '$R')::bigint\" | tr -d '[:space:]'); echo \"$n trails node1 by $D bytes\"; [ \"${D:-0}\" -gt 16000000 ] || AHEAD=0; done; [ $AHEAD = 1 ] && break; sleep 1; done; [ $AHEAD = 1 ] || { echo 'FAIL: the standbys never trailed node1 by more than 16 MB'; exit 1; }; sleep 3"
+        },
+        {
+          "type": "cmd",
+          "comment": "Kill the leader.",
+          "cmd": "docker compose kill node1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Let the walreceivers run so they see the stream is gone.",
+          "cmd": "for n in node2 node3; do docker compose exec -T $n pkill -CONT -f '[w]alreceiver'; done; true"
+        },
+        {
+          "type": "wait_cluster",
+          "comment": "The sampled gate never elects here: the dead leader's report stays the maximum after it ages.",
+          "nodes": 3,
+          "live_nodes": 2,
+          "leaders": 1,
+          "leader_not_var": "leader_before_load",
+          "timeout_sec": 45
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_not",
+          "var": "leader_before_load"
+        },
+        {
+          "type": "sql",
+          "comment": "The unacknowledged load is not on the new leader.",
+          "file": "standby-elected-mid-load-assert.sql",
+          "node": "leader"
+        }
+      ],
+      "cleanup": [
+        {
+          "type": "cmd",
+          "cmd": "for n in node2 node3; do docker compose exec -T $n pkill -CONT -f '[w]alreceiver'; done; docker compose start node1",
+          "expect_exit": null
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 120
+        }
+      ]
+    },
+    {
       "id": "lsn-leaderless-livelock-recovery",
       "contracts": [
         "V1"
       ],
-      "description": "Regression coverage for the LSN-fail-closed leaderless livelock. `max_cluster_lsn` is refreshed only by Raft applies; during a leaderless window exceeding LSN_STALENESS_THRESHOLD_SECS (30s), the cached value stayed non-zero while all stored LSN timestamps aged into staleness. Pre-fix, every voter saw every candidate as stale and refused every vote \u2192 election livelock. Post-fix, is_lsn_acceptable_for_election re-derives the fresh max on the fly from node_lsns and falls back to bootstrap-permissive when nothing is fresh. Scenario: kill node1 (leader by default), wait long enough that all surviving nodes' last-seen LSN updates from the dead leader have aged out (45s = staleness + margin), then verify the surviving voters elect a new leader.",
+      "description": "A long leaderless window must not wedge the LSN-safe election. Votes compare the candidate's WAL position with the voter's own, both read at vote time, so no report ages and a dead leader's last position plays no part. The sampled gate this replaced livelocked here once stored reports went stale. Scenario: kill the leader, stay leaderless well past any report's freshness (45s), then verify the surviving voters elect a new leader.",
       "actions": [
         {
           "type": "record_leader",
@@ -4314,7 +4399,7 @@
         {
           "type": "sleep",
           "seconds": 45,
-          "comment": "Wait long enough that any LSN heartbeats from the dead leader present in node_lsns have aged past LSN_STALENESS_THRESHOLD_SECS=30s. Pre-fix the survivors would be wedged on votes during this window; post-fix they fall back to bootstrap-permissive."
+          "comment": "Stay leaderless past every report's freshness, the window in which a sampled gate wedged."
         },
         {
           "type": "wait_cluster",
@@ -4518,7 +4603,7 @@
       "contracts": [
         "L3"
       ],
-      "description": "A forged or buggy follower LSN report far beyond any possible write position must be rejected by the leader before it reaches replicated state. An accepted over-report would inflate max_cluster_lsn and make every legitimate election candidate look 'too far behind', wedging failover. The leader rejects with HTTP 400 \u2014 either because the value exceeds its current write position, or (when the write position is momentarily unverifiable) via the implausible-advance clamp \u2014 and increments pgbattery_lsn_report_rejected_*. Followers would return 421 (misdirected); only the leader applies the guard.",
+      "description": "A forged or buggy follower LSN report far beyond any possible write position must be rejected by the leader before it reaches its book of WAL positions. An accepted over-report would make every legitimate transfer target and yield candidate look 'too far behind', wedging planned leadership changes (elections never read the book: votes compare positions read at vote time). The leader rejects with HTTP 400 because the value exceeds its current write position, and increments pgbattery_lsn_report_rejected_*. Followers would return 421 (misdirected); only the leader applies the guard.",
       "actions": [
         {
           "type": "wait_cluster",

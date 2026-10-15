@@ -196,10 +196,6 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
         "Times pg_rewind was refused because local WAL was more than one block ahead of the source — rewinding would discard WAL the cluster may still need. Operator inspection required when this counter increments."
     );
     describe_counter!(
-        "pgbattery_promotion_refused_lsn_behind",
-        "Times promotion was refused because the local LSN was beyond the catch-up threshold behind the cluster max (label: sync_mode = sync|async)"
-    );
-    describe_counter!(
         "pgbattery_sync_mode_commit_failures",
         "Failed attempts by the reconciler to commit a sync-mode transition to the Raft log"
     );
@@ -224,18 +220,14 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
         "Attempts to pin redb durability to Immediate that returned an error; surface to detect any future redb default change"
     );
 
-    // LSN tracking — used by L3 (LSN-safe election) gate
+    // LSN tracking — L3 (LSN-safe election) is decided at vote time
     describe_gauge!(
         "pgbattery_local_lsn_bytes",
         "Local PostgreSQL LSN in bytes (advances monotonically per write)"
     );
     describe_counter!(
-        "pgbattery_lsn_future_skew_total",
-        "LSN heartbeats whose timestamp is ahead of local wall clock (NTP skew indicator)"
-    );
-    describe_counter!(
-        "pgbattery_clock_before_epoch",
-        "Times SystemTime::now() returned a value before the UNIX epoch (broken clock)"
+        "pgbattery_votes_lsn_rejected",
+        "Votes this node refused because the candidate held less WAL than this voter, or this voter could not read its own"
     );
 
     // Safety / fencing — surfaces from app.rs lease enforcement + gateway

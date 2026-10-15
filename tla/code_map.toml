@@ -15,18 +15,9 @@
 ]
 
 [raft_lsn]
-"app.rs" = []
-"config/constants.rs" = [
-  "LSN_CATCHUP_THRESHOLD_BYTES_ASYNC",
-  "LSN_CATCHUP_THRESHOLD_BYTES_SYNC",
-]
-"governor/network.rs" = ["vote_granted"]
-"state_machine.rs" = [
-  "is_lsn_acceptable_for_election",
-  "lsn_catchup_threshold_bytes",
-  "max_cluster_lsn",
-  "node_lsns",
-]
+"config/constants.rs" = ["LSN_CATCHUP_THRESHOLD_BYTES_ASYNC"]
+"governor/network.rs" = ["LocalWal", "VoteFrame", "vote_lsn_gate"]
+"governor/state_machine.rs" = ["vote_lsn_threshold_bytes"]
 
 [timeline_verification]
 "crates/pgbattery-supervisor/src/process.rs" = [

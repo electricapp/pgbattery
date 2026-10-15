@@ -36,6 +36,8 @@ enums.DonorClaim = ["Confirms", "Contradicts", "Silent"]
 enums.DonorPollVerdict = ["Confirmed", "Retry", "Expired"]
 enums.DonorRisk = ["Continue", "Abort"]
 enums.PostmasterState = ["Running", "NotRunning", "Exited"]
+# What a node knows of its own WAL when a vote is sent or answered (§1).
+enums.OwnWal = ["At", "Empty", "Unknown"]
 # Wire-compat labels on NodeInfo — not live Raft leadership (see STATE_MACHINE §5).
 enums.NodeRole = ["Leader", "Follower"]
 enums.TimelineCheck = ["Match", "Mismatch", "Unknown", "Foreign"]
@@ -73,6 +75,10 @@ types = [
   "NodeInfo",
   "NodeRole",
   "PostmasterState",
+  "OwnWal",
+  "LocalWal",
+  "VoteFrame",
+  "WalPositions",
   "PromotionWatchdog",
   "ReplicaHealth",
   "ReplicaStatus",

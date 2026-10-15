@@ -183,9 +183,9 @@ itself stops existing.
 | RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                              | L1, L2   | `fencing_tail.py` wedges PostgreSQL, costs the node quorum, and races the prober across the whole window                                                          |
 | RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely                                                                            | L1       | `dual_writability_prober.py` writes every internal port at 50 ms resolution. The `trust` perimeter itself is an accepted risk                                     |
 | RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                    | W1       | **Nothing.** Cases drive a follower gateway across a leadership change but assert connection migration, not the routing decision                                  |
-| RW-7  | After a long leaderless window every LSN report ages past the staleness threshold, and a node restored from an old backup can win                                      | L3       | The aged-LSN tiebreak in `evaluate_lsn_acceptable`, and `test_stale_restored_node_loses_a_leaderless_election`                                                    |
+| RW-7  | A node restored from an old backup, Raft directory intact, standing for election after a long leaderless window                                                        | L3       | Every voter compares the candidate's WAL with its own, both read at vote time (`network::vote_lsn_gate`); nothing ages. Unit and property tests in `network.rs`   |
 | RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1       | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`                                                                |
-| RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1       | The lease fence runs on its own PostgreSQL session; `governor::fence::spawn` is handed that session and the lease, never the supervisor mutex                    |
+| RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1       | The lease fence runs on its own PostgreSQL session; `governor::fence::spawn` is handed that session and the lease, never the supervisor mutex                     |
 | RW-10 | Join and rejoin edges: a clone source deposed mid-copy, orphan slots pinning WAL, a learner dying mid-join, a wiped bootstrap node impersonating the cluster           | R1, V2   | `join_edges.py`, five cases, run in CI                                                                                                                            |
 | RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active | W1, L3   | `sync_mode_agreement.py` measures how long the replicated flag runs looser than the leader's live GUC, against a budget derived from the reconcile that closes it |
 
@@ -255,11 +255,17 @@ changes.
   disconnect timeout, the leader drops to asynchronous replication and the
   published RPO becomes non-zero. Measured rather than asserted: `rewind_loss.py`
   forces the fallback and counts the survivors.
-- **LSN staleness uses the wall clock** because those timestamps ride in
-  replicated Raft state and snapshots, where a monotonic `Instant` would be
-  meaningless. Future skew is capped and the failure direction is permissive.
-  The promotion hold-down, by contrast, is monotonic precisely because it is a
-  local safety decision.
+- **A stopped standby's WAL reads as its replay position.** With no server
+  running, a node reads where its WAL ends from the control file, which for a
+  standby is the replay position: WAL it received and had not replayed lies
+  past it, so as a voter it can grant a candidate missing that WAL. Only a
+  clean stop reaches this; a crashed or hung server reads as unknown and
+  refuses. Without it, a Track B freeze, which stops every standby, could not
+  elect the leader that moves the upgrade record on.
+- **A voter whose PostgreSQL neither answers nor stopped cleanly refuses every
+  vote**, since it may hold the acknowledged writes. Boot starts PostgreSQL
+  before Raft, so this is a hung or crashed server, and a cluster that has lost
+  a leader and has such a voter in every majority waits for it.
 - **openraft 0.9 has no pre-vote**, so a flapping partitioned node inflates terms
   and can disrupt a healthy leader. `CheckQuorum` is the only guard. The
   flap-partition nemesis exists but is checked for convergence, not for

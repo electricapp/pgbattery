@@ -88,6 +88,8 @@ pub struct ManagementApiState {
     pub cluster_state: Arc<RwLock<ClusterState>>,
     /// This node's lease, which carries the promotion hold-down anchor.
     pub lease: crate::governor::SharedLeaseState,
+    /// Members' WAL positions as this node last heard them (soft state).
+    pub wal_positions: crate::governor::wal_positions::SharedWalPositions,
     /// `PostgreSQL` manager for creating replication slots (`None` for witness nodes)
     pub postgres_manager: Option<Arc<tokio::sync::Mutex<crate::supervisor::Supervisor>>>,
     /// Backup manager (None for witness nodes or if backups disabled)

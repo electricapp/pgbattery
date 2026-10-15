@@ -20,29 +20,6 @@ pub fn parse_lsn(lsn_str: &str) -> Option<u64> {
     Some((upper << 32) | lower)
 }
 
-fn unix_now_secs() -> u64 {
-    // SystemTime::duration_since(UNIX_EPOCH) only fails if `now` is before
-    // 1970, which on modern systems means a *broken* clock (freshly-booted
-    // VM with no RTC, container without /etc/localtime, etc.). Returning
-    // 0 silently here would weaken `recalculate_max_cluster_lsn`'s staleness
-    // filter — stored LSN timestamps would always look "in the future"
-    // (ts > now=0), get rejected, and `max_cluster_lsn` would collapse to 0,
-    // bypassing the LSN-safety gate on the next election. Surface it loudly
-    // so the operator can fix the clock instead of debugging a "why are
-    // nodes electing without LSN checks?" mystery weeks later.
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs(),
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "SystemTime is before UNIX epoch — clock is broken. LSN staleness checks degraded."
-            );
-            metrics::counter!("pgbattery_clock_before_epoch").increment(1);
-            0
-        }
-    }
-}
-
 /// Cluster state managed by Raft.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClusterState {
@@ -56,18 +33,11 @@ pub struct ClusterState {
     /// Current learner IDs (from Raft membership)
     pub learner_ids: std::collections::HashSet<NodeId>,
 
-    /// Postgres LSN tracking for LSN-aware leader elections.
-    /// Maps `node_id` -> (LSN bytes, unix timestamp of last update).
-    /// Stale entries (no update within staleness threshold) are excluded from
-    /// `max_cluster_lsn` calculation to prevent dead nodes from blocking elections.
+    /// Retired: WAL positions are soft state, and votes compare live ones.
+    /// Kept only so postcard decodes stored snapshots; never read.
     pub node_lsns: HashMap<NodeId, (u64, u64)>,
 
-    /// Advisory cached max of fresh `node_lsns` entries (staleness-filtered).
-    ///
-    /// Safety gates must not trust this field alone: it only refreshes on Raft
-    /// apply, so it can freeze while reports age. Prefer
-    /// [`ClusterState::fresh_max_lsn`] / [`ClusterState::is_lsn_acceptable_for_election`]
-    /// which recompute from `node_lsns`.
+    /// Retired with `node_lsns`; never read.
     pub max_cluster_lsn: u64,
 
     /// Whether the leader currently has `synchronous_standby_names` set to a
@@ -88,8 +58,9 @@ pub struct ClusterState {
     /// Updated by the leader via `ClusterCommand::SetSyncMode` whenever the
     /// underlying `PostgreSQL` GUC transitions, then replicated to every
     /// follower through normal Raft apply. Read only through
-    /// [`ClusterState::lsn_catchup_threshold_bytes`] so the fail-safe rule
-    /// lives in one place.
+    /// [`ClusterState::lsn_catchup_threshold_bytes`],
+    /// [`ClusterState::vote_lsn_threshold_bytes`] and
+    /// [`ClusterState::rewind_budget`], which each apply the fail-safe rule.
     ///
     /// Apply lag is safe-by-construction: a follower that hasn't yet seen the
     /// leader's transition to async still uses the tight threshold, which can
@@ -406,20 +377,12 @@ pub enum ClusterCommand {
     /// Update a node's status
     UpdateNode { id: NodeId, role: NodeRole },
 
-    /// Update a node's Postgres LSN for leader election safety.
-    ///
-    /// Each node periodically reports its WAL position. During leader election,
-    /// candidates significantly behind the cluster's max LSN trigger warnings
-    /// to help prevent electing nodes that would cause data loss.
-    ///
-    /// Entries include timestamps for staleness detection - if a node stops
-    /// reporting, its LSN is excluded from calculations after the threshold.
+    /// Retired WAL-position report. Never proposed; an old entry decodes and
+    /// applies as a no-op. Kept in place because postcard tags variants by
+    /// position.
     UpdateLsn {
         node_id: NodeId,
-        /// LSN as bytes (parsed from Postgres LSN string like "0/16B3C90")
         lsn_bytes: u64,
-        /// Observation timestamp from caller. State machine currently records
-        /// authoritative local commit time and ignores this value.
         #[serde(default)]
         timestamp: u64,
     },
@@ -626,8 +589,6 @@ impl ClusterState {
             }
             ClusterCommand::RemoveNode(id) => {
                 self.nodes.remove(&id);
-                self.node_lsns.remove(&id);
-                self.recalculate_max_cluster_lsn();
                 // A removed node never rejoins; the upgrade must not wait on
                 // it, and the leader must not promote it.
                 self.pg_upgrade.awaiting_rejoin.retain(|n| *n != id);
@@ -663,39 +624,9 @@ impl ClusterState {
                     node.role = role;
                 }
             }
-            ClusterCommand::UpdateLsn {
-                node_id,
-                lsn_bytes,
-                timestamp: _,
-            } => {
-                // Defense-in-depth: ignore LSN updates for unknown nodes.
-                if !self.nodes.contains_key(&node_id) {
-                    return CommandOutcome::OutOfOrder;
-                }
-
-                // Authoritative timestamp is always assigned locally.
-                let ts = unix_now_secs();
-
-                // Accept the reported LSN unconditionally, including regressions.
-                // A lower LSN is a legitimate report: pg_rewind and timeline
-                // switches move a node's WAL position backward, and raw LSNs are
-                // not comparable across timelines. Retaining the higher phantom
-                // value would inflate `max_cluster_lsn` against a position that
-                // no longer exists (stalling failover until staleness expiry)
-                // and then mark the rewound node stale until it re-passed it.
-                // Trade-off: two in-flight reports from one node committing out
-                // of order can dip its entry for at most one report tick; the
-                // next report corrects it, and the election gate fails closed
-                // for the dipped node in the interim.
-                if self.node_lsns.get(&node_id).map(|&(lsn, _)| lsn) == Some(lsn_bytes) {
-                    // LSN unchanged — refresh the timestamp so the node isn't
-                    // treated as stale while idle.
-                    self.node_lsns.insert(node_id, (lsn_bytes, ts));
-                    return CommandOutcome::Applied;
-                }
-                self.node_lsns.insert(node_id, (lsn_bytes, ts));
-                self.recalculate_max_cluster_lsn();
-            }
+            // Retired telemetry: WAL positions are soft state and votes compare
+            // live ones. An old entry decodes and changes nothing.
+            ClusterCommand::UpdateLsn { .. } => {}
             ClusterCommand::SetSyncMode { active } => {
                 self.sync_replication_active = Some(active);
             }
@@ -832,261 +763,6 @@ impl ClusterState {
         CommandOutcome::Applied
     }
 
-    /// Recalculate `max_cluster_lsn` from fresh entries only.
-    ///
-    /// Excludes LSN entries older than the staleness threshold, preventing
-    /// dead or partitioned nodes from permanently blocking leader elections.
-    fn recalculate_max_cluster_lsn(&mut self) {
-        let now = unix_now_secs();
-
-        // Only consider entries updated within the staleness threshold.
-        // A timestamp strictly in the future indicates wall-clock skew
-        // (NTP step backward on this node, or step forward on the writer):
-        // we cap it at `now` instead of dropping the entry, so a brief
-        // skew does not artificially shrink `max_cluster_lsn` and let a
-        // stale candidate slip past the LSN gate. We do log+count the
-        // event so persistent skew is visible.
-        let mut future_skew = 0u64;
-        let fresh_max = self
-            .node_lsns
-            .values()
-            .filter(|(_, ts)| {
-                let age = if *ts > now {
-                    future_skew += 1;
-                    0
-                } else {
-                    now.saturating_sub(*ts)
-                };
-                age < crate::config::constants::LSN_STALENESS_THRESHOLD_SECS
-            })
-            .map(|(lsn, _)| *lsn)
-            .max()
-            .unwrap_or(0);
-
-        if future_skew > 0 {
-            tracing::warn!(
-                future_skew_entries = future_skew,
-                "LSN entries have timestamps in the future — clock skew suspected. \
-                 Treating them as fresh (age=0) to avoid weakening the LSN gate."
-            );
-            metrics::counter!("pgbattery_lsn_future_skew_total").increment(future_skew);
-        }
-
-        self.max_cluster_lsn = fresh_max;
-    }
-
-    /// Staleness-filtered maximum LSN across the cluster, recomputed on the fly.
-    ///
-    /// Same rule as `Self::recalculate_max_cluster_lsn` but pure (no
-    /// mutation, no skew logging): excludes entries older than the staleness
-    /// window and caps future-skewed timestamps at age 0. Safety gates re-derive
-    /// through this rather than reading the stored `max_cluster_lsn` field, which
-    /// is only refreshed on a Raft apply: during a leaderless window past the
-    /// staleness threshold the stored value stays frozen at the pre-outage max
-    /// while every timestamp has aged out, whereas this falls back to 0
-    /// (bootstrap-permissive) — and the promote path stays consistent with the
-    /// election gate, which already re-derives.
-    #[must_use]
-    pub fn fresh_max_lsn(&self) -> u64 {
-        let now = unix_now_secs();
-        self.node_lsns
-            .values()
-            .filter(|(_, ts)| {
-                let age = if *ts > now {
-                    0
-                } else {
-                    now.saturating_sub(*ts)
-                };
-                age < crate::config::constants::LSN_STALENESS_THRESHOLD_SECS
-            })
-            .map(|(lsn, _)| *lsn)
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Check if a candidate's LSN is acceptable for leader election.
-    ///
-    /// Returns `(acceptable, reason)`. Rejects when:
-    /// - the candidate's LSN is significantly behind the cluster's freshly-
-    ///   recomputed max LSN, or
-    /// - the candidate's LSN heartbeat is stale relative to peers that are
-    ///   still reporting fresh data.
-    ///
-    /// The check is advisory — Raft's log-matching property provides the
-    /// final safety guarantee — but adds defence in depth against electing
-    /// a partitioned-and-behind candidate when peers with fresh data on
-    /// that candidate are still reachable.
-    ///
-    /// **Fresh max is recomputed on the fly** from `node_lsns` filtered by
-    /// the staleness window. The stored `self.max_cluster_lsn` is only
-    /// refreshed by Raft applies, so during a leaderless window past the
-    /// staleness threshold it remains frozen at the pre-outage value while
-    /// every individual timestamp has aged out. Re-deriving here keeps the
-    /// comparison honest about which reports are current.
-    ///
-    /// **When every report has aged out** the gate does not go permissive. It
-    /// compares against the maximum of the *aged* reports instead: WAL
-    /// positions do not go backwards, so a peer that once reported a position
-    /// still holds at least that much, and a node restored from an old
-    /// basebackup would otherwise win the election Raft log-matching cannot
-    /// see is unsafe (RW-7). Only a cluster where nobody has *ever* reported
-    /// is permissive. See `evaluate_lsn_acceptable` for why that branch
-    /// cannot livelock and why it uses the loose threshold.
-    ///
-    /// **Threshold selection** uses `self.sync_replication_active`:
-    /// - sync active: one WAL block. Under sync replication the leader's
-    ///   last-acked LSN equals at least one follower's LSN, so any
-    ///   candidate many KB behind cannot hold the acked WAL.
-    /// - sync inactive: 16 MB, matching the published async RPO.
-    ///
-    /// The aged-report branch overrides that selection and always uses the
-    /// loose threshold, because a sync-mode flag as stale as the LSNs is not
-    /// evidence that a standby currently holds acked WAL.
-    #[must_use]
-    pub fn is_lsn_acceptable_for_election(&self, candidate_id: NodeId) -> (bool, &'static str) {
-        // Election gate: permissive when the candidate has no LSN report yet
-        // (initial-join window) — Raft log-matching is the final safety net.
-        self.evaluate_lsn_acceptable(candidate_id, true)
-    }
-
-    /// Stricter sibling of [`Self::is_lsn_acceptable_for_election`] for the
-    /// promote-to-voter / transfer paths: a candidate with no fresh LSN report
-    /// is rejected (fail-closed), since we can't prove it's caught up. The
-    /// "no fresh data anywhere" bootstrap case stays permissive.
-    #[must_use]
-    pub fn is_lsn_acceptable_for_promotion(&self, candidate_id: NodeId) -> (bool, &'static str) {
-        self.evaluate_lsn_acceptable(candidate_id, false)
-    }
-
-    fn evaluate_lsn_acceptable(
-        &self,
-        candidate_id: NodeId,
-        missing_candidate_ok: bool,
-    ) -> (bool, &'static str) {
-        let catchup_threshold_bytes = self.lsn_catchup_threshold_bytes();
-        let now = unix_now_secs();
-        let staleness = crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
-        let mut fresh_max: u64 = 0;
-        let mut any_fresh = false;
-        // Maximum over *every* report regardless of age. Read only from the
-        // `!any_fresh` branch below, where no report is fresh and it is
-        // therefore the aged maximum; computed here to keep the scan single-pass.
-        let mut reported_max: u64 = 0;
-        for &(lsn, ts) in self.node_lsns.values() {
-            let age = if ts > now { 0 } else { now.saturating_sub(ts) };
-            if age < staleness {
-                any_fresh = true;
-                if lsn > fresh_max {
-                    fresh_max = lsn;
-                }
-            }
-            if lsn > reported_max {
-                reported_max = lsn;
-            }
-        }
-
-        if !any_fresh {
-            // Genuine bootstrap: nobody has ever reported. Permissive, because
-            // there is nothing to compare against and the cluster has to be
-            // able to elect a first leader.
-            if self.node_lsns.is_empty() {
-                return (true, "bootstrap: no cluster LSN data at all");
-            }
-
-            // Leaderless past the staleness window. Every report is aged, but
-            // aged is not absent: an old report still says this node once held
-            // that LSN, and WAL positions do not go backwards. Comparing
-            // against the aged maximum is what stops a node restored from an
-            // old basebackup — with its Raft directory intact, so log matching
-            // sees a current log and has no view of how old the PostgreSQL
-            // data under it is — from winning an election it would win under a
-            // blanket permissive rule (RW-7).
-            //
-            // This cannot livelock, which is what made the permissive branch
-            // look necessary: the node holding `reported_max` compares against
-            // itself and its gap is zero, so at least one candidate is always
-            // acceptable no matter how stale the data is.
-            let Some(&(candidate_lsn, _)) = self.node_lsns.get(&candidate_id) else {
-                if missing_candidate_ok {
-                    return (true, "leaderless: no aged LSN data for candidate");
-                }
-                return (
-                    false,
-                    "no LSN report for candidate in a leaderless window (fail-closed)",
-                );
-            };
-            // The LOOSE threshold here, deliberately, even under sync mode.
-            //
-            // The tight threshold's premise is that synchronous replication is
-            // *currently* holding acked WAL on a standby, so a candidate even
-            // one block behind may be missing an ack. Once every report has
-            // aged past the staleness window, that premise is exactly as stale
-            // as the numbers are: the silence that invalidates the LSNs
-            // invalidates the assumption about sync state along with them.
-            //
-            // It also has to be loose to stay live. "Somebody always qualifies"
-            // holds cluster-wide — the node at `reported_max` compares against
-            // itself — but not inside a partition, where that node may be on
-            // the other side. With a single-block tolerance every reachable
-            // follower is then rejected and the majority cannot elect at all.
-            // Measured: a 3/2 split left the majority unable to elect for four
-            // minutes under the tight threshold.
-            //
-            // RW-7 survives the loosening by an order of magnitude — a node
-            // restored from an old basebackup is a whole backup behind, not
-            // 16 MB.
-            let leaderless_threshold = crate::config::constants::lsn_catchup_threshold_for(false);
-            if reported_max > candidate_lsn && (reported_max - candidate_lsn) > leaderless_threshold
-            {
-                return (
-                    false,
-                    "candidate LSN too far behind cluster max (aged reports)",
-                );
-            }
-            return (
-                true,
-                "leaderless: candidate within catch-up of aged cluster max",
-            );
-        }
-
-        // Bootstrap: cluster has fresh data from someone, but the candidate
-        // has never reported an LSN. Typically initial-join window.
-        let Some(&(candidate_lsn, candidate_ts)) = self.node_lsns.get(&candidate_id) else {
-            if missing_candidate_ok {
-                return (true, "bootstrap: no LSN data for candidate");
-            }
-            // Cluster has fresh data but none for the candidate — can't verify
-            // catch-up, so fail closed.
-            return (
-                false,
-                "no fresh LSN report for candidate; refusing promotion (fail-closed)",
-            );
-        };
-
-        // Cluster has fresh data from some peer, but the candidate's own
-        // LSN heartbeat is stale — fail closed. We cannot verify the
-        // candidate is caught up; a partitioned-stale candidate is exactly
-        // what this check exists to reject. Voters that still have fresh
-        // heartbeats on the candidate can vote yes; this only blocks voters
-        // that have lost sight of it.
-        let candidate_age = if candidate_ts > now {
-            0
-        } else {
-            now.saturating_sub(candidate_ts)
-        };
-        if candidate_age > staleness {
-            return (false, "candidate LSN data stale, cannot verify catch-up");
-        }
-
-        // Reject candidates more than the catch-up threshold behind the
-        // freshly-recomputed cluster max.
-        if fresh_max > candidate_lsn && (fresh_max - candidate_lsn) > catchup_threshold_bytes {
-            return (false, "candidate LSN too far behind cluster max");
-        }
-
-        (true, "LSN within acceptable range")
-    }
-
     /// How much divergent WAL a rewind may discard: without bound only while
     /// the committed record says sync replication is in force, when every
     /// acknowledged commit is on the new leader; otherwise the async RPO.
@@ -1117,8 +793,9 @@ impl ClusterState {
         }
     }
 
-    /// LSN catch-up threshold (bytes) for election/promotion gates, applying
-    /// the fail-safe rule for [`ClusterState::sync_replication_active`]: only a
+    /// How far a sampled report may trail the leader's book for the advisory
+    /// transfer, promote and yield gates, applying the fail-safe rule for
+    /// [`ClusterState::sync_replication_active`]: only a
     /// *positively known* async mode (`Some(false)`) gets the loose threshold;
     /// sync (`Some(true)`) and unknown (`None`, e.g. just after restart) both
     /// use the tight one.
@@ -1126,6 +803,21 @@ impl ClusterState {
     pub fn lsn_catchup_threshold_bytes(&self) -> u64 {
         let use_tight = self.sync_replication_active != Some(false);
         crate::config::constants::lsn_catchup_threshold_for(use_tight)
+    }
+
+    /// How far a candidate may trail a voter's live WAL and still get its vote.
+    ///
+    /// Zero unless async is committed: both positions are live, so there is
+    /// no sampling slack to allow for, and any slack between two standbys is
+    /// acknowledged commits the sync one holds and the candidate lacks. Under
+    /// a committed async fallback, the published RPO bound.
+    #[must_use]
+    pub fn vote_lsn_threshold_bytes(&self) -> u64 {
+        if self.sync_replication_active == Some(false) {
+            crate::config::constants::LSN_CATCHUP_THRESHOLD_BYTES_ASYNC
+        } else {
+            0
+        }
     }
 }
 
@@ -1138,7 +830,6 @@ impl ClusterState {
 )]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn add_test_node(state: &mut ClusterState, id: NodeId) {
         let host_octet = u16::try_from(id).unwrap_or(1).min(254);
@@ -1829,35 +1520,6 @@ mod tests {
         assert_eq!(state.cutover.epoch, 1);
     }
 
-    /// `fresh_max_lsn` re-derives the cluster max from only non-stale entries,
-    /// so a peer whose LSN report has aged out is excluded even while the stored
-    /// `max_cluster_lsn` (frozen at the last Raft apply) still reflects it. The
-    /// promotion gate reads through this so a frozen stale max can't wedge it.
-    #[test]
-    fn test_fresh_max_lsn_excludes_stale_entries() {
-        use crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-        // Node 2 holds the higher LSN but its report is stale; node 1 is fresh.
-        state.node_lsns.insert(1, (100_000, now));
-        state
-            .node_lsns
-            .insert(2, (900_000, now - LSN_STALENESS_THRESHOLD_SECS - 1));
-        // Model a stored max frozen before node 2 aged out.
-        state.max_cluster_lsn = 900_000;
-
-        // fresh_max_lsn ignores the stale node-2 entry and returns node 1's LSN,
-        // while the stored cache still holds the frozen, now-stale value — which
-        // is exactly why the promotion gate re-derives instead of reading it.
-        assert_eq!(state.fresh_max_lsn(), 100_000);
-        assert_eq!(state.max_cluster_lsn, 900_000);
-    }
-
     #[test]
     fn test_parse_lsn() {
         // Standard PostgreSQL LSN format
@@ -1877,320 +1539,6 @@ mod tests {
         assert_eq!(parse_lsn(""), None);
     }
 
-    #[test]
-    fn test_lsn_acceptable_for_election() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Bootstrap case - no LSN data, should always accept
-        let (acceptable, _) = state.is_lsn_acceptable_for_election(1);
-        assert!(acceptable);
-
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-        // This test exercises the async (loose, 16 MB) threshold explicitly;
-        // the default `None` now fails safe to the tight threshold.
-        state.sync_replication_active = Some(false);
-
-        // Set some LSN data
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 100_000_000, // 100 MB
-            timestamp: now,
-        });
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 2,
-            lsn_bytes: 50_000_000, // 50 MB
-            timestamp: now,
-        });
-
-        // Node 1 has the highest LSN, should be acceptable
-        let (acceptable, _) = state.is_lsn_acceptable_for_election(1);
-        assert!(acceptable);
-
-        // Node 2 is 50MB behind (>16MB threshold), should be rejected
-        let (acceptable, _) = state.is_lsn_acceptable_for_election(2);
-        assert!(!acceptable);
-
-        // Unknown node (no LSN data) should be accepted - allows bootstrap scenarios
-        // where nodes haven't exchanged LSN info yet
-        let (acceptable, _) = state.is_lsn_acceptable_for_election(999);
-        assert!(acceptable);
-
-        // Update node 2 to be within threshold
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 2,
-            lsn_bytes: 90_000_000, // 90 MB (only 10MB behind)
-            timestamp: now,
-        });
-        let (acceptable, _) = state.is_lsn_acceptable_for_election(2);
-        assert!(acceptable);
-    }
-
-    /// Regression test: a prolonged leaderless window must not wedge the
-    /// cluster by rejecting every candidate as "stale."
-    ///
-    /// `max_cluster_lsn` is only refreshed by Raft applies. During a
-    /// leaderless window (cascading failover, network split) no commands
-    /// commit, so the cached value froze at its pre-outage maximum. Pre-fix,
-    /// once every stored LSN entry aged past `LSN_STALENESS_THRESHOLD_SECS`,
-    /// `is_lsn_acceptable_for_election` saw the *cached* max as non-zero
-    /// and the candidate's data as stale → reject every vote → election
-    /// livelock. Post-fix, the check re-derives the fresh max on the fly
-    /// from `node_lsns` and falls back to bootstrap-permissive when no
-    /// fresh data remains anywhere in the cluster.
-    #[test]
-    fn test_lsn_acceptable_leaderless_window_bootstrap_fallback() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-        add_test_node(&mut state, 3);
-
-        // `apply` rejects client-supplied timestamps and assigns its own
-        // (security boundary), so we mutate `node_lsns` directly to simulate
-        // the post-leaderless state: every entry has an aged timestamp from
-        // some pre-outage Raft apply, max_cluster_lsn is the cached
-        // non-zero pre-outage max.
-        let stale_ts =
-            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
-        state.node_lsns.insert(1, (100_000_000, stale_ts));
-        state.node_lsns.insert(2, (100_000_000, stale_ts));
-        state.node_lsns.insert(3, (100_000_000, stale_ts));
-        state.max_cluster_lsn = 100_000_000; // simulate cached pre-outage max
-
-        // Pre-fix: would short-circuit on max_cluster_lsn>0, then reject
-        // every candidate as stale → election livelock. Post-fix:
-        // re-derives fresh_max from node_lsns (filtered by freshness),
-        // finds nothing fresh, falls back to bootstrap-permissive.
-        let (acceptable_1, reason_1) = state.is_lsn_acceptable_for_election(1);
-        assert!(
-            acceptable_1,
-            "leaderless window must allow some voter to win — got reject: {reason_1}"
-        );
-        let (acceptable_2, _) = state.is_lsn_acceptable_for_election(2);
-        assert!(acceptable_2);
-        let (acceptable_3, _) = state.is_lsn_acceptable_for_election(3);
-        assert!(acceptable_3);
-    }
-
-    /// RW-7: a node restored from an old basebackup, with its Raft directory
-    /// intact, must not win an election held after the staleness window.
-    ///
-    /// Raft log matching cannot catch this — it sees a current log and has no
-    /// view of how old the `PostgreSQL` data underneath it is. The blanket
-    /// "no fresh data anywhere ⇒ permissive" rule this replaced would have let
-    /// the restored node win and silently discard every write its peers held.
-    ///
-    /// Aged reports are the only evidence available in a leaderless window, and
-    /// they are still evidence: WAL positions do not go backwards, so a peer
-    /// that once reported 100 MB has at least that much.
-    #[test]
-    fn test_stale_restored_node_loses_a_leaderless_election() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        for id in 1..=3 {
-            add_test_node(&mut state, id);
-        }
-        let stale_ts =
-            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
-        state.node_lsns.insert(1, (100_000_000, stale_ts));
-        state.node_lsns.insert(2, (100_000_000, stale_ts));
-        // Restored from a basebackup taken ~50 MB of WAL ago.
-        state.node_lsns.insert(3, (50_000_000, stale_ts));
-
-        let (stale_wins, reason) = state.is_lsn_acceptable_for_election(3);
-        assert!(
-            !stale_wins,
-            "a node 50 MB behind won a leaderless election: {reason}"
-        );
-
-        // Not vacuous: the peers at the aged max are still electable, which is
-        // the liveness property the permissive rule existed to protect.
-        for id in [1, 2] {
-            let (acceptable, reason) = state.is_lsn_acceptable_for_election(id);
-            assert!(
-                acceptable,
-                "node{id} at the aged max was rejected: {reason}"
-            );
-        }
-    }
-
-    /// The tiebreak must not be able to reject everyone — that would be the
-    /// election livelock the permissive branch was introduced to avoid.
-    ///
-    /// Whatever the spread of aged reports, the node holding the maximum
-    /// compares against itself with a gap of zero, so it always passes.
-    #[test]
-    fn test_aged_tiebreak_always_leaves_someone_electable() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        for id in 1..=3 {
-            add_test_node(&mut state, id);
-        }
-        let stale_ts =
-            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
-        for (id, lsn) in [(1u64, 10_000_000u64), (2, 900_000_000), (3, 1_000)] {
-            state.node_lsns.insert(id, (lsn, stale_ts));
-        }
-        let electable: Vec<u64> = (1..=3)
-            .filter(|&id| state.is_lsn_acceptable_for_election(id).0)
-            .collect();
-        assert!(
-            !electable.is_empty(),
-            "every candidate rejected in a leaderless window — livelock"
-        );
-        assert!(
-            electable.contains(&2),
-            "the node holding the aged maximum must always be electable, got {electable:?}"
-        );
-    }
-
-    /// A normally-lagging follower must stay electable in a leaderless window,
-    /// even under sync mode.
-    ///
-    /// This is the regression the aged tiebreak first shipped with. The tight
-    /// threshold is a single WAL block, and "somebody always qualifies" holds
-    /// cluster-wide but not inside a partition — the node at the aged maximum
-    /// may be on the far side of it. Under the tight threshold every reachable
-    /// follower was then rejected and the majority could not elect: a live 3/2
-    /// split sat leaderless for four minutes.
-    #[test]
-    fn test_ordinary_lag_stays_electable_in_a_leaderless_window() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        for id in 1..=3 {
-            add_test_node(&mut state, id);
-        }
-        // Sync mode active: without the explicit loosening this uses the
-        // single-block threshold.
-        state.sync_replication_active = Some(true);
-        let stale_ts =
-            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
-        state.node_lsns.insert(1, (100_000_000, stale_ts));
-        // A few hundred KB behind — ordinary streaming lag, far beyond one
-        // block but nowhere near a stale basebackup.
-        state.node_lsns.insert(2, (99_600_000, stale_ts));
-        state.node_lsns.insert(3, (99_700_000, stale_ts));
-
-        for id in [2, 3] {
-            let (acceptable, reason) = state.is_lsn_acceptable_for_election(id);
-            assert!(
-                acceptable,
-                "node{id} with ordinary lag was rejected in a leaderless window: {reason}"
-            );
-        }
-    }
-
-    /// A cluster that has genuinely never reported stays permissive: there is
-    /// nothing to compare against and a first leader has to be electable.
-    #[test]
-    fn test_true_bootstrap_stays_permissive() {
-        let mut state = at_current_level();
-        for id in 1..=3 {
-            add_test_node(&mut state, id);
-        }
-        assert!(state.node_lsns.is_empty());
-        let (acceptable, reason) = state.is_lsn_acceptable_for_election(1);
-        assert!(acceptable, "first boot must be able to elect: {reason}");
-    }
-
-    /// L3 fail-closed must still fire when SOME peer has fresh data but
-    /// the candidate's data is stale. This is the partitioned-stale
-    /// candidate threat. Paired with the bootstrap-fallback test above,
-    /// this proves the bootstrap allowance does not downgrade the L3
-    /// contract.
-    /// Under sync mode, a candidate that's 9 KiB behind the cluster max
-    /// must be rejected (only one WAL block of tolerance). Under async
-    /// mode the same candidate is accepted (16 MB tolerance). The
-    /// asymmetry is what closes the silent-data-loss window where an
-    /// async-lagged replica could be elected while a sync replica with
-    /// the actual ack'd data was still recoverable.
-    #[test]
-    #[allow(
-        clippy::similar_names,
-        reason = "ok_sync/ok_async mirror the two replication modes under test"
-    )]
-    fn test_sync_mode_rejects_what_async_accepts() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-
-        // Node 1: fresh leader-equivalent LSN.
-        let leader_lsn: u64 = 100_000_000;
-        state.node_lsns.insert(1, (leader_lsn, now));
-        // Node 2 (candidate): fresh heartbeat but 9 KiB behind — within
-        // the sync grace block, well within async tolerance.
-        state.node_lsns.insert(2, (leader_lsn - 9_216, now));
-        state.max_cluster_lsn = leader_lsn;
-
-        // Async mode: 9 KiB lag is acceptable.
-        state.sync_replication_active = Some(false);
-        let (ok_async, _) = state.is_lsn_acceptable_for_election(2);
-        assert!(
-            ok_async,
-            "9 KiB behind must be acceptable under async-mode threshold"
-        );
-
-        // Sync mode: 9 KiB lag is over the one-block tolerance.
-        state.sync_replication_active = Some(true);
-        let (ok_sync, reason_sync) = state.is_lsn_acceptable_for_election(2);
-        assert!(
-            !ok_sync,
-            "9 KiB behind must be rejected under sync-mode threshold: an async-lagged replica must not win an election while a sync replica has the ack'd data"
-        );
-        assert!(reason_sync.contains("LSN too far behind"));
-    }
-
-    /// Sync mode must still accept a candidate within one WAL block of
-    /// the leader — otherwise the brief "leader wrote WAL but sync hasn't
-    /// streamed yet" window would block promotion of the sync replica
-    /// itself.
-    #[test]
-    fn test_sync_mode_accepts_within_one_wal_block() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-
-        let leader_lsn: u64 = 100_000_000;
-        state.node_lsns.insert(1, (leader_lsn, now));
-        // Within one WAL block: 4 KiB behind, tolerance is 8 KiB.
-        state.node_lsns.insert(2, (leader_lsn - 4_096, now));
-        state.max_cluster_lsn = leader_lsn;
-        state.sync_replication_active = Some(true);
-
-        let (ok, reason) = state.is_lsn_acceptable_for_election(2);
-        assert!(
-            ok,
-            "sync replica within one WAL block must be acceptable, got: {reason}"
-        );
-    }
-
     /// `ClusterCommand::SetSyncMode` correctly toggles the replicated
     /// flag. Followers will see this via normal Raft apply.
     #[test]
@@ -2205,66 +1553,18 @@ mod tests {
         assert_eq!(state.sync_replication_active, Some(false));
     }
 
-    /// After a restart (or a snapshot that predates the last `SetSyncMode`),
-    /// `sync_replication_active` is `None`. The election LSN gate must fail
-    /// safe to the *tight* (sync) threshold in that state — treating an
-    /// unknown cluster as async would let an async-lagged replica win an
-    /// election while a sync replica still holds the ack'd WAL, the exact
-    /// silent-data-loss window the gate exists to close.
+    /// Only a committed async fallback loosens the vote: an unknown mode (just
+    /// after a restart) votes as strictly as sync.
     #[test]
-    fn test_unknown_sync_mode_fails_safe_to_tight_threshold() {
+    fn the_vote_allows_slack_only_under_committed_async() {
         let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-
-        let leader_lsn: u64 = 100_000_000;
-        state.node_lsns.insert(1, (leader_lsn, now));
-        // 9 KiB behind: within the async (16 MB) tolerance but over the sync
-        // one-block (8 KiB) tolerance.
-        state.node_lsns.insert(2, (leader_lsn - 9_216, now));
-        state.max_cluster_lsn = leader_lsn;
-
-        // No SetSyncMode observed yet → unknown → must use the tight threshold.
-        assert_eq!(state.sync_replication_active, None);
-        let (ok, reason) = state.is_lsn_acceptable_for_election(2);
-        assert!(
-            !ok,
-            "unknown sync mode must fail safe to the tight threshold: {reason}"
-        );
-    }
-
-    #[test]
-    fn test_lsn_acceptable_l3_still_fires_with_fresh_peer() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-
-        // `apply` stamps timestamps server-side, so mutate directly to
-        // place node 2's entry firmly outside the staleness window while
-        // node 1 stays fresh.
-        let stale_ts =
-            now.saturating_sub(crate::config::constants::LSN_STALENESS_THRESHOLD_SECS + 60);
-        state.node_lsns.insert(1, (100_000_000, now));
-        state.node_lsns.insert(2, (50_000_000, stale_ts));
-        state.max_cluster_lsn = 100_000_000;
-
-        let (acceptable, reason) = state.is_lsn_acceptable_for_election(2);
-        assert!(
-            !acceptable,
-            "partitioned-stale candidate with fresh peer must be rejected (L3)"
-        );
-        assert!(
-            reason.contains("stale"),
-            "expected L3 staleness rejection reason, got: {reason}"
+        assert_eq!(state.vote_lsn_threshold_bytes(), 0);
+        state.apply(ClusterCommand::SetSyncMode { active: true });
+        assert_eq!(state.vote_lsn_threshold_bytes(), 0);
+        state.apply(ClusterCommand::SetSyncMode { active: false });
+        assert_eq!(
+            state.vote_lsn_threshold_bytes(),
+            crate::config::constants::LSN_CATCHUP_THRESHOLD_BYTES_ASYNC
         );
     }
 
@@ -2304,487 +1604,39 @@ mod tests {
         assert_eq!(state.nodes.get(&2).unwrap().role, NodeRole::Follower);
     }
 
+    /// A replayed `UpdateLsn` from an old log decodes and changes nothing.
     #[test]
-    fn test_update_lsn_tracks_max() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 1000,
-            timestamp: now,
-        });
-        assert_eq!(state.max_cluster_lsn, 1000);
-        assert_eq!(state.node_lsns.get(&1).map(|(lsn, _)| *lsn), Some(1000));
-
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 2,
-            lsn_bytes: 2000,
-            timestamp: now,
-        });
-        assert_eq!(state.max_cluster_lsn, 2000);
-
-        // A lower LSN is accepted (pg_rewind / timeline switch regresses a
-        // node's position); the cluster max still tracks the highest entry.
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 500,
-            timestamp: now,
-        });
-        assert_eq!(state.max_cluster_lsn, 2000);
-        assert_eq!(state.node_lsns.get(&1).map(|(lsn, _)| *lsn), Some(500));
-    }
-
-    /// After `pg_rewind` a node legitimately reports a lower LSN. The state
-    /// machine must adopt it (and refresh the entry's timestamp) instead of
-    /// pinning a phantom pre-rewind high-water: the phantom would inflate
-    /// `max_cluster_lsn` against a WAL position that no longer exists —
-    /// rejecting a fully-caught-up sync replica during failover — and then
-    /// brand the rewound node stale until it re-passed the old value.
-    #[test]
-    fn test_update_lsn_accepts_rewind_regression() {
+    fn a_retired_lsn_report_changes_nothing() {
         let mut state = at_current_level();
         add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        // Node 1 held the cluster max before its rewind.
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 100_000_000,
-            timestamp: now,
-        });
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 2,
-            lsn_bytes: 60_000_000,
-            timestamp: now,
-        });
-        assert_eq!(state.max_cluster_lsn, 100_000_000);
-
-        // Age node 1's entry so a timestamp refresh is observable.
-        let old_ts = now.saturating_sub(10);
-        state.node_lsns.insert(1, (100_000_000, old_ts));
-
-        // Post-rewind report: lower LSN on the new timeline.
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 50_000_000,
-            timestamp: now,
-        });
-
-        let (lsn, ts) = *state.node_lsns.get(&1).unwrap();
-        assert_eq!(lsn, 50_000_000, "regressed LSN must replace the phantom");
-        assert!(ts >= now, "timestamp must be refreshed with the new value");
+        let before = postcard::to_allocvec(&state).unwrap();
         assert_eq!(
-            state.max_cluster_lsn, 60_000_000,
-            "cluster max must drop to the highest live position"
+            state.apply(ClusterCommand::UpdateLsn {
+                node_id: 1,
+                lsn_bytes: 4_096,
+                timestamp: 1,
+            }),
+            CommandOutcome::Applied
         );
+        assert_eq!(postcard::to_allocvec(&state).unwrap(), before);
     }
 
     #[test]
-    fn test_remove_node_cleans_lsn() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        state.apply(ClusterCommand::AddNode(NodeInfo {
-            id: 1,
-            pg_addr: "10.0.0.1:5432".parse().unwrap(),
-            raft_addr: "10.0.0.1:5433".parse().unwrap(),
-            mgmt_addr: "10.0.0.1:9091".parse().unwrap(),
-            metrics_addr: "10.0.0.1:9090".parse().unwrap(),
-            role: NodeRole::Follower,
-            last_seen: 0,
-        }));
-
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 1000,
-            timestamp: now,
-        });
-        assert_eq!(state.node_lsns.get(&1).map(|(lsn, _)| *lsn), Some(1000));
-
-        state.apply(ClusterCommand::RemoveNode(1));
-        assert_eq!(state.node_lsns.get(&1), None);
-    }
-
-    #[test]
-    fn test_stale_lsn_excluded_from_max() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-
-        // Add fresh LSN for node 1
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 100_000_000, // 100 MB
-            timestamp: now,
-        });
-        assert_eq!(state.max_cluster_lsn, 100_000_000);
-
-        // Inject a stale LSN entry for node 2 (timestamp in the past).
-        // We intentionally bypass apply() because apply() assigns authoritative now.
-        let stale_ts = now - crate::config::constants::LSN_STALENESS_THRESHOLD_SECS - 10;
-        state.node_lsns.insert(2, (200_000_000, stale_ts));
-        state.recalculate_max_cluster_lsn();
-
-        // max_cluster_lsn should still be from node 1 (fresh entry)
-        // because node 2's entry is stale
-        assert_eq!(state.max_cluster_lsn, 100_000_000);
-
-        // Node 2's stale data must reject the vote — fail-closed: the
-        // cluster has fresh data from node 1 but node 2's last-seen LSN
-        // is beyond the staleness window, so we can't verify it caught up.
-        let (acceptable, reason) = state.is_lsn_acceptable_for_election(2);
-        assert!(!acceptable);
-        assert!(reason.contains("stale"));
-    }
-
-    #[test]
-    fn test_update_lsn_ignores_unknown_nodes() {
-        let mut state = at_current_level();
-        add_test_node(&mut state, 1);
-
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 999,
-            lsn_bytes: 1234,
-            timestamp: 1,
-        });
-
-        assert!(state.node_lsns.is_empty());
-        assert_eq!(state.max_cluster_lsn, 0);
-    }
-
-    #[test]
-    fn test_update_lsn_uses_local_timestamp() {
-        let mut state = at_current_level();
-        add_test_node(&mut state, 1);
-
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 42,
-            timestamp: u64::MAX,
-        });
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let stored_ts = state.node_lsns.get(&1).map_or(0, |(_, ts)| *ts);
-        assert!(stored_ts <= now);
-    }
-
-    #[test]
-    fn test_remove_node_drops_membership_and_lsn() {
+    fn test_remove_node_drops_membership() {
         let mut state = at_current_level();
         add_test_node(&mut state, 1);
         add_test_node(&mut state, 2);
 
         state.apply(ClusterCommand::RemoveNode(1));
         assert!(!state.nodes.contains_key(&1));
-        assert!(!state.node_lsns.contains_key(&1));
         assert!(state.nodes.contains_key(&2));
     }
 
-    /// Property tests over the pure election/promotion LSN gate.
-    ///
-    /// Timestamps are built relative to the real `unix_now_secs()` the gate
-    /// itself reads, so generated ages deliberately avoid a band around
-    /// `LSN_STALENESS_THRESHOLD_SECS`: a one-second tick between building the
-    /// state and evaluating it must not flip an entry across the freshness
-    /// boundary and turn a passing property into a false counterexample.
     mod props {
         use super::*;
-        use crate::config::constants::LSN_STALENESS_THRESHOLD_SECS;
         use proptest::prelude::*;
-        use std::collections::BTreeMap;
-
-        /// Node id used for the candidate under test. Disjoint from the peer
-        /// id range so a generated peer never aliases the candidate's entry.
-        const CANDIDATE: NodeId = 99;
-        /// Peer id used by the fixed-topology boundary properties.
-        const PEER: NodeId = 1;
-
-        /// `(node_id, lsn, age_secs)`. A negative age is a future-skewed
-        /// timestamp, which the gate must clamp to age 0 rather than drop.
-        type LsnRow = (NodeId, u64, i64);
-
-        fn now_secs() -> u64 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs())
-        }
-
-        fn age_strategy() -> impl Strategy<Value = i64> {
-            let staleness = i64::try_from(LSN_STALENESS_THRESHOLD_SECS).unwrap_or(30);
-            prop_oneof![
-                // Future skew.
-                -10i64..0,
-                // Comfortably fresh.
-                0i64..staleness - 10,
-                // Comfortably stale.
-                staleness + 10..staleness + 600,
-            ]
-        }
-
-        fn lsn_rows() -> impl Strategy<Value = Vec<LsnRow>> {
-            proptest::collection::vec((1u64..=8u64, 0u64..500_000_000u64, age_strategy()), 0..6)
-        }
-
-        fn sync_mode() -> impl Strategy<Value = Option<bool>> {
-            prop_oneof![Just(None), Just(Some(true)), Just(Some(false))]
-        }
-
-        fn state_from(rows: &[LsnRow], sync: Option<bool>) -> ClusterState {
-            let now = i64::try_from(now_secs()).unwrap_or(i64::MAX);
-            let mut state = at_current_level();
-            state.sync_replication_active = sync;
-            for &(id, lsn, age) in rows {
-                let ts = u64::try_from(now.saturating_sub(age)).unwrap_or(0);
-                state.node_lsns.insert(id, (lsn, ts));
-            }
-            state
-        }
-
-        /// Independent oracle for the staleness filter: last row wins per id
-        /// (matching `HashMap::insert`), future skew counts as age 0.
-        fn oracle_fresh_max(rows: &[LsnRow]) -> u64 {
-            let mut by_id: BTreeMap<NodeId, (u64, i64)> = BTreeMap::new();
-            for &(id, lsn, age) in rows {
-                by_id.insert(id, (lsn, age));
-            }
-            let staleness = i64::try_from(LSN_STALENESS_THRESHOLD_SECS).unwrap_or(30);
-            by_id
-                .values()
-                .filter(|&&(_, age)| age.max(0) < staleness)
-                .map(|(lsn, _)| *lsn)
-                .max()
-                .unwrap_or(0)
-        }
 
         proptest! {
-            /// Raising a candidate's own reported LSN can only ever help it.
-            /// If the gate were non-monotone, a replica could lose a vote it
-            /// would have won by streaming *more* WAL.
-            ///
-            /// Applies to votes arriving over the network
-            /// (`governor::network::process_request`); a candidate's own
-            /// self-vote is issued inside openraft and never consults the gate.
-            #[test]
-            fn prop_election_gate_monotone_in_candidate_lsn(
-                peers in lsn_rows(),
-                lower in 0u64..500_000_000u64,
-                delta in 0u64..500_000_000u64,
-                sync in sync_mode(),
-            ) {
-                let higher = lower.saturating_add(delta);
-                let now = now_secs();
-                let mut state = state_from(&peers, sync);
-
-                state.node_lsns.insert(CANDIDATE, (lower, now));
-                let (low_ok, _) = state.is_lsn_acceptable_for_election(CANDIDATE);
-                state.node_lsns.insert(CANDIDATE, (higher, now));
-                let (high_ok, high_reason) = state.is_lsn_acceptable_for_election(CANDIDATE);
-
-                prop_assert!(
-                    !low_ok || high_ok,
-                    "lsn {lower} accepted but higher lsn {higher} rejected: {high_reason}"
-                );
-            }
-
-            /// Within one state, acceptance is upward-closed in LSN across
-            /// fresh-reporting nodes: the lower-LSN node being acceptable
-            /// implies the higher-LSN node is too, all else equal.
-            #[test]
-            fn prop_election_gate_upward_closed_among_fresh_peers(
-                lsns in proptest::collection::vec(0u64..500_000_000u64, 2..6),
-                sync in sync_mode(),
-            ) {
-                let now = now_secs();
-                let mut state = at_current_level();
-                state.sync_replication_active = sync;
-                for (i, &lsn) in lsns.iter().enumerate() {
-                    let id = u64::try_from(i).unwrap_or(0).saturating_add(1);
-                    state.node_lsns.insert(id, (lsn, now));
-                }
-
-                for (i, &lsn_i) in lsns.iter().enumerate() {
-                    for (j, &lsn_j) in lsns.iter().enumerate() {
-                        if lsn_i > lsn_j {
-                            continue;
-                        }
-                        let id_i = u64::try_from(i).unwrap_or(0).saturating_add(1);
-                        let id_j = u64::try_from(j).unwrap_or(0).saturating_add(1);
-                        let (ok_i, _) = state.is_lsn_acceptable_for_election(id_i);
-                        let (ok_j, reason_j) = state.is_lsn_acceptable_for_election(id_j);
-                        prop_assert!(
-                            !ok_i || ok_j,
-                            "node {id_i} (lsn {lsn_i}) accepted but node {id_j} \
-                             (lsn {lsn_j}) rejected: {reason_j}"
-                        );
-                    }
-                }
-            }
-
-            /// Tri-state fail-safe: an unknown sync mode must never pick a
-            /// threshold looser than known-sync, and must never accept a
-            /// candidate that known-sync would reject. Known-async is the only
-            /// mode allowed to be looser.
-            #[test]
-            fn prop_unknown_sync_mode_never_looser_than_sync(
-                rows in lsn_rows(),
-                candidate_lsn in 0u64..500_000_000u64,
-            ) {
-                let now = now_secs();
-                let build = |sync: Option<bool>| {
-                    let mut state = state_from(&rows, sync);
-                    state.node_lsns.insert(CANDIDATE, (candidate_lsn, now));
-                    state
-                };
-                let unknown = build(None);
-                let known_sync = build(Some(true));
-                let known_async = build(Some(false));
-
-                prop_assert_eq!(
-                    unknown.lsn_catchup_threshold_bytes(),
-                    known_sync.lsn_catchup_threshold_bytes(),
-                    "unknown sync mode must use the tight (sync) threshold"
-                );
-                prop_assert!(
-                    known_sync.lsn_catchup_threshold_bytes()
-                        <= known_async.lsn_catchup_threshold_bytes(),
-                    "sync threshold must not exceed the async threshold"
-                );
-
-                let (unknown_ok, unknown_reason) =
-                    unknown.is_lsn_acceptable_for_election(CANDIDATE);
-                let (sync_ok, _) = known_sync.is_lsn_acceptable_for_election(CANDIDATE);
-                prop_assert!(
-                    !unknown_ok || sync_ok,
-                    "unknown mode accepted what sync mode rejects: {unknown_reason}"
-                );
-            }
-
-            /// The documented boundary rule is inclusive: a candidate exactly
-            /// `threshold` bytes behind the fresh cluster max is accepted
-            /// (`>` not `>=`), one byte further is rejected. Holds for every
-            /// sync mode, i.e. for both threshold values.
-            #[test]
-            fn prop_threshold_boundary_is_inclusive(
-                peers_max in 20_000_000u64..1_000_000_000u64,
-                sync in sync_mode(),
-            ) {
-                let now = now_secs();
-                let mut state = at_current_level();
-                state.sync_replication_active = sync;
-                state.node_lsns.insert(PEER, (peers_max, now));
-                let threshold = state.lsn_catchup_threshold_bytes();
-
-                state
-                    .node_lsns
-                    .insert(CANDIDATE, (peers_max - threshold, now));
-                let (at_ok, at_reason) = state.is_lsn_acceptable_for_election(CANDIDATE);
-                prop_assert!(at_ok, "exactly at threshold must be accepted: {at_reason}");
-
-                state
-                    .node_lsns
-                    .insert(CANDIDATE, (peers_max - threshold - 1, now));
-                let (over_ok, _) = state.is_lsn_acceptable_for_election(CANDIDATE);
-                prop_assert!(!over_ok, "one byte beyond threshold must be rejected");
-            }
-
-            /// Staleness filtering can only ever remove entries: `fresh_max_lsn`
-            /// equals the max over fresh entries and never exceeds the max over
-            /// all stored entries, so a dropped peer cannot inflate the bar a
-            /// candidate must clear.
-            #[test]
-            fn prop_fresh_max_lsn_matches_fresh_entries(rows in lsn_rows()) {
-                let state = state_from(&rows, None);
-                let all_max = rows.iter().map(|&(_, lsn, _)| lsn).max().unwrap_or(0);
-
-                prop_assert_eq!(state.fresh_max_lsn(), oracle_fresh_max(&rows));
-                prop_assert!(state.fresh_max_lsn() <= all_max);
-            }
-
-            /// A future-skewed timestamp is clamped to age 0, not treated as an
-            /// arbitrarily large freshness credit: the result is identical to
-            /// the same entry stamped `now`, and still bounded by a real stored
-            /// LSN.
-            #[test]
-            fn prop_future_skew_clamps_rather_than_inflates(rows in lsn_rows()) {
-                let clamped: Vec<LsnRow> = rows
-                    .iter()
-                    .map(|&(id, lsn, age)| (id, lsn, age.max(0)))
-                    .collect();
-
-                let skewed_state = state_from(&rows, None);
-                let clamped_state = state_from(&clamped, None);
-
-                prop_assert_eq!(skewed_state.fresh_max_lsn(), clamped_state.fresh_max_lsn());
-                let all_max = rows.iter().map(|&(_, lsn, _)| lsn).max().unwrap_or(0);
-                prop_assert!(skewed_state.fresh_max_lsn() <= all_max);
-            }
-
-            /// Cross-check on the fresh-max computation duplicated between
-            /// `fresh_max_lsn` and `evaluate_lsn_acceptable`: a candidate
-            /// sitting exactly at `fresh_max_lsn()` with a fresh heartbeat has
-            /// zero lag and must pass both gates. A disagreement between the
-            /// two derivations shows up here as a rejection.
-            #[test]
-            fn prop_candidate_at_fresh_max_is_accepted(
-                rows in lsn_rows(),
-                sync in sync_mode(),
-            ) {
-                let now = now_secs();
-                let mut state = state_from(&rows, sync);
-                let max = state.fresh_max_lsn();
-                state.node_lsns.insert(CANDIDATE, (max, now));
-
-                let (election_ok, election_reason) =
-                    state.is_lsn_acceptable_for_election(CANDIDATE);
-                let (promotion_ok, promotion_reason) =
-                    state.is_lsn_acceptable_for_promotion(CANDIDATE);
-                prop_assert!(election_ok, "candidate at fresh max rejected: {election_reason}");
-                prop_assert!(promotion_ok, "candidate at fresh max rejected: {promotion_reason}");
-            }
-
-            /// The promotion gate is documented as the strictly stronger
-            /// sibling of the election gate (it additionally fails closed on a
-            /// candidate with no fresh report), so anything it accepts the
-            /// election gate must accept too.
-            #[test]
-            fn prop_promotion_gate_never_looser_than_election(
-                rows in lsn_rows(),
-                sync in sync_mode(),
-                candidate in 1u64..=10u64,
-            ) {
-                let state = state_from(&rows, sync);
-                let (promotion_ok, _) = state.is_lsn_acceptable_for_promotion(candidate);
-                let (election_ok, election_reason) =
-                    state.is_lsn_acceptable_for_election(candidate);
-                prop_assert!(
-                    !promotion_ok || election_ok,
-                    "promotion accepted node {candidate} but election rejected it: \
-                     {election_reason}"
-                );
-            }
-
             /// `parse_lsn` round-trips PostgreSQL's `upper/lower` hex encoding
             /// for every 64-bit position, and never panics on arbitrary input.
             #[test]
@@ -2798,46 +1650,5 @@ mod tests {
                 let _ = parse_lsn(&s);
             }
         }
-    }
-
-    #[test]
-    fn test_lsn_election_threshold_boundary() {
-        let mut state = at_current_level();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        add_test_node(&mut state, 1);
-        add_test_node(&mut state, 2);
-        // Exercises the async (loose) threshold; set it explicitly since the
-        // default `None` now fails safe to the tight threshold.
-        state.sync_replication_active = Some(false);
-
-        let max_lsn: u64 = 200_000_000; // 200 MB
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: max_lsn,
-            timestamp: now,
-        });
-
-        // Exactly at the lag threshold — should still be acceptable (`>`
-        // not `>=`). Uses the async catch-up threshold (set above).
-        let at_threshold = max_lsn - crate::config::constants::LSN_CATCHUP_THRESHOLD_BYTES_ASYNC;
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 2,
-            lsn_bytes: at_threshold,
-            timestamp: now,
-        });
-        let (ok, _) = state.is_lsn_acceptable_for_election(2);
-        assert!(ok, "node exactly at threshold should be acceptable");
-
-        // One byte beyond threshold — must be rejected.
-        state.apply(ClusterCommand::UpdateLsn {
-            node_id: 2,
-            lsn_bytes: at_threshold - 1,
-            timestamp: now,
-        });
-        let (ok, _) = state.is_lsn_acceptable_for_election(2);
-        assert!(!ok, "node one byte over threshold should be rejected");
     }
 }

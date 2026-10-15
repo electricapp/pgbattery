@@ -23,11 +23,8 @@ accept writes:
     src/governor/reconciler/mod.rs            write gate, async fallback grace
     src/governor/reconciler/follow.rs         promotion hold-down
     src/governor/reconciler/replication.rs    replica disconnect hysteresis
-
-`src/governor/state_machine.rs` is deliberately absent. LSN staleness rides in
-replicated Raft state and snapshots, where a monotonic `Instant` is meaningless
-across processes, so it uses the wall clock on purpose — documented in
-HARDENING.md's Accepted risks and in docs/STATE_MACHINE.md.
+    src/governor/state_machine.rs             replicated state: reads no clock
+    src/governor/wal_positions.rs             report freshness, on the caller's clock
 
 Test code is exempt: a test constructing a real `Instant` as a fixture is not a
 safety decision, and `ManualClock` itself has to build one somewhere.
@@ -55,6 +52,8 @@ GUARDED: Final[tuple[str, ...]] = (
     "src/governor/reconciler/mod.rs",
     "src/governor/reconciler/follow.rs",
     "src/governor/reconciler/replication.rs",
+    "src/governor/state_machine.rs",
+    "src/governor/wal_positions.rs",
 )
 
 CLOCK_READ: Final[re.Pattern[str]] = re.compile(r"\b(?:Instant|SystemTime)::now\(\)")

@@ -96,8 +96,8 @@ pub struct YieldCandidate {
     pub node_id: NodeId,
     /// The peer's last reported WAL position.
     pub lsn: u64,
-    /// `ClusterState::is_lsn_acceptable_for_promotion`, which fails closed on a
-    /// peer with no fresh report.
+    /// `WalPositions::caught_up`, which fails closed on a peer with no fresh
+    /// report.
     pub acceptable: bool,
 }
 

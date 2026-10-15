@@ -322,6 +322,7 @@ impl LocalSqlClient {
 #[derive(Debug)]
 struct SessionTarget {
     pg_bin_dir: std::sync::RwLock<PathBuf>,
+    pg_data_dir: std::sync::RwLock<PathBuf>,
     pg_port: u16,
     pg_user: String,
     /// Carried by every pgbattery session, so the fence's client termination
@@ -337,17 +338,29 @@ impl SessionTarget {
             .finish();
         Self {
             pg_bin_dir: std::sync::RwLock::new(config.pg_bin_dir.clone()),
+            pg_data_dir: std::sync::RwLock::new(config.pg_data_dir.clone()),
             pg_port: config.pg_port,
             pg_user: config.pg_user.clone(),
             application_name: format!("pgbattery-{nonce:016x}"),
         }
     }
 
-    fn psql(&self) -> PathBuf {
+    fn bin_dir(&self) -> PathBuf {
         self.pg_bin_dir
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .join("psql")
+            .clone()
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.pg_data_dir
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn psql(&self) -> PathBuf {
+        self.bin_dir().join("psql")
     }
 }
 
@@ -408,7 +421,40 @@ impl FenceSession {
     pub async fn terminate_client_backends(&self) -> Result<String> {
         self.session.terminate_client_backends().await
     }
+
+    /// The running server's reportable WAL position, as
+    /// [`Supervisor::get_reportable_lsn`] reads it.
+    ///
+    /// # Errors
+    /// The server did not answer.
+    pub async fn reportable_lsn(&self) -> Result<String> {
+        let raw = self.session.execute_sql(REPORTABLE_LSN_SQL).await?;
+        Ok(raw.trim().to_string())
+    }
+
+    /// Whether there is a data directory at all.
+    #[must_use]
+    pub fn has_data_directory(&self) -> bool {
+        self.session.target.data_dir().join("PG_VERSION").exists()
+    }
+
+    /// Where the WAL ends while no server runs, if the last one shut down
+    /// cleanly: the control file's record, exact for a primary, the replay
+    /// position for a standby.
+    ///
+    /// # Errors
+    /// `pg_controldata` failed or timed out.
+    pub async fn stopped_wal_end(&self) -> Result<Option<u64>> {
+        let target = &self.session.target;
+        read_stopped_wal_end(&target.bin_dir(), &target.data_dir()).await
+    }
 }
+
+/// Receive (or replay, before the walreceiver starts) on a standby; write on
+/// a primary. One round trip, lazy CASE arms.
+const REPORTABLE_LSN_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() \
+     THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) \
+     ELSE pg_current_wal_lsn() END::text;";
 
 /// Whether two `synchronous_standby_names` values are semantically equal.
 ///
@@ -1270,6 +1316,54 @@ pub async fn read_system_identifier(pg_bin_dir: &Path, pg_data_dir: &Path) -> Re
     if !pg_data_dir.join("global/pg_control").exists() {
         return Ok(None);
     }
+    let stdout = run_pg_controldata(pg_bin_dir, pg_data_dir).await?;
+    parse_controldata_fields(&stdout)
+        .get(CONTROLDATA_SYSTEM_IDENTIFIER)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Error::Postgres(format!(
+                "pg_controldata output carries no readable {CONTROLDATA_SYSTEM_IDENTIFIER}"
+            ))
+        })
+}
+
+/// Where the WAL of a data directory no server is running on ends, from its
+/// control file; `None` unless the file says the last server shut down
+/// cleanly, since after a crash the WAL past the last checkpoint is unknown.
+///
+/// Exact for a primary, whose last record is its shutdown checkpoint. A
+/// standby's is its replay position: WAL it received and had not replayed
+/// lies past it.
+///
+/// # Errors
+/// `pg_controldata` failed or timed out.
+async fn read_stopped_wal_end(pg_bin_dir: &Path, pg_data_dir: &Path) -> Result<Option<u64>> {
+    if !pg_data_dir.join("global/pg_control").exists() {
+        return Ok(None);
+    }
+    let stdout = run_pg_controldata(pg_bin_dir, pg_data_dir).await?;
+    Ok(stopped_wal_end(&parse_controldata_fields(&stdout)))
+}
+
+fn stopped_wal_end(fields: &std::collections::HashMap<&str, &str>) -> Option<u64> {
+    if !matches!(
+        fields.get("Database cluster state"),
+        Some(&("shut down" | "shut down in recovery"))
+    ) {
+        return None;
+    }
+    let checkpoint = parse_lsn_local(fields.get("Latest checkpoint location")?)?;
+    let replayed = fields
+        .get("Minimum recovery ending location")
+        .and_then(|raw| parse_lsn_local(raw))
+        .unwrap_or(0);
+    Some(checkpoint.max(replayed))
+}
+
+/// `pg_controldata`'s report on `pg_data_dir`, bounded: a pure read of the
+/// control file, so a timeout means the volume is frozen.
+async fn run_pg_controldata(pg_bin_dir: &Path, pg_data_dir: &Path) -> Result<String> {
     let command = Command::new(pg_bin_dir.join("pg_controldata"))
         .env("LC_ALL", "C")
         .arg("-D")
@@ -1291,7 +1385,7 @@ pub async fn read_system_identifier(pg_bin_dir: &Path, pg_data_dir: &Path) -> Re
         Err(_) => {
             metrics::counter!("pgbattery_pg_controldata_timeouts").increment(1);
             return Err(Error::Postgres(format!(
-                "pg_controldata exceeded {PG_CONTROLDATA_TIMEOUT_MS} ms reading the system identifier"
+                "pg_controldata exceeded {PG_CONTROLDATA_TIMEOUT_MS} ms (data directory may be on a frozen volume)"
             )));
         }
     };
@@ -1301,16 +1395,7 @@ pub async fn read_system_identifier(pg_bin_dir: &Path, pg_data_dir: &Path) -> Re
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_controldata_fields(&stdout)
-        .get(CONTROLDATA_SYSTEM_IDENTIFIER)
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Some)
-        .ok_or_else(|| {
-            Error::Postgres(format!(
-                "pg_controldata output carries no readable {CONTROLDATA_SYSTEM_IDENTIFIER}"
-            ))
-        })
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn parse_controldata_fields(output: &str) -> std::collections::HashMap<&str, &str> {
@@ -1343,12 +1428,17 @@ impl Supervisor {
     ///
     /// Must be called while the postmaster is stopped.
     pub fn retarget_paths(&mut self, bin_dir: PathBuf, data_dir: PathBuf) {
-        self.session
-            .target
+        let target = &self.session.target;
+        target
             .pg_bin_dir
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone_from(&bin_dir);
+        target
+            .pg_data_dir
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&data_dir);
         self.config.pg_bin_dir = bin_dir;
         self.config.pg_data_dir = data_dir;
     }
@@ -2374,11 +2464,9 @@ host all all ::/0 {auth_method}
     /// - We can extract a valid timeline ID, REDO LSN, and checkpoint LSN.
     ///
     /// What this **does not** verify:
-    /// - That the standby has replayed enough WAL to be safe to promote.
-    ///   That is the caller's job: `App::promote_local_postgres` checks
-    ///   `local_lsn >= max_cluster_lsn - threshold`, where the threshold comes
-    ///   from `ClusterState::lsn_catchup_threshold_bytes` (tight under sync,
-    ///   loose under async), against the Raft-replicated `max_cluster_lsn`.
+    /// - That the standby holds enough WAL to be safe to promote. The
+    ///   election decided that: each voter compared this node's position
+    ///   with its own before granting its vote.
     /// - That `pg_rewind` succeeded earlier in the demote path. If rewind
     ///   silently failed and `pg_basebackup` ran instead, timelines align
     ///   anyway (basebackup ships the leader's TLI), so the local TLI vs.
@@ -2395,50 +2483,13 @@ host all all ::/0 {auth_method}
     /// Returns an error if `pg_controldata` cannot be run or its output cannot
     /// be parsed into a valid timeline ID, REDO LSN, and checkpoint LSN.
     pub async fn verify_promotion_safe(&self) -> Result<TimelineInfo> {
-        let pg_controldata = self.config.pg_bin_dir.join("pg_controldata");
-
         tracing::info!("Running promotion safety check (pg_controldata)");
 
-        // Bound `pg_controldata`. It's a pure file read against the control
-        // file — should be sub-second under any conditions. A timeout
-        // indicates the data directory is on a frozen volume (e.g. NFS
-        // hang, disk wedged). This call is on the promotion hot path and
-        // holds the supervisor mutex; unbounded wait would defer every
-        // failover until the disk unfreezes.
-        let controldata_cmd = Command::new(&pg_controldata)
-            .env("LC_ALL", "C")
-            .arg("-D")
-            .arg(&self.config.pg_data_dir)
-            .kill_on_drop(true)
-            .output();
-        let output = match tokio::time::timeout(
-            Duration::from_millis(PG_CONTROLDATA_TIMEOUT_MS),
-            controldata_cmd,
-        )
-        .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(Error::Promotion(format!(
-                    "Failed to run pg_controldata: {e}"
-                )));
-            }
-            Err(_) => {
-                metrics::counter!("pgbattery_pg_controldata_timeouts").increment(1);
-                return Err(Error::Promotion(format!(
-                    "pg_controldata exceeded {PG_CONTROLDATA_TIMEOUT_MS} ms (data directory may be on a frozen volume)"
-                )));
-            }
-        };
-
-        if !output.status.success() {
-            return Err(Error::Promotion(format!(
-                "pg_controldata failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // On the promotion hot path, under the supervisor mutex: bounded, so
+        // a frozen volume cannot defer every failover until the disk returns.
+        let stdout = run_pg_controldata(&self.config.pg_bin_dir, &self.config.pg_data_dir)
+            .await
+            .map_err(|e| Error::Promotion(e.to_string()))?;
 
         let fields = parse_controldata_fields(&stdout);
         // Treat a missing/unparseable TimeLineID as fatal: callers feed
@@ -4718,34 +4769,17 @@ impl Supervisor {
         Ok(result.trim().to_string())
     }
 
-    /// LSN to advertise to the cluster for election / lag tracking.
+    /// The WAL this node holds, for votes and the leader's book.
     ///
-    /// On a standby this is the furthest WAL the node has **received and flushed
-    /// to disk** (`pg_last_wal_receive_lsn`), not just what it has replayed.
-    /// That is the data the node actually holds and could serve if promoted —
-    /// under healthy streaming it tracks the leader's write position closely.
-    /// Reporting the *replayed* position (which lags receive under load) made
-    /// the election/promotion LSN gate treat a caught-up-but-still-replaying
-    /// standby as "too far behind" the dead leader's last-reported write
-    /// position, stalling failover until that entry aged out of the staleness
-    /// window. `GREATEST` ignores a NULL `receive_lsn` (walreceiver not yet
-    /// started) and falls back to the replay position.
-    ///
-    /// On a primary this is `pg_current_wal_lsn()` (the write position), which
-    /// is also the upper bound any follower's reported LSN may legitimately
-    /// reach — the leader uses it to clamp follower reports.
+    /// On a standby, what it has **received and flushed** (falling back to
+    /// replay before the walreceiver starts): the data it could serve if
+    /// promoted, which replay trails under load. On a primary, the write
+    /// position, which bounds what any follower can legitimately report.
     ///
     /// # Errors
     /// Returns an error if the LSN query fails.
     pub async fn get_reportable_lsn(&self) -> Result<String> {
-        // One round trip; lazy CASE arms as in `get_current_lsn`.
-        let result = self
-            .execute_sql(
-                "SELECT CASE WHEN pg_is_in_recovery() \
-                 THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) \
-                 ELSE pg_current_wal_lsn() END::text;",
-            )
-            .await?;
+        let result = self.execute_sql(REPORTABLE_LSN_SQL).await?;
         Ok(result.trim().to_string())
     }
 
@@ -5415,6 +5449,34 @@ mod tests {
         let fields = parse_controldata_fields(output);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields.get("key"), Some(&"value"));
+    }
+
+    /// A clean stop leaves the WAL's end in the control file; a crash or a
+    /// running server does not, since WAL past the checkpoint is unread.
+    #[test]
+    fn only_a_clean_stop_says_where_the_wal_ends() {
+        let report = |state: &str| {
+            format!(
+                "Database cluster state:               {state}\n\
+                 Latest checkpoint location:           0/3000060\n\
+                 Minimum recovery ending location:     0/5000148\n"
+            )
+        };
+        let end = |state: &str| stopped_wal_end(&parse_controldata_fields(&report(state)));
+        assert_eq!(end("shut down in recovery"), Some(0x500_0148));
+        assert_eq!(end("shut down"), Some(0x500_0148));
+        assert_eq!(end("in production"), None);
+        assert_eq!(end("in archive recovery"), None);
+        let unreadable = "Database cluster state: shut down\nLatest checkpoint location: bogus\n";
+        assert_eq!(stopped_wal_end(&parse_controldata_fields(unreadable)), None);
+
+        let primary = "Database cluster state: shut down\n\
+                       Latest checkpoint location: 0/3000060\n\
+                       Minimum recovery ending location: 0/0\n";
+        assert_eq!(
+            stopped_wal_end(&parse_controldata_fields(primary)),
+            Some(0x300_0060)
+        );
     }
 
     #[test]

@@ -188,7 +188,7 @@ pgbattery_connections_severed
 pgbattery_emergency_fence
 pgbattery_queries_rejected_lease_expired
 pgbattery_local_lsn_bytes
-pgbattery_lsn_future_skew_total
+pgbattery_votes_lsn_rejected
 ```
 
 - Default flush interval is 250 ms to limit CPU overhead; crank it down for chaos runs if you need millisecond-level insight.

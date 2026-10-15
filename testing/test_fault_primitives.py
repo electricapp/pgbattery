@@ -285,7 +285,6 @@ class SystemTimingsTests(unittest.TestCase):
         self.assertEqual(self.timings.heartbeat_interval_ms, 250)
         self.assertEqual(self.timings.quorum_timeout_ms, 1000)
         self.assertEqual(self.timings.metrics_watchdog_timeout_ms, 1500)
-        self.assertEqual(self.timings.lsn_staleness_threshold_ms, 30_000)
         self.assertEqual(self.timings.leadership_transfer_lease_safety_ms, 100)
 
     def test_election_timeout_comes_from_the_running_config(self) -> None:

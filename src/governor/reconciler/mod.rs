@@ -2,11 +2,11 @@
 //! with this node's Raft role and the committed log.
 //!
 //! A pass takes the supervisor lock, reads leadership and committed state
-//! after taking it ([`View`]), and acts: promote or follow the leader, keep the
+//! after taking it (`View`), and acts: promote or follow the leader, keep the
 //! leader's sync list and slots, open writes once the lease and sync
 //! durability allow, and level the cutover client fence. What needs the
 //! network — Raft proposals, the LSN report, a leadership yield — comes back as
-//! [`Effect`]s run after the lock is released, each under a deadline, so a
+//! `Effect`s run after the lock is released, each under a deadline, so a
 //! cluster without quorum cannot wedge the loop. Closing writes is not here:
 //! the lease fence (`governor::fence`) closes on its own session and never
 //! waits on this lock.
@@ -37,6 +37,7 @@ use super::promotion_watchdog::{
 };
 use super::raft::{FenceState, Governor, TypeConfig};
 use super::state_machine::{ClusterCommand, ClusterState, CutoverPhase, NodeId, PgUpgradeState};
+use super::wal_positions::SharedWalPositions;
 use crate::supervisor::{FollowTerms, LineageTerm, PostmasterState, Supervisor};
 
 /// Pass cadence with nothing to wake it sooner.
@@ -50,8 +51,8 @@ const OPENING_INTERVAL: Duration = Duration::from_millis(100);
 /// Deadline on every effect. A leader without quorum never commits.
 const EFFECT_DEADLINE: Duration = Duration::from_secs(2);
 
-/// An unchanged LSN still reports this often, far inside the 30 s staleness
-/// window, while an idle cluster stops paying a consensus round per second.
+/// An unchanged LSN still reports this often, well inside the leader's
+/// `wal_positions::POSITION_FRESHNESS`.
 const LSN_HEARTBEAT: Duration = Duration::from_secs(5);
 
 /// Cadence of the LSN probe and the liveness probe, whatever the pass rate.
@@ -234,9 +235,8 @@ enum Effect {
     CommitSyncMode(bool),
     /// Commit this primary's lineage as the cluster's.
     CommitLineage(u64),
-    /// Report this node's WAL position: into the log on a leader, to the
-    /// leader's API on a follower.
-    ReportLsn { lsn: u64, to: Option<SocketAddr> },
+    /// Report this node's WAL position to its leader's book.
+    ReportLsn { lsn: u64, to: SocketAddr },
     /// Hand leadership to `target` through this node's own transfer endpoint.
     Yield { target: NodeId },
 }
@@ -263,11 +263,11 @@ impl Outcome {
     }
 }
 
-/// When the LSN was last probed and reported.
+/// When the LSN was last probed, and what was last reported to whom.
 #[derive(Debug, Default)]
 struct LsnCadence {
     probed_at: Option<Instant>,
-    reported: Option<u64>,
+    reported: Option<(u64, SocketAddr)>,
     reported_at: Option<Instant>,
 }
 
@@ -282,17 +282,18 @@ impl LsnCadence {
         due
     }
 
-    /// A moved LSN reports at once; an unchanged one on the heartbeat. A
-    /// failed report changes nothing here, so the next probe retries.
-    fn report_due(&self, lsn: u64, now: Instant) -> bool {
-        self.reported != Some(lsn)
+    /// A moved LSN or a new leader reports at once; an unchanged one on the
+    /// heartbeat. A failed report changes nothing here, so the next probe
+    /// retries.
+    fn report_due(&self, lsn: u64, to: SocketAddr, now: Instant) -> bool {
+        self.reported != Some((lsn, to))
             || self
                 .reported_at
                 .is_none_or(|at| now.duration_since(at) >= LSN_HEARTBEAT)
     }
 
-    const fn reported(&mut self, lsn: u64, now: Instant) {
-        self.reported = Some(lsn);
+    const fn reported(&mut self, lsn: u64, to: SocketAddr, now: Instant) {
+        self.reported = Some((lsn, to));
         self.reported_at = Some(now);
     }
 }
@@ -311,6 +312,7 @@ pub(crate) struct NodeReconciler {
     /// Also the leadership tenure the async-fallback grace measures.
     watchdog: PromotionWatchdog,
     lsn: LsnCadence,
+    wal_positions: SharedWalPositions,
 }
 
 impl std::fmt::Debug for NodeReconciler {
@@ -330,6 +332,7 @@ impl NodeReconciler {
         lease: SharedLeaseState,
         client_fence: ClientFenceConfig,
         disconnect_timeout: Duration,
+        wal_positions: SharedWalPositions,
     ) -> Self {
         Self {
             node_id,
@@ -341,6 +344,7 @@ impl NodeReconciler {
             replicas: Replicas::default(),
             watchdog: PromotionWatchdog::default(),
             lsn: LsnCadence::default(),
+            wal_positions,
         }
     }
 
@@ -454,18 +458,17 @@ impl NodeReconciler {
             .leader_for(now)
             .unwrap_or_default()
             .as_millis();
-        let candidates: Vec<YieldCandidate> = {
-            let state = self.cluster_state.read();
-            view.raft_voters
-                .iter()
-                .filter(|&&id| id != self.node_id)
-                .map(|&id| YieldCandidate {
-                    node_id: id,
-                    lsn: state.node_lsns.get(&id).map_or(0, |&(lsn, _)| lsn),
-                    acceptable: state.is_lsn_acceptable_for_promotion(id).0,
-                })
-                .collect()
-        };
+        let threshold = self.cluster_state.read().lsn_catchup_threshold_bytes();
+        let candidates: Vec<YieldCandidate> = view
+            .raft_voters
+            .iter()
+            .filter(|&&id| id != self.node_id)
+            .map(|&id| YieldCandidate {
+                node_id: id,
+                lsn: self.wal_positions.fresh(id, now).unwrap_or(0),
+                acceptable: self.wal_positions.caught_up(id, threshold, now).0,
+            })
+            .collect();
         let Some(target) = choose_yield_target(&candidates) else {
             warn!(
                 leader_for_ms,
@@ -603,8 +606,8 @@ impl NodeReconciler {
         }
     }
 
-    /// Probe the reportable LSN on its cadence and ask for a report when it
-    /// moved or the heartbeat is due.
+    /// Probe the reportable LSN on its cadence into this node's book, and on
+    /// a follower ask for a report to the leader's when one is due.
     async fn report_lsn<P: PgControl>(
         &mut self,
         pg: &P,
@@ -638,19 +641,14 @@ impl NodeReconciler {
         };
         #[allow(clippy::cast_precision_loss, reason = "LSN metric")]
         metrics::gauge!("pgbattery_local_lsn_bytes").set(lsn as f64);
-        if !self.lsn.report_due(lsn, now) {
-            return;
-        }
-        match view.role {
-            Role::Leader => out.propose(view, Effect::ReportLsn { lsn, to: None }),
-            Role::Follower {
-                mgmt_addr: Some(addr),
-                ..
-            } => out.effects.push(Effect::ReportLsn {
-                lsn,
-                to: Some(addr),
-            }),
-            Role::Follower { .. } | Role::NoLeader => {}
+        self.wal_positions.record(self.node_id, lsn, now);
+        if let Role::Follower {
+            mgmt_addr: Some(to),
+            ..
+        } = view.role
+            && self.lsn.report_due(lsn, to, now)
+        {
+            out.effects.push(Effect::ReportLsn { lsn, to });
         }
     }
 }
@@ -798,30 +796,9 @@ impl Driver {
                 }
             }
             Effect::ReportLsn { lsn, to } => {
-                let reported = match to {
-                    None => {
-                        let command = ClusterCommand::UpdateLsn {
-                            node_id: self.reconciler.node_id,
-                            lsn_bytes: lsn,
-                            timestamp: 0,
-                        };
-                        match commit(command).await {
-                            Ok(Ok(_)) => true,
-                            Ok(Err(e)) => {
-                                error!(error = %e, lsn_bytes = lsn, "Failed to update LSN in Raft");
-                                false
-                            }
-                            Err(_) => {
-                                warn!(lsn_bytes = lsn, "LSN commit missed its deadline");
-                                false
-                            }
-                        }
-                    }
-                    Some(mgmt_addr) => self.report_lsn_to_leader(mgmt_addr, lsn).await,
-                };
-                if reported {
+                if self.report_lsn_to_leader(to, lsn).await {
                     let now = self.reconciler.lease.read().now();
-                    self.reconciler.lsn.reported(lsn, now);
+                    self.reconciler.lsn.reported(lsn, to, now);
                 }
             }
             Effect::Yield { target } => {
@@ -1002,6 +979,7 @@ mod tests {
                 awaits_write_authority_from: None,
             },
             disconnect_timeout,
+            Arc::default(),
         )
     }
 
@@ -1141,10 +1119,15 @@ mod tests {
         assert!(out.effects.contains(&Effect::CommitLineage(
             crate::governor::pg_control::MODEL_LINEAGE
         )));
+        // P3: its own position goes into its book, not into the log.
+        let now = node.lease.read().now();
+        assert_eq!(node.wal_positions.fresh(1, now), Some(0x0100_0000));
         assert!(
-            out.effects
+            !out.effects
                 .iter()
-                .any(|e| matches!(e, Effect::ReportLsn { to: None, .. }))
+                .any(|e| matches!(e, Effect::ReportLsn { .. })),
+            "{:?}",
+            out.effects
         );
     }
 
@@ -1171,29 +1154,35 @@ mod tests {
             out.effects,
             vec![Effect::ReportLsn {
                 lsn: 0x0100_0000,
-                to: Some(leader_mgmt)
+                to: leader_mgmt
             }]
         );
     }
 
     #[tokio::test]
-    async fn an_unchanged_lsn_reports_only_on_the_heartbeat() {
+    async fn an_unchanged_lsn_reports_only_on_the_heartbeat_or_to_a_new_leader() {
         let mut node = reconciler(Duration::from_secs(5));
         let start = node.lease.read().now();
+        let leader = SocketAddr::from(([10, 0, 0, 2], 9_091));
+        let next_leader = SocketAddr::from(([10, 0, 0, 3], 9_091));
         let mut cadence = LsnCadence::default();
         assert!(cadence.probe_due(start));
         assert!(
             !cadence.probe_due(start),
             "probed twice inside the interval"
         );
-        assert!(cadence.report_due(7, start));
-        cadence.reported(7, start);
-        assert!(!cadence.report_due(7, start + PROBE_INTERVAL));
+        assert!(cadence.report_due(7, leader, start));
+        cadence.reported(7, leader, start);
+        assert!(!cadence.report_due(7, leader, start + PROBE_INTERVAL));
         assert!(
-            cadence.report_due(8, start + PROBE_INTERVAL),
+            cadence.report_due(8, leader, start + PROBE_INTERVAL),
             "a moved LSN waits for nothing"
         );
-        assert!(cadence.report_due(7, start + LSN_HEARTBEAT));
+        assert!(
+            cadence.report_due(7, next_leader, start + PROBE_INTERVAL),
+            "a new leader's book has nothing for this node yet"
+        );
+        assert!(cadence.report_due(7, leader, start + LSN_HEARTBEAT));
         node.lsn = cadence;
     }
 

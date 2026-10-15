@@ -236,6 +236,7 @@ impl Governor {
         heartbeat_interval_ms: u64,
         lease: super::SharedLeaseState,
         tls_config: Option<&super::tls::RaftTlsConfig>,
+        local_wal: Arc<super::network::LocalWal>,
         cluster_id: &str,
         awaits_authority_from: Option<&str>,
     ) -> Result<Self> {
@@ -254,16 +255,14 @@ impl Governor {
         // entries at or below it, so the in-memory `ClusterState` must be
         // rebuilt here: verified snapshot as the base, then a replay of
         // applied log entries past it. Without this, a full-cluster restart
-        // would run its first election with empty `node_lsns` — the LSN
-        // safety gate inert in exactly the acked-write-loss scenario it
-        // exists to prevent.
+        // would forget the committed sync mode, lineage, cutover authority and
+        // upgrade record until new entries happened to re-commit them.
         let (mut restored, replay_from) = load_snapshot_state(&storage)?;
 
         // Layer config-derived node records over the snapshot base (operator
         // intent for addresses at boot), then replay — the same order the
         // original application observed: config nodes are registered before
-        // any replicated command applies, so replayed `UpdateLsn` entries
-        // find their nodes known.
+        // any replicated command applies.
         restored.apply(ClusterCommand::AddNode(NodeInfo {
             id: node_id,
             pg_addr,
@@ -292,12 +291,10 @@ impl Governor {
         let state_machine = StateMachineStore::new(state.clone(), storage.clone());
         let log_storage = LogStorageAdapter::new(storage.clone());
 
-        // Create network factory (with optional TLS)
+        // Create network factory (with optional TLS). Votes it sends carry
+        // this node's own WAL position, read live.
         let heartbeat = Duration::from_millis(heartbeat_interval_ms);
-        let network_factory = tls_config.map_or_else(
-            || NetworkFactory::new(node_id, peers.clone(), heartbeat),
-            |tls| NetworkFactory::with_tls(node_id, peers.clone(), heartbeat, tls),
-        );
+        let network_factory = NetworkFactory::new(peers.clone(), heartbeat, tls_config, local_wal);
 
         // Build the Raft node
         let raft =
@@ -1880,35 +1877,24 @@ pub struct NetworkFactory {
     rpc_client: RaftRpcClient,
     /// Configured heartbeat interval, the floor of [`unreachable_backoff`].
     heartbeat: Duration,
+    /// This node's own WAL, which every vote it sends carries.
+    local_wal: Arc<super::network::LocalWal>,
 }
 
 impl NetworkFactory {
-    /// Create a new network factory.
-    ///
-    /// Note: `node_id` is accepted for API compatibility but not currently used.
+    /// Create a network factory, with TLS when `tls_config` is given.
     #[must_use]
-    pub const fn new(_node_id: NodeId, peers: Vec<PeerConfig>, heartbeat: Duration) -> Self {
-        Self {
-            peers,
-            rpc_client: RaftRpcClient::new(),
-            heartbeat,
-        }
-    }
-
-    /// Create a new network factory with TLS enabled.
-    ///
-    /// Note: `node_id` is accepted for API compatibility but not currently used.
-    #[must_use]
-    pub fn with_tls(
-        _node_id: NodeId,
+    pub fn new(
         peers: Vec<PeerConfig>,
         heartbeat: Duration,
-        tls_config: &super::tls::RaftTlsConfig,
+        tls_config: Option<&super::tls::RaftTlsConfig>,
+        local_wal: Arc<super::network::LocalWal>,
     ) -> Self {
         Self {
             peers,
-            rpc_client: RaftRpcClient::with_tls(tls_config),
+            rpc_client: tls_config.map_or_else(RaftRpcClient::new, RaftRpcClient::with_tls),
             heartbeat,
+            local_wal,
         }
     }
 }
@@ -1935,6 +1921,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             rpc_client: self.rpc_client.clone(),
             conn: None,
             heartbeat: self.heartbeat,
+            local_wal: Arc::clone(&self.local_wal),
         })
     }
 }
@@ -1991,6 +1978,8 @@ pub struct NetworkConnection {
     conn: Option<super::network::PeerConnection>,
     /// Configured heartbeat interval, the floor of [`unreachable_backoff`].
     heartbeat: Duration,
+    /// This node's own WAL, for the votes this connection carries.
+    local_wal: Arc<super::network::LocalWal>,
 }
 
 impl RaftNetwork<TypeConfig> for NetworkConnection {
@@ -2064,9 +2053,9 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
     ) -> std::result::Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
     {
         let addr = self.target_addr.ok_or_else(no_target_addr)?;
-
+        let own_lsn = self.local_wal.read().await.position();
         self.rpc_client
-            .vote(&mut self.conn, addr, req)
+            .vote(&mut self.conn, addr, req, own_lsn)
             .await
             .map_err(|e| unreachable(&e))
     }
@@ -2297,9 +2286,7 @@ fn load_snapshot_state(storage: &RedbLogStorage) -> Result<(ClusterState, u64)> 
 ///
 /// Entries beyond `last_applied` are present in the log but not yet
 /// committed-and-applied; openraft delivers them through `apply` once
-/// committed, so they must not be replayed here. Replayed `UpdateLsn`
-/// entries get freshly-stamped timestamps (the state machine always assigns
-/// local commit time), which can only make the LSN gate stricter.
+/// committed, so they must not be replayed here.
 fn replay_applied_entries(
     storage: &RedbLogStorage,
     state: &mut ClusterState,
@@ -2429,6 +2416,23 @@ mod tests {
     use super::*;
     use crate::governor::state_machine::ClusterCommand;
 
+    /// A node with no server and no data directory behind its WAL reads.
+    fn no_local_wal() -> Arc<super::super::network::LocalWal> {
+        let supervisor = crate::supervisor::Supervisor::new(crate::supervisor::SupervisorConfig {
+            pg_bin_dir: std::path::PathBuf::from("/nonexistent"),
+            pg_data_dir: std::path::PathBuf::from("/nonexistent"),
+            pg_port: 1,
+            pg_user: "postgres".to_string(),
+            wal_level: crate::config::WalLevel::Replica,
+            node_id: 1,
+            pg_auth_mode: crate::config::PgAuthMode::Trust,
+            wal_archive_dir: None,
+        });
+        Arc::new(super::super::network::LocalWal::new(
+            supervisor.fence_session(),
+        ))
+    }
+
     /// A `NetworkConnection` aimed at a port nothing is listening on.
     async fn connection_to_a_closed_port() -> NetworkConnection {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2439,6 +2443,7 @@ mod tests {
             rpc_client: RaftRpcClient::new(),
             conn: None,
             heartbeat: Duration::from_millis(250),
+            local_wal: no_local_wal(),
         }
     }
 
@@ -2493,6 +2498,7 @@ mod tests {
             rpc_client: RaftRpcClient::new(),
             conn: None,
             heartbeat: Duration::from_millis(250),
+            local_wal: no_local_wal(),
         };
         let voted = conn
             .vote(
@@ -3055,16 +3061,12 @@ mod tests {
         }
     }
 
-    fn lsn_entry(index: u64, node_id: NodeId, lsn_bytes: u64) -> LogEntry {
+    fn add_node_entry(index: u64, node_id: NodeId) -> LogEntry {
         LogEntry {
             index,
             term: 1,
             leader_node_id: 1,
-            payload: LogEntryPayload::Normal(ClusterCommand::UpdateLsn {
-                node_id,
-                lsn_bytes,
-                timestamp: 0,
-            }),
+            payload: LogEntryPayload::Normal(ClusterCommand::AddNode(test_node_info(node_id))),
         }
     }
 
@@ -3109,23 +3111,18 @@ mod tests {
 
     /// After restart the state machine must be rebuilt from the snapshot plus
     /// a replay of `(snapshot, last_applied]` — openraft never re-delivers
-    /// entries at or below `last_applied`, so without the rebuild the first
-    /// election would run with empty `node_lsns` and the LSN gate inert.
+    /// entries at or below `last_applied`, so without the rebuild the node
+    /// would run on a state missing everything it had already applied.
     /// Entries beyond `last_applied` must NOT be replayed.
     #[test]
     fn restore_replays_snapshot_then_log_up_to_last_applied() {
         let dir = tempfile::tempdir().unwrap();
         let storage = RedbLogStorage::new(dir.path().join("raft.db")).unwrap();
 
-        // Snapshot at index 5: nodes 1 and 2 known, node 1 at LSN 1000.
+        // Snapshot at index 5: nodes 1 and 2 known.
         let mut snap_state = ClusterState::new();
         snap_state.apply(ClusterCommand::AddNode(test_node_info(1)));
         snap_state.apply(ClusterCommand::AddNode(test_node_info(2)));
-        snap_state.apply(ClusterCommand::UpdateLsn {
-            node_id: 1,
-            lsn_bytes: 1000,
-            timestamp: 0,
-        });
         let meta = SnapshotMeta {
             last_applied: LastAppliedState {
                 last_applied_term: Some(1),
@@ -3147,9 +3144,9 @@ mod tests {
         // from the state machine's point of view and must not replay.
         storage
             .append_entries(&[
-                lsn_entry(6, 2, 2000),
-                lsn_entry(7, 1, 3000),
-                lsn_entry(8, 1, 9999),
+                add_node_entry(6, 3),
+                add_node_entry(7, 4),
+                add_node_entry(8, 5),
             ])
             .unwrap();
         storage
@@ -3162,17 +3159,17 @@ mod tests {
 
         let (mut state, replay_from) = load_snapshot_state(&storage).unwrap();
         assert_eq!(replay_from, 6, "replay must start just past the snapshot");
-        assert_eq!(
-            state.node_lsns.get(&1).map(|&(lsn, _)| lsn),
-            Some(1000),
-            "snapshot base must carry its node_lsns"
-        );
+        let known = |state: &ClusterState| {
+            let mut ids: Vec<NodeId> = state.nodes.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(known(&state), [1, 2], "snapshot base must carry its nodes");
 
         replay_applied_entries(&storage, &mut state, replay_from).unwrap();
-        assert_eq!(state.node_lsns.get(&1).map(|&(lsn, _)| lsn), Some(3000));
-        assert_eq!(state.node_lsns.get(&2).map(|&(lsn, _)| lsn), Some(2000));
         assert_eq!(
-            state.max_cluster_lsn, 3000,
+            known(&state),
+            [1, 2, 3, 4],
             "entry 8 (beyond last_applied) must not be replayed"
         );
     }
@@ -3384,15 +3381,7 @@ mod tests {
         let storage = RedbLogStorage::new(dir.path().join("raft.db")).unwrap();
 
         storage
-            .append_entries(&[
-                LogEntry {
-                    index: 1,
-                    term: 1,
-                    leader_node_id: 1,
-                    payload: LogEntryPayload::Normal(ClusterCommand::AddNode(test_node_info(1))),
-                },
-                lsn_entry(2, 1, 4242),
-            ])
+            .append_entries(&[add_node_entry(1, 1), add_node_entry(2, 2)])
             .unwrap();
         storage
             .save_last_applied(&LastAppliedState {
@@ -3404,11 +3393,10 @@ mod tests {
 
         let (mut state, replay_from) = load_snapshot_state(&storage).unwrap();
         assert_eq!(replay_from, 0);
-        assert!(state.node_lsns.is_empty());
+        assert!(state.nodes.is_empty());
 
         replay_applied_entries(&storage, &mut state, replay_from).unwrap();
-        assert_eq!(state.node_lsns.get(&1).map(|&(lsn, _)| lsn), Some(4242));
-        assert_eq!(state.max_cluster_lsn, 4242);
+        assert_eq!(state.nodes.len(), 2);
     }
 
     /// A fresh node (no snapshot, nothing applied) restores to an empty
@@ -3422,7 +3410,6 @@ mod tests {
         assert_eq!(replay_from, 0);
         replay_applied_entries(&storage, &mut state, replay_from).unwrap();
         assert!(state.nodes.is_empty());
-        assert!(state.node_lsns.is_empty());
     }
 
     /// An arm and an abort, once the level admits them: together they move

@@ -12,7 +12,7 @@
 //! postcard is positional and untagged, so a wrong-shaped record does not
 //! announce itself — it decodes as a structurally valid value of the wrong
 //! meaning. This target drives every record type over arbitrary bytes and then
-//! puts the decoded `ClusterState` through the safety gates that read it.
+//! puts the decoded `ClusterState` through the policy reads that use it.
 //!
 //! Invariants checked:
 //!   - A decoder that returns `Ok` consumed a prefix that re-encodes no larger
@@ -26,24 +26,13 @@
 //!     again yields the identical encoding. An asymmetric `Serialize`/
 //!     `Deserialize` pair would break this, and for a positional format that
 //!     asymmetry is exactly what silently corrupts a `raft.db`.
-//!   - `serde(skip)` really keeps local projections out of a snapshot: no
-//!     byte string may make `ClusterState::leader_id` or `leader_addr` decode
-//!     to anything but `None`. This is a security property — the field docs
-//!     state that an installed snapshot must not be able to inject a leader
-//!     identity, which would be a split-brain primitive.
-//!   - `fresh_max_lsn()` re-derives from `node_lsns` and can never exceed the
-//!     largest LSN actually present there, whatever the attacker put in the
-//!     `max_cluster_lsn` field.
-//!   - The election and promotion LSN gates do not panic on a decoded state,
-//!     and agree with each other in the safe direction: promotion is
-//!     documented as the stricter sibling, so promotion-acceptable implies
-//!     election-acceptable.
+//!   - No snapshot loosens the vote: the WAL slack a voter allows is zero
+//!     unless the state commits async, whatever else the bytes say.
 //!
 //! Not asserted: that a decoded `ClusterState` is *semantically* coherent
-//! (nodes present for every LSN entry, voters disjoint from learners, and so
-//! on). Nothing enforces that on the install path today, so asserting it here
-//! would be asserting a property the code does not have. It is worth a look as
-//! a separate hardening question rather than a fuzz assertion.
+//! (voters disjoint from learners, and so on). Nothing enforces that on the
+//! install path today, so asserting it here would be asserting a property the
+//! code does not have.
 //!
 //! Run with: cargo fuzz run raft_record_decode
 #![no_main]
@@ -93,51 +82,19 @@ fuzz_target!(|data: &[u8]| {
 
     // The snapshot body a peer sends. `ClusterState` holds HashMap/HashSet
     // fields whose serialization order is not stable across instances, so the
-    // byte-level round-trip above does not apply; the security and
-    // re-derivation properties do.
+    // byte-level round-trip above does not apply; the policy reads do.
     let Ok(state) = postcard::from_bytes::<ClusterState>(data) else {
         return;
     };
 
-    assert!(
-        state.failover_started_at.is_none(),
-        "a snapshot injected failover_started_at = {:?}",
-        state.failover_started_at
-    );
-    // ClusterState local projections use serde(skip); an installed snapshot
-    // must not inject them.
-
-    let fresh = state.fresh_max_lsn();
-    let reported_max = state
-        .node_lsns
-        .values()
-        .map(|&(lsn, _)| lsn)
-        .max()
-        .unwrap_or(0);
-    assert!(
-        fresh <= reported_max,
-        "fresh_max_lsn {fresh} exceeds the largest reported LSN {reported_max}"
-    );
-
-    // Safety gates over adversarial state: must not panic, and promotion must
-    // be no more permissive than election.
-    let threshold = state.lsn_catchup_threshold_bytes();
-    assert!(threshold > 0, "LSN catch-up threshold must be positive");
-    // Bounded so a snapshot declaring thousands of nodes cannot make this a
-    // quadratic walk (each gate call is itself O(node_lsns)).
-    for candidate in state
-        .node_lsns
-        .keys()
-        .copied()
-        .chain(state.nodes.keys().copied())
-        .take(16)
-        .chain([0, u64::MAX])
-    {
-        let (election_ok, _) = state.is_lsn_acceptable_for_election(candidate);
-        let (promotion_ok, _) = state.is_lsn_acceptable_for_promotion(candidate);
-        assert!(
-            !promotion_ok || election_ok,
-            "promotion gate accepted node {candidate} that the election gate rejected"
-        );
+    // Whatever a snapshot says, the vote is exact unless async is committed,
+    // and only a positively committed async mode loosens it.
+    let vote = state.vote_lsn_threshold_bytes();
+    if state.sync_replication_active == Some(false) {
+        assert!(vote > 0, "a committed async fallback votes with no slack");
+    } else {
+        assert_eq!(vote, 0, "an unknown or sync mode loosened the vote");
     }
+    assert!(state.lsn_catchup_threshold_bytes() > 0);
+    let _ = state.follow_terms();
 });

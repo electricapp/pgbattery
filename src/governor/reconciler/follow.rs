@@ -13,7 +13,6 @@ use tracing::{error, info};
 use super::replication::{peer_voter_names, sync_standby_list};
 use crate::governor::SharedLeaseState;
 use crate::governor::fence::{TICK_SQL_BUDGET, log_termination};
-use crate::governor::parse_lsn;
 use crate::governor::pg_control::PgControl;
 use crate::governor::state_machine::{ClusterState, NodeId};
 
@@ -44,58 +43,12 @@ pub(crate) fn promotion_lease_holddown(
     (elapsed < lease).then_some(elapsed)
 }
 
-/// Whether this node holds enough WAL to be promoted. Fails closed.
-///
-/// Compares the *reportable* LSN (receive position on a standby) — the same
-/// definition every node reports into `node_lsns` — against
-/// `fresh_max_lsn()`, which re-derives rather than reading a stored maximum
-/// frozen through a leaderless window. A zero local and zero max is a fresh
-/// cluster, not broken tracking.
-async fn lsn_catchup_permits_promotion<P: PgControl>(
-    pg: &P,
-    cluster_state: &RwLock<ClusterState>,
-) -> bool {
-    let local = match pg.get_reportable_lsn().await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, "Could not read local LSN — refusing promotion (fail-closed)");
-            metrics::counter!("pgbattery_promotion_lsn_probe_failures").increment(1);
-            return false;
-        }
-    };
-    let Some(local_lsn) = parse_lsn(&local) else {
-        error!(local_lsn = %local, "Could not parse local LSN — refusing promotion (fail-closed)");
-        metrics::counter!("pgbattery_promotion_lsn_parse_failures").increment(1);
-        return false;
-    };
-    let (max_cluster_lsn, sync_active, threshold) = {
-        let state = cluster_state.read();
-        (
-            state.fresh_max_lsn(),
-            state.sync_replication_active,
-            state.lsn_catchup_threshold_bytes(),
-        )
-    };
-    if local_lsn + threshold < max_cluster_lsn {
-        error!(
-            local_lsn = %local,
-            max_cluster_lsn,
-            catchup_threshold = threshold,
-            ?sync_active,
-            "LSN too far behind cluster — refusing promotion"
-        );
-        metrics::counter!(
-            "pgbattery_promotion_refused_lsn_behind",
-            "sync_mode" => if sync_active == Some(false) { "async" } else { "sync" }
-        )
-        .increment(1);
-        return false;
-    }
-    true
-}
-
 /// Promote, if every gate allows; return whether `PostgreSQL` is primary
 /// after this pass (`None` when unprobeable). The promotion watchdog reads it.
+///
+/// Holding enough WAL is not checked here: the voters that elected this node
+/// each compared its position with their own (`network::vote_lsn_gate`), and
+/// nothing has written since.
 pub(super) async fn promote_local_postgres<P: PgControl>(
     pg: &mut P,
     cluster_state: &Arc<RwLock<ClusterState>>,
@@ -122,10 +75,6 @@ pub(super) async fn promote_local_postgres<P: PgControl>(
             return observed;
         }
     }
-    if !lsn_catchup_permits_promotion(&*pg, cluster_state).await {
-        return observed;
-    }
-
     // Winning the election does not prove the deposed leader's lease expired:
     // the election timeout is shorter than the lease. Hold until one lease
     // after the term advance; the next pass re-checks.

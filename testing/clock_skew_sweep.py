@@ -6,11 +6,9 @@ so it never landed near a boundary and never went backwards — the harder
 direction, since a timestamp recorded before the step reads as future-dated
 afterwards.
 
-Two wall-clock-sensitive paths should be immune: the promotion hold-down (now
-`Instant` with `checked_duration_since`), and the LSN staleness filter, which
-caps future-dated entries at age 0 rather than dropping them and weakening the
-election gate. `pgbattery_lsn_future_skew_total` is how that path reports it
-was reached.
+Nothing that decides write authority should read the wall clock: the
+promotion hold-down is `Instant` with `checked_duration_since`, and votes
+compare WAL positions read at vote time. This sweep is the evidence.
 
 Each step runs inside a live failover with `dual_writability_prober` attached
 as the L1 oracle. A step that lands outside the window raises rather than
@@ -63,7 +61,6 @@ class StepResult:
     offset_into_window_ms: float
     releases_holddown_early: bool
     holddown_engaged: bool | None
-    future_skew_delta: float | None
     verdict: str
 
     @property
@@ -181,17 +178,6 @@ def finish_prober(proc: subprocess.Popen[str]) -> None:
         raise SweepError(f"prober failed to run (rc={proc.returncode}):\n{out[-1_000:]}")
 
 
-def _future_skew_total() -> float:
-    """`pgbattery_lsn_future_skew_total` across the cluster — proof a backward step
-    reached the staleness filter. Summed, since the step lands on the election winner."""
-    total = 0.0
-    for node in fp.NODES:
-        value = fp.read_metric(node, "pgbattery_lsn_future_skew_total")
-        if value is not None:
-            total += value
-    return total
-
-
 def run_step(skew_ms: int, aim: fp.Aim, timings: fp.SystemTimings) -> StepResult:
     """One skew step, applied inside a live failover with the oracle attached."""
     await_healthy_cluster(RECOVERY_TIMEOUT_S)
@@ -200,7 +186,6 @@ def run_step(skew_ms: int, aim: fp.Aim, timings: fp.SystemTimings) -> StepResult
         raise SweepError("no leader to depose")
 
     label = f"skew{skew_ms:+d}ms-{aim.value}"
-    before = _future_skew_total()
     proc = start_prober(WINDOW_S, label)
     try:
         await_prober_running(proc)
@@ -225,7 +210,6 @@ def run_step(skew_ms: int, aim: fp.Aim, timings: fp.SystemTimings) -> StepResult
             offset_into_window_ms=0.0,
             releases_holddown_early=False,
             holddown_engaged=None,
-            future_skew_delta=None,
             verdict=f"FAIL: {exc}",
         )
     finally:
@@ -238,7 +222,6 @@ def run_step(skew_ms: int, aim: fp.Aim, timings: fp.SystemTimings) -> StepResult
         offset_into_window_ms=handle.offset_into_window_ms,
         releases_holddown_early=handle.releases_holddown_early,
         holddown_engaged=handle.holddown_engaged,
-        future_skew_delta=_future_skew_total() - before,
         verdict=verdict,
     )
 
@@ -284,7 +267,6 @@ def run(
     table.add_column("Into window", justify="right")
     table.add_column("Would release early")
     table.add_column("Hold-down engaged")
-    table.add_column("Future-skew entries", justify="right")
     table.add_column("L1")
     for r in results:
         table.add_row(
@@ -293,7 +275,6 @@ def run(
             f"{r.offset_into_window_ms:.0f} ms",
             "yes" if r.releases_holddown_early else "no",
             "-" if r.holddown_engaged is None else ("yes" if r.holddown_engaged else "no"),
-            "-" if r.future_skew_delta is None else f"{r.future_skew_delta:.0f}",
             "[green]held[/]" if r.ok else "[red]VIOLATED[/]",
         )
     console.print(table)

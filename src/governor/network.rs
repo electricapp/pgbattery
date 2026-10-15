@@ -307,11 +307,10 @@ impl TryFrom<u8> for RpcType {
 pub struct RaftRpcServer {
     listener: TcpListener,
     raft: Arc<openraft::Raft<TypeConfig>>,
-    /// Cluster state for LSN-aware vote checking. The state machine
-    /// itself decides which catch-up threshold applies based on the
-    /// replicated `sync_replication_active` flag — the vote handler
-    /// just hands it the candidate id.
+    /// Committed state, whose sync mode sets the vote gate's threshold.
     cluster_state: Arc<RwLock<ClusterState>>,
+    /// This node's own WAL position, read live for each vote request.
+    local_wal: Arc<LocalWal>,
     /// Optional TLS configuration for secure transport
     tls_config: Option<RaftTlsConfig>,
     shutdown_rx: watch::Receiver<bool>,
@@ -335,6 +334,7 @@ impl RaftRpcServer {
         addr: SocketAddr,
         raft: Arc<openraft::Raft<TypeConfig>>,
         cluster_state: Arc<RwLock<ClusterState>>,
+        local_wal: Arc<LocalWal>,
         tls_config: Option<RaftTlsConfig>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Self> {
@@ -359,6 +359,7 @@ impl RaftRpcServer {
             listener,
             raft,
             cluster_state,
+            local_wal,
             tls_config,
             shutdown_rx,
         })
@@ -402,6 +403,7 @@ impl RaftRpcServer {
                             let raft = self.raft.clone();
                             let cluster_state = self.cluster_state.clone();
                             let tls_config = self.tls_config.clone();
+                            let local_wal = Arc::clone(&self.local_wal);
 
                             tokio::spawn(async move {
                                 // Held for the connection's lifetime, freeing the
@@ -419,7 +421,7 @@ impl RaftRpcServer {
                                     .await
                                     {
                                         Ok(Ok(tls_stream)) => {
-                                            handle_connection_generic(tls_stream, peer_addr, raft, cluster_state).await
+                                            handle_connection_generic(tls_stream, peer_addr, raft, cluster_state, local_wal).await
                                         }
                                         Ok(Err(e)) => {
                                             tracing::warn!(%peer_addr, error = %e, "TLS handshake failed");
@@ -432,7 +434,7 @@ impl RaftRpcServer {
                                     }
                                 } else {
                                     // Plaintext connection
-                                    handle_connection_generic(stream, peer_addr, raft, cluster_state).await
+                                    handle_connection_generic(stream, peer_addr, raft, cluster_state, local_wal).await
                                 };
 
                                 if let Err(e) = result {
@@ -464,6 +466,7 @@ async fn handle_connection_generic<S>(
     peer_addr: SocketAddr,
     raft: Arc<openraft::Raft<TypeConfig>>,
     cluster_state: Arc<RwLock<ClusterState>>,
+    local_wal: Arc<LocalWal>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -556,6 +559,7 @@ where
             peer_addr,
             &raft,
             &cluster_state,
+            &local_wal,
             &mut response_buf,
         )
         .await?;
@@ -569,8 +573,117 @@ where
     }
 }
 
+/// A vote as it travels: openraft's request plus the candidate's WAL position.
+#[derive(Debug, Serialize, Deserialize)]
+struct VoteFrame {
+    request: VoteRequest<NodeId>,
+    /// The candidate's WAL position when it asked ([`LocalWal::read`]);
+    /// `None` when it could not say.
+    candidate_lsn: Option<u64>,
+}
+
+/// What a node knows of its own WAL when a vote is sent or answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnWal {
+    /// Its running server's reportable position, or where a cleanly stopped
+    /// data directory's WAL ends.
+    At(u64),
+    /// It has no data directory, so it holds nothing an election could lose.
+    Empty,
+    /// Its `PostgreSQL` did not answer and did not stop cleanly.
+    Unknown,
+}
+
+/// Raft's up-to-date rule applied to `PostgreSQL`: grant only a candidate that
+/// holds this voter's WAL, within `threshold`.
+///
+/// Under sync replication the sync set intersects every majority, so some
+/// voter in any electing majority holds every acknowledged write, and the
+/// winner is within the threshold of it. Both positions are read at vote time,
+/// so a leader's last report frozen at its death plays no part. A voter that
+/// cannot read its own position refuses: it may be the one holding the writes.
+pub(crate) const fn vote_lsn_gate(
+    candidate: Option<u64>,
+    voter: OwnWal,
+    threshold: u64,
+) -> std::result::Result<(), &'static str> {
+    match (voter, candidate) {
+        (OwnWal::Empty, _) => Ok(()),
+        (OwnWal::Unknown, _) => Err("this voter's own WAL position is unreadable"),
+        (OwnWal::At(_), None) => Err("the candidate sent no WAL position"),
+        (OwnWal::At(own), Some(lsn)) => {
+            if lsn.saturating_add(threshold) >= own {
+                Ok(())
+            } else {
+                Err("the candidate is behind this voter's WAL beyond the threshold")
+            }
+        }
+    }
+}
+
+impl OwnWal {
+    /// The position a vote this node sends carries.
+    #[must_use]
+    pub const fn position(self) -> Option<u64> {
+        match self {
+            Self::At(lsn) => Some(lsn),
+            Self::Empty | Self::Unknown => None,
+        }
+    }
+}
+
+/// This node's own WAL, read live when it asks for a vote and when it answers
+/// one: a session of its own, never the supervisor lock a demote holds for
+/// minutes.
+#[derive(Debug)]
+pub struct LocalWal {
+    session: crate::supervisor::FenceSession,
+}
+
+impl LocalWal {
+    /// How long a vote waits on this node's running `PostgreSQL`.
+    const SQL_BUDGET: Duration = Duration::from_millis(500);
+    /// How long a vote waits for this node's WAL position at all.
+    const BUDGET: Duration = Duration::from_secs(1);
+
+    #[must_use]
+    pub const fn new(session: crate::supervisor::FenceSession) -> Self {
+        Self { session }
+    }
+
+    /// This node's reportable WAL position, or why there is none.
+    ///
+    /// A server that does not answer may be stopped, and a cleanly stopped
+    /// data directory says where its WAL ends: a Track B freeze stops every
+    /// standby, and without that the cluster could not elect the leader that
+    /// moves the record on.
+    pub async fn read(&self) -> OwnWal {
+        let read = async {
+            if let Ok(Ok(text)) =
+                tokio::time::timeout(Self::SQL_BUDGET, self.session.reportable_lsn()).await
+            {
+                return super::parse_lsn(&text).map_or(OwnWal::Unknown, OwnWal::At);
+            }
+            if !self.session.has_data_directory() {
+                return OwnWal::Empty;
+            }
+            match self.session.stopped_wal_end().await {
+                Ok(Some(lsn)) => OwnWal::At(lsn),
+                Ok(None) | Err(_) => OwnWal::Unknown,
+            }
+        };
+        tokio::time::timeout(Self::BUDGET, read)
+            .await
+            .unwrap_or(OwnWal::Unknown)
+    }
+}
+
 /// Dispatch a single decoded RPC request to the local Raft instance,
 /// framing the response (echoing `corr_id`) into `response_buf`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the frame, the peer, and the three handles a request reads"
+)]
 async fn process_request(
     rpc_type: RpcType,
     body: &[u8],
@@ -578,6 +691,7 @@ async fn process_request(
     peer_addr: SocketAddr,
     raft: &openraft::Raft<TypeConfig>,
     cluster_state: &RwLock<ClusterState>,
+    local_wal: &LocalWal,
     response_buf: &mut BytesMut,
 ) -> Result<()> {
     match rpc_type {
@@ -591,38 +705,32 @@ async fn process_request(
             append_frame_serialize(response_buf, RpcType::AppendEntriesResponse, corr_id, &resp)
         }
         RpcType::Vote => {
-            let req: VoteRequest<NodeId> = postcard::from_bytes(body)?;
+            let VoteFrame {
+                request: req,
+                candidate_lsn,
+            } = postcard::from_bytes(body)?;
             let candidate_id = req.vote.leader_id().node_id;
 
-            // LSN safety check: reject candidates significantly behind in
-            // PostgreSQL WAL position. The state machine selects the
-            // threshold from the replicated `sync_replication_active`
-            // flag — sync mode uses one WAL block, async mode uses the
-            // 16 MB RPO bound. Small or unknown gaps still forward to
-            // Raft.
-            let (lsn_acceptable, reason) = {
-                let state = cluster_state.read();
-                state.is_lsn_acceptable_for_election(candidate_id)
-            };
+            let own = local_wal.read().await;
+            let threshold = cluster_state.read().vote_lsn_threshold_bytes();
+            let gate = vote_lsn_gate(candidate_lsn, own, threshold);
 
-            if lsn_acceptable {
-                tracing::trace!(
-                    %peer_addr,
-                    candidate_id = candidate_id,
-                    reason = reason,
-                    "Vote request LSN check passed"
-                );
+            if gate.is_ok() {
+                tracing::trace!(%peer_addr, candidate_id, ?candidate_lsn, ?own, "Vote request LSN check passed");
                 let resp = raft
                     .vote(req)
                     .await
                     .map_err(|e| Error::Raft(e.to_string()))?;
                 append_frame_serialize(response_buf, RpcType::VoteResponse, corr_id, &resp)
             } else {
-                tracing::error!(
-                    candidate_id = candidate_id,
+                tracing::warn!(
+                    candidate_id,
                     %peer_addr,
-                    reason = reason,
-                    "LSN check FAILED - rejecting vote to prevent data loss"
+                    ?candidate_lsn,
+                    ?own,
+                    threshold,
+                    reason = gate.err().unwrap_or_default(),
+                    "Rejecting a candidate behind this voter's WAL"
                 );
                 metrics::counter!("pgbattery_votes_lsn_rejected").increment(1);
                 // Return a proper VoteResponse{vote_granted=false} instead of
@@ -955,8 +1063,13 @@ impl RaftRpcClient {
         conn: &mut Option<PeerConnection>,
         addr: SocketAddr,
         req: VoteRequest<NodeId>,
+        candidate_lsn: Option<u64>,
     ) -> Result<VoteResponse<NodeId>> {
-        let response = self.request(conn, addr, RpcType::Vote, &req).await?;
+        let frame = VoteFrame {
+            request: req,
+            candidate_lsn,
+        };
+        let response = self.request(conn, addr, RpcType::Vote, &frame).await?;
         let resp: VoteResponse<NodeId> = postcard::from_bytes(&response)?;
         Ok(resp)
     }
@@ -1093,6 +1206,89 @@ impl Default for RaftRpcClient {
 )]
 mod tests {
     use super::*;
+
+    /// H15: the leader died mid bulk-load having written to 10 MB; the sync
+    /// standby holds 9 MB, the other 8 MB. Live positions elect the sync
+    /// standby at once, and never the one missing its WAL.
+    #[test]
+    fn the_standby_holding_the_most_wal_wins_once_the_leader_is_gone() {
+        let sync_standby = OwnWal::At(9_000_000);
+        let lagging = OwnWal::At(8_000_000);
+        assert_eq!(vote_lsn_gate(Some(9_000_000), lagging, 0), Ok(()));
+        assert!(vote_lsn_gate(Some(8_000_000), sync_standby, 0).is_err());
+    }
+
+    #[test]
+    fn under_sync_a_candidate_one_byte_behind_is_refused() {
+        // That byte may be an acknowledged commit only this voter holds.
+        assert!(vote_lsn_gate(Some(99), OwnWal::At(100), 0).is_err());
+        assert_eq!(vote_lsn_gate(Some(100), OwnWal::At(100), 0), Ok(()));
+    }
+
+    #[test]
+    fn a_committed_async_fallback_allows_its_rpo_bound() {
+        assert_eq!(
+            vote_lsn_gate(Some(0), OwnWal::At(1_000), 16_000_000),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_voter_refuses_and_an_empty_one_grants() {
+        // An unreadable voter may hold the writes; an empty one holds nothing.
+        assert!(vote_lsn_gate(Some(u64::MAX), OwnWal::Unknown, 0).is_err());
+        assert_eq!(vote_lsn_gate(None, OwnWal::Empty, 0), Ok(()));
+    }
+
+    #[test]
+    fn a_candidate_with_no_position_is_refused_by_a_voter_with_data() {
+        assert!(vote_lsn_gate(None, OwnWal::At(1), 16_000_000).is_err());
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn threshold() -> impl Strategy<Value = u64> {
+            prop_oneof![
+                Just(0),
+                Just(crate::config::constants::LSN_CATCHUP_THRESHOLD_BYTES_ASYNC)
+            ]
+        }
+
+        proptest! {
+            /// More WAL never loses a vote, and a candidate holding exactly
+            /// the voter's WAL always wins it: whoever holds the most WAL in
+            /// a majority can be elected by it, so the gate cannot livelock.
+            #[test]
+            fn more_wal_never_loses_a_vote(
+                voter in any::<u64>(),
+                lower in any::<u64>(),
+                more in any::<u64>(),
+                threshold in threshold(),
+            ) {
+                let own = OwnWal::At(voter);
+                let higher = lower.saturating_add(more);
+                prop_assert!(
+                    vote_lsn_gate(Some(lower), own, threshold).is_err()
+                        || vote_lsn_gate(Some(higher), own, threshold).is_ok()
+                );
+                prop_assert!(vote_lsn_gate(Some(voter), own, threshold).is_ok());
+            }
+
+            /// The boundary is inclusive: exactly `threshold` behind wins, one
+            /// byte further loses.
+            #[test]
+            fn the_threshold_boundary_is_inclusive(
+                voter in 20_000_000u64..u64::MAX,
+                threshold in threshold(),
+            ) {
+                let own = OwnWal::At(voter);
+                prop_assert!(vote_lsn_gate(Some(voter - threshold), own, threshold).is_ok());
+                prop_assert!(vote_lsn_gate(Some(voter - threshold - 1), own, threshold).is_err());
+            }
+        }
+    }
 
     #[test]
     fn test_rpc_type_conversion() {

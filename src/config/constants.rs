@@ -193,11 +193,10 @@ pub const LSN_CATCHUP_THRESHOLD_BYTES_SYNC: u64 = 8_192;
 ///
 /// 16 MB. With no sync replica, the cluster has a published RPO equal to
 /// the maximum replication lag we'd accept (`MAX_REPLICATION_LAG_BYTES`).
-/// Catching up to within 16 MB of `max_cluster_lsn` is the boundary at
-/// which we consider a replica "fresh enough" to win an election under a
-/// fully-async durability contract. Tighter here would deadlock async
-/// clusters under transient lag; looser would silently extend the
-/// published RPO.
+/// Within 16 MB of a voter's WAL is the boundary at which a replica is
+/// "fresh enough" to win its vote under a fully-async durability contract.
+/// Tighter here would deadlock async clusters under transient lag; looser
+/// would silently extend the published RPO.
 pub const LSN_CATCHUP_THRESHOLD_BYTES_ASYNC: u64 = 16_000_000;
 
 /// Pick the catch-up threshold matching the local node's current sync
@@ -215,11 +214,6 @@ pub const fn lsn_catchup_threshold_for(sync_active: bool) -> u64 {
         LSN_CATCHUP_THRESHOLD_BYTES_ASYNC
     }
 }
-
-/// LSN staleness threshold in seconds.
-/// LSN entries older than this are excluded from `max_cluster_lsn` calculation,
-/// preventing dead or partitioned nodes from blocking leader elections.
-pub const LSN_STALENESS_THRESHOLD_SECS: u64 = 30;
 
 /// Metrics sync interval in milliseconds.
 /// Batches atomic counter updates to Prometheus gauges.

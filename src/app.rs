@@ -19,12 +19,13 @@ use crate::config::Config;
 use crate::config::constants;
 use crate::gateway::Gateway;
 use crate::governor::Governor;
-use crate::governor::network::RaftRpcServer;
+use crate::governor::network::{LocalWal, RaftRpcServer};
 use crate::governor::raft::FenceState;
 use crate::governor::reconciler;
 use crate::governor::state_machine::NodeId;
 use crate::governor::storage::RedbLogStorage;
 use crate::governor::tls::RaftTlsConfig;
+use crate::governor::wal_positions::SharedWalPositions;
 use crate::observability::management_api::{
     LeaderResponse, ManagementApiState, start_management_api,
 };
@@ -110,6 +111,7 @@ struct DataNodeSpawnInputs {
     shutdown_rx: watch::Receiver<bool>,
     lease_state: crate::governor::SharedLeaseState,
     raft_tls_config: Option<RaftTlsConfig>,
+    local_wal: Arc<LocalWal>,
 }
 
 impl std::fmt::Debug for DataNodeSpawnInputs {
@@ -182,6 +184,9 @@ impl App {
         let mut supervisor = Supervisor::new(self.config.supervisor_config());
         self.start_supervisor_for_mode(&mut supervisor, bootstrap)
             .await?;
+        // Votes sent and answered read this node's WAL on a session of their
+        // own, never behind the supervisor lock.
+        let local_wal = Arc::new(LocalWal::new(supervisor.fence_session()));
 
         let raft_tls_config = self.setup_raft_tls()?;
         let lease_state = Self::create_lease_state();
@@ -194,6 +199,7 @@ impl App {
                 shutdown_rx.clone(),
                 lease_state.clone(),
                 raft_tls_config.as_ref(),
+                Arc::clone(&local_wal),
             )
             .await?;
         self.initialize_membership(&storage, &governor, bootstrap)
@@ -218,6 +224,7 @@ impl App {
                 shutdown_rx: shutdown_rx.clone(),
                 lease_state,
                 raft_tls_config,
+                local_wal,
             })
             .await?;
 
@@ -480,6 +487,10 @@ impl App {
         lease_state
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "hands the governor every channel and handle it owns, at its one call site"
+    )]
     async fn create_governor(
         &self,
         storage: RedbLogStorage,
@@ -488,6 +499,7 @@ impl App {
         shutdown_rx: watch::Receiver<bool>,
         lease_state: crate::governor::SharedLeaseState,
         raft_tls_config: Option<&RaftTlsConfig>,
+        local_wal: Arc<LocalWal>,
     ) -> Result<Governor> {
         Governor::new_with_tls(
             self.config.node_id,
@@ -504,6 +516,7 @@ impl App {
             self.config.heartbeat_interval_ms,
             lease_state,
             raft_tls_config,
+            local_wal,
             &self.config.cluster_id,
             self.config.awaits_write_authority_from.as_deref(),
         )
@@ -605,11 +618,13 @@ impl App {
             shutdown_rx,
             lease_state,
             raft_tls_config,
+            local_wal,
         } = input;
 
         // Cloned before the gateway takes ownership of these receivers.
         let observer_leader_rx = leader_rx.clone();
         let observer_fence_rx = fence_rx.clone();
+        let wal_positions: SharedWalPositions = Arc::default();
         let reconciler = self.build_reconciler(
             &raft,
             &cluster_state,
@@ -617,6 +632,7 @@ impl App {
             &lease_state,
             (&leader_rx, &fence_rx),
             (&shutdown_tx, &shutdown_rx),
+            Arc::clone(&wal_positions),
         )?;
         // Its own session, taken once: the fence never waits on the
         // supervisor lock after this.
@@ -626,6 +642,7 @@ impl App {
             self.config.raft_addr,
             raft.clone(),
             cluster_state.clone(),
+            local_wal,
             raft_tls_config,
             shutdown_rx.clone(),
         )
@@ -644,6 +661,7 @@ impl App {
             Arc::clone(&debug_events),
             shutdown_tx.clone(),
             fence_tx,
+            wal_positions,
         );
         let management_addr = self.config.get_mgmt_addr();
 
@@ -680,7 +698,8 @@ impl App {
     /// a tokenless client whose every report 401'd; it is refused here.
     #[allow(
         clippy::type_complexity,
-        reason = "paired channel ends, named at the one call site"
+        clippy::too_many_arguments,
+        reason = "paired channel ends and shared handles, named at the one call site"
     )]
     fn build_reconciler(
         &self,
@@ -693,6 +712,7 @@ impl App {
             &watch::Receiver<FenceState>,
         ),
         (shutdown_tx, shutdown_rx): (&watch::Sender<bool>, &watch::Receiver<bool>),
+        wal_positions: SharedWalPositions,
     ) -> Result<reconciler::Driver> {
         let token = self
             .config
@@ -722,6 +742,7 @@ impl App {
                         .map(Arc::from),
                 },
                 Duration::from_millis(self.config.replica_disconnect_timeout_ms),
+                wal_positions,
             ),
             postgres: Arc::clone(postgres),
             raft: Arc::clone(raft),
@@ -865,9 +886,11 @@ impl App {
         debug_events: Arc<crate::observability::debug_events::DebugEventBuffer>,
         shutdown_tx: watch::Sender<bool>,
         fence_tx: watch::Sender<FenceState>,
+        wal_positions: SharedWalPositions,
     ) -> Arc<ManagementApiState> {
         Arc::new(ManagementApiState {
             node_id: self.config.node_id,
+            wal_positions,
             raft: raft.clone(),
             cluster_state: cluster_state.clone(),
             lease: lease.clone(),

@@ -25,7 +25,6 @@ def timings(*, lease_duration_ms: int = 2_000) -> fp.SystemTimings:
         heartbeat_interval_ms=250,
         quorum_timeout_ms=1_000,
         metrics_watchdog_timeout_ms=1_500,
-        lsn_staleness_threshold_ms=30_000,
         leadership_transfer_lease_safety_ms=500,
         slot_ensure_interval_ms=30_000,
         replica_check_interval_ms=1_000,
@@ -93,7 +92,6 @@ class StepResultTests(unittest.TestCase):
                 offset_into_window_ms=10.0,
                 releases_holddown_early=False,
                 holddown_engaged=True,
-                future_skew_delta=3.0,
                 verdict=verdict,
             )
 

@@ -5,7 +5,9 @@
 //! without depending on a structured serialization format.
 //!
 //! Invariants checked after each command sequence:
-//!   - `max_cluster_lsn` is 0 when `node_lsns` is empty
+//!   - The retired WAL-position fields are never written: an old `UpdateLsn`
+//!     decodes and changes nothing.
+//!   - The vote threshold is zero unless async is committed.
 //!
 //! Run with: cargo fuzz run cluster_commands
 #![no_main]
@@ -80,7 +82,15 @@ fuzz_target!(|data: &[u8]| {
     // production). Live leadership is `RaftMetrics::current_leader`, not
     // `NodeRole`. Do not assert "at most one role=Leader".
 
-    if state.node_lsns.is_empty() {
-        assert_eq!(state.max_cluster_lsn, 0);
+    assert!(
+        state.node_lsns.is_empty(),
+        "a retired LSN report was recorded"
+    );
+    assert_eq!(
+        state.max_cluster_lsn, 0,
+        "a retired LSN maximum was recorded"
+    );
+    if state.sync_replication_active != Some(false) {
+        assert_eq!(state.vote_lsn_threshold_bytes(), 0);
     }
 });

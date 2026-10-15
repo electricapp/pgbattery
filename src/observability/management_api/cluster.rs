@@ -644,10 +644,7 @@ fn validate_promote_membership(
         ));
     }
 
-    let (lsn_ok, lsn_reason) = state
-        .cluster_state
-        .read()
-        .is_lsn_acceptable_for_promotion(node_id);
+    let (lsn_ok, lsn_reason) = wal_caught_up(state, node_id);
     if !lsn_ok {
         warn!(
             node_id = node_id,
@@ -921,14 +918,13 @@ async fn drop_replication_slot_for_removed(state: &Arc<ManagementApiState>, node
     }
 }
 
-/// Drop a removed node's replicated record: its `NodeInfo` and its LSN.
+/// Drop a removed node's replicated record: its `NodeInfo`, its voter intent
+/// and any upgrade's wait for its rejoin.
 ///
 /// Changing membership takes the node out of the voter set and nothing else.
 /// `ClusterState` keeps its own map, so without this the node is served by
-/// `/api/v1/cluster/nodes` forever — and, worse, its last LSN stays in
-/// `node_lsns` feeding `max_cluster_lsn`, which is the bar every candidate is
-/// measured against. A node removed while ahead would raise that bar
-/// permanently against the nodes still in the cluster.
+/// `/api/v1/cluster/nodes` forever, and the leader keeps promoting it from its
+/// voter intent.
 ///
 /// Best-effort and logged: the membership change has already committed by the
 /// time this runs, so failing here must not turn a completed removal into an
@@ -1069,6 +1065,15 @@ pub(super) async fn remove_node(
             )
         }
     }
+}
+
+/// Whether `node`'s last reported WAL position is fresh and within the
+/// committed sync mode's threshold of every fresh position this leader holds.
+/// Advisory: the voters' live check decides any election that follows.
+fn wal_caught_up(state: &ManagementApiState, node: NodeId) -> (bool, &'static str) {
+    let threshold = state.cluster_state.read().lsn_catchup_threshold_bytes();
+    let now = state.lease.read().now();
+    state.wal_positions.caught_up(node, threshold, now)
 }
 
 /// Why this node could not win an election right now, or `None` if it can.
@@ -1369,10 +1374,7 @@ pub(super) async fn transfer_leadership(
     // Raft-log catch-up doesn't imply PG WAL replay. Gate on the target's PG
     // LSN too (fail-closed) so we can't promote a data-behind standby.
     {
-        let (lsn_ok, lsn_reason) = state
-            .cluster_state
-            .read()
-            .is_lsn_acceptable_for_promotion(target_node_id);
+        let (lsn_ok, lsn_reason) = wal_caught_up(&state, target_node_id);
         if !lsn_ok {
             warn!(
                 target_node_id,

@@ -14,7 +14,6 @@ use axum::{
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use tracing::error;
 
 use crate::config::constants::SYNC_LAG_THRESHOLD_BYTES;
 
@@ -42,13 +41,6 @@ pub struct ReportLsnRequest {
 pub struct ReportLsnResponse {
     pub success: bool,
     pub message: String,
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 /// Read the leader's current WAL **write** position as a parsed LSN, used to
@@ -81,74 +73,94 @@ async fn leader_current_write_lsn(state: &ManagementApiState) -> Option<u64> {
     crate::governor::parse_lsn(&lsn_str)
 }
 
-/// Get replication lag for a specific node (used for health-based promotion).
+/// Replication lag for a node, from the leader's book of WAL positions.
 ///
-/// Leader id from `RaftMetrics::current_leader` per `docs/STATE_MACHINE.md`.
+/// Only the leader hears every position, so any other node forwards the
+/// question to it. Fails closed: `is_synced` is true only when both the
+/// leader's and the node's positions are fresh (a join readiness gate and the
+/// Track A roll consume it).
 pub(super) async fn get_node_lag(
     State(state): State<Arc<ManagementApiState>>,
     Path(node_id): Path<u64>,
-) -> impl IntoResponse {
-    let leader_id = {
-        let metrics = state.raft.metrics();
-        let m = metrics.borrow();
-        let v = m.current_leader;
-        drop(m);
-        v
-    };
-
-    let (known_leader_lsn, max_cluster_lsn, node_lsn) = {
-        let cluster_state = state.cluster_state.read();
-        let known_leader_lsn =
-            leader_id.and_then(|id| cluster_state.node_lsns.get(&id).map(|(lsn, _)| *lsn));
-        let node_lsn = cluster_state
-            .node_lsns
-            .get(&node_id)
-            .map_or(0, |(lsn, _)| *lsn);
-        (known_leader_lsn, cluster_state.max_cluster_lsn, node_lsn)
-    };
-
-    // Without the leader's own reported LSN, lag against `max_cluster_lsn` is a
-    // historical max that may equal this node's own stale value — computing
-    // is_synced from it can report a false "synced" for a node that is actually
-    // behind. Fail closed: report the lag for display but never is_synced=true
-    // when the leader position is unknown (a join readiness gate consumes this).
-    let (lag_bytes, is_synced) = known_leader_lsn.map_or_else(
-        || {
-            // The leader hasn't durably reported its own LSN. is_synced is
-            // forced false (a join-readiness gate consumes this), which silently
-            // blocks auto-promotion of every new node — surface it so the root
-            // cause (leader LSN-report failing) is visible, not a mystery.
-            metrics::counter!("pgbattery_node_lag_leader_lsn_unknown").increment(1);
-            (max_cluster_lsn.saturating_sub(node_lsn), false)
-        },
-        |leader_lsn| {
-            let lag = leader_lsn.saturating_sub(node_lsn);
+) -> axum::response::Response {
+    let leader_id = state.raft.metrics().borrow().current_leader;
+    if leader_id != Some(state.node_id) {
+        return forward_lag_to_leader(&state, leader_id, node_id).await;
+    }
+    let now = state.lease.read().now();
+    let leader_lsn = state.wal_positions.fresh(state.node_id, now);
+    let node_lsn = state.wal_positions.fresh(node_id, now);
+    let (lag_bytes, is_synced) = match (leader_lsn, node_lsn) {
+        (Some(leader), Some(node)) => {
+            let lag = leader.saturating_sub(node);
             (lag, lag < SYNC_LAG_THRESHOLD_BYTES)
-        },
-    );
-    let leader_lsn = known_leader_lsn.unwrap_or(max_cluster_lsn);
-
+        }
+        (Some(leader), None) => (leader, false),
+        (None, _) => {
+            metrics::counter!("pgbattery_node_lag_leader_lsn_unknown").increment(1);
+            (0, false)
+        }
+    };
     (
         StatusCode::OK,
         Json(LagResponse {
             node_id,
             lag_bytes,
-            leader_lsn,
-            node_lsn,
+            leader_lsn: leader_lsn.unwrap_or(0),
+            node_lsn: node_lsn.unwrap_or(0),
             is_synced,
         }),
     )
+        .into_response()
 }
 
-/// Report LSN from a follower node.
-/// Followers call this endpoint to report their LSN to the leader,
-/// who then commits it to Raft.
+async fn forward_lag_to_leader(
+    state: &ManagementApiState,
+    leader_id: Option<u64>,
+    node_id: u64,
+) -> axum::response::Response {
+    let leader_mgmt = leader_id.and_then(|id| {
+        state
+            .cluster_state
+            .read()
+            .nodes
+            .get(&id)
+            .map(|n| n.mgmt_addr)
+    });
+    let Some(addr) = leader_mgmt else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no leader to ask for replication lag",
+        )
+            .into_response();
+    };
+    let url = format!("http://{addr}/api/v1/cluster/node/{node_id}/lag");
+    let answer = async {
+        reqwest::Client::new()
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<LagResponse>()
+            .await
+    };
+    match answer.await {
+        Ok(lag) => (StatusCode::OK, Json(lag)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("asking the leader at {addr}: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Report LSN from a follower node: the leader records it in its book of WAL
+/// positions (soft state, never replicated).
 pub(super) async fn report_lsn(
     State(state): State<Arc<ManagementApiState>>,
     Json(req): Json<ReportLsnRequest>,
 ) -> impl IntoResponse {
-    use crate::governor::state_machine::ClusterCommand;
-
     // Check if we're the leader. `current_leader` is `Copy`; no need to
     // clone the full `RaftMetrics` snapshot on every report.
     let current_leader = state.raft.metrics().borrow().current_leader;
@@ -175,10 +187,9 @@ pub(super) async fn report_lsn(
     }
 
     // A follower physically cannot hold WAL the leader has not written, so its
-    // reported LSN must not exceed the leader's current write position. Reject
-    // an over-report before it reaches replicated state: a bogus high value
-    // (buggy node, bit-flip, or a token-holder) would inflate `max_cluster_lsn`
-    // and reject election candidates as "too far behind" — a failover wedge.
+    // reported LSN must not exceed the leader's current write position. A
+    // bogus high value (buggy node, bit-flip, or a token-holder) would make
+    // every transfer target and yield candidate look "too far behind".
     match leader_current_write_lsn(&state).await {
         Some(leader_write_lsn) if req.lsn_bytes > leader_write_lsn => {
             tracing::warn!(
@@ -199,65 +210,19 @@ pub(super) async fn report_lsn(
                 }),
             );
         }
-        Some(_) => {}
-        None => {
-            // The exact bound is unknowable (leader PG slow/contended, or still
-            // in recovery right after our own election). Don't skip the check
-            // entirely — a bit-flipped or buggy report could otherwise inflate
-            // `max_cluster_lsn` to an astronomical value and wedge every future
-            // election until it ages out. Fall back to rejecting values
-            // implausibly far above the cluster's known fresh max; a legit
-            // report can never be gigabytes ahead of every other node.
-            const MAX_UNVERIFIED_LSN_ADVANCE_BYTES: u64 = 4_294_967_296; // 4 GiB
-            let fresh_max = state.cluster_state.read().fresh_max_lsn();
-            if req.lsn_bytes > fresh_max.saturating_add(MAX_UNVERIFIED_LSN_ADVANCE_BYTES) {
-                tracing::warn!(
-                    node_id = req.node_id,
-                    reported = req.lsn_bytes,
-                    fresh_max,
-                    "Rejecting LSN report implausibly far ahead of cluster max while leader write position is unverifiable"
-                );
-                metrics::counter!("pgbattery_lsn_report_rejected_implausible").increment(1);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ReportLsnResponse {
-                        success: false,
-                        message: format!(
-                            "Reported LSN {} implausibly far ahead of cluster max {fresh_max}",
-                            req.lsn_bytes
-                        ),
-                    }),
-                );
-            }
-        }
+        // Unknowable right now (PG slow, or still promoting): elections never
+        // read this book, so a report taken unchecked can mislead only the
+        // leader's own soft gates, which the voters' live check backs.
+        Some(_) | None => {}
     }
 
-    // Commit the LSN update to Raft.
-    // Never trust client timestamp at this boundary.
-    let observed_at = unix_now_secs();
-    let command = ClusterCommand::UpdateLsn {
-        node_id: req.node_id,
-        lsn_bytes: req.lsn_bytes,
-        timestamp: observed_at,
-    };
-
-    match crate::governor::propose::propose(&state.raft, &state.cluster_state, command).await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ReportLsnResponse {
-                success: true,
-                message: format!("LSN {} recorded for node {}", req.lsn_bytes, req.node_id),
-            }),
-        ),
-        Err(e) => {
-            error!(node_id = req.node_id, error = %e, "Failed to commit LSN update");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ReportLsnResponse {
-                    success: false,
-                    message: format!("Failed to commit LSN: {e}"),
-                }),
-            )
-        }
-    }
+    let now = state.lease.read().now();
+    state.wal_positions.record(req.node_id, req.lsn_bytes, now);
+    (
+        StatusCode::OK,
+        Json(ReportLsnResponse {
+            success: true,
+            message: format!("LSN {} recorded for node {}", req.lsn_bytes, req.node_id),
+        }),
+    )
 }

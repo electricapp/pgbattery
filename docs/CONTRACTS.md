@@ -92,14 +92,18 @@ than silently dropped from the analysis.
 
 ### L3 — LSN-Safe Election (FATAL)
 
-A candidate significantly behind the cluster's maximum known LSN (>16 MB by
-default) must not be elected without operator intervention.
+A candidate behind a voter's WAL must not get that voter's vote: under sync by
+any byte, under a committed async fallback by more than the async RPO (16 MB).
+Both positions are read at vote time. Under sync the sync set meets every
+majority, so a candidate missing an acknowledged write cannot be elected.
 
 **Violation**: new leader elected with stale WAL, causing unrecoverable
 data loss on promotion.
 
-**Tests**: unit tests in `governor/state_machine.rs`
-(`test_lsn_election_threshold_boundary`, `test_lsn_acceptable_for_election`).
+**Tests**: unit and property tests in `governor/network.rs`
+(`under_sync_a_candidate_one_byte_behind_is_refused`,
+`the_standby_holding_the_most_wal_wins_once_the_leader_is_gone`,
+`the_threshold_boundary_is_inclusive`, `more_wal_never_loses_a_vote`).
 `testing/torn_raft.py` covers the storage side of the same property: a node
 whose `raft.db` was torn must tolerate the damage cleanly or refuse to start,
 never come back voting on a store nothing vouched for.
@@ -287,7 +291,7 @@ oracle data it must reject, proving the oracle can fail.
 | W3                                | FATAL    | `ddl-failover`                                                                                                                                                                           | `assert-sanity-ddl`                                                                                                                                                                                                                                     |
 | L1                                | FATAL    | `stale-leader-fencing`, `rogue-pg-promote`, `correctness-lite-invariants` I4, `dual-writability-prober`, `testing/wal_enospc.py` (prober across the full-disk window)                    | unit: `test_two_confirmed_acceptances_is_a_fatal_violation`, `test_split_brain_signal_flags_l2`                                                                                                                                                         |
 | L2                                | FATAL    | `majority-loss`, `async-degraded-durability`, `correctness-lite-invariants` I5                                                                                                           | unit: `test_contained_ack_is_fatal_i5`, `test_fence_failure_signal_flags_l2`                                                                                                                                                                            |
-| L3                                | FATAL    | unit: `test_lsn_election_threshold_boundary`, `testing/torn_raft.py` — a torn `raft.db` must tolerate or refuse, never vote on a store nothing vouched for                               | unit: `test_emergency_fence_without_confirmation_flags_l3`, LSN-gate proptest, `testing/torn_raft.py` run with the store mangled past repair                                                                                                            |
+| L3                                | FATAL    | unit: `the_threshold_boundary_is_inclusive`, `testing/torn_raft.py` — a torn `raft.db` must tolerate or refuse, never vote on a store nothing vouched for                                | unit: `test_emergency_fence_without_confirmation_flags_l3`, LSN-gate proptest, `testing/torn_raft.py` run with the store mangled past repair                                                                                                            |
 | Linearizability (single-register) | FATAL    | `linearizability-register`                                                                                                                                                               | `testing/test_checker_sanity.py` — every `assert_flagged` case                                                                                                                                                                                          |
 | V1                                | SLO      | `ha-sequential` wait budgets, `ha-controlplane-pr`                                                                                                                                       | —                                                                                                                                                                                                                                                       |
 | V2                                | SLO      | `diverged-node-rejoin`, `wal-hole-resync`, `storage-fault-recovery`                                                                                                                      | `assert-sanity-diverged`                                                                                                                                                                                                                                |

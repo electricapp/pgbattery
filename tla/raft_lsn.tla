@@ -5,88 +5,57 @@
  * Machine-checked: `make -C tla check` (CI: .github/workflows/tla.yml).
  *
  * This spec extends standard Raft voting to include PostgreSQL LSN (Log Sequence
- * Number) as an additional constraint on vote acceptance. This is the "Kukushkin
+ * Number) as an additional constraint on vote acceptance, the "Kukushkin
  * Safety" feature that prevents electing a leader with stale data.
  *
- * The key modification:
- *   A follower rejects a vote if the Candidate's LSN is unacceptably behind
- *   the follower's known max cluster LSN.
+ * The key modification, Raft's up-to-date rule applied to PostgreSQL:
+ *   A voter rejects a candidate whose WAL position is behind the voter's own
+ *   by more than the threshold. The vote carries the candidate's position, and
+ *   the voter reads its own at vote time.
  *
  * We verify:
- *   1. Safety: Only candidates with acceptable LSN can become leader
- *   2. Liveness: The cluster can eventually elect a leader (no permanent deadlock)
+ *   1. Safety: at most one leader.
+ *   2. Liveness: the gate never leaves every node unelectable.
  *
  * === MAPPING TO IMPLEMENTATION ===
  *
- * TLA+ Variable → Rust Code:
- *   lsn[n]         → state_machine.rs: node_lsns.get(&n)
- *   maxKnownLSN[n] → state_machine.rs: max_cluster_lsn
- *   IsLSNAcceptable → state_machine.rs: is_lsn_acceptable_for_election()
- *   RequestVote    → governor/network.rs: vote RPC handler
- *
- * Vote Rejection:
- *   TLA: CanVoteFor = FALSE → vote not granted
- *   Code: governor/network.rs → vote_granted: false
+ * TLA+ → Rust Code:
+ *   lsn[n]          → governor/network.rs: LocalWal::read(), node n's position
+ *   IsLSNAcceptable → governor/network.rs: vote_lsn_gate()
+ *   RequestVote     → governor/network.rs: VoteFrame, the vote RPC handler
  *
  * SIMPLIFICATIONS:
  *
  * 1. LSN UPDATE MECHANISM:
- *    Spec: lsn values change non-deterministically
- *    Reality: Supervisor reports LSN every 1s via UpdateLsn command
- *    Justification: How LSN changes doesn't affect election safety
- *    CODE: app.rs (LSN reporting loop)
+ *    Spec: lsn values change by leader writes and replication.
+ *    Reality: PostgreSQL moves them; nothing samples or reports them for an
+ *      election, so there is no staleness to model.
  *
- * 2. MAX CLUSTER LSN PROPAGATION:
- *    Spec: maxKnownLSN updated in RequestVote action
- *    Reality: ClusterState updates when UpdateLsn applied
- *    Justification: Both propagate max LSN to voters
- *    CODE: state_machine.rs (update max_cluster_lsn)
- *
- * 3. LSN LAG THRESHOLD (single, abstracted):
+ * 2. LSN LAG THRESHOLD (single, abstracted):
  *    Spec: one LSNLagThreshold constant.
- *    Reality: state_machine.rs lsn_catchup_threshold_bytes() picks a DUAL
- *      threshold by replication mode, taking the tight branch whenever sync is
- *      active OR the mode is unknown, so an unknown mode fails safe.
- *    The two it picks between live in config/constants.rs:
- *      LSN_CATCHUP_THRESHOLD_BYTES_SYNC, one WAL block, against
- *      LSN_CATCHUP_THRESHOLD_BYTES_ASYNC, the published async RPO. They are
- *      orders of magnitude apart, which is why one model cannot stand in for
- *      both — an abstraction that collapses them hides the distance.
+ *    Reality: state_machine.rs vote_lsn_threshold_bytes() is zero unless the
+ *      committed sync mode says async, then the published async RPO in
+ *      config/constants.rs (LSN_CATCHUP_THRESHOLD_BYTES_ASYNC). An unknown
+ *      mode votes as strictly as sync.
  *    One constant abstracts whichever mode is active, so the model is checked
  *      at both ends: raft_lsn.cfg is the tight one and
  *      raft_lsn.alt-loose-lsn-gate.cfg the loose one, and `make check` runs
  *      both.
  *
- * 4. VOTING LOGIC (core comparison only):
- *    Spec: candidateLSN + threshold >= voterMaxLSN  (i.e. max - candidate <=
- *      threshold), matching the "too far behind" branch of evaluate_lsn_acceptable.
- *    Abstracted away (no clock in this spec, so documented not checked):
- *      the staleness window (LSN_STALENESS_THRESHOLD_SECS = 30 s) that recomputes
- *      a *fresh* max and rejects a candidate whose own LSN heartbeat is stale;
- *      and the fail-open vs fail-closed split — is_lsn_acceptable_for_election
- *      accepts a candidate with no LSN report, is_lsn_acceptable_for_promotion
- *      rejects it when the cluster has fresh data.
+ * 3. UNREADABLE POSITIONS: not modeled. In the code a voter that cannot read
+ *    its own WAL refuses, one with no data directory grants, and a candidate
+ *    that sends none is refused by any voter with data.
  *
  * WHAT THIS PROVES: ElectionSafety (at most one leader) and that the LSN gate
- *   never deadlocks elections (NoLSNDeadlock / SomeNodeCanWin).
- * WHAT TLC ACTIVELY DISPROVES: that the elected leader has an acceptable or
- *   non-behind LSN. The gate is ADVISORY — the self-vote is not LSN-checked, so
- *   a candidate behind on LSN self-votes and can still reach quorum via an
- *   under-informed voter. LeaderHasAcceptableLSN and LeaderLSNNotBelowVoters are
- *   defined below as the aspiration but are NOT in the cfg: TLC finds a
- *   counterexample to each. Leader freshness rests on Raft log-matching
- *   (LogIsUpToDate, abstracted to TRUE here), not on the LSN gate.
- * ALSO NOT MODELED: LSN reporting timeliness; the staleness window and the
- *   fail-closed-promotion path above; whether the dual threshold is well-chosen.
- *
- * === IMPLEMENTATION vs SPEC NOTE ===
- *
- * A VOTER rejects a candidate whose LSN is too far behind the voter's known max
- * (governor/network.rs rejects the vote RPC). But this is per-voter and
- * advisory: a candidate self-votes without an LSN check and needs only the rest
- * of a quorum, so an under-informed voter can still carry a behind candidate to
- * leadership. The implementation says as much — the gate is "advisory; Raft
- * log-matching provides the final safety guarantee" (state_machine.rs).
+ *   never deadlocks elections (NoLSNDeadlock / SomeNodeCanWin): the node
+ *   holding the most WAL passes every voter.
+ * WHAT TLC ACTIVELY DISPROVES: that the leader is never behind a voter that
+ *   elected it. The gate holds at vote time, but this spec has no lease, so a
+ *   deposed leader's ReplicateLSN can advance a voter after it voted.
+ *   LeaderHasAcceptableLSN and LeaderLSNNotBelowVoters are defined below as the
+ *   aspiration but are NOT in the cfg. In the code the deposed leader's lease
+ *   fence stops its writes first (lease_fencing.tla).
+ * ALSO NOT MODELED: which voters hold acknowledged writes (the sync set).
  *
  * Authors: pgbattery team
  * Date: 2024
@@ -114,11 +83,10 @@ VARIABLES
     votedFor,           \* votedFor[n] = node that n voted for in current term (or None)
     state,              \* state[n] \in {Follower, Candidate, Leader}
     lsn,                \* lsn[n] = PostgreSQL LSN of node n
-    maxKnownLSN,        \* maxKnownLSN[n] = max LSN node n has observed in cluster
     votesGranted,       \* votesGranted[n] = set of nodes that granted vote to n
     leader              \* leader = current leader node (or None)
 
-vars == <<currentTerm, votedFor, state, lsn, maxKnownLSN, votesGranted, leader>>
+vars == <<currentTerm, votedFor, state, lsn, votesGranted, leader>>
 
 \* ============================================================================
 \* TYPE INVARIANTS
@@ -131,7 +99,6 @@ TypeOK ==
     /\ votedFor \in [Nodes -> Nodes \cup {None}]
     /\ state \in [Nodes -> {"Follower", "Candidate", "Leader"}]
     /\ lsn \in [Nodes -> 0..MaxLSN]
-    /\ maxKnownLSN \in [Nodes -> 0..MaxLSN]
     /\ votesGranted \in [Nodes -> SUBSET Nodes]
     /\ leader \in Nodes \cup {None}
 
@@ -153,16 +120,10 @@ LogIsUpToDate(candidate, voter) ==
     TRUE
 
 \* LSN acceptability check - THE KEY MODIFICATION
-\* A candidate's LSN is acceptable if it's not too far behind the voter's
-\* known max cluster LSN
+\* A candidate's LSN is acceptable if it is within the threshold of the
+\* voter's own, both as they stand when the vote is asked.
 IsLSNAcceptable(candidate, voter) ==
-    LET candidateLSN == lsn[candidate]
-        voterMaxLSN == maxKnownLSN[voter]
-    IN
-        \* If voter hasn't observed any LSN, accept (bootstrap case)
-        \/ voterMaxLSN = 0
-        \* If candidate is within threshold of max known LSN, accept
-        \/ candidateLSN + LSNLagThreshold >= voterMaxLSN
+    lsn[candidate] + LSNLagThreshold >= lsn[voter]
 
 \* Combined vote acceptance logic
 \*
@@ -189,8 +150,6 @@ Init ==
     /\ state = [n \in Nodes |-> "Follower"]
     \* LSN values are chosen non-deterministically to model different scenarios
     /\ lsn \in [Nodes -> 0..MaxLSN]
-    \* Initially, each node only knows its own LSN
-    /\ maxKnownLSN = [n \in Nodes |-> lsn[n]]
     /\ votesGranted = [n \in Nodes |-> {}]
     /\ leader = None
 
@@ -211,7 +170,7 @@ StartElection(n) ==
     /\ votedFor' = [votedFor EXCEPT ![n] = n]  \* Vote for self
     /\ state' = [state EXCEPT ![n] = "Candidate"]
     /\ votesGranted' = [votesGranted EXCEPT ![n] = {n}]  \* Self-vote
-    /\ UNCHANGED <<lsn, maxKnownLSN, leader>>
+    /\ UNCHANGED <<lsn, leader>>
 
 (*
  * RequestVote: Candidate requests vote from another node
@@ -225,11 +184,6 @@ RequestVote(candidate, voter) ==
     /\ votedFor' = [votedFor EXCEPT ![voter] = candidate]
     /\ currentTerm' = [currentTerm EXCEPT ![voter] = currentTerm[candidate]]
     /\ votesGranted' = [votesGranted EXCEPT ![candidate] = votesGranted[candidate] \cup {voter}]
-    \* Update voter's known max LSN (candidate shares its LSN in vote request)
-    /\ maxKnownLSN' = [maxKnownLSN EXCEPT ![voter] =
-                       IF lsn[candidate] > maxKnownLSN[voter]
-                       THEN lsn[candidate]
-                       ELSE maxKnownLSN[voter]]
     /\ UNCHANGED <<state, lsn, leader>>
 
 (*
@@ -255,7 +209,7 @@ BecomeLeader(n) ==
                           IF state[m] = "Leader" /\ currentTerm[m] < currentTerm[n] /\ m /= n
                           THEN {}
                           ELSE votesGranted[m]]
-    /\ UNCHANGED <<currentTerm, votedFor, lsn, maxKnownLSN>>
+    /\ UNCHANGED <<currentTerm, votedFor, lsn>>
 
 (*
  * StepDown: A node discovers a higher term and steps down
@@ -269,7 +223,7 @@ StepDown(n, higherTermNode) ==
     /\ votedFor' = [votedFor EXCEPT ![n] = None]
     /\ votesGranted' = [votesGranted EXCEPT ![n] = {}]
     /\ leader' = IF leader = n THEN None ELSE leader
-    /\ UNCHANGED <<lsn, maxKnownLSN>>
+    /\ UNCHANGED <<lsn>>
 
 (*
  * UpdateLSN: Leader's LSN increases (PostgreSQL writes WAL)
@@ -280,10 +234,6 @@ UpdateLSN(n) ==
     /\ state[n] = "Leader"  \* Only leader can write
     /\ lsn[n] < MaxLSN
     /\ lsn' = [lsn EXCEPT ![n] = lsn[n] + 1]
-    /\ maxKnownLSN' = [maxKnownLSN EXCEPT ![n] =
-                       IF lsn[n] + 1 > maxKnownLSN[n]
-                       THEN lsn[n] + 1
-                       ELSE maxKnownLSN[n]]
     /\ UNCHANGED <<currentTerm, votedFor, state, votesGranted, leader>>
 
 (*
@@ -295,24 +245,7 @@ ReplicateLSN(leaderNode, follower) ==
     /\ follower /= leaderNode
     /\ lsn[follower] < lsn[leaderNode]  \* Follower is behind
     /\ lsn' = [lsn EXCEPT ![follower] = lsn[leaderNode]]
-    /\ maxKnownLSN' = [maxKnownLSN EXCEPT ![follower] =
-                       IF lsn[leaderNode] > maxKnownLSN[follower]
-                       THEN lsn[leaderNode]
-                       ELSE maxKnownLSN[follower]]
     /\ UNCHANGED <<currentTerm, votedFor, state, votesGranted, leader>>
-
-(*
- * PropagateMaxLSN: Leader propagates max LSN to follower (via AppendEntries)
- * This is how followers learn about the cluster's max LSN
- *)
-PropagateMaxLSN(leaderNode, follower) ==
-    /\ state[leaderNode] = "Leader"
-    /\ follower /= leaderNode
-    /\ maxKnownLSN' = [maxKnownLSN EXCEPT ![follower] =
-                       IF maxKnownLSN[leaderNode] > maxKnownLSN[follower]
-                       THEN maxKnownLSN[leaderNode]
-                       ELSE maxKnownLSN[follower]]
-    /\ UNCHANGED <<currentTerm, votedFor, state, lsn, votesGranted, leader>>
 
 (*
  * LeaderFails: Current leader crashes/becomes unavailable
@@ -323,7 +256,7 @@ LeaderFails(n) ==
     /\ state' = [state EXCEPT ![n] = "Follower"]
     /\ leader' = None
     /\ votesGranted' = [votesGranted EXCEPT ![n] = {}]
-    /\ UNCHANGED <<currentTerm, votedFor, lsn, maxKnownLSN>>
+    /\ UNCHANGED <<currentTerm, votedFor, lsn>>
 
 (*
  * ElectionTimeoutBreaksTie: Models Raft's random election timeout
@@ -359,7 +292,7 @@ ElectionTimeoutBreaksTie(winner) ==
     /\ votedFor' = [n \in Nodes |->
                       IF state[n] = "Candidate" /\ n /= winner THEN None
                       ELSE votedFor[n]]
-    /\ UNCHANGED <<currentTerm, lsn, maxKnownLSN, leader>>
+    /\ UNCHANGED <<currentTerm, lsn, leader>>
 
 \* ============================================================================
 \* NEXT STATE RELATION
@@ -381,7 +314,6 @@ Next ==
     \/ \E n, m \in Nodes : StepDown(n, m)
     \/ \E n \in Nodes : UpdateLSN(n)
     \/ \E l, f \in Nodes : ReplicateLSN(l, f)
-    \/ \E l, f \in Nodes : PropagateMaxLSN(l, f)
     \/ \E n \in Nodes : LeaderFails(n)
     \/ \E n \in Nodes : ElectionTimeoutBreaksTie(n)  \* Breaks split-votes
     \/ Terminating
@@ -401,24 +333,20 @@ ElectionSafety ==
         (state[n] = "Leader" /\ state[m] = "Leader") => n = m
 
 (*
- * LeaderHasAcceptableLSN: aspiration that every voter found the leader's LSN
- * acceptable. NOT checked — TLC disproves it. The self-vote skips the LSN check
- * (StartElection sets votesGranted[n] = {n} unconditionally), so a candidate
- * behind its own maxKnownLSN reaches quorum via one under-informed voter. The
- * gate is advisory; this stays as documentation of what it does NOT guarantee.
+ * LeaderHasAcceptableLSN: aspiration that every voter still finds the leader's
+ * LSN acceptable. NOT checked — TLC disproves it. Each voter's check held when
+ * it voted, but this spec has no lease: a deposed leader still in Leader state
+ * can ReplicateLSN to a voter after its vote and before the winner takes over.
+ * In the code the deposed leader's lease fence stops its writes first.
  *)
 LeaderHasAcceptableLSN ==
     leader /= None =>
         \A voter \in votesGranted[leader] :
-            \* Each voter must have found the leader's LSN acceptable
-            \* at the time they voted (based on their maxKnownLSN)
             IsLSNAcceptable(leader, voter)
 
 (*
- * LeaderLSNNotBelowVoters: the leader's actual LSN within threshold of every
- * voter's actual LSN. Also NOT checked — TLC disproves it too, on a path where
- * a behind candidate self-votes, gains an under-informed vote, and ReplicateLSN
- * then advances a voter past the leader. Same advisory caveat as above.
+ * LeaderLSNNotBelowVoters: the same claim stated over raw positions. NOT
+ * checked, for the same reason.
  *)
 LeaderLSNNotBelowVoters ==
     leader /= None =>
@@ -520,7 +448,6 @@ Fairness ==
     /\ \A n \in Nodes : SF_vars(BecomeLeader(n))
     /\ \A n \in Nodes : WF_vars(UpdateLSN(n))
     /\ \A l, f \in Nodes : WF_vars(ReplicateLSN(l, f))
-    /\ \A l, f \in Nodes : WF_vars(PropagateMaxLSN(l, f))
     \* Split-votes eventually resolve via timeout
     /\ \A n \in Nodes : WF_vars(ElectionTimeoutBreaksTie(n))
 
