@@ -2316,10 +2316,12 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
         .map_err(|e| anyhow::anyhow!("start after pg_upgrade: {e}"))?;
 
     // Probe before the gateway is unfrozen: held clients must be released
-    // into a primary that answers, not one still in startup.
+    // into a primary that answers, not one still in startup. The primary is
+    // born fenced, so the probe opts its own transaction out of the default.
     supervisor
         .execute_sql(
-            "CREATE TEMP TABLE pgbattery_upgrade_probe(i int); DROP TABLE pgbattery_upgrade_probe;",
+            "BEGIN READ WRITE; CREATE TEMP TABLE pgbattery_upgrade_probe(i int); \
+             DROP TABLE pgbattery_upgrade_probe; COMMIT;",
         )
         .await
         .context("upgraded primary did not accept a write")?;
@@ -2332,6 +2334,7 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
         let port = read_postmaster_port(new_data)?;
         let status = Command::new(&vacuumdb)
             .kill_on_drop(true)
+            .env("PGOPTIONS", MAINTENANCE_PGOPTIONS)
             .args([
                 "-h",
                 "127.0.0.1",
@@ -2681,6 +2684,11 @@ fn post_upgrade_script_kind(name: &str) -> PostUpgradeScriptKind {
 /// distinction matters because looking in the wrong place silently runs
 /// nothing. SQL files run through the new cluster's `psql` against the
 /// upgraded local primary; shell scripts run through bash.
+/// libpq options for pgbattery's own maintenance sessions on an upgraded
+/// primary, which is born fenced: they write without lifting the read-only
+/// default clients still see.
+const MAINTENANCE_PGOPTIONS: &str = "-c default_transaction_read_only=off";
+
 async fn run_post_upgrade_scripts(work_dir: &Path, new_bindir: &Path, port: u16) -> Result<()> {
     for name in ["update_extensions.sql", "analyze_new_cluster.sh"] {
         let script = work_dir.join(name);
@@ -2715,6 +2723,7 @@ async fn run_post_upgrade_scripts(work_dir: &Path, new_bindir: &Path, port: u16)
         };
         let status = cmd
             .current_dir(work_dir)
+            .env("PGOPTIONS", MAINTENANCE_PGOPTIONS)
             .kill_on_drop(true)
             .status()
             .await

@@ -490,14 +490,12 @@ impl App {
                 // Existing data + no standby.signal means this node was last a
                 // primary — but `--bootstrap` is a standing flag in deployment
                 // configs, so this path also runs when a deposed primary
-                // restarts. Its data may be on a stale timeline; start fenced
-                // like the non-bootstrap existing-data path and let the lease
-                // loop unfence once Raft confirms leadership.
+                // restarts. Its data may be on a stale timeline; it comes up
+                // fenced, as every start does, until the lease loop unfences.
                 info!(
                     "Existing PostgreSQL data found, starting as bootstrap primary (fenced until Raft confirms leadership)"
                 );
                 supervisor.start().await?;
-                supervisor.set_readonly(true).await?;
                 return Ok(());
             }
             info!("No existing data, will run initdb for new cluster...");
@@ -514,7 +512,6 @@ impl App {
 
             info!("Starting with existing data as primary (fenced until Raft confirms leadership)");
             supervisor.start().await?;
-            supervisor.set_readonly(true).await?;
             return Ok(());
         }
 
