@@ -63,6 +63,7 @@
         "stale-sync-metric-after-kill",
         "lsn-leaderless-livelock-recovery",
         "standby-elected-after-leader-dies-mid-load",
+        "follower-gateway-deposed-primary",
         "vote-rejection-progresses",
         "rewind-refused-on-data-loss-risk"
       ]
@@ -4306,6 +4307,25 @@
           "nodes": 3,
           "leaders": 1,
           "timeout_sec": 120
+        }
+      ]
+    },
+    {
+      "id": "follower-gateway-deposed-primary",
+      "contracts": ["W1", "L1"],
+      "description": "RW-6: a follower's gateway must not route a write to a deposed primary. The leader's Raft port is cut in both directions while its PostgreSQL stays reachable, so the cluster elects past it and the follower's gateway can still reach the old primary through the whole detection interval. A writer runs through that follower's gateway throughout, and each row records the accepting server and its commit time (the containers share the host clock). Asserts every acked key is on the final leader (W1), that no ack from the deposed node follows one from the new node in the writer's order, and that the deposed node's last commit precedes the new node's first. Refuses a run whose partition dropped no Raft packets, whose leadership did not move, or whose writer was not acked on both sides.",
+      "actions": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "min_healthy_replicas": 2
+        },
+        {
+          "type": "cmd",
+          "cmd": "testing/follower_gateway_routing.py",
+          "timeout_sec": 600
         }
       ]
     },

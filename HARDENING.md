@@ -175,23 +175,19 @@ code and the harnesses by their `RW-N` id, so this is the definition list for
 those names rather than a record of work — a row leaves only when the window
 itself stops existing.
 
-| #     | Window                                                                                                                                                                 | Contract | Watched by                                                                                                                                                        |
-| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| RW-1  | Deposed leader retains a quorum excluding the election winner, so its last ack can be later than the winner's first sight of leaderlessness                            | L1       | `lease_fencing.tla` with explicit quorum sets, and its counterexample model; live in `five_node_suite.py` Phase 2d with the prober running                        |
-| RW-2  | Post-promotion window: a freshly promoted primary acknowledging commits with zero standby acks                                                                         | W1, R2   | `post_promotion_sync_gap.py`, which enters the window on protocol state rather than a sleep; the commit is refused                                                |
-| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL                                                                                                         | W1       | `rewind_loss.py` forces the fallback and counts the survivors. The loss is real and accepted — see Accepted risks                                                 |
-| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                              | L1, L2   | `fencing_tail.py` wedges PostgreSQL, costs the node quorum, and races the prober across the whole window                                                          |
-| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely                                                                            | L1       | `dual_writability_prober.py` writes every internal port at 50 ms resolution. The `trust` perimeter itself is an accepted risk                                     |
-| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                    | W1       | **Nothing.** Cases drive a follower gateway across a leadership change but assert connection migration, not the routing decision                                  |
-| RW-7  | A node restored from an old backup, Raft directory intact, standing for election after a long leaderless window                                                        | L3       | Every voter compares the candidate's WAL with its own, both read at vote time (`network::vote_lsn_gate`); nothing ages. Unit and property tests in `network.rs`   |
-| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1       | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`                                                                |
-| RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1       | The lease fence runs on its own PostgreSQL session; `governor::fence::spawn` is handed that session and the lease, never the supervisor mutex                     |
-| RW-10 | Join and rejoin edges: a clone source deposed mid-copy, orphan slots pinning WAL, a learner dying mid-join, a wiped bootstrap node impersonating the cluster           | R1, V2   | `join_edges.py`, five cases, run in CI                                                                                                                            |
-| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active | W1, L3   | `sync_mode_agreement.py` measures how long the replicated flag runs looser than the leader's live GUC, against a budget derived from the reconcile that closes it |
-
-One row is unwatched. RW-6's conditions are producible and the specific
-decision is not asserted, which is a missing oracle rather than a missing
-fault — the same shape RW-11 was in.
+| #     | Window                                                                                                                                                                 | Contract | Watched by                                                                                                                                                                                                                                                                                             |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| RW-1  | Deposed leader retains a quorum excluding the election winner, so its last ack can be later than the winner's first sight of leaderlessness                            | L1       | `lease_fencing.tla` with explicit quorum sets, and its counterexample model; live in `five_node_suite.py` Phase 2d with the prober running                                                                                                                                                             |
+| RW-2  | Post-promotion window: a freshly promoted primary acknowledging commits with zero standby acks                                                                         | W1, R2   | `post_promotion_sync_gap.py`, which enters the window on protocol state rather than a sleep; the commit is refused                                                                                                                                                                                     |
+| RW-3  | Async fallback then `pg_rewind` discarding genuinely acked WAL                                                                                                         | W1       | `rewind_loss.py` forces the fallback and counts the survivors. The loss is real and accepted — see Accepted risks                                                                                                                                                                                      |
+| RW-4  | Fencing failure tail: wedged postmaster, exhausted connection slots, or a backend in uninterruptible I/O surviving `pg_terminate_backend`                              | L1, L2   | `fencing_tail.py` wedges PostgreSQL, costs the node quorum, and races the prober across the whole window                                                                                                                                                                                               |
+| RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely                                                                            | L1       | `dual_writability_prober.py` writes every internal port at 50 ms resolution. The `trust` perimeter itself is an accepted risk                                                                                                                                                                          |
+| RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                    | W1       | `follower_gateway_routing.py` (`follower-gateway-deposed-primary`) cuts the leader's Raft port both ways with its PostgreSQL reachable, writes through every follower gateway, and asserts from each row's accepting server and commit time that no deposed-side write follows the new primary's first |
+| RW-7  | A node restored from an old backup, Raft directory intact, standing for election after a long leaderless window                                                        | L3       | Every voter compares the candidate's WAL with its own, both read at vote time (`network::vote_lsn_gate`); nothing ages. Unit and property tests in `network.rs`                                                                                                                                        |
+| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1       | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`                                                                                                                                                                                                     |
+| RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1       | The lease fence runs on its own PostgreSQL session; `governor::fence::spawn` is handed that session and the lease, never the supervisor mutex                                                                                                                                                          |
+| RW-10 | Join and rejoin edges: a clone source deposed mid-copy, orphan slots pinning WAL, a learner dying mid-join, a wiped bootstrap node impersonating the cluster           | R1, V2   | `join_edges.py`, five cases, run in CI                                                                                                                                                                                                                                                                 |
+| RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active | W1, L3   | `sync_mode_agreement.py` measures how long the replicated flag runs looser than the leader's live GUC, against a budget derived from the reconcile that closes it                                                                                                                                      |
 
 ## Tier 4 — Deterministic simulation
 
@@ -299,13 +295,11 @@ The roadmap is done when:
    the same faults against a system that may schedule them differently. Closing
    it outright needs a deterministic runtime.
 4. Every risk window is either covered by a test, closed by design, or listed in
-   Accepted risks with a rationale. **Not met**, by one row: RW-6 is reachable
-   with no oracle asserting the property.
+   Accepted risks with a rationale. **Met.**
 5. The specs are checked against traces from the running binary. **Not met.** The
    static half of the mapping is enforced; the shape of a run is not.
 
-So the distance to zero is criteria 3, 4 and 5. Two of the three are
-infrastructure rather than a missing assertion: a deterministic runtime, and a
+So the distance to zero is criteria 3 and 5: a deterministic runtime, and a
 trace-checking harness.
 
 ## Execution plan
@@ -330,15 +324,6 @@ Rules that apply to every task, so they are not repeated per line:
 
 Effort: **S** hours · **M** one to two days · **L** about a week · **XL**
 multi-week.
-
-- [ ] **Assert RW-6: a follower gateway must not route a write to a deposed
-      primary.** The shape is already produced by cases that hold sessions
-      through a follower's gateway across a leadership change; what none of them
-      assert is the routing decision itself.
-      **Done when** a case drives writes through a _follower_ gateway while the
-      primary it points at is deposed, and the write is refused or re-routed
-      rather than landing on the deposed node.
-      _Closes_ RW-6 · _Effort_ M
 
 - [ ] **Validate real traces against the specs.** A harness run's transitions,
       checked against `lease_fencing` and `raft_lsn`, with an injected drift
