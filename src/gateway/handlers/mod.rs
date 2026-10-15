@@ -72,6 +72,21 @@ fn needs_migration(current: Option<SocketAddr>, target: SocketAddr, backend_lost
     backend_lost || current != Some(target)
 }
 
+/// How long until the session counts as idle, or `None` while a request is in
+/// flight: a statement can run silently past the idle timeout, and its answer
+/// is the client's to wait for (`statement_timeout` bounds it, not us).
+const fn idle_remaining(
+    since_activity: Duration,
+    idle_timeout: Duration,
+    response_pending: bool,
+) -> Option<Duration> {
+    if response_pending {
+        None
+    } else {
+        Some(idle_timeout.saturating_sub(since_activity))
+    }
+}
+
 /// Whether a failed reconnect may succeed on a later try: the route had no
 /// target yet, or the target was not accepting sessions yet. Anything else
 /// already told the client why it ended.
@@ -739,9 +754,13 @@ impl ConnectionHandler {
         loop {
             self.wait_for_upgrade_hold_if_needed().await?;
             self.wait_for_fence_if_needed().await?;
-            let remaining = idle_timeout.saturating_sub(last_activity.elapsed());
-            if remaining.is_zero() {
-                return Err(self.idle_timeout_error());
+            let idle = idle_remaining(
+                last_activity.elapsed(),
+                idle_timeout,
+                self.state.read().response_pending(),
+            );
+            if idle == Some(Duration::ZERO) {
+                return Err(self.sever_idle().await);
             }
 
             // No `biased;` here: with biased polling, a client that always
@@ -750,8 +769,8 @@ impl ConnectionHandler {
             // indefinitely. Random arm polling keeps both directions and
             // the timeout/fencing arms live under sustained load.
             tokio::select! {
-                () = tokio::time::sleep(remaining) => {
-                    return Err(self.idle_timeout_error());
+                () = tokio::time::sleep(idle.unwrap_or_default()), if idle.is_some() => {
+                    return Err(self.sever_idle().await);
                 }
 
                 result = self.leader_rx.changed() => {
@@ -1168,7 +1187,28 @@ impl ConnectionHandler {
     /// [`PROXY_WRITE_DEADLINE`] so a client that stopped draining its
     /// socket can't pin the severance path.
     async fn send_failover_error_response(&mut self, reason: &str) {
-        let msg = build_failover_error_response(reason);
+        self.send_fatal(
+            crate::gateway::protocol::SQLSTATE_CONNECTION_FAILURE,
+            reason,
+        )
+        .await;
+    }
+
+    /// End an idle session the way `PostgreSQL`'s own `idle_session_timeout`
+    /// does: a FATAL 57P05 the driver can name, then the close.
+    async fn sever_idle(&mut self) -> Error {
+        self.send_fatal(
+            crate::gateway::protocol::SQLSTATE_IDLE_SESSION_TIMEOUT,
+            "pgbattery: terminating connection due to idle-session timeout",
+        )
+        .await;
+        self.idle_timeout_error()
+    }
+
+    /// Send a FATAL `ErrorResponse` with `sqlstate`, bounded by
+    /// [`PROXY_WRITE_DEADLINE`]; the caller severs either way.
+    async fn send_fatal(&mut self, sqlstate: &str, reason: &str) {
+        let msg = crate::gateway::protocol::build_fatal_error_response(sqlstate, reason);
         let write = async {
             self.client.write_all(&msg).await?;
             self.client.flush().await
@@ -1178,21 +1218,24 @@ impl ConnectionHandler {
                 metrics::counter!("pgbattery_connections_severed_with_error_response").increment(1);
                 tracing::debug!(
                     conn_id = self.id,
+                    sqlstate,
                     reason,
-                    "Sent 08006 ErrorResponse before severing connection"
+                    "Sent ErrorResponse before severing connection"
                 );
             }
             Ok(Err(e)) => {
                 tracing::debug!(
                     conn_id = self.id,
+                    sqlstate,
                     error = %e,
-                    "Failed to send 08006 ErrorResponse to client before severing"
+                    "Failed to send ErrorResponse to client before severing"
                 );
             }
             Err(_) => {
                 tracing::debug!(
                     conn_id = self.id,
-                    "Client stalled; dropped 08006 ErrorResponse before severing"
+                    sqlstate,
+                    "Client stalled; dropped ErrorResponse before severing"
                 );
             }
         }
@@ -2932,6 +2975,22 @@ mod tests {
     /// crash-restart) keeps its address. Skipping the reconnect left the
     /// session reading EOF from a dead socket until it was severed (H13), or
     /// spinning on it until the idle timeout when relayed (H10).
+    /// H11: a statement that runs silently past the idle timeout is not an
+    /// idle session; severing it dropped a running query with no error.
+    #[test]
+    fn a_session_waiting_on_its_answer_is_never_idle() {
+        let timeout = Duration::from_mins(5);
+        assert_eq!(idle_remaining(Duration::from_hours(1), timeout, true), None);
+        assert_eq!(
+            idle_remaining(Duration::from_mins(2), timeout, false),
+            Some(Duration::from_mins(3))
+        );
+        assert_eq!(
+            idle_remaining(Duration::from_hours(1), timeout, false),
+            Some(Duration::ZERO)
+        );
+    }
+
     #[test]
     fn a_lost_backend_reconnects_even_to_an_unchanged_route() {
         let primary: SocketAddr = "10.0.0.1:5434".parse().unwrap();

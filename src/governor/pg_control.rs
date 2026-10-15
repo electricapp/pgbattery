@@ -395,7 +395,7 @@ impl PgControl for ModelPg {
     fn postmaster_state(&mut self) -> Result<crate::supervisor::PostmasterState> {
         use crate::supervisor::PostmasterState;
         Ok(if self.exited {
-            PostmasterState::Exited { refused: false }
+            PostmasterState::Exited { code: Some(1) }
         } else if self.has_postmaster {
             PostmasterState::Running
         } else {

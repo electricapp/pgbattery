@@ -68,8 +68,10 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 - **Source of truth**:
   - **Role**: `pg_is_in_recovery()`.
   - **On-disk intent**: `standby.signal`.
-  - **Liveness**: `PostmasterState` from `Child::try_wait()` + exit code → `Running` | `NotRunning` | `Exited { refused }` (`refused` = nonzero exit; signal death is not refusal).
-  - **Consumed on read**: `postmaster_state()` clears the child; the `refused` bit is one-shot → `Error::PostgresRefusedToOpen`.
+  - **Liveness**: `PostmasterState` from `Child::try_wait()` → `Running` | `NotRunning` | `Exited { code }` (`None` = a signal ended it).
+  - **Consumed on read**: `postmaster_state()` clears the child.
+  - **Refusal** (`Error::PostgresRefusedToOpen`), decided at startup: no data directory, or a nonzero exit whose stderr, drained to EOF, named a data-directory fault (`data_directory_fault`: a timeline fork, a missing or invalid checkpoint, an incompatible or corrupt control file). Anything else — a signal, a port clash, shared memory, a bad setting — is retried and never cloned over: a clone of a former primary skips the rewind divergence gate.
+  - **`initdb` only for a new cluster**: `start()` never runs it; `initialize()` does, from the bootstrap path, and only when no configured peer's committed membership lists this node. Anywhere else an empty directory is a refusal, repaired by a clone from the leader.
 - **Triggers** (the node reconciler's pass, §7):
   - `start()` — startup; refusal non-fatal (reconcile repairs once a leader address exists).
   - `promote()` — `current_leader == Some(self.node_id)`; idempotent if not in recovery.

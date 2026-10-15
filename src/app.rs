@@ -431,7 +431,18 @@ impl App {
                 supervisor.start().await?;
                 return Ok(());
             }
+            // A wiped node a live cluster still lists clones from its leader;
+            // an initdb here would mint a lineage no peer follows.
+            if let Some(peer) = self.peer_listing_this_node().await {
+                info!(
+                    %peer,
+                    "No PostgreSQL data, and a peer's cluster lists this node — leaving \
+                     PostgreSQL down for the reconciler to clone from its leader"
+                );
+                return Ok(());
+            }
             info!("No existing data, will run initdb for new cluster...");
+            supervisor.initialize().await?;
             supervisor.start().await?;
             return Ok(());
         }

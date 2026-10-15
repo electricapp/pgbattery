@@ -695,6 +695,9 @@ pub struct TimelineInfo {
 pub struct Supervisor {
     config: SupervisorConfig,
     child: Option<Child>,
+    /// The running postmaster's stderr relay, which ends with the last line
+    /// that named a data-directory fault.
+    log_relay: Option<tokio::task::JoinHandle<Option<String>>>,
     session: SqlSession,
 }
 
@@ -997,27 +1000,46 @@ pub enum PostmasterState {
     /// This node started it and it is still running.
     Running,
     /// It was running under this node and has exited — a crash, and the
-    /// node's cue to hand off.
-    ///
-    /// `refused` when the postmaster gave up on its own: a nonzero exit code
-    /// is the data directory refusing to open, and it will refuse identically
-    /// at every attempt. Death by signal is not that — a `SIGKILL` from
-    /// outside says nothing about the directory, and rebuilding on one clones
-    /// a healthy node.
-    Exited { refused: bool },
+    /// node's cue to hand off. `code` is its exit code, `None` when a signal
+    /// ended it; whether the exit refused the data directory is decided at
+    /// startup, from what the postmaster wrote (`exit_was_a_refusal`).
+    Exited { code: Option<i32> },
     /// This node is not running one: never started this boot, deliberately
     /// stopped, or left down after a start that would not open.
     NotRunning,
 }
 
-/// Whether a postmaster's exit was it giving up on the data directory.
+/// Whether a postmaster's exit was it giving up on the data directory: a
+/// nonzero exit, and `fault`, the last line of its stderr that named a
+/// data-directory fault ([`data_directory_fault`]).
 ///
-/// `code` is `None` when a signal killed it. That is the case this exists to
-/// keep out: a `SIGKILL` from outside — a test, an operator, the OOM killer —
-/// looks identical from here to a refusal, and the answer decides whether the
-/// data directory is discarded and cloned from the leader.
-const fn exit_was_a_refusal(code: Option<i32>) -> bool {
-    matches!(code, Some(code) if code != 0)
+/// `code` is `None` when a signal killed it: a `SIGKILL` from outside — a
+/// test, an operator, the OOM killer — says nothing about the directory, and
+/// the answer decides whether it is discarded and cloned from the leader.
+const fn exit_was_a_refusal(code: Option<i32>, fault: Option<&str>) -> bool {
+    matches!(code, Some(code) if code != 0) && fault.is_some()
+}
+
+/// Whether a line of the postmaster's stderr is it refusing the data
+/// directory itself: a fault no restart changes, which only a rewind or a
+/// clone repairs. Anything else — a port clash, shared memory, a bad setting
+/// — is retried, never cloned over. Matches `PostgreSQL`'s English messages.
+fn data_directory_fault(line: &str) -> bool {
+    const FAULTS: &[&str] = &[
+        "is not a child of this server's history",
+        "does not contain minimum recovery point",
+        "could not locate a valid checkpoint record",
+        "could not locate required checkpoint record",
+        "could not find redo location",
+        "invalid checkpoint record",
+        "invalid primary checkpoint record",
+        "database files are incompatible with server",
+        "incorrect checksum in control file",
+        "WAL file is from different database system",
+        "is not a valid data directory",
+    ];
+    (line.contains("FATAL:  ") || line.contains("PANIC:  "))
+        && FAULTS.iter().any(|fault| line.contains(fault))
 }
 
 /// What a rewind attempt left behind for the caller to finish.
@@ -1071,10 +1093,12 @@ const fn rewind_recovery(error: &Error) -> RewindRecovery {
 }
 
 /// Relay the postmaster's stderr into our own log until the pipe closes,
-/// which it does when `PostgreSQL` exits.
-async fn relay_postgres_log(stderr: tokio::process::ChildStderr) {
+/// which it does when `PostgreSQL` exits; returns the last line that named a
+/// data-directory fault.
+async fn relay_postgres_log(stderr: tokio::process::ChildStderr) -> Option<String> {
     let mut lines = BufReader::new(stderr).lines();
     let mut level = tracing::Level::INFO;
+    let mut fault = None;
     while let Ok(Some(line)) = lines.next_line().await {
         level = pg_line_level(&line, level);
         match level {
@@ -1083,7 +1107,11 @@ async fn relay_postgres_log(stderr: tokio::process::ChildStderr) {
             tracing::Level::INFO => tracing::info!(target: "postgres", "{line}"),
             _ => tracing::debug!(target: "postgres", "{line}"),
         }
+        if data_directory_fault(&line) {
+            fault = Some(line);
+        }
     }
+    fault
 }
 
 /// Level to relay one line of `PostgreSQL`'s stderr at, from its own
@@ -1300,6 +1328,7 @@ impl Supervisor {
         Self {
             config,
             child: None,
+            log_relay: None,
             session,
         }
     }
@@ -1399,7 +1428,7 @@ impl Supervisor {
                 // None, later polls report NotRunning and never re-emit.
                 metrics::gauge!("pgbattery_pg_is_primary").set(0.0);
                 Ok(PostmasterState::Exited {
-                    refused: exit_was_a_refusal(status.code()),
+                    code: status.code(),
                 })
             }
             Ok(None) => Ok(PostmasterState::Running),
@@ -1409,11 +1438,39 @@ impl Supervisor {
         }
     }
 
-    /// Start `PostgreSQL`.
+    /// Whether the postmaster that just exited with `code` refused its data
+    /// directory, read from what it wrote before its stderr closed.
+    async fn exit_refused(&mut self, code: Option<i32>) -> bool {
+        const DRAIN: Duration = Duration::from_secs(2);
+        let fault = match self.log_relay.take() {
+            Some(relay) => tokio::time::timeout(DRAIN, relay)
+                .await
+                .ok()
+                .and_then(std::result::Result::ok)
+                .flatten(),
+            None => None,
+        };
+        exit_was_a_refusal(code, fault.as_deref())
+    }
+
+    /// Run `initdb` into an empty data directory. Only a new cluster's
+    /// bootstrap does: anywhere else an empty directory is repaired by a
+    /// clone, and an `initdb` would mint a lineage no peer follows.
     ///
     /// # Errors
-    /// Returns an error if initialization, configuration, or launching the
-    /// `PostgreSQL` process fails, or it does not become ready in time.
+    /// The directory could not be cleared or `initdb` failed.
+    pub async fn initialize(&mut self) -> Result<()> {
+        // Clear any stale files (e.g., raft.db created before initdb)
+        self.clear_data_directory().await?;
+        self.init_db().await
+    }
+
+    /// Start `PostgreSQL` on an existing data directory.
+    ///
+    /// # Errors
+    /// `PostgresRefusedToOpen` when there is no data directory or the
+    /// postmaster refused it; otherwise configuration, launch, or readiness
+    /// failures.
     pub async fn start(&mut self) -> Result<()> {
         // Always reconnect SQL client after PostgreSQL restarts.
         self.invalidate_sql_client().await;
@@ -1426,12 +1483,13 @@ impl Supervisor {
         // start, crash-looping pgbattery forever.
         self.cleanup_stale_postgres().await;
 
-        // Ensure PGDATA is initialized (check for postgresql.conf, not just directory existence)
-        let conf_path = self.config.pg_data_dir.join("postgresql.conf");
-        if !conf_path.exists() {
-            // Clear any stale files (e.g., raft.db created before initdb)
-            self.clear_data_directory().await?;
-            self.init_db().await?;
+        // postgresql.conf, not just the directory: a clone that failed partway
+        // leaves files without one.
+        if !self.config.pg_data_dir.join("postgresql.conf").exists() {
+            return Err(Error::PostgresRefusedToOpen(format!(
+                "no PostgreSQL data directory at {}",
+                self.config.pg_data_dir.display()
+            )));
         }
 
         // Configure for replication
@@ -1472,7 +1530,7 @@ impl Supervisor {
         // it leaves those undiagnosable from the outside — including from the
         // logs CI keeps as a failure's evidence.
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(relay_postgres_log(stderr));
+            self.log_relay = Some(tokio::spawn(relay_postgres_log(stderr)));
         }
 
         self.child = Some(child);
@@ -1487,11 +1545,11 @@ impl Supervisor {
             // unreadable signal. The wait reports the refusal itself when it
             // saw the exit, and reaped the child in doing so, so that verdict
             // stands on its own.
-            let refused = matches!(e, Error::PostgresRefusedToOpen(_))
-                || matches!(
-                    self.postmaster_state(),
-                    Ok(PostmasterState::Exited { refused: true })
-                );
+            let refused = match (&e, self.postmaster_state()) {
+                (Error::PostgresRefusedToOpen(_), _) => true,
+                (_, Ok(PostmasterState::Exited { code })) => self.exit_refused(code).await,
+                _ => false,
+            };
             // Shut down gracefully: a fast shutdown preserves replay
             // progress (restartpoints / minRecoveryPoint), while SIGKILL
             // forces the next start to redo recovery from the previous
@@ -1882,19 +1940,18 @@ host all all ::/0 {auth_method}
                 return Ok(());
             }
 
-            // A postmaster that has given up will not become ready, and sitting
+            // A postmaster that has exited will not become ready, and sitting
             // out the budget for one holds the supervisor lock for the whole
             // budget: a directory `PostgreSQL` refused in thirty milliseconds
             // was reported thirty seconds later, with the node looking dead to
             // everything that needed the lock in between.
-            if matches!(
-                self.postmaster_state(),
-                Ok(PostmasterState::Exited { refused: true })
-            ) {
-                return Err(Error::PostgresRefusedToOpen(format!(
-                    "the postmaster gave up during startup (pg_isready exit code {})",
-                    status.code().unwrap_or(-1)
-                )));
+            if let Ok(PostmasterState::Exited { code }) = self.postmaster_state() {
+                let detail = format!("the postmaster exited during startup (exit code {code:?})");
+                return Err(if self.exit_refused(code).await {
+                    Error::PostgresRefusedToOpen(detail)
+                } else {
+                    Error::Postgres(detail)
+                });
             }
 
             let rejecting = status.code() == Some(1);
@@ -6124,9 +6181,71 @@ mod tests {
         // The verdict decides whether the data directory is discarded and
         // cloned. A node whose PostgreSQL is SIGKILLed — which the restart
         // budget case does six times in a row — must not be rebuilt for it.
-        assert!(exit_was_a_refusal(Some(1)), "refused the data directory");
-        assert!(!exit_was_a_refusal(None), "killed by a signal");
-        assert!(!exit_was_a_refusal(Some(0)), "exited cleanly");
+        let fork = "FATAL:  requested timeline 3 is not a child of this server's history";
+        assert!(
+            exit_was_a_refusal(Some(1), Some(fork)),
+            "refused the data directory"
+        );
+        assert!(!exit_was_a_refusal(None, Some(fork)), "killed by a signal");
+        assert!(!exit_was_a_refusal(Some(0), Some(fork)), "exited cleanly");
+    }
+
+    #[test]
+    fn an_exit_is_a_refusal_only_when_postgres_names_its_data_directory() {
+        // H3: a nonzero exit for a port clash or a shared-memory failure
+        // rebuilt a healthy standby, and a former primary's rebuild skips the
+        // rewind divergence gate that would have kept its WAL.
+        assert!(
+            !exit_was_a_refusal(Some(1), None),
+            "an exit nothing explained"
+        );
+        for environmental in [
+            "FATAL:  could not bind IPv4 address \"0.0.0.0\": Address already in use",
+            "FATAL:  could not create shared memory segment: No space left on device",
+            "FATAL:  lock file \"postmaster.pid\" already exists",
+            "FATAL:  configuration file \"/data/postgresql.auto.conf\" contains errors",
+        ] {
+            assert!(
+                !data_directory_fault(environmental),
+                "rebuilt a directory for: {environmental}"
+            );
+        }
+        for refusal in [
+            "FATAL:  requested timeline 3 is not a child of this server's history",
+            "PANIC:  could not locate a valid checkpoint record",
+            "FATAL:  could not find redo location 0/3000060 referenced by checkpoint record",
+            "FATAL:  database files are incompatible with server",
+            "FATAL:  incorrect checksum in control file",
+            "FATAL:  requested timeline 2 does not contain minimum recovery point 0/30000A0 on timeline 1",
+        ] {
+            assert!(data_directory_fault(refusal), "missed: {refusal}");
+        }
+    }
+
+    /// H3: only a new cluster's bootstrap runs `initdb`. A start that finds
+    /// no data directory — a clone that failed partway — is refused, so the
+    /// repair clones from the leader instead of minting a foreign lineage.
+    #[tokio::test]
+    async fn an_empty_data_directory_is_refused_rather_than_initialized() {
+        let dir = std::env::temp_dir().join(format!("pgbattery-empty-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut supervisor = Supervisor::new(SupervisorConfig {
+            pg_bin_dir: PathBuf::from("/nonexistent"),
+            pg_data_dir: dir.clone(),
+            pg_port: 5_432,
+            pg_user: "postgres".to_string(),
+            wal_level: WalLevel::Replica,
+            node_id: 1,
+            pg_auth_mode: PgAuthMode::Trust,
+            wal_archive_dir: None,
+        });
+        let started = supervisor.start().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(started, Err(Error::PostgresRefusedToOpen(_))),
+            "{started:?}"
+        );
     }
 
     #[test]

@@ -313,6 +313,17 @@ const FAILOVER_ERROR_MESSAGE_MAX: usize = 512;
 /// further framing required.
 #[must_use]
 pub fn build_failover_error_response(message: &str) -> BytesMut {
+    build_fatal_error_response(SQLSTATE_CONNECTION_FAILURE, message)
+}
+
+/// SQLSTATE `PostgreSQL` itself ends an idle session with
+/// (`idle_session_timeout`).
+pub const SQLSTATE_IDLE_SESSION_TIMEOUT: &str = "57P05";
+
+/// A FATAL `ErrorResponse` carrying `sqlstate`; see
+/// [`build_failover_error_response`] for the wire layout.
+#[must_use]
+pub fn build_fatal_error_response(sqlstate: &str, message: &str) -> BytesMut {
     const SEVERITY: &str = "FATAL";
 
     // Truncate at a character boundary so we don't emit a malformed cstring.
@@ -331,7 +342,7 @@ pub fn build_failover_error_response(message: &str) -> BytesMut {
     // Body layout (each \0-terminated):
     //   S<SEVERITY>\0  V<SEVERITY>\0  C<SQLSTATE>\0  M<msg>\0  \0
     let body_len = 2 * (1 + SEVERITY.len() + 1)                 // S + V
-        + (1 + SQLSTATE_CONNECTION_FAILURE.len() + 1)           // C
+        + (1 + sqlstate.len() + 1)                              // C
         + (1 + truncated_msg.len() + 1)                         // M
         + 1; // final terminator
 
@@ -350,7 +361,7 @@ pub fn build_failover_error_response(message: &str) -> BytesMut {
     buf.put_slice(SEVERITY.as_bytes());
     buf.put_u8(0);
     buf.put_u8(b'C');
-    buf.put_slice(SQLSTATE_CONNECTION_FAILURE.as_bytes());
+    buf.put_slice(sqlstate.as_bytes());
     buf.put_u8(0);
     buf.put_u8(b'M');
     buf.put_slice(truncated_msg.as_bytes());
