@@ -1,6 +1,10 @@
 # Track B major-upgrade proof: boots on PostgreSQL 17 with 18 binaries present
 # (`config/pgupgrade/`). Separate project/subnet/ports from the default 3-node
 # compose. Topology via COMPOSE_FILE + testing/topology.py.
+#
+# The mounted config is a read-only template; each node runs from a copy on its
+# state volume, because an upgrade rewrites pg_bin_dir / pg_data_dir there and
+# that rewrite must survive a container restart (the proof restarts every node).
 name: pgbattery-pgup
 
 x-node-env: &node-env
@@ -20,7 +24,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive /var/lib/postgresql/backups && echo '+0s' > /tmp/faketime && exec pgbattery run --bootstrap",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive /var/lib/postgresql/backups && echo '+0s' > /tmp/faketime && cp -n /app/pgbattery.toml /var/lib/postgresql/pgbattery.toml && exec pgbattery --config /var/lib/postgresql/pgbattery.toml run --bootstrap",
       ]
     cap_add: [NET_ADMIN]
     volumes:
@@ -39,7 +43,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.31.0.11:9091 --node-id 2 --voter",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && cp -n /app/pgbattery.toml /var/lib/postgresql/pgbattery.toml && exec pgbattery --config /var/lib/postgresql/pgbattery.toml join --peer 172.31.0.11:9091 --node-id 2 --voter",
       ]
     cap_add: [NET_ADMIN]
     volumes:
@@ -58,7 +62,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && exec pgbattery join --peer 172.31.0.11:9091 --node-id 3 --voter",
+        "mkdir -p /var/lib/postgresql/data /var/lib/postgresql/raft /var/lib/postgresql/wal_archive && echo '+0s' > /tmp/faketime && cp -n /app/pgbattery.toml /var/lib/postgresql/pgbattery.toml && exec pgbattery --config /var/lib/postgresql/pgbattery.toml join --peer 172.31.0.11:9091 --node-id 3 --voter",
       ]
     cap_add: [NET_ADMIN]
     volumes:

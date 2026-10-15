@@ -138,6 +138,19 @@ class NodePaths(BaseModel):
     pg_bin_dirs: dict[str, str]
 
 
+LIVE_CONFIG: Final[str] = "/var/lib/postgresql/pgbattery.toml"
+"""The writable copy each node boots from (docker-compose.pgupgrade.yml)."""
+
+
+class LivePaths(BaseModel):
+    """The active-PostgreSQL pointer in the file a node boots from."""
+
+    model_config = {"extra": "ignore"}
+
+    pg_bin_dir: str
+    pg_bin_dirs: dict[str, str]
+
+
 @dataclass(frozen=True)
 class KillReport:
     """What the in-container kill observed at the moment it fired."""
@@ -367,6 +380,31 @@ class Writer(threading.Thread):
     def stop(self) -> None:
         self._stop_event.set()
         self.join(timeout=15)
+
+
+def _assert_retarget_durable() -> None:
+    """The upgrade is durable only if the file each node boots from names the
+    new major's binaries, and a restart comes back on that major.
+
+    Read from the file itself before any restart: a node that booted the old
+    major's directory would be re-provisioned onto the new lineage within
+    seconds, so the major alone could pass while the pointer was never written.
+    """
+    for n in load().nodes:
+        live = LivePaths.model_validate(tomllib.loads(_exec(n.service, "cat", LIVE_CONFIG)))
+        want = live.pg_bin_dirs.get(str(TO_MAJOR))
+        if want is None or PurePosixPath(live.pg_bin_dir) != PurePosixPath(want):
+            raise ContractFailure(
+                f"{n.service} boots from pg_bin_dir {live.pg_bin_dir}, not the "
+                f"{TO_MAJOR} binaries {want}: the retarget was not persisted"
+            )
+    for n in load().nodes:
+        _compose("restart", n.service)
+        major = _pg_major(n)
+        if major != TO_MAJOR:
+            raise ContractFailure(f"{n.service} restarted onto major {major}, not {TO_MAJOR}")
+        settle.await_settled(load().nodes)
+    console.print(f"retarget durable: every node boots and restarts onto {TO_MAJOR}")
 
 
 def _assert_acked_survived(node: Node, acked: list[str]) -> None:
@@ -737,6 +775,7 @@ def main(
 
     _assert_majors(TO_MAJOR)
     _assert_acked_survived(cli, writer.acked)
+    _assert_retarget_durable()
 
     if rollback_drill:
         refused = _pgbattery(

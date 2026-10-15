@@ -187,6 +187,13 @@ fn load_config(config_path: Option<&str>) -> Result<crate::config::Config> {
     })
 }
 
+/// The file this process loaded its config from (`Config::load` reads
+/// `pgbattery.toml`). Track B rewrites its `pg_bin_dir` / `pg_data_dir` keys,
+/// so a joined node's retarget survives a restart as a bootstrapped one's does.
+fn loaded_config_path(config_path: Option<&str>) -> std::path::PathBuf {
+    std::path::PathBuf::from(config_path.unwrap_or("pgbattery.toml"))
+}
+
 /// Run the join command - join an existing cluster as a learner.
 ///
 /// # Errors
@@ -248,7 +255,8 @@ pub async fn run_join(
             node_id = config.node_id,
             "Existing Raft state found - resuming (skipping join-info fetch)"
         );
-        let app = crate::app::App::new(config);
+        let app = crate::app::App::new(config)
+            .with_config_path(Some(loaded_config_path(config_path.as_deref())));
         return app.run_join_flow(peer, voter).await;
     }
     if start == JoinStart::Reprovision {
@@ -331,7 +339,8 @@ pub async fn run_join(
     // 3. Run pg_basebackup from leader
     // 4. Start the node
     // 5. Auto-promote to voter if --voter flag is set
-    let app = crate::app::App::new(config);
+    let app = crate::app::App::new(config)
+        .with_config_path(Some(loaded_config_path(config_path.as_deref())));
     app.run_join_flow(peer, voter).await
 }
 
