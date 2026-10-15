@@ -906,7 +906,7 @@ def _chaos_mid_drain(blue_leader: Node, green_leader: Node, _blue: list[Node]) -
     _post(blue_leader, "arm", {"target_cluster_id": GREEN_CLUSTER}).raise_for_status()
     _post(blue_leader, "seal", {"app_roles": [APP_ROLE]}).raise_for_status()
     _kill_and_await_down(green_leader)
-    r = _post(blue_leader, "abort", {"app_roles": [APP_ROLE]})
+    r = _post(blue_leader, "abort")
     r.raise_for_status()
     st = _cutover_status(blue_leader)
     if st.get("phase") != "aborted":

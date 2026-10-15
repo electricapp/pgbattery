@@ -90,7 +90,24 @@ struct ClientFenceReconcilerInputs {
     configured_roles: Vec<String>,
     cluster_id: Arc<str>,
     awaits_write_authority_from: Option<Arc<str>>,
-    fence_apply_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// What the client-write fence should be, from the committed log plus
+/// boot-fence config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WantedClientFence {
+    fenced: bool,
+    phase: crate::governor::state_machine::CutoverPhase,
+    roles: Vec<String>,
+}
+
+impl WantedClientFence {
+    /// A cluster no cutover ever touched, with nothing to fence, has nothing
+    /// to reconcile and is never probed.
+    fn needs_reconcile(&self) -> bool {
+        self.phase != crate::governor::state_machine::CutoverPhase::Idle
+            || (self.fenced && !self.roles.is_empty())
+    }
 }
 
 #[derive(Debug)]
@@ -681,7 +698,6 @@ impl App {
             Arc::clone(&debug_events),
             shutdown_tx.clone(),
             fence_tx,
-            Arc::clone(&fence_reconciler.fence_apply_lock),
         );
         let management_addr = self.config.get_mgmt_addr();
 
@@ -787,27 +803,19 @@ impl App {
                 .awaits_write_authority_from
                 .as_deref()
                 .map(Arc::from),
-            // Shared with the seal/abort handlers (via ManagementApiState) so
-            // neither side changes the PG fence inside the other's window.
-            fence_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// `(fenced, phase, roles)` the client-write fence should have, from the
-    /// committed log plus boot-fence config. Never the metrics-tick fence
-    /// projection, which lags apply. A recipient fenced before any cutover
-    /// entry has only its configured roles; a donor sealing gets them from
-    /// the log.
+    /// The fence the committed log plus boot-fence config asks for. Never the
+    /// metrics-tick fence projection, which lags apply. A recipient fenced
+    /// before any cutover entry has only its configured roles; a donor
+    /// sealing gets them from the log.
     fn wanted_client_fence(
         state: &crate::governor::state_machine::ClusterState,
         cluster_id: &str,
         awaits_write_authority_from: Option<&str>,
         configured_roles: &[String],
-    ) -> (
-        bool,
-        crate::governor::state_machine::CutoverPhase,
-        Vec<String>,
-    ) {
+    ) -> WantedClientFence {
         let (holds, _) = Governor::cutover_authority_projection(
             &state.cutover,
             cluster_id,
@@ -818,12 +826,22 @@ impl App {
         } else {
             state.cutover.fenced_app_roles.clone()
         };
-        (!holds, state.cutover.phase, roles)
+        WantedClientFence {
+            fenced: !holds,
+            phase: state.cutover.phase,
+            roles,
+        }
     }
 
+    /// The only writer of the client-write fence and the DDL freeze.
+    ///
+    /// Level-triggered: each pass re-derives the wanted state under the
+    /// supervisor lock and compares it with the catalog. The catalog can drift
+    /// with no fence change at all — a seed restoring the dump's grants onto
+    /// a fenced recipient — so while a cutover is in play the pass also
+    /// repeats every `CLIENT_FENCE_RECHECK_INTERVAL`, which doubles as the
+    /// retry after a failure.
     fn spawn_client_fence_reconciler(input: ClientFenceReconcilerInputs) -> JoinHandle<()> {
-        use crate::commands::upgrade::client_fence;
-
         let ClientFenceReconcilerInputs {
             mut fence_rx,
             cluster_state,
@@ -832,81 +850,31 @@ impl App {
             configured_roles,
             cluster_id,
             awaits_write_authority_from,
-            fence_apply_lock,
         } = input;
         tokio::spawn(async move {
+            let wanted = || {
+                Self::wanted_client_fence(
+                    &cluster_state.read(),
+                    &cluster_id,
+                    awaits_write_authority_from.as_deref(),
+                    &configured_roles,
+                )
+            };
             loop {
-                let wanted = || {
-                    Self::wanted_client_fence(
-                        &cluster_state.read(),
-                        &cluster_id,
-                        awaits_write_authority_from.as_deref(),
-                        &configured_roles,
-                    )
-                };
-                let (_, _, roles) = wanted();
-                // A standby refuses every REVOKE and every CREATE EVENT
-                // TRIGGER, so retrying there would spin for the life of the
-                // process. The primary carries the fence; replication carries
-                // it to the rest.
-                let primary = if roles.is_empty() {
-                    Ok(false)
-                } else {
+                let recheck = wanted().needs_reconcile();
+                if recheck {
                     let guard = postgres.lock().await;
-                    let answer = client_fence::node_is_primary(&guard).await;
+                    // Decided after acquiring: an operation holding the lock
+                    // may have outlived a phase change.
+                    let now = wanted();
+                    let result = reconcile_ddl_and_fence(&guard, &now, &cluster_id).await;
                     drop(guard);
-                    answer
-                };
-                match primary {
-                    Ok(true) => {
-                        // Same lock the seal/abort handlers hold across their
-                        // direct fence changes: a reconcile must not interleave
-                        // with a seal's fence→LSN-read→commit window.
-                        let _fence_guard = fence_apply_lock.lock().await;
-                        let guard = postgres.lock().await;
-                        // Wanted state is re-derived under both locks, from the
-                        // committed log: a SEAL or abort that held them may
-                        // have moved the phase while this pass waited, and a
-                        // decision from before the wait would lift the fence
-                        // the SEAL just applied.
-                        let (want_fenced, phase, roles) = wanted();
-                        // Unfreeze before touching the fence and freeze after:
-                        // applying the fence creates the snapshot table, which is
-                        // DDL the freeze would refuse.
-                        let result = reconcile_ddl_and_fence(
-                            &guard,
-                            &roles,
-                            want_fenced,
-                            phase,
-                            &cluster_id,
-                        )
-                        .await;
-                        drop(guard);
-                        if let Err(e) = result {
-                            // Waiting for the next fence change would strand the
-                            // cluster: the abort that needs lifting has already
-                            // been observed, and nothing else is coming.
-                            warn!(error = %e, want_fenced, "Client-write fence reconcile failed; retrying");
-                            tokio::select! {
-                                () = tokio::time::sleep(CLIENT_FENCE_RETRY_INTERVAL) => continue,
-                                _ = shutdown_rx.changed() => return,
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        // "Could not probe" is not "not primary": a node
-                        // promoted mid-cutover whose PG is briefly unready
-                        // must retry, or its internal port stays unfenced
-                        // with no further wake-up coming.
-                        warn!(error = %e, "Client-write fence primary probe failed; retrying");
-                        tokio::select! {
-                            () = tokio::time::sleep(CLIENT_FENCE_RETRY_INTERVAL) => continue,
-                            _ = shutdown_rx.changed() => return,
-                        }
+                    if let Err(e) = result {
+                        warn!(error = %e, fenced = now.fenced, "Client-write fence reconcile failed; retrying");
                     }
                 }
                 tokio::select! {
+                    () = tokio::time::sleep(CLIENT_FENCE_RECHECK_INTERVAL), if recheck => {}
                     _ = fence_rx.changed() => {}
                     _ = shutdown_rx.changed() => return,
                 }
@@ -1038,7 +1006,6 @@ impl App {
         debug_events: Arc<crate::observability::debug_events::DebugEventBuffer>,
         shutdown_tx: watch::Sender<bool>,
         fence_tx: watch::Sender<FenceState>,
-        client_fence_apply_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Arc<ManagementApiState> {
         Arc::new(ManagementApiState {
             node_id: self.config.node_id,
@@ -1072,7 +1039,6 @@ impl App {
                 .awaits_write_authority_from
                 .as_deref()
                 .map(Arc::from),
-            client_fence_apply_lock,
         })
     }
 
@@ -3584,52 +3550,42 @@ const GENESIS_LEADERSHIP_WAIT: Duration = Duration::from_secs(30);
 const JOIN_CLONE_ATTEMPTS: u32 = 12;
 const JOIN_CLONE_RETRY: Duration = Duration::from_secs(2);
 
-/// Gap before retrying a failed client-fence reconcile. The desired state is
-/// already known, so the only thing to wait for is `PostgreSQL`.
-const CLIENT_FENCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the client-fence reconciler re-reads the catalog while a cutover
+/// is in play, and its retry after a failed pass.
+const CLIENT_FENCE_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Bring the DDL freeze and the client-write fence in line with committed state.
 ///
-/// Order matters: the fence's snapshot table is created with DDL, so the freeze
-/// has to be off while the fence is touched and go back on afterwards.
+/// Primary only: a standby refuses every REVOKE and every `CREATE EVENT
+/// TRIGGER`, and physical replication carries both there. Each move is
+/// idempotent and the two are independent — the fence's DDL passes the
+/// freeze exempt — so a steady pass writes nothing.
 async fn reconcile_ddl_and_fence(
     supervisor: &Supervisor,
-    roles: &[String],
-    want_fenced: bool,
-    phase: crate::governor::state_machine::CutoverPhase,
+    wanted: &WantedClientFence,
     cluster_id: &str,
 ) -> Result<()> {
     use crate::commands::upgrade::{client_fence, ddl_freeze};
 
-    let want_freeze = ddl_freeze::ddl_should_freeze(phase);
-    let frozen = ddl_freeze::ddl_freeze_installed(supervisor).await?;
-    let is_fenced = client_fence::fence_is_applied(supervisor, roles, cluster_id).await?;
-    let action = client_fence::fence_action(want_fenced, is_fenced);
-    // Idempotent: a steady pass moves nothing. Dropping and reinstalling the
-    // trigger every pass opened a DDL window inside SEALED on every reconcile.
-    let plan = ddl_freeze::ddl_freeze_plan(
-        want_freeze,
-        frozen,
-        action != client_fence::FenceAction::None,
-    );
-    if plan.unfreeze_first {
+    let seen = client_fence::observe(supervisor, &wanted.roles, cluster_id).await?;
+    if !seen.is_primary {
+        return Ok(());
+    }
+    let want_freeze = ddl_freeze::ddl_should_freeze(wanted.phase);
+    if want_freeze && !seen.freeze_installed {
+        ddl_freeze::install_ddl_freeze(supervisor).await?;
+    } else if !want_freeze && seen.freeze_installed {
         ddl_freeze::remove_ddl_freeze(supervisor).await?;
     }
-
-    match action {
+    match client_fence::fence_action(wanted.fenced, seen.grants) {
         client_fence::FenceAction::Apply => {
-            client_fence::apply_client_write_fence(supervisor, roles, cluster_id).await?;
+            client_fence::apply_client_write_fence(supervisor, &wanted.roles, cluster_id).await
         }
         client_fence::FenceAction::Lift => {
-            client_fence::lift_client_write_fence(supervisor, roles, cluster_id).await?;
+            client_fence::lift_client_write_fence(supervisor, cluster_id).await
         }
-        client_fence::FenceAction::None => {}
+        client_fence::FenceAction::None => Ok(()),
     }
-
-    if plan.freeze_after {
-        ddl_freeze::install_ddl_freeze(supervisor).await?;
-    }
-    Ok(())
 }
 
 /// Run `attempt` until it succeeds, up to `attempts` times, pausing `delay`
@@ -4788,7 +4744,7 @@ mod tests {
         );
     }
 
-    use super::{App, LeaseAction};
+    use super::{App, LeaseAction, WantedClientFence};
 
     #[test]
     fn test_lease_enforcement_action_matrix() {
@@ -4932,28 +4888,65 @@ mod tests {
         };
         let configured = vec!["app".to_string()];
         let recipient = ClusterState::new();
+        let awaiting = App::wanted_client_fence(&recipient, "green", Some("blue"), &configured);
         assert_eq!(
-            App::wanted_client_fence(&recipient, "green", Some("blue"), &configured),
-            (true, CutoverPhase::Idle, configured.clone())
+            awaiting,
+            WantedClientFence {
+                fenced: true,
+                phase: CutoverPhase::Idle,
+                roles: configured.clone(),
+            }
         );
+        assert!(awaiting.needs_reconcile());
 
         let mut donor = ClusterState {
             feature_level: FEATURE_LEVEL,
             ..ClusterState::new()
         };
-        assert!(!App::wanted_client_fence(&donor, "blue", None, &configured).0);
+        let untouched = App::wanted_client_fence(&donor, "blue", None, &configured);
+        assert!(!untouched.fenced);
+        assert!(!untouched.needs_reconcile());
         donor.apply(ClusterCommand::CutoverArmed {
             target_cluster_id: "green".into(),
             local_cluster_id: "blue".into(),
         });
-        donor.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 1,
+        donor.apply(ClusterCommand::CutoverSealing {
             app_roles: vec!["writer".into()],
         });
         assert_eq!(
             App::wanted_client_fence(&donor, "blue", None, &configured),
-            (true, CutoverPhase::Sealed, vec!["writer".to_string()])
+            WantedClientFence {
+                fenced: true,
+                phase: CutoverPhase::Sealing,
+                roles: vec!["writer".to_string()],
+            }
         );
+    }
+
+    /// An abort clears the fenced roles, yet the grants it took are still to
+    /// be restored: an unsealed cluster keeps reconciling until the lift
+    /// lands, whatever roles are left.
+    #[test]
+    fn an_aborted_cutover_still_reconciles_its_lift() {
+        use crate::governor::state_machine::{ClusterCommand, ClusterState, FEATURE_LEVEL};
+        let mut donor = ClusterState {
+            feature_level: FEATURE_LEVEL,
+            ..ClusterState::new()
+        };
+        donor.apply(ClusterCommand::CutoverArmed {
+            target_cluster_id: "green".into(),
+            local_cluster_id: "blue".into(),
+        });
+        donor.apply(ClusterCommand::CutoverSealing {
+            app_roles: vec!["writer".into()],
+        });
+        donor.apply(ClusterCommand::CutoverAbortUnseal {
+            local_cluster_id: "blue".into(),
+        });
+        let wanted = App::wanted_client_fence(&donor, "blue", None, &[]);
+        assert!(!wanted.fenced);
+        assert_eq!(wanted.roles, Vec::<String>::new());
+        assert!(wanted.needs_reconcile());
     }
 
     #[test]

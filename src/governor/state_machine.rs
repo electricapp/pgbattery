@@ -202,7 +202,7 @@ pub struct CutoverAuthorityState {
 
     pub phase: CutoverPhase,
 
-    /// Final flush LSN recorded at SEAL, read after client writes stopped.
+    /// Final insert LSN recorded at SEAL, read after client writes stopped.
     #[serde(default)]
     pub sealed_final_lsn: Option<u64>,
 
@@ -220,8 +220,9 @@ pub struct CutoverAuthorityState {
     pub transfer_forced: bool,
 
     /// Roles the client-write fence covers while this cluster is not the
-    /// authority. Read by the supervisor reconciler, so a node promoted after
-    /// SEAL applies the same fence without being told again.
+    /// authority, from SEALING on. Read by the supervisor reconciler, so a
+    /// node promoted mid-seal applies the same fence without being told
+    /// again. Cleared when authority returns; the lift needs no roles.
     #[serde(default)]
     pub fenced_app_roles: Vec<String>,
 }
@@ -229,13 +230,13 @@ pub struct CutoverAuthorityState {
 impl CutoverAuthorityState {
     /// Whether `local_cluster_id` may accept client writes.
     ///
-    /// Authority in transit (SEALED/DRAINING) belongs to nobody, and an
-    /// authority naming another cluster excludes this one whatever its own
+    /// Authority in transit (SEALING through DRAINING) belongs to nobody, and
+    /// an authority naming another cluster excludes this one whatever its own
     /// Raft group thinks.
     #[must_use]
     pub fn holds_client_write_authority(&self, local_cluster_id: &str) -> bool {
         match self.phase {
-            CutoverPhase::Sealed | CutoverPhase::Draining => false,
+            CutoverPhase::Sealing | CutoverPhase::Sealed | CutoverPhase::Draining => false,
             CutoverPhase::Idle
             | CutoverPhase::Armed
             | CutoverPhase::Transferred
@@ -245,14 +246,43 @@ impl CutoverAuthorityState {
                 .is_none_or(|id| id == local_cluster_id),
         }
     }
+
+    /// ABORT: authority back to the local cluster in a new epoch.
+    ///
+    /// Armed is included so a wrong-target arm has an exit that does not
+    /// require fencing clients first; nothing is sealed there, so "unseal" is
+    /// only the epoch bump and phase move.
+    fn unseal(&mut self, local_cluster_id: String) -> CommandOutcome {
+        if !matches!(
+            self.phase,
+            CutoverPhase::Armed
+                | CutoverPhase::Sealing
+                | CutoverPhase::Sealed
+                | CutoverPhase::Draining
+        ) {
+            return CommandOutcome::OutOfOrder;
+        }
+        self.epoch = self.epoch.saturating_add(1);
+        self.phase = CutoverPhase::Aborted;
+        self.authority_cluster_id = Some(local_cluster_id);
+        self.sealed_final_lsn = None;
+        self.target_cluster_id = None;
+        self.target_pg_addr = None;
+        self.transfer_forced = false;
+        self.fenced_app_roles.clear();
+        CommandOutcome::Applied
+    }
 }
 
-/// Cutover protocol phase (blue log). Matches `tla/cutover_authority.tla` Phases.
+/// Cutover protocol phase (blue log). `tla/cutover_authority.tla` Phases, with
+/// the spec's atomic SEAL split into `Sealing` (authority withdrawn, fence
+/// going on) and `Sealed` (final LSN recorded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CutoverPhase {
     #[default]
     Idle,
     Armed,
+    Sealing,
     Sealed,
     Draining,
     Transferred,
@@ -265,6 +295,7 @@ impl CutoverPhase {
         match self {
             Self::Idle => "idle",
             Self::Armed => "armed",
+            Self::Sealing => "sealing",
             Self::Sealed => "sealed",
             Self::Draining => "draining",
             Self::Transferred => "transferred",
@@ -361,15 +392,11 @@ pub enum ClusterCommand {
         local_cluster_id: String,
     },
 
-    /// Track C: `WRITE_AUTHORITY_SEALED{final_lsn}`. `final_lsn` is read after
-    /// the fence is in place, so no acked client write carries a higher one.
-    /// `app_roles` travels with it so a node promoted mid-cutover can
-    /// reconcile the PG-role fence from committed state.
-    CutoverSeal {
-        final_lsn: u64,
-        #[serde(default)]
-        app_roles: Vec<String>,
-    },
+    /// Track C: `WRITE_AUTHORITY_SEALED{final_lsn}`, from SEALING only.
+    /// `final_lsn` is read once the fence is verified in force and the fenced
+    /// roles' sessions have exited, so no acked client write carries a higher
+    /// one.
+    CutoverSeal { final_lsn: u64 },
 
     /// Track B: gateways hold client queries for a major upgrade.
     ///
@@ -410,6 +437,11 @@ pub enum ClusterCommand {
     /// Raise the committed feature level. Proposed only once every member
     /// reports support for `level` (`governor::propose::finalize_feature_level`).
     SetFeatureLevel { level: u32 },
+
+    /// Track C: withdraw client write authority and name the roles to fence.
+    /// The primary's reconciler revokes from the committed record, so a node
+    /// promoted mid-seal applies the same fence without being told again.
+    CutoverSealing { app_roles: Vec<String> },
 }
 
 /// Highest cluster feature level this binary decodes.
@@ -431,6 +463,7 @@ impl ClusterCommand {
             | Self::UpdateLsn { .. }
             | Self::SetSyncMode { .. } => 0,
             Self::CutoverArmed { .. }
+            | Self::CutoverSealing { .. }
             | Self::CutoverSeal { .. }
             | Self::SetUpgradeFreeze { .. }
             | Self::CutoverDrainObserved
@@ -602,7 +635,10 @@ impl ClusterState {
                     CutoverPhase::Transferred => {
                         self.cutover.holds_client_write_authority(&local_cluster_id)
                     }
-                    CutoverPhase::Armed | CutoverPhase::Sealed | CutoverPhase::Draining => false,
+                    CutoverPhase::Armed
+                    | CutoverPhase::Sealing
+                    | CutoverPhase::Sealed
+                    | CutoverPhase::Draining => false,
                 };
                 if !may_arm {
                     return CommandOutcome::OutOfOrder;
@@ -612,16 +648,19 @@ impl ClusterState {
                 self.cutover.target_cluster_id = Some(target_cluster_id);
                 self.cutover.transfer_forced = false;
             }
-            ClusterCommand::CutoverSeal {
-                final_lsn,
-                app_roles,
-            } => {
+            ClusterCommand::CutoverSealing { app_roles } => {
                 if self.cutover.phase != CutoverPhase::Armed {
+                    return CommandOutcome::OutOfOrder;
+                }
+                self.cutover.phase = CutoverPhase::Sealing;
+                self.cutover.fenced_app_roles = app_roles;
+            }
+            ClusterCommand::CutoverSeal { final_lsn } => {
+                if self.cutover.phase != CutoverPhase::Sealing {
                     return CommandOutcome::OutOfOrder;
                 }
                 self.cutover.phase = CutoverPhase::Sealed;
                 self.cutover.sealed_final_lsn = Some(final_lsn);
-                self.cutover.fenced_app_roles = app_roles;
             }
             ClusterCommand::CutoverDrainObserved => {
                 if self.cutover.phase != CutoverPhase::Sealed {
@@ -655,22 +694,7 @@ impl ClusterState {
                 self.cutover.transfer_forced = forced;
             }
             ClusterCommand::CutoverAbortUnseal { local_cluster_id } => {
-                // Armed is included so a wrong-target arm has an exit that
-                // does not require fencing clients first; nothing is sealed
-                // there, so "unseal" is only the epoch bump and phase move.
-                if !matches!(
-                    self.cutover.phase,
-                    CutoverPhase::Armed | CutoverPhase::Sealed | CutoverPhase::Draining
-                ) {
-                    return CommandOutcome::OutOfOrder;
-                }
-                self.cutover.epoch = self.cutover.epoch.saturating_add(1);
-                self.cutover.phase = CutoverPhase::Aborted;
-                self.cutover.authority_cluster_id = Some(local_cluster_id);
-                self.cutover.sealed_final_lsn = None;
-                self.cutover.target_cluster_id = None;
-                self.cutover.target_pg_addr = None;
-                self.cutover.transfer_forced = false;
+                return self.cutover.unseal(local_cluster_id);
             }
             ClusterCommand::CutoverAuthorityReceived {
                 epoch,
@@ -689,6 +713,7 @@ impl ClusterState {
                 self.cutover.target_pg_addr = None;
                 self.cutover.sealed_final_lsn = None;
                 self.cutover.transfer_forced = false;
+                self.cutover.fenced_app_roles.clear();
             }
             // Non-cutover commands are handled by `apply`, which only routes
             // the cutover variants here.
@@ -1029,6 +1054,13 @@ mod tests {
         });
     }
 
+    fn sealed(state: &mut ClusterState, final_lsn: u64) {
+        state.apply(ClusterCommand::CutoverSealing {
+            app_roles: vec!["app".into()],
+        });
+        state.apply(ClusterCommand::CutoverSeal { final_lsn });
+    }
+
     /// A cluster that never committed a feature level is one a binary
     /// without cutover support may still be replicating; the entry is a
     /// no-op on every replica rather than a fork between those that decode
@@ -1100,10 +1132,7 @@ mod tests {
         armed(&mut state);
         assert_eq!(state.cutover.phase, CutoverPhase::Armed);
 
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 100,
-            app_roles: vec![],
-        });
+        sealed(&mut state, 100);
         assert_eq!(state.cutover.phase, CutoverPhase::Sealed);
         assert_eq!(state.cutover.sealed_final_lsn, Some(100));
 
@@ -1155,10 +1184,7 @@ mod tests {
     fn the_cluster_that_gave_authority_away_cannot_arm_itself_back() {
         let mut state = at_current_level();
         armed(&mut state);
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 10,
-            app_roles: vec![],
-        });
+        sealed(&mut state, 10);
         state.apply(ClusterCommand::CutoverDrainObserved);
         state.apply(ClusterCommand::CutoverTransfer {
             target_cluster_id: GREEN.into(),
@@ -1187,10 +1213,7 @@ mod tests {
         let mut green = at_current_level();
 
         armed(&mut blue);
-        blue.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 10,
-            app_roles: vec![],
-        });
+        sealed(&mut blue, 10);
         blue.apply(ClusterCommand::CutoverDrainObserved);
         blue.apply(ClusterCommand::CutoverTransfer {
             target_cluster_id: GREEN.into(),
@@ -1216,10 +1239,7 @@ mod tests {
             }),
             CommandOutcome::Applied
         );
-        green.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 20,
-            app_roles: vec![],
-        });
+        sealed(&mut green, 20);
         green.apply(ClusterCommand::CutoverDrainObserved);
         green.apply(ClusterCommand::CutoverTransfer {
             target_cluster_id: BLUE.into(),
@@ -1248,10 +1268,7 @@ mod tests {
     fn cutover_abort_unseal_returns_authority_in_a_new_epoch() {
         let mut state = at_current_level();
         armed(&mut state);
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 50,
-            app_roles: vec![],
-        });
+        sealed(&mut state, 50);
         state.apply(ClusterCommand::CutoverAbortUnseal {
             local_cluster_id: BLUE.into(),
         });
@@ -1260,6 +1277,74 @@ mod tests {
         assert!(state.cutover.holds_client_write_authority(BLUE));
         assert_eq!(state.cutover.epoch, 1);
         assert!(state.cutover.sealed_final_lsn.is_none());
+    }
+
+    /// SEAL records a final LSN only after the fence is verified, and only
+    /// SEALING says the fence was asked for. From ARMED, nothing was revoked.
+    #[test]
+    fn a_seal_applies_only_from_sealing() {
+        let mut state = at_current_level();
+        armed(&mut state);
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverSeal { final_lsn: 5 }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(state.cutover.phase, CutoverPhase::Armed);
+
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverSealing {
+                app_roles: vec!["app".into()],
+            }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.cutover.phase, CutoverPhase::Sealing);
+        assert_eq!(state.cutover.fenced_app_roles, vec!["app".to_string()]);
+        assert!(state.cutover.sealed_final_lsn.is_none());
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverSeal { final_lsn: 5 }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.cutover.sealed_final_lsn, Some(5));
+    }
+
+    /// A SEAL that cannot verify its fence leaves SEALING committed; abort is
+    /// the way out, and the unsealed cluster fences no one.
+    #[test]
+    fn an_abort_from_sealing_unseals_and_forgets_the_fenced_roles() {
+        let mut state = at_current_level();
+        armed(&mut state);
+        state.apply(ClusterCommand::CutoverSealing {
+            app_roles: vec!["app".into()],
+        });
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverAbortUnseal {
+                local_cluster_id: BLUE.into(),
+            }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.cutover.phase, CutoverPhase::Aborted);
+        assert!(state.cutover.holds_client_write_authority(BLUE));
+        assert_eq!(state.cutover.fenced_app_roles, Vec::<String>::new());
+    }
+
+    /// Forced transfer skips the drain proof, never the final LSN: from
+    /// SEALING there is no sealed position for the log to name.
+    #[test]
+    fn a_forced_transfer_needs_a_recorded_final_lsn() {
+        let mut state = at_current_level();
+        armed(&mut state);
+        state.apply(ClusterCommand::CutoverSealing {
+            app_roles: vec!["app".into()],
+        });
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverTransfer {
+                target_cluster_id: GREEN.into(),
+                target_pg_addr: "10.0.0.1:5434".into(),
+                forced: true,
+            }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(state.cutover.phase, CutoverPhase::Sealing);
     }
 
     /// A wrong-target arm needs an exit that does not fence clients first:
@@ -1286,10 +1371,11 @@ mod tests {
     fn an_out_of_phase_command_reports_out_of_order() {
         let mut state = at_current_level();
         assert_eq!(
-            state.apply(ClusterCommand::CutoverSeal {
-                final_lsn: 1,
-                app_roles: vec![]
-            }),
+            state.apply(ClusterCommand::CutoverSeal { final_lsn: 1 }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(
+            state.apply(ClusterCommand::CutoverSealing { app_roles: vec![] }),
             CommandOutcome::OutOfOrder
         );
         assert_eq!(state.cutover.phase, CutoverPhase::Idle);
@@ -1323,10 +1409,13 @@ mod tests {
         armed(&mut state);
         assert!(state.cutover.holds_client_write_authority(BLUE));
 
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 7,
-            app_roles: vec![],
+        state.apply(ClusterCommand::CutoverSealing {
+            app_roles: vec!["app".into()],
         });
+        assert!(!state.cutover.holds_client_write_authority(BLUE));
+        assert!(!state.cutover.holds_client_write_authority(GREEN));
+
+        state.apply(ClusterCommand::CutoverSeal { final_lsn: 7 });
         assert!(!state.cutover.holds_client_write_authority(BLUE));
         assert!(!state.cutover.holds_client_write_authority(GREEN));
 
@@ -1341,10 +1430,7 @@ mod tests {
     fn the_donor_stops_holding_authority_after_transfer() {
         let mut state = at_current_level();
         armed(&mut state);
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 7,
-            app_roles: vec![],
-        });
+        sealed(&mut state, 7);
         state.apply(ClusterCommand::CutoverDrainObserved);
         state.apply(ClusterCommand::CutoverTransfer {
             target_cluster_id: GREEN.into(),
@@ -1361,10 +1447,7 @@ mod tests {
     fn a_forced_transfer_is_distinguishable_from_a_drained_one() {
         let mut state = at_current_level();
         armed(&mut state);
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 7,
-            app_roles: vec![],
-        });
+        sealed(&mut state, 7);
         // Forced may leave SEALED directly — there was no drain proof.
         assert_eq!(
             state.apply(ClusterCommand::CutoverTransfer {
@@ -1383,10 +1466,7 @@ mod tests {
     fn an_unforced_transfer_refuses_to_skip_drain() {
         let mut state = at_current_level();
         armed(&mut state);
-        state.apply(ClusterCommand::CutoverSeal {
-            final_lsn: 7,
-            app_roles: vec![],
-        });
+        sealed(&mut state, 7);
         assert_eq!(
             state.apply(ClusterCommand::CutoverTransfer {
                 target_cluster_id: GREEN.into(),

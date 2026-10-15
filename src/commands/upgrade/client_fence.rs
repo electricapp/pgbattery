@@ -1,9 +1,10 @@
 //! Client-vs-apply fence for Track C cutover (U1 / role-based).
 //!
-//! After SEAL, application roles lose DML while the subscription owner (and
-//! superuser) keep it, so logical apply continues on a primary that refuses
-//! client writes. Preflight (`blue_green.rs`) must have proven the roles this
-//! can actually cover.
+//! From SEALING on, application roles lose DML while the subscription owner
+//! (and superuser) keep it, so logical apply continues on a primary that
+//! refuses client writes. Preflight (`blue_green.rs`) must have proven the
+//! roles this can actually cover. The supervisor's reconciler is the only
+//! writer; the seal handler only observes and drains.
 
 #![allow(
     unreachable_pub,
@@ -21,6 +22,21 @@ const FENCED_PRIVILEGES: &str = "'INSERT','UPDATE','DELETE','TRUNCATE','USAGE'";
 const FENCE_SCHEMA: &str = "pgbattery";
 const FENCE_TABLE: &str = "pgbattery.client_fence_revoked";
 
+/// Schemas whose relations the fence covers (`n` is `pg_namespace`): the
+/// snapshot, the REVOKE and the revocable-grant probe must agree on this set,
+/// or a settled fence reads as unsettled forever.
+const USER_SCHEMAS: &str = "n.nspname NOT IN ('pg_catalog','information_schema','pgbattery') \
+     AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%'";
+
+/// Session setting the DDL freeze trigger lets through, for superusers only,
+/// so the fence's REVOKE/GRANT and snapshot DDL never take the freeze down.
+pub(crate) const DDL_FREEZE_EXEMPT_GUC: &str = "pgbattery.ddl_freeze_exempt";
+
+/// Wrap fence statements in one transaction the DDL freeze lets through.
+fn exempt_transaction(body: &str) -> String {
+    format!("BEGIN; SET LOCAL {DDL_FREEZE_EXEMPT_GUC} = 'on'; {body} COMMIT;")
+}
+
 /// The snapshot INSERT for one role. Rows are keyed by `cluster_id` so a
 /// donor's snapshot rows and a recipient's can never collide, even under a
 /// hand-made FOR ALL TABLES publication that replicates this table.
@@ -37,9 +53,7 @@ fn snapshot_insert_sql(escaped_cluster: &str, escaped_role: &str) -> String {
          WHERE g.rolname = '{escaped_role}' \
            AND c.relkind IN ('r','p','v','f','S') \
            AND a.privilege_type IN ({FENCED_PRIVILEGES}) \
-           AND n.nspname NOT IN ('pg_catalog','information_schema','{FENCE_SCHEMA}') \
-           AND n.nspname NOT LIKE 'pg_toast%' \
-           AND n.nspname NOT LIKE 'pg_temp%' \
+           AND {USER_SCHEMAS} \
          ON CONFLICT DO NOTHING;"
     )
 }
@@ -95,6 +109,42 @@ fn default_revoke_sql(escaped_role: &str) -> String {
     )
 }
 
+fn revoke_sql(escaped_role: &str) -> String {
+    format!(
+        "DO $$ \
+         DECLARE r record; \
+         BEGIN \
+           FOR r IN SELECT n.nspname AS schema FROM pg_namespace n WHERE {USER_SCHEMAS} \
+           LOOP \
+             EXECUTE format( \
+               'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA %I FROM %I', \
+               r.schema, '{escaped_role}' \
+             ); \
+             EXECUTE format( \
+               'REVOKE USAGE, UPDATE ON ALL SEQUENCES IN SCHEMA %I FROM %I', \
+               r.schema, '{escaped_role}' \
+             ); \
+           END LOOP; \
+         END $$;"
+    )
+}
+
+/// Snapshot then revoke, every role in one transaction.
+fn apply_sql(escaped_cluster: &str, escaped_roles: &[String]) -> String {
+    let mut body = fence_table_ddl();
+    for role in escaped_roles {
+        body.push(' ');
+        body.push_str(&snapshot_insert_sql(escaped_cluster, role));
+        body.push(' ');
+        body.push_str(&default_snapshot_insert_sql(escaped_cluster, role));
+        body.push(' ');
+        body.push_str(&revoke_sql(role));
+        body.push(' ');
+        body.push_str(&default_revoke_sql(role));
+    }
+    exempt_transaction(&body)
+}
+
 /// Revoke client DML from `app_roles`, recording exactly what was taken.
 ///
 /// The snapshot is the point: `REVOKE` destroys the only record of which
@@ -112,69 +162,35 @@ pub async fn apply_client_write_fence(
     if app_roles.is_empty() {
         bail!("client-write fence requires at least one app role");
     }
-    ensure_fence_table(supervisor).await?;
-    let escaped_cluster = cluster_id.replace('\'', "''");
+    let mut escaped = Vec::with_capacity(app_roles.len());
     for role in app_roles {
         validate_role_ident(role)?;
-        let escaped = role.replace('\'', "''");
-        supervisor
-            .execute_sql(&snapshot_insert_sql(&escaped_cluster, &escaped))
-            .await
-            .with_context(|| format!("snapshotting grants for app role {role}"))?;
-        supervisor
-            .execute_sql(&default_snapshot_insert_sql(&escaped_cluster, &escaped))
-            .await
-            .with_context(|| format!("snapshotting default-ACL grants for app role {role}"))?;
-
-        let revoke = format!(
-            "DO $$ \
-             DECLARE r record; \
-             BEGIN \
-               FOR r IN \
-                 SELECT n.nspname AS schema \
-                 FROM pg_namespace n \
-                 WHERE n.nspname NOT IN ('pg_catalog','information_schema','{FENCE_SCHEMA}') \
-                   AND n.nspname NOT LIKE 'pg_toast%' \
-                   AND n.nspname NOT LIKE 'pg_temp%' \
-               LOOP \
-                 EXECUTE format( \
-                   'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA %I FROM %I', \
-                   r.schema, '{escaped}' \
-                 ); \
-                 EXECUTE format( \
-                   'REVOKE USAGE, UPDATE ON ALL SEQUENCES IN SCHEMA %I FROM %I', \
-                   r.schema, '{escaped}' \
-                 ); \
-               END LOOP; \
-             END $$;"
-        );
-        supervisor
-            .execute_sql(&revoke)
-            .await
-            .with_context(|| format!("revoking DML from app role {role}"))?;
-        supervisor
-            .execute_sql(&default_revoke_sql(&escaped))
-            .await
-            .with_context(|| format!("revoking default-ACL grants from app role {role}"))?;
-        info!(%role, "Client-write fence applied");
+        escaped.push(role.replace('\'', "''"));
     }
+    supervisor
+        .execute_sql(&apply_sql(&cluster_id.replace('\'', "''"), &escaped))
+        .await
+        .with_context(|| format!("fencing app roles {app_roles:?}"))?;
+    info!(roles = ?app_roles, "Client-write fence applied");
     Ok(())
 }
 
-/// The restore-and-forget block for one role, filtered to this cluster's own
-/// snapshot rows — replicated rows from another cluster's fence must never
-/// grant anything here.
-fn lift_sql(escaped_cluster: &str, escaped_role: &str) -> String {
-    format!(
+/// Restore and forget every grant this cluster recorded, whichever role it
+/// was taken from. Filtered to this cluster's own snapshot rows: replicated
+/// rows from another cluster's fence must never grant anything here.
+fn lift_sql(escaped_cluster: &str) -> String {
+    exempt_transaction(&format!(
         "DO $$ \
          DECLARE r record; \
          BEGIN \
            FOR r IN \
-             SELECT schema_name, rel_name, rel_kind, privilege, grant_kind \
+             SELECT role_name, schema_name, rel_name, rel_kind, privilege, grant_kind \
              FROM {FENCE_TABLE} \
-             WHERE cluster_id = '{escaped_cluster}' AND role_name = '{escaped_role}' \
+             WHERE cluster_id = '{escaped_cluster}' \
            LOOP \
-             IF r.grant_kind = 'd' THEN \
+             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.role_name) THEN \
+               RAISE NOTICE 'client fence lift: role % no longer exists; skipping', r.role_name; \
+             ELSIF r.grant_kind = 'd' THEN \
                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.rel_name) THEN \
                  EXECUTE format( \
                    'ALTER DEFAULT PRIVILEGES FOR ROLE %I %s GRANT %s ON %s TO %I', \
@@ -182,7 +198,7 @@ fn lift_sql(escaped_cluster: &str, escaped_role: &str) -> String {
                    CASE WHEN r.schema_name = '' THEN '' ELSE format('IN SCHEMA %I', r.schema_name) END, \
                    r.privilege, \
                    CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCES' ELSE 'TABLES' END, \
-                   '{escaped_role}' \
+                   r.role_name \
                  ); \
                ELSE \
                  RAISE NOTICE 'client fence lift: defacl owner % no longer exists; skipping', r.rel_name; \
@@ -192,42 +208,32 @@ fn lift_sql(escaped_cluster: &str, escaped_role: &str) -> String {
                  'GRANT %s ON %s %I.%I TO %I', \
                  r.privilege, \
                  CASE WHEN r.rel_kind = 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, \
-                 r.schema_name, r.rel_name, '{escaped_role}' \
+                 r.schema_name, r.rel_name, r.role_name \
                ); \
              ELSE \
                RAISE NOTICE 'client fence lift: %.% no longer exists; skipping its % grant', \
                  r.schema_name, r.rel_name, r.privilege; \
              END IF; \
            END LOOP; \
-           DELETE FROM {FENCE_TABLE} \
-           WHERE cluster_id = '{escaped_cluster}' AND role_name = '{escaped_role}'; \
+           DELETE FROM {FENCE_TABLE} WHERE cluster_id = '{escaped_cluster}'; \
          END $$;"
-    )
+    ))
 }
 
-/// Restore exactly the grants [`apply_client_write_fence`] recorded.
+/// Restore exactly the grants [`apply_client_write_fence`] recorded. Only
+/// called once the snapshot table reports rows, so it exists.
 ///
 /// # Errors
-/// SQL failure, or a role name rejected as an identifier.
+/// SQL failure.
 pub async fn lift_client_write_fence(
     supervisor: &crate::supervisor::Supervisor,
-    app_roles: &[String],
     cluster_id: &str,
 ) -> Result<()> {
-    if app_roles.is_empty() {
-        return Ok(());
-    }
-    ensure_fence_table(supervisor).await?;
-    let escaped_cluster = cluster_id.replace('\'', "''");
-    for role in app_roles {
-        validate_role_ident(role)?;
-        let escaped = role.replace('\'', "''");
-        supervisor
-            .execute_sql(&lift_sql(&escaped_cluster, &escaped))
-            .await
-            .with_context(|| format!("restoring recorded grants for app role {role}"))?;
-        info!(%role, "Client-write fence lifted");
-    }
+    supervisor
+        .execute_sql(&lift_sql(&cluster_id.replace('\'', "''")))
+        .await
+        .context("restoring the grants the client fence recorded")?;
+    info!("Client-write fence lifted");
     Ok(())
 }
 
@@ -247,41 +253,71 @@ fn quoted_role_list(app_roles: &[String]) -> Result<String> {
     Ok(quoted.join(","))
 }
 
+/// Terminate every backend logged in as a fenced role or a member of one,
+/// returning the signalled pids. Membership is walked down: a login role in
+/// a fenced group writes through the group's grants. The terminate sits in
+/// the aggregate, so it runs only on rows the filter kept.
 fn terminate_backends_sql(quoted_roles: &str) -> String {
     format!(
-        "SELECT count(pg_terminate_backend(pid))::text FROM pg_stat_activity \
-         WHERE usename IN ({quoted_roles}) AND pid <> pg_backend_pid();"
+        "WITH RECURSIVE fenced AS ( \
+           SELECT oid FROM pg_roles WHERE rolname IN ({quoted_roles}) \
+           UNION \
+           SELECT m.member FROM pg_auth_members m JOIN fenced f ON m.roleid = f.oid \
+         ) \
+         SELECT COALESCE(string_agg(CASE WHEN pg_terminate_backend(pid) THEN pid::text END, ','), '') \
+         FROM pg_stat_activity \
+         WHERE usesysid IN (SELECT oid FROM fenced) AND pid <> pg_backend_pid();"
     )
 }
 
-fn remaining_backends_sql(quoted_roles: &str) -> String {
-    format!(
-        "SELECT count(*)::text FROM pg_stat_activity \
-         WHERE usename IN ({quoted_roles}) AND pid <> pg_backend_pid();"
-    )
+fn surviving_backends_sql(pids: &str) -> String {
+    format!("SELECT count(*)::text FROM pg_stat_activity WHERE pid IN ({pids});")
 }
 
-/// End every session of the fenced roles and wait until none remain.
+fn parse_pid_list(raw: &str) -> Result<Vec<u32>> {
+    raw.trim()
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.trim()
+                .parse::<u32>()
+                .with_context(|| format!("expected a backend pid, got {p:?}"))
+        })
+        .collect()
+}
+
+/// End every fenced-role session alive now and wait for those to exit.
 ///
-/// The REVOKE fences new privilege checks only: a transaction that passed its
-/// check before the fence and commits after the LSN read is an acked write
-/// past `final_lsn` (U2). Termination closes that window; the bounded poll
-/// proves it closed rather than assuming the signal landed.
+/// Called once the fence is verified in force. The REVOKE fences new
+/// privilege checks only, so the one writer left is a transaction that passed
+/// its check before it, in a session that is therefore alive now; one that
+/// commits after the LSN read is an acked write past `final_lsn` (U2). Later
+/// sessions see the REVOKE and are left alone. Re-running after a crash
+/// re-terminates whatever is still alive, so nothing is persisted.
 ///
 /// # Errors
-/// SQL failure, or fenced-role backends still alive after the wait.
-pub async fn terminate_fenced_role_backends(
+/// SQL failure, or a signalled backend still alive after the wait.
+pub async fn drain_fenced_sessions(
     supervisor: &crate::supervisor::Supervisor,
     app_roles: &[String],
 ) -> Result<()> {
     let quoted = quoted_role_list(app_roles)?;
-    supervisor
+    let raw = supervisor
         .execute_sql(&terminate_backends_sql(&quoted))
         .await
         .context("terminating fenced-role backends")?;
+    let pids = parse_pid_list(&raw)?;
+    if pids.is_empty() {
+        return Ok(());
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     for _ in 0..BACKEND_DRAIN_ATTEMPTS {
         let raw = supervisor
-            .execute_sql(&remaining_backends_sql(&quoted))
+            .execute_sql(&surviving_backends_sql(&list))
             .await
             .context("counting fenced-role backends")?;
         let remaining: u64 = raw
@@ -289,20 +325,14 @@ pub async fn terminate_fenced_role_backends(
             .parse()
             .with_context(|| format!("expected a backend count, got {raw:?}"))?;
         if remaining == 0 {
-            info!("No fenced-role backends remain");
+            info!(terminated = pids.len(), "Fenced-role sessions drained");
             return Ok(());
         }
-        // Re-terminate each round: a fenced role can reconnect between polls,
-        // and a new backend must not survive to commit past the seal.
-        supervisor
-            .execute_sql(&terminate_backends_sql(&quoted))
-            .await
-            .context("re-terminating fenced-role backends")?;
         tokio::time::sleep(BACKEND_DRAIN_PAUSE).await;
     }
     bail!(
-        "fenced-role backends survived {BACKEND_DRAIN_ATTEMPTS} termination rounds; \
-         refusing to read a final LSN their in-flight transactions could outrun"
+        "fenced-role backends {list} survived {BACKEND_DRAIN_ATTEMPTS} rounds after \
+         termination; refusing to read a final LSN their transactions could outrun"
     )
 }
 
@@ -314,19 +344,155 @@ pub enum FenceAction {
     None,
 }
 
+/// The grants side of the fence, as the catalog has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceGrants {
+    /// A fenced role holds a direct DML grant the fence would revoke.
+    pub revocable: bool,
+    /// This cluster's snapshot table records grants the fence took.
+    pub recorded: bool,
+}
+
+/// The local server's cutover-relevant catalog state, read in one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceObservation {
+    pub is_primary: bool,
+    pub freeze_installed: bool,
+    pub grants: FenceGrants,
+}
+
+impl FenceObservation {
+    /// The fence and the DDL freeze both hold on a primary: nothing a fenced
+    /// role can still be granted is left to revoke. Preflight at SEAL proved
+    /// the roles have no other write path.
+    #[must_use]
+    pub const fn sealable(self) -> bool {
+        self.is_primary && self.freeze_installed && !self.grants.revocable
+    }
+}
+
 /// Reconcile the observed fence against the wanted one.
 ///
-/// Both inputs are observed — one from the committed log, one from
-/// `PostgreSQL`. Deriving `is_fenced` from what this process last did instead
-/// would miss the fence the seal handler applies directly, and an abort would
-/// then leave the application locked out of an unsealed cluster.
+/// Both sides are facts: the wanted state comes from the committed log, the
+/// observed one from the catalog. A grant restored behind the fence's back —
+/// a seed's ACL restore, an operator GRANT — is revoked on the next pass,
+/// whatever the snapshot table already holds.
 #[must_use]
-pub const fn fence_action(want_fenced: bool, is_fenced: bool) -> FenceAction {
-    match (want_fenced, is_fenced) {
-        (true, false) => FenceAction::Apply,
-        (false, true) => FenceAction::Lift,
+pub const fn fence_action(want_fenced: bool, grants: FenceGrants) -> FenceAction {
+    match (want_fenced, grants.revocable, grants.recorded) {
+        (true, true, _) => FenceAction::Apply,
+        (false, _, true) => FenceAction::Lift,
         _ => FenceAction::None,
     }
+}
+
+/// Whether any of the roles holds a direct grant the fence revokes, on a
+/// relation or in a default ACL. The same set the snapshot and REVOKE cover.
+fn revocable_grants_expr(quoted_roles: &str) -> String {
+    if quoted_roles.is_empty() {
+        return "false".to_string();
+    }
+    format!(
+        "(EXISTS (SELECT 1 FROM pg_class c \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+           CROSS JOIN LATERAL aclexplode(c.relacl) a \
+           JOIN pg_roles g ON g.oid = a.grantee \
+           WHERE g.rolname IN ({quoted_roles}) \
+             AND c.relkind IN ('r','p','v','f','S') \
+             AND a.privilege_type IN ({FENCED_PRIVILEGES}) \
+             AND {USER_SCHEMAS}) \
+         OR EXISTS (SELECT 1 FROM pg_default_acl d \
+           CROSS JOIN LATERAL aclexplode(d.defaclacl) a \
+           JOIN pg_roles g ON g.oid = a.grantee \
+           WHERE g.rolname IN ({quoted_roles}) \
+             AND d.defaclobjtype IN ('r','S') \
+             AND a.privilege_type IN ({FENCED_PRIVILEGES})))"
+    )
+}
+
+/// Read the catalog facts the reconciler and the seal decide on.
+///
+/// The snapshot rows are asked separately: `PostgreSQL` resolves every table
+/// a statement names before running it, so one statement guarding the table
+/// with `to_regclass` still fails before the first fence creates it.
+///
+/// # Errors
+/// SQL failure, a reply that does not parse, or an invalid role name.
+pub async fn observe(
+    supervisor: &crate::supervisor::Supervisor,
+    app_roles: &[String],
+    cluster_id: &str,
+) -> Result<FenceObservation> {
+    let revocable = revocable_grants_expr(&quoted_role_list(app_roles)?);
+    let raw = supervisor
+        .execute_sql(&format!(
+            "SELECT (NOT pg_is_in_recovery())::text \
+             || '|' || EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = '{}')::text \
+             || '|' || (to_regclass('{FENCE_TABLE}') IS NOT NULL)::text \
+             || '|' || {revocable}::text;",
+            super::ddl_freeze::DDL_TRIGGER
+        ))
+        .await
+        .context("observing the client fence")?;
+    let fields: Vec<&str> = raw.trim().split('|').collect();
+    let [primary, freeze, table, grants] = fields.as_slice() else {
+        bail!("expected four fence facts, got {raw:?}");
+    };
+    let recorded = if parse_pg_bool(table)? {
+        let escaped_cluster = cluster_id.replace('\'', "''");
+        let rows = supervisor
+            .execute_sql(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} \
+                 WHERE cluster_id = '{escaped_cluster}')::text;"
+            ))
+            .await
+            .context("reading the client-fence snapshot")?;
+        parse_pg_bool(&rows)?
+    } else {
+        false
+    };
+    Ok(FenceObservation {
+        is_primary: parse_pg_bool(primary)?,
+        freeze_installed: parse_pg_bool(freeze)?,
+        grants: FenceGrants {
+            revocable: parse_pg_bool(grants)?,
+            recorded,
+        },
+    })
+}
+
+fn sealed_position_sql(quoted_roles: &str) -> String {
+    format!(
+        "SELECT {}::text || '|' || pg_current_wal_insert_lsn()::text;",
+        revocable_grants_expr(quoted_roles)
+    )
+}
+
+/// The final LSN: the insert position, read in the statement that re-checks
+/// the grants.
+///
+/// The insert position bounds every commit record written so far, acked or
+/// not; the flush position can trail an acked asynchronous commit. A standby
+/// errors on the read, so a seal never records a position from one.
+///
+/// # Errors
+/// SQL failure, a fenced role holding a write grant again, or an unparseable
+/// reply.
+pub async fn sealed_position(
+    supervisor: &crate::supervisor::Supervisor,
+    app_roles: &[String],
+) -> Result<u64> {
+    let raw = supervisor
+        .execute_sql(&sealed_position_sql(&quoted_role_list(app_roles)?))
+        .await
+        .context("reading the sealed position")?;
+    let Some((grants, lsn)) = raw.trim().split_once('|') else {
+        bail!("expected grants|lsn, got {raw:?}");
+    };
+    if parse_pg_bool(grants)? {
+        bail!("a fenced role holds a write grant again; the fence is not in force");
+    }
+    parse_lsn_bytes(lsn)
 }
 
 /// Whether this node can be written to at all.
@@ -345,46 +511,6 @@ pub async fn node_is_primary(supervisor: &crate::supervisor::Supervisor) -> Resu
     parse_pg_bool(&raw)
 }
 
-/// Whether the fence is currently applied to any of `app_roles`.
-///
-/// Read from the snapshot table rather than remembered: the seal handler
-/// applies the fence itself, so a reconciler that trusted its own history
-/// would believe an unfenced cluster was fenced (and, worse, never lift).
-///
-/// # Errors
-/// SQL failure, or a reply that is not a boolean.
-pub async fn fence_is_applied(
-    supervisor: &crate::supervisor::Supervisor,
-    app_roles: &[String],
-    cluster_id: &str,
-) -> Result<bool> {
-    if app_roles.is_empty() {
-        return Ok(false);
-    }
-    let quoted = quoted_role_list(app_roles)?;
-    let escaped_cluster = cluster_id.replace('\'', "''");
-    // Asked separately because PostgreSQL plans both arms of a CASE: guarding
-    // the table reference with to_regclass in one statement still fails to
-    // parse before the first seal has created it.
-    let exists = supervisor
-        .execute_sql(&format!("SELECT to_regclass('{FENCE_TABLE}') IS NOT NULL;"))
-        .await
-        .context("probing for the client-fence snapshot table")?;
-    if !parse_pg_bool(&exists)? {
-        return Ok(false);
-    }
-    // Filtered by cluster: rows replicated from another cluster's snapshot
-    // must not make this one believe it is fenced.
-    let raw = supervisor
-        .execute_sql(&format!(
-            "SELECT EXISTS(SELECT 1 FROM {FENCE_TABLE} \
-             WHERE cluster_id = '{escaped_cluster}' AND role_name IN ({quoted}));"
-        ))
-        .await
-        .context("reading client-fence snapshot state")?;
-    parse_pg_bool(&raw)
-}
-
 pub(crate) fn parse_pg_bool(raw: &str) -> Result<bool> {
     match raw.trim() {
         "t" | "true" => Ok(true),
@@ -393,7 +519,7 @@ pub(crate) fn parse_pg_bool(raw: &str) -> Result<bool> {
     }
 }
 
-/// Current flush LSN in bytes, read after the fence is in place.
+/// Current flush LSN in bytes.
 ///
 /// # Errors
 /// SQL failure, or an LSN that does not parse as `X/Y` hex.
@@ -438,14 +564,6 @@ fn fence_table_ddl() -> String {
     )
 }
 
-async fn ensure_fence_table(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
-    supervisor
-        .execute_sql(&fence_table_ddl())
-        .await
-        .context("creating client-fence snapshot table")?;
-    Ok(())
-}
-
 fn validate_role_ident(role: &str) -> Result<()> {
     if !crate::config::is_valid_pg_role_name(role) {
         bail!("app role {role:?} is not a valid role name (^[a-zA-Z_][a-zA-Z0-9_$]*$)");
@@ -458,24 +576,91 @@ fn validate_role_ident(role: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The seal handler fences directly, so the reconciler never applied it.
-    /// A reconciler tracking its own history sees "I applied nothing" and
-    /// leaves the application locked out of a cluster that has unsealed.
-    #[test]
-    fn a_fence_this_process_did_not_apply_is_still_lifted() {
-        assert_eq!(fence_action(false, true), FenceAction::Lift);
+    const fn seen(revocable: bool, recorded: bool) -> FenceGrants {
+        FenceGrants {
+            revocable,
+            recorded,
+        }
     }
 
+    /// The seal reads its final LSN only once the primary shows both the
+    /// fence and the DDL freeze; a standby or a revocable grant is not yet.
     #[test]
-    fn a_wanted_fence_that_is_not_in_place_is_applied() {
-        assert_eq!(fence_action(true, false), FenceAction::Apply);
+    fn only_a_fenced_frozen_primary_is_sealable() {
+        let at = |is_primary, freeze_installed, revocable| FenceObservation {
+            is_primary,
+            freeze_installed,
+            grants: seen(revocable, true),
+        };
+        assert!(at(true, true, false).sealable());
+        assert!(!at(false, true, false).sealable());
+        assert!(!at(true, false, false).sealable());
+        assert!(!at(true, true, true).sealable());
     }
 
-    /// Reconciling an already-correct fence must not churn REVOKEs.
+    /// Seeding restores the dump's ACLs onto a recipient fenced from boot,
+    /// and snapshot rows from an earlier pass say nothing about that. The
+    /// grant in the catalog is the fact: a fenced cluster holding one revokes
+    /// it again.
     #[test]
-    fn a_fence_already_matching_the_log_is_left_alone() {
-        assert_eq!(fence_action(true, true), FenceAction::None);
-        assert_eq!(fence_action(false, false), FenceAction::None);
+    fn a_regranted_privilege_on_a_fenced_cluster_is_revoked_again() {
+        assert_eq!(fence_action(true, seen(true, true)), FenceAction::Apply);
+        assert_eq!(fence_action(true, seen(true, false)), FenceAction::Apply);
+    }
+
+    /// Unfenced, every grant this cluster recorded goes back, whoever took it.
+    #[test]
+    fn an_unfenced_cluster_restores_every_recorded_grant() {
+        assert_eq!(fence_action(false, seen(false, true)), FenceAction::Lift);
+        assert_eq!(fence_action(false, seen(true, true)), FenceAction::Lift);
+    }
+
+    /// A role with nothing left to revoke is fenced, recorded rows or not;
+    /// reconciling a settled fence must not churn.
+    #[test]
+    fn a_settled_fence_is_left_alone() {
+        assert_eq!(fence_action(true, seen(false, true)), FenceAction::None);
+        assert_eq!(fence_action(true, seen(false, false)), FenceAction::None);
+        assert_eq!(fence_action(false, seen(true, false)), FenceAction::None);
+        assert_eq!(fence_action(false, seen(false, false)), FenceAction::None);
+    }
+
+    /// A login role that is a member of a fenced group writes through the
+    /// group's grants, so its in-flight transaction outruns the seal just the
+    /// same. The drain walks membership down from the fenced roles.
+    #[test]
+    fn the_seal_drain_reaches_members_of_fenced_roles() {
+        let sql = terminate_backends_sql("'bg_app'");
+        assert!(sql.contains("pg_auth_members"), "{sql}");
+        assert!(sql.contains("usesysid IN"), "{sql}");
+        assert!(sql.contains("pid <> pg_backend_pid()"), "{sql}");
+    }
+
+    /// The insert position bounds every commit record written so far, acked
+    /// or not; the flush position can trail an acked asynchronous commit.
+    /// Read in the same statement that re-checks the grants, so a grant
+    /// restored after the fence was verified refuses the seal.
+    #[test]
+    fn the_final_lsn_is_the_insert_position_read_with_the_grant_check() {
+        let sql = sealed_position_sql("'bg_app'");
+        assert!(sql.contains("pg_current_wal_insert_lsn()"), "{sql}");
+        assert!(!sql.contains("flush_lsn"), "{sql}");
+        assert!(sql.contains("aclexplode"), "{sql}");
+    }
+
+    /// Fence moves are DDL, and the DDL freeze is on while they happen. One
+    /// transaction marked exempt passes the freeze without taking it down:
+    /// dropping the trigger for the move opened a DDL window inside SEALED.
+    #[test]
+    fn fence_moves_run_in_one_transaction_exempt_from_the_ddl_freeze() {
+        for sql in [apply_sql("blue", &["bg_app".to_string()]), lift_sql("blue")] {
+            assert!(sql.starts_with("BEGIN; "), "{sql}");
+            assert!(
+                sql.contains(&format!("SET LOCAL {DDL_FREEZE_EXEMPT_GUC} = 'on';")),
+                "{sql}"
+            );
+            assert!(sql.ends_with(" COMMIT;"), "{sql}");
+        }
     }
 
     /// The probe must read a plain `t`/`f`, and refuse anything else rather
@@ -509,29 +694,18 @@ mod tests {
         assert!(FENCED_PRIVILEGES.contains("'UPDATE'"));
     }
 
-    /// The REVOKE fences only new privilege checks: a session already past its
-    /// check commits after the seal's LSN read, so the seal must end every
-    /// fenced-role backend — sparing only itself.
+    /// The wait follows the signalled sessions only. A fenced role that
+    /// reconnects sees the REVOKE, so counting it would stall the seal behind
+    /// a reader that cannot write.
     #[test]
-    fn the_seal_terminates_fenced_backends_by_role_and_spares_itself() {
-        let sql = terminate_backends_sql("'bg_app','other'");
+    fn the_drain_waits_for_the_signalled_sessions_not_new_ones() {
         assert_eq!(
-            sql,
-            "SELECT count(pg_terminate_backend(pid))::text FROM pg_stat_activity \
-             WHERE usename IN ('bg_app','other') AND pid <> pg_backend_pid();"
+            surviving_backends_sql("101,202"),
+            "SELECT count(*)::text FROM pg_stat_activity WHERE pid IN (101,202);"
         );
-    }
-
-    /// The wait polls what remains, with the same self-exclusion — otherwise
-    /// the seal's own session keeps the count at one forever.
-    #[test]
-    fn the_backend_drain_poll_counts_survivors_not_signals() {
-        let sql = remaining_backends_sql("'bg_app'");
-        assert_eq!(
-            sql,
-            "SELECT count(*)::text FROM pg_stat_activity \
-             WHERE usename IN ('bg_app') AND pid <> pg_backend_pid();"
-        );
+        assert_eq!(parse_pid_list("101,202\n").unwrap(), vec![101, 202]);
+        assert_eq!(parse_pid_list("").unwrap(), Vec::<u32>::new());
+        assert!(parse_pid_list("101,x").is_err());
     }
 
     /// Role quoting matches the fence's own conventions: validated idents,
@@ -572,7 +746,7 @@ mod tests {
         assert!(snap.contains("pg_default_acl"));
         assert!(snap.contains("defaclobjtype"));
         assert!(snap.contains("'d'"), "default rows must be marked: {snap}");
-        let lift = lift_sql("blue", "bg_app");
+        let lift = lift_sql("blue");
         assert!(
             lift.contains("ALTER DEFAULT PRIVILEGES FOR ROLE"),
             "the lift must restore default-ACL grants: {lift}"
@@ -593,7 +767,7 @@ mod tests {
     /// would otherwise retry the same failure forever.
     #[test]
     fn the_lift_skips_dropped_relations_instead_of_failing() {
-        let sql = lift_sql("blue", "bg_app");
+        let sql = lift_sql("blue");
         assert!(
             sql.contains("to_regclass"),
             "each relation grant must be guarded: {sql}"
@@ -616,10 +790,8 @@ mod tests {
     /// and must never be deleted by this cluster's lift.
     #[test]
     fn the_lift_touches_only_this_clusters_rows() {
-        let sql = lift_sql("blue", "bg_app");
-        let filters = sql
-            .matches("cluster_id = 'blue' AND role_name = 'bg_app'")
-            .count();
+        let sql = lift_sql("blue");
+        let filters = sql.matches("WHERE cluster_id = 'blue'").count();
         assert_eq!(
             filters, 2,
             "both the SELECT and the DELETE must filter: {sql}"

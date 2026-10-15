@@ -150,10 +150,6 @@ pub struct ManagementApiState {
     /// entry; handlers must read authority through
     /// `Governor::cutover_authority_projection`, never the raw log state.
     pub awaits_write_authority_from: Option<Arc<str>>,
-    /// Shared with the client-fence reconciler: whoever changes the PG-side
-    /// fence holds this, so a reconcile cannot lift the fence inside a seal
-    /// handler's fence→LSN-read→commit window (U2).
-    pub client_fence_apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The two paths needed to read a data directory's control file, plus Track B

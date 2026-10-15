@@ -113,10 +113,7 @@ fn sample_log_entries() -> Vec<LogEntry> {
             target_cluster_id: "green".to_string(),
             local_cluster_id: "blue".to_string(),
         }),
-        LogEntryPayload::Normal(ClusterCommand::CutoverSeal {
-            final_lsn: 8_192,
-            app_roles: vec!["app".to_string()],
-        }),
+        LogEntryPayload::Normal(ClusterCommand::CutoverSeal { final_lsn: 8_192 }),
         LogEntryPayload::Normal(ClusterCommand::SetUpgradeFreeze { frozen: true }),
         LogEntryPayload::Normal(ClusterCommand::CutoverDrainObserved),
         LogEntryPayload::Normal(ClusterCommand::CutoverTransfer {
@@ -133,6 +130,9 @@ fn sample_log_entries() -> Vec<LogEntry> {
             local_cluster_id: "green".to_string(),
         }),
         LogEntryPayload::Normal(ClusterCommand::SetFeatureLevel { level: 1 }),
+        LogEntryPayload::Normal(ClusterCommand::CutoverSealing {
+            app_roles: vec!["app".to_string()],
+        }),
     ];
     commands
         .into_iter()

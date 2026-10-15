@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::ManagementApiState;
-use crate::commands::upgrade::client_fence::apply_client_write_fence;
+use crate::commands::upgrade::client_fence;
 use crate::governor::state_machine::NodeId;
 use crate::governor::state_machine::{ClusterCommand, CommandOutcome, CutoverPhase};
 
@@ -32,6 +32,12 @@ const _: () = assert!(
 );
 /// Gap between polling rounds while the donor's followers catch up.
 const DONOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long SEAL waits for the primary's reconciler to put the fence and the
+/// DDL freeze in place, and the pause between looks. The budget only ends the
+/// wait with a refusal; the seal itself is gated on what the catalog says.
+const SEAL_FENCE_BUDGET: Duration = Duration::from_secs(20);
+const SEAL_FENCE_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutoverStatusResponse {
@@ -58,6 +64,7 @@ pub struct CutoverArmRequest {
 pub struct CutoverSealRequest {
     /// Application roles to REVOKE DML from (client-vs-apply fence).
     /// Required: without them the seal fences nothing on the internal port.
+    /// A SEAL re-issued from SEALING must name the roles SEALING committed.
     pub app_roles: Vec<String>,
     /// SECURITY DEFINER functions accepted by name (`schema.func`); paths
     /// not named here still refuse the seal.
@@ -376,43 +383,16 @@ pub(super) async fn cutover_arm(
     .await
 }
 
-/// Undo the fence a failing SEAL applied, then refuse with `reason`.
+/// SEAL, in two commits: withdraw authority, then record where writes stopped.
 ///
-/// Nothing committed, so the reconciler — which reads the committed log —
-/// would never lift this fence on its own.
-async fn lift_and_refuse(
-    state: &ManagementApiState,
-    guard: &crate::supervisor::Supervisor,
-    app_roles: &[String],
-    reason: &str,
-) -> (StatusCode, Json<CutoverActionResponse>) {
-    let lifted = crate::commands::upgrade::client_fence::lift_client_write_fence(
-        guard,
-        app_roles,
-        &state.cluster_id,
-    )
-    .await;
-    let suffix = match lifted {
-        Ok(()) => "the fence was lifted",
-        Err(_) => {
-            "lifting the fence also failed — clients are fenced with no seal entry; retry SEAL or abort"
-        }
-    };
-    refuse(
-        state,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("{reason}; {suffix}"),
-    )
-}
-
-/// SEAL: fence client writes, then record the LSN they stopped at.
-///
-/// The order is the contract (U2). Committing SEAL first and revoking after
-/// leaves a window where an acked client write carries an LSN past
-/// `final_lsn`, so the recipient's drain gate passes without it; and reading
-/// the LSN before the fence has the same effect one step earlier. The fence
-/// goes on first, the LSN is read here rather than supplied by the caller,
-/// and only then does the entry commit.
+/// SEALING commits first. Authority is then nobody's, gateways hold, and the
+/// primary's reconciler revokes from the committed roles. This handler waits
+/// until the local primary shows the fence and the DDL freeze in place,
+/// drains every fenced-role session that predates the fence, reads the insert
+/// LSN in the statement that re-checks the grants, and commits SEAL — so no
+/// acked client write carries an LSN past `final_lsn` (U2). Re-issued from
+/// SEALING it resumes; a failure leaves SEALING committed for a retry or an
+/// abort, and nothing is undone by hand.
 pub(super) async fn cutover_seal(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<CutoverSealRequest>,
@@ -425,110 +405,119 @@ pub(super) async fn cutover_seal(
              on the internal PG port, and would report U1 held while blind",
         );
     }
-    if state.cluster_state.read().cutover.phase != CutoverPhase::Armed {
-        let phase = state.cluster_state.read().cutover.phase;
-        return refuse(
-            &state,
-            StatusCode::CONFLICT,
-            format!(
-                "Refusing SEAL from phase {}: arm the cutover first",
-                phase.as_str()
-            ),
-        );
-    }
     let Some(pg) = state.postgres_manager.as_ref() else {
         return refuse(
             &state,
             StatusCode::BAD_REQUEST,
-            "No supervisor on this node to apply the client-write fence",
+            "No supervisor on this node to verify the client-write fence",
         );
     };
-
-    // Held from fence-apply through the Raft commit: the reconciler derives
-    // its wanted state from the committed log, which still says "unfenced"
-    // inside this window, so an unguarded wake here would lift the fence and
-    // let an acked write carry an LSN past the recorded final_lsn (U2).
-    let _fence_guard = state.client_fence_apply_lock.lock().await;
-
-    let guard = pg.lock().await;
-    if let Err(e) = crate::commands::upgrade::blue_green::require_fence_covers_roles(
-        &guard,
-        &body.app_roles,
-        &body.accepted_security_definer,
-    )
-    .await
-    {
-        return refuse(
-            &state,
-            StatusCode::BAD_REQUEST,
-            format!("Refusing SEAL: {e}"),
-        );
-    }
-    if let Err(e) = apply_client_write_fence(&guard, &body.app_roles, &state.cluster_id).await {
-        return refuse(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Refusing SEAL: client-write fence failed: {e}"),
-        );
-    }
-    // The REVOKE stops new privilege checks only. A transaction that passed
-    // its check before the fence and commits after the LSN read below is an
-    // acked write past final_lsn (U2) — so every fenced-role backend is ended
-    // and proven gone before the LSN is read.
-    if let Err(e) = crate::commands::upgrade::client_fence::terminate_fenced_role_backends(
-        &guard,
-        &body.app_roles,
-    )
-    .await
-    {
-        return lift_and_refuse(
-            &state,
-            &guard,
-            &body.app_roles,
-            &format!("Fenced-role sessions could not be drained, not sealing ({e})"),
-        )
-        .await;
-    }
-    let final_lsn = match crate::commands::upgrade::client_fence::flush_lsn_bytes(&guard).await {
-        Ok(lsn) => lsn,
-        Err(e) => {
-            return lift_and_refuse(
-                &state,
+    let cutover = state.cluster_state.read().cutover.clone();
+    match cutover.phase {
+        CutoverPhase::Armed => {
+            let guard = pg.lock().await;
+            let covered = crate::commands::upgrade::blue_green::require_fence_covers_roles(
                 &guard,
                 &body.app_roles,
-                &format!("Final LSN unreadable, not sealing ({e})"),
+                &body.accepted_security_definer,
             )
             .await;
+            drop(guard);
+            if let Err(e) = covered {
+                return refuse(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    format!("Refusing SEAL: {e}"),
+                );
+            }
+            info!(roles = ?body.app_roles, "Cutover SEALING");
+            let (status, resp) = apply_cutover(
+                &state,
+                ClusterCommand::CutoverSealing {
+                    app_roles: body.app_roles.clone(),
+                },
+            )
+            .await;
+            if status != StatusCode::OK {
+                return (status, resp);
+            }
         }
-    };
-    drop(guard);
-
-    info!(final_lsn, "Cutover SEAL (fence applied, LSN read after)");
-    let (status, resp) = apply_cutover(
-        &state,
-        ClusterCommand::CutoverSeal {
-            final_lsn,
-            app_roles: body.app_roles.clone(),
-        },
-    )
-    .await;
-    if status != StatusCode::OK {
-        // The fence went on but no SEAL committed (leadership or quorum lost
-        // mid-handler). Leaving it on locks the application out with the
-        // committed state still Armed — and the reconciler, reading that
-        // state, would never lift it. Undo what this handler did.
-        let guard = pg.lock().await;
-        if let Err(e) = crate::commands::upgrade::client_fence::lift_client_write_fence(
-            &guard,
-            &body.app_roles,
-            &state.cluster_id,
-        )
-        .await
-        {
-            warn!(error = %e, "SEAL did not commit and the fence lift failed; clients stay fenced until abort or a seal retry");
+        CutoverPhase::Sealing if same_roles(&cutover.fenced_app_roles, &body.app_roles) => {}
+        CutoverPhase::Sealing => {
+            return refuse(
+                &state,
+                StatusCode::CONFLICT,
+                format!(
+                    "SEALING is committed for roles {:?}; re-issue SEAL with \
+                     those roles, or abort",
+                    cutover.fenced_app_roles
+                ),
+            );
+        }
+        phase => {
+            return refuse(
+                &state,
+                StatusCode::CONFLICT,
+                format!(
+                    "Refusing SEAL from phase {}: arm the cutover first",
+                    phase.as_str()
+                ),
+            );
         }
     }
-    (status, resp)
+    match sealed_position_once_fenced(&state, pg, &body.app_roles).await {
+        Ok(final_lsn) => {
+            info!(final_lsn, "Cutover SEAL (fence verified, sessions drained)");
+            apply_cutover(&state, ClusterCommand::CutoverSeal { final_lsn }).await
+        }
+        Err(e) => refuse(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "SEALING is committed, so gateways hold and the reconciler keeps \
+                 fencing, but SEAL did not finish: {e:#}. Re-issue SEAL to \
+                 resume, or abort to unseal"
+            ),
+        ),
+    }
+}
+
+fn same_roles(committed: &[String], asked: &[String]) -> bool {
+    let mut committed = committed.to_vec();
+    let mut asked = asked.to_vec();
+    committed.sort();
+    asked.sort();
+    committed == asked
+}
+
+/// Wait for the fence on the local primary, drain, and read the final LSN.
+async fn sealed_position_once_fenced(
+    state: &ManagementApiState,
+    pg: &tokio::sync::Mutex<crate::supervisor::Supervisor>,
+    roles: &[String],
+) -> anyhow::Result<u64> {
+    let started = Instant::now();
+    loop {
+        let guard = pg.lock().await;
+        let seen = client_fence::observe(&guard, roles, &state.cluster_id).await;
+        if let Ok(seen) = &seen
+            && seen.sealable()
+        {
+            client_fence::drain_fenced_sessions(&guard, roles).await?;
+            return client_fence::sealed_position(&guard, roles).await;
+        }
+        drop(guard);
+        if started.elapsed() >= SEAL_FENCE_BUDGET {
+            let waited = SEAL_FENCE_BUDGET.as_secs();
+            return Err(match seen {
+                Ok(seen) => anyhow::anyhow!(
+                    "the fence is not in force on this node after {waited}s ({seen:?})"
+                ),
+                Err(e) => e.context(format!("the fence was unobservable for {waited}s")),
+            });
+        }
+        tokio::time::sleep(SEAL_FENCE_POLL).await;
+    }
 }
 
 pub(super) async fn cutover_drain_observed(
@@ -581,64 +570,20 @@ pub(super) async fn cutover_transfer(
     .await
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CutoverAbortRequest {
-    /// Roles to re-GRANT after unseal. Must be the set sealed with.
-    pub app_roles: Vec<String>,
-}
-
+/// ABORT: unseal into a new epoch. Commit only — the primary's reconciler
+/// lifts the fence and the DDL freeze from the committed record, the same
+/// way it put them on.
 pub(super) async fn cutover_abort(
     State(state): State<Arc<ManagementApiState>>,
-    Json(body): Json<CutoverAbortRequest>,
 ) -> impl IntoResponse {
     info!("Cutover ABORT unseal");
-    let (status, resp) = apply_cutover(
+    apply_cutover(
         &state,
         ClusterCommand::CutoverAbortUnseal {
             local_cluster_id: state.cluster_id.to_string(),
         },
     )
-    .await;
-    if status != StatusCode::OK {
-        return (status, resp);
-    }
-    if body.app_roles.is_empty() {
-        return (status, resp);
-    }
-    let Some(pg) = state.postgres_manager.as_ref() else {
-        return (status, resp);
-    };
-    // Same exclusion as SEAL: the lift must not interleave with a reconcile
-    // or an in-flight seal's fence window.
-    let _fence_guard = state.client_fence_apply_lock.lock().await;
-    let guard = pg.lock().await;
-    // The freeze trigger fires on ddl_command_start and GRANT is DDL, so the
-    // lift's re-GRANTs would be refused by the very freeze the abort ends.
-    // Drop it first; the reconciler keeps it off once the phase is Aborted.
-    if let Err(e) = crate::commands::upgrade::ddl_freeze::remove_ddl_freeze(&guard).await {
-        return refuse(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Unsealed into a new epoch but removing the DDL freeze failed, \
-                 so the fence lift's GRANTs would be refused: {e}"
-            ),
-        );
-    }
-    if let Err(e) = crate::commands::upgrade::client_fence::lift_client_write_fence(
-        &guard,
-        &body.app_roles,
-        &state.cluster_id,
-    )
     .await
-    {
-        return refuse(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Unsealed into a new epoch but lifting the client fence failed: {e}"),
-        );
-    }
-    (status, resp)
 }
 
 /// Break glass after the recipient could not prove drain. Never a timeout.

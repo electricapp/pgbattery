@@ -15,6 +15,7 @@ enums.ClusterCommand = [
   "UpdateLsn",
   "SetSyncMode",
   "CutoverArmed",
+  "CutoverSealing",
   "CutoverSeal",
   "CutoverDrainObserved",
   "CutoverTransfer",
@@ -23,7 +24,7 @@ enums.ClusterCommand = [
   "SetUpgradeFreeze",
   "SetFeatureLevel",
 ]
-enums.CutoverPhase = ["Idle", "Armed", "Sealed", "Draining", "Transferred", "Aborted"]
+enums.CutoverPhase = ["Idle", "Armed", "Sealing", "Sealed", "Draining", "Transferred", "Aborted"]
 enums.CommandOutcome = ["Applied", "OutOfOrder"]
 enums.FenceAction = ["Apply", "Lift", "None"]
 enums.DonorClaim = ["Confirms", "Contradicts", "Silent"]

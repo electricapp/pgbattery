@@ -1,7 +1,9 @@
 //! DDL freeze and schema digest for Track C cutovers.
 //!
 //! Driven from the committed cutover phase by the reconciler, which retries: a
-//! trigger left installed would block every DDL in the database forever.
+//! trigger left installed would block every DDL in the database forever. The
+//! fence's own DDL passes it by an exempt superuser session, so the freeze
+//! and the fence reconcile independently.
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -9,7 +11,7 @@ use tracing::info;
 use crate::governor::state_machine::CutoverPhase;
 
 const FENCE_SCHEMA: &str = "pgbattery";
-const DDL_TRIGGER: &str = "pgbattery_ddl_freeze";
+pub(super) const DDL_TRIGGER: &str = "pgbattery_ddl_freeze";
 
 /// Shape of the user schema: relation, column, type, nullability.
 ///
@@ -40,49 +42,10 @@ const SCHEMA_DIGEST_SQL: &str = "SELECT COALESCE(md5(string_agg(sig, E'\\n' ORDE
 /// recipient that cannot run DDL cannot be seeded.
 #[must_use]
 pub(crate) const fn ddl_should_freeze(phase: CutoverPhase) -> bool {
-    matches!(phase, CutoverPhase::Sealed | CutoverPhase::Draining)
-}
-
-/// What one reconcile pass does to the freeze trigger, around the fence work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DdlFreezePlan {
-    /// Drop the trigger before touching the fence (the fence's snapshot
-    /// table is DDL the freeze would refuse).
-    pub unfreeze_first: bool,
-    /// Install the trigger after the fence settles.
-    pub freeze_after: bool,
-}
-
-/// Decide the freeze moves for one pass. Idempotent: a steady state — the
-/// trigger already matching the wanted phase, no fence change — moves
-/// nothing. Dropping and reinstalling every pass opened a DDL window inside
-/// SEALED on every reconcile.
-#[must_use]
-pub(crate) const fn ddl_freeze_plan(
-    want_freeze: bool,
-    installed: bool,
-    fence_changes: bool,
-) -> DdlFreezePlan {
-    DdlFreezePlan {
-        unfreeze_first: installed && (fence_changes || !want_freeze),
-        freeze_after: want_freeze && (fence_changes || !installed),
-    }
-}
-
-/// Whether the freeze trigger is installed. Probed, not remembered.
-///
-/// # Errors
-/// SQL failure, or a reply that is not a boolean.
-pub(crate) async fn ddl_freeze_installed(
-    supervisor: &crate::supervisor::Supervisor,
-) -> Result<bool> {
-    let raw = supervisor
-        .execute_sql(&format!(
-            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = '{DDL_TRIGGER}');"
-        ))
-        .await
-        .context("probing for the DDL freeze trigger")?;
-    super::client_fence::parse_pg_bool(&raw)
+    matches!(
+        phase,
+        CutoverPhase::Sealing | CutoverPhase::Sealed | CutoverPhase::Draining
+    )
 }
 
 /// Digest of the user schema, for comparing donor against recipient.
@@ -111,23 +74,33 @@ pub(crate) fn schema_digests_agree(donor: &str, recipient: &str) -> bool {
 /// # Errors
 /// The trigger could not be created.
 pub(crate) async fn install_ddl_freeze(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
-    let sql = format!(
+    supervisor
+        .execute_sql(&install_sql())
+        .await
+        .context("installing the DDL freeze trigger")?;
+    info!("DDL freeze installed");
+    Ok(())
+}
+
+/// The trigger refuses all DDL except a superuser session that marked itself
+/// exempt: the fence's own REVOKE/GRANT, which then never takes it down.
+fn install_sql() -> String {
+    let exempt = super::client_fence::DDL_FREEZE_EXEMPT_GUC;
+    format!(
         "CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}; \
          CREATE OR REPLACE FUNCTION {FENCE_SCHEMA}.refuse_ddl() RETURNS event_trigger \
            LANGUAGE plpgsql AS $pgb$ BEGIN \
+             IF current_setting('{exempt}', true) = 'on' \
+                AND (SELECT rolsuper FROM pg_roles WHERE rolname = session_user) THEN \
+               RETURN; \
+             END IF; \
              RAISE EXCEPTION 'DDL is frozen: a pgbattery cutover is in progress'; \
            END $pgb$; \
          DO $pgb$ BEGIN \
            CREATE EVENT TRIGGER {DDL_TRIGGER} ON ddl_command_start \
              EXECUTE FUNCTION {FENCE_SCHEMA}.refuse_ddl(); \
          EXCEPTION WHEN duplicate_object THEN NULL; END $pgb$;"
-    );
-    supervisor
-        .execute_sql(&sql)
-        .await
-        .context("installing the DDL freeze trigger")?;
-    info!("DDL freeze installed");
-    Ok(())
+    )
 }
 
 /// Allow DDL again. Idempotent, and safe to call when nothing is installed.
@@ -164,11 +137,29 @@ mod tests {
         assert!(!ddl_should_freeze(CutoverPhase::Armed));
     }
 
-    /// The donor mid-cutover is the whole point: the digest was taken here.
+    /// The donor mid-cutover is the whole point: the digest was taken here,
+    /// and the final LSN is read only once the freeze is in place.
     #[test]
     fn the_donor_is_frozen_from_seal_until_the_handoff_resolves() {
+        assert!(ddl_should_freeze(CutoverPhase::Sealing));
         assert!(ddl_should_freeze(CutoverPhase::Sealed));
         assert!(ddl_should_freeze(CutoverPhase::Draining));
+    }
+
+    /// The fence's own REVOKE/GRANT is DDL. The trigger lets a superuser
+    /// session that marked itself exempt through, and refuses everyone else,
+    /// so the freeze never comes down for a fence move.
+    #[test]
+    fn the_freeze_exempts_only_superuser_fence_writers() {
+        let sql = install_sql();
+        assert!(
+            sql.contains(&format!(
+                "current_setting('{}', true) = 'on'",
+                super::super::client_fence::DDL_FREEZE_EXEMPT_GUC
+            )),
+            "{sql}"
+        );
+        assert!(sql.contains("rolsuper"), "{sql}");
     }
 
     /// Once it resolves either way, DDL has to come back.
@@ -207,61 +198,6 @@ mod tests {
                 "digest must cover {shape}"
             );
         }
-    }
-
-    /// SEALED steady state: the trigger is installed, the phase still wants
-    /// it, no fence move — the pass must not drop and reinstall it, because
-    /// that opens a DDL window inside SEALED on every reconcile.
-    #[test]
-    fn a_steady_sealed_reconcile_leaves_the_installed_freeze_alone() {
-        let plan = ddl_freeze_plan(true, true, false);
-        assert!(!plan.unfreeze_first);
-        assert!(!plan.freeze_after);
-    }
-
-    /// A fence move under an installed freeze needs the window: the snapshot
-    /// table is DDL, so unfreeze, move the fence, refreeze.
-    #[test]
-    fn a_fence_move_under_freeze_opens_and_closes_the_window() {
-        let plan = ddl_freeze_plan(true, true, true);
-        assert!(plan.unfreeze_first);
-        assert!(plan.freeze_after);
-    }
-
-    #[test]
-    fn missing_or_stale_triggers_converge_to_the_wanted_phase() {
-        // Wanted but missing: install, nothing to drop.
-        assert_eq!(
-            ddl_freeze_plan(true, false, false),
-            DdlFreezePlan {
-                unfreeze_first: false,
-                freeze_after: true
-            }
-        );
-        // Installed but no longer wanted: drop, never reinstall.
-        assert_eq!(
-            ddl_freeze_plan(false, true, false),
-            DdlFreezePlan {
-                unfreeze_first: true,
-                freeze_after: false
-            }
-        );
-        // Not wanted, not installed: nothing.
-        assert_eq!(
-            ddl_freeze_plan(false, false, false),
-            DdlFreezePlan {
-                unfreeze_first: false,
-                freeze_after: false
-            }
-        );
-    }
-
-    /// A fence move with no freeze wanted still never installs one.
-    #[test]
-    fn a_fence_move_without_a_wanted_freeze_installs_nothing() {
-        let plan = ddl_freeze_plan(false, false, true);
-        assert!(!plan.unfreeze_first);
-        assert!(!plan.freeze_after);
     }
 
     /// A dropped column leaves a permanent gap in `attnum`, so a donor that

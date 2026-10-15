@@ -468,10 +468,12 @@ Concretely, the authority identity widens from `node_id` to
 1. `CUTOVER_ARMED{green_cluster_id}` — committed in blue's log. Nothing changes
    for clients. Green's supervisor learns which cluster it is chasing, and
    blue's gateways learn a handoff is pending.
-2. `WRITE_AUTHORITY_SEALED{final_lsn}` — blue's leader stops accepting client
-   writes and records its final flush LSN. This reuses the existing fence path,
-   so it inherits L2's testing rather than introducing a parallel mechanism.
-   The entry commits before any write can land on green.
+2. `WRITE_AUTHORITY_SEALED{final_lsn}` — in two commits on blue's log.
+   SEALING withdraws authority and names the roles to fence; blue's gateways
+   hold and its primary's reconciler revokes their DML. Once the primary shows
+   the fence in force and every session that predates it has exited, SEAL
+   records the insert LSN, read in the statement that re-checks the grants.
+   Both commit before any write can land on green.
 3. Green drains. Its supervisor waits until the subscription's applied origin
    LSN has reached `final_lsn`, then advances every sequence past blue's
    current values, then runs the equality checks. Green is still read-only.
