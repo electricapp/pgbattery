@@ -37,6 +37,7 @@ from rich.console import Console
 
 os.environ.setdefault("COMPOSE_FILE", "docker-compose.bluegreen.yml")
 
+import settle
 import topology
 from topology import Node, Topology, load
 from waiting import WaitTimeout, await_until
@@ -1100,10 +1101,10 @@ def main(
     blue, green = _blue_green(topo)
     console.print(f"topology: blue={[n.service for n in blue]} green={[n.service for n in green]}")
 
-    for n in (blue[0], green[0]):
-        _wait_leader(n, timeout=180)
-    blue_leader = _leader_node(blue)
-    green_leader = _leader_node(green)
+    # Each cluster settles on its own: a leader alone races the joins, and a
+    # one-voter blue cannot lose the quorum the chaos cases take away.
+    blue_leader = settle.await_settled(blue)
+    green_leader = settle.await_settled(green)
 
     def _maj(node: Node) -> int:
         return int(_psql(node, "SHOW server_version_num;").strip()) // 10_000

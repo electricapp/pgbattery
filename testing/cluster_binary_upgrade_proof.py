@@ -29,6 +29,7 @@ from rich.console import Console
 
 os.environ.setdefault("COMPOSE_FILE", "docker-compose.yml")
 
+import settle
 import topology
 from topology import Node, Topology, load
 from waiting import WaitTimeout, await_until
@@ -279,7 +280,11 @@ def main(
 
     topo = load()
     entry = topo.voters[0]
-    _leader_node(topo)
+    # The roll's preflight is `doctor --strict`: starting it while the joins
+    # are still learners refuses on replication:sync for a reason the roll
+    # did not cause.
+    leader = settle.await_settled(topo.voters)
+    console.print(f"settled: {len(topo.voters)} voters, leader {leader.service}")
 
     # Probe current + next binaries inside the image.
     cur = _exec(entry.service, "pgbattery", "--version").strip().splitlines()[0]

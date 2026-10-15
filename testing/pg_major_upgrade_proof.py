@@ -29,6 +29,7 @@ from rich.console import Console
 
 os.environ.setdefault("COMPOSE_FILE", "docker-compose.pgupgrade.yml")
 
+import settle
 import topology
 from topology import Node, load
 from waiting import WaitTimeout, await_until
@@ -395,8 +396,10 @@ def main(
         _compose("down", "-v", check=False)
         _compose("up", "-d", "--remove-orphans")
 
-    leader = _leader_node()
     topo = load()
+    # The apply's preflight is `doctor --strict`, which refuses a cluster
+    # whose joins are still learners or whose standbys are not yet sync.
+    leader = settle.await_settled(topo.nodes)
     console.print(f"topology: {[n.service for n in topo.nodes]}; leader={leader.service}")
     _require_dual_majors()
     _assert_majors(FROM_MAJOR)
