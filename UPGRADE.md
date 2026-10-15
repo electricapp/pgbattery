@@ -87,7 +87,13 @@ must become explicit and tested:
    decode failure. This bounds the supported window to adjacent releases
    and makes violations loud. Greenfield: the byte is present from the first
    release (`RAFT_RPC_FRAME_VERSION = 0`); there is no unversioned legacy
-   frame shape to bootstrap around.
+   frame shape to bootstrap around. Accepting N-1 is not yet speaking it:
+   responses carry the responder's own version, and a refused client gives
+   up. The first bump must make responses echo the request's version and
+   clients retry in the version a refusal names, or an N-1 leader rejects
+   every upgraded follower's response; a tripwire test
+   (`a_frame_bump_needs_version_negotiation_first`) fails the bump until it
+   does.
 2. redb store schema. The store gets a schema-version key written at create
    time; a store with no key reads as schema 0, which is how every existing
    store adopts the scheme. On open: equal version proceeds; older version

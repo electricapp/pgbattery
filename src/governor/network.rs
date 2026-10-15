@@ -1115,6 +1115,22 @@ mod tests {
         assert!(validate_rpc_frame_len(MAX_RPC_FRAME_LEN + 1, "request").is_err());
     }
 
+    /// Tripwire for the first frame bump. Every frame, responses included, is
+    /// stamped with this binary's own version, and a client refused by an
+    /// older peer gives up. With one version in existence that is invisible;
+    /// after a bump, an N-1 leader rejects every response from an upgraded
+    /// follower, and an N leader cannot reach an N-1 one. The bump must land
+    /// with responses echoing the request's version and clients retrying in
+    /// the version a refusal names, then move this bound.
+    #[test]
+    fn a_frame_bump_needs_version_negotiation_first() {
+        assert_eq!(
+            RAFT_RPC_FRAME_VERSION, 0,
+            "bumping the frame version requires per-connection negotiation \
+             (UPGRADE.md, compatibility contract 1)"
+        );
+    }
+
     #[test]
     fn take_frame_accepts_current_version_and_refuses_newer() {
         let mut ok = BytesMut::new();
