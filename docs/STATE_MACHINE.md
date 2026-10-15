@@ -92,6 +92,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
   2. WAL hole leader cannot fill → `streaming_gap_action` / `replay_can_continue`.
   3. Failed rewind / foreign lineage → `Error::RewindFailed::target_intact`, `Error::ForeignDataDirectory` (intact → restart+retry; compromised/foreign → clone).
 - Discard is safe: W1 + V1 ⇒ a same-lineage leader holds every acked write; foreign/half-rewound directories hold nothing this cluster promised. Related divergence hits the divergence gate (refuse), not discard.
+- **Divergence gate**: what `pg_rewind` discards is local WAL past the fork its own `--dry-run` names (`parse_rewind_plan`), not past the source's current position, which shrinks to nothing once the new leader writes enough. The budget is policy from committed state (`ClusterState::rewind_budget`): unbounded while `SetSyncMode` says sync is in force, since every acked commit is then on the new leader; the async RPO (`PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`) otherwise. Past it, `RewindDataLossRisk` keeps the node out for an operator; the fork does not move, so nothing heals it silently.
 - These must be doors, not holds: PG dies on every start in these states → permanent restart loop.
 - Wrong prediction → act on refusal: `standby_action_for_mismatch` may skip rewind when replay ≤ leader; `repoint_standby` takes rewind when the checkpoint-based fork refuses.
 - **No `Supervisor::role` field.** `pgbattery_pg_is_primary` is set from the `pg_is_in_recovery()` result at the writer.

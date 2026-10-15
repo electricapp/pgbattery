@@ -55,25 +55,12 @@ pub const PG_CTL_PROMOTE_TIMEOUT_MS: u64 = 90_000;
 /// here usually indicates the data directory is on a frozen volume.
 pub const PG_CONTROLDATA_TIMEOUT_MS: u64 = 5_000;
 
-/// Maximum local-WAL-ahead-of-source divergence the supervisor will
-/// silently discard via `pg_rewind`.
+/// Most local WAL past the fork a rewind may discard while sync replication
+/// is not in force: the published async RPO.
 ///
-/// One `PostgreSQL` WAL segment (16 MiB). A crashed primary (e.g. the leader
-/// `SIGKILLed` mid-write) is almost always ahead of the freshly-elected leader
-/// by some *uncommitted* WAL — the in-flight transaction plus checkpoint /
-/// autovacuum / FPI background records — which routinely exceeds a single
-/// 8 KiB block. With pgbattery's synchronous replication and LSN-aware
-/// election the new leader already holds every acknowledged commit, so that
-/// "extra" WAL on the old primary is unacked and safe for `pg_rewind` to
-/// discard. The previous one-block threshold refused it, so a crashed leader
-/// could never auto-rejoin — it crash-looped on the fence gate (deposed
-/// primary, lease expired, PG stopped after the refused rewind → "FAILED TO
-/// FENCE" → shutdown → restart → repeat).
-///
-/// Beyond a full segment the node ran independently long enough to be a
-/// genuine divergence concern, so we still refuse with
-/// `Error::RewindDataLossRisk` and leave it out of the cluster for operator
-/// inspection rather than risk discarding ack'd writes (the async-failover
-/// edge case the gate exists to surface). Lower this if your data-safety
-/// posture favours manual intervention over automatic rejoin under load.
+/// One `PostgreSQL` WAL segment (16 MiB). Under committed sync replication
+/// the budget is unbounded instead, because every acknowledged commit is on
+/// the new leader and the tail is unacknowledged whatever its size. Past this
+/// bound under async, the node stays out with `Error::RewindDataLossRisk` for
+/// an operator to inspect rather than discard acknowledged writes.
 pub const PG_REWIND_DIVERGENCE_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;

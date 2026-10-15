@@ -102,20 +102,18 @@ pub enum Error {
     #[error("Promotion error: {0}")]
     Promotion(String),
 
-    /// Refused to run `pg_rewind` because the local WAL is ahead of the
-    /// source by more than the acceptable divergence. Rewinding in this
-    /// state would discard WAL the cluster may still need.
+    /// Refused to run `pg_rewind` because the local WAL past the fork exceeds
+    /// the discard budget while sync replication was not in force.
     ///
-    /// Returned by `Supervisor::run_pg_rewind` before any data is touched.
-    /// Stays out of the cluster until the
-    /// operator inspects (or until the divergence is naturally healed —
-    /// e.g. the source catches up past the local position).
+    /// Returned by `Supervisor::run_pg_rewind` before any data is touched. The
+    /// fork does not move as the source writes on, so the node stays out
+    /// until an operator inspects it.
     #[error(
-        "pg_rewind refused: local LSN ({local_lsn_bytes}) ahead of source LSN ({source_lsn_bytes}) by {divergence_bytes} bytes (threshold {threshold_bytes}); rewinding would discard WAL the cluster may still need"
+        "pg_rewind refused: local WAL ends at {local_lsn_bytes}, {divergence_bytes} bytes past the fork at {fork_lsn_bytes} (budget {threshold_bytes}); rewinding would discard WAL that may hold acknowledged commits"
     )]
     RewindDataLossRisk {
         local_lsn_bytes: u64,
-        source_lsn_bytes: u64,
+        fork_lsn_bytes: u64,
         divergence_bytes: u64,
         threshold_bytes: u64,
     },

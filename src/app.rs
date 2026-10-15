@@ -1486,11 +1486,12 @@ impl App {
         // node), not leadership data, so the nodes map is the right source.
         // upgrade_frozen rides the same committed-state read: the Track B
         // freeze decides below whether a stopped standby is left alone.
-        let (leader_pg_addr, upgrade_frozen) = {
+        let (leader_pg_addr, upgrade_frozen, rewind_budget) = {
             let state = cluster_state.read();
             (
                 state.nodes.get(&leader_id).map(|n| n.pg_addr),
                 state.upgrade_frozen,
+                state.rewind_budget(),
             )
         };
         let Some(addr) = leader_pg_addr else {
@@ -1512,7 +1513,14 @@ impl App {
             return LeadershipObservation::not_leading();
         }
 
-        Self::demote_to_leader(postgres, addr, "follow leader", upgrade_frozen).await;
+        Self::demote_to_leader(
+            postgres,
+            addr,
+            "follow leader",
+            upgrade_frozen,
+            rewind_budget,
+        )
+        .await;
         LeadershipObservation::not_leading()
     }
 
@@ -1849,6 +1857,7 @@ impl App {
         leader_addr: SocketAddr,
         context: &str,
         upgrade_frozen: bool,
+        rewind_budget: crate::supervisor::RewindBudget,
     ) {
         // We log + count per-cause failures here rather than propagating: the
         // caller is the reconcile loop, which retries on the next tick (every
@@ -1918,7 +1927,7 @@ impl App {
             // lease fence uses.
             Self::terminate_client_backends(&*pg).await;
         }
-        if let Err(e) = pg.demote(leader_addr).await {
+        if let Err(e) = pg.demote(leader_addr, rewind_budget).await {
             metrics::counter!("pgbattery_demote_apply_failures").increment(1);
             error!(error = %e, "Failed to configure standby for new leader");
         }

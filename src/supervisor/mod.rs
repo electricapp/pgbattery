@@ -11,6 +11,6 @@
 
 pub use pgbattery_supervisor::backup::recover_interrupted_restore;
 pub use pgbattery_supervisor::{
-    BackupManager, PgWriteState, PostmasterState, ReplicationStat, ReplicationState, Supervisor,
-    SupervisorConfig, SyncState, TimelineInfo, read_system_identifier,
+    BackupManager, PgWriteState, PostmasterState, ReplicationStat, ReplicationState, RewindBudget,
+    Supervisor, SupervisorConfig, SyncState, TimelineInfo, read_system_identifier,
 };

@@ -12,8 +12,7 @@ use tokio::time::sleep;
 
 use pgbattery_core::constants::{
     PG_CONTROLDATA_TIMEOUT_MS, PG_CTL_PROMOTE_TIMEOUT_MS, PG_CTL_RELOAD_TIMEOUT_MS,
-    PG_CTL_STOP_TIMEOUT_MS, PG_REWIND_DIVERGENCE_THRESHOLD_BYTES, PG_REWIND_MAX_RETRIES,
-    PG_REWIND_RETRY_DELAY_MS,
+    PG_CTL_STOP_TIMEOUT_MS, PG_REWIND_MAX_RETRIES, PG_REWIND_RETRY_DELAY_MS,
 };
 use pgbattery_core::{Error, NodeId, PgAuthMode, ReplicationSlot, Result, WalLevel};
 
@@ -613,38 +612,97 @@ fn parse_lsn_local(lsn_str: &str) -> Option<u64> {
     Some((upper << 32) | lower)
 }
 
-/// Outcome of comparing the local WAL position to the prospective rewind
-/// source. Drives the silent-data-loss gate in
-/// [`Supervisor::check_rewind_divergence_safe`].
+/// How much divergent WAL a rewind may discard; the control plane decides
+/// from the cluster's committed sync mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindBudget {
+    /// Sync replication was in force: every acknowledged commit is on the new
+    /// leader, so the tail past the fork is unacknowledged whatever its size.
+    Unbounded,
+    /// Async or unknown: the tail may hold acknowledged commits, bounded by
+    /// the published async RPO.
+    Bytes(u64),
+}
+
+/// What `pg_rewind --dry-run` says the real run would do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewindPlan {
+    /// Local WAL past `fork`, where the histories split, is what a rewind
+    /// discards.
+    Diverged { fork: u64 },
+    /// The target is already on the source's history.
+    NothingToDiscard,
+}
+
+/// Read a [`RewindPlan`] from `pg_rewind --dry-run` output under `LC_ALL=C`.
+/// `None` when the output names neither, which the gate refuses on.
+fn parse_rewind_plan(output: &str) -> Option<RewindPlan> {
+    if let Some(rest) = output.split("servers diverged at WAL location ").nth(1) {
+        let lsn = rest.split_whitespace().next()?;
+        return parse_lsn_local(lsn).map(|fork| RewindPlan::Diverged { fork });
+    }
+    output
+        .contains("no rewind required")
+        .then_some(RewindPlan::NothingToDiscard)
+}
+
+/// The error a failed `pg_rewind` run stands for, decided where its stderr is
+/// held. A foreign lineage is its own error: the one failure a caller can
+/// resolve, by re-provisioning a directory that holds no write this cluster
+/// acknowledged. A dry run never touches the target, so its failures leave it
+/// intact whatever the stderr says.
+fn rewind_failure_error(stderr: &str, source_addr: SocketAddr, dry_run: bool) -> Error {
+    if stderr
+        .to_ascii_lowercase()
+        .contains(REWIND_FOREIGN_LINEAGE_MARKER)
+    {
+        metrics::counter!("pgbattery_pg_rewind_foreign_lineage").increment(1);
+        tracing::error!(
+            source = %source_addr,
+            stderr = %stderr,
+            "This data directory belongs to a different PostgreSQL cluster than the leader"
+        );
+        return Error::ForeignDataDirectory {
+            rewind_source: source_addr.to_string(),
+            detail: stderr.trim().to_string(),
+        };
+    }
+    tracing::warn!(stderr = %stderr, dry_run, "pg_rewind failed");
+    Error::RewindFailed {
+        target_intact: dry_run || pg_rewind_failure_is_pre_copy(stderr),
+        detail: stderr.trim().to_string(),
+    }
+}
+
+/// Outcome of the rewind data-loss gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RewindDecision {
-    /// Local is at or behind the source — `pg_rewind` can proceed normally.
+    /// Local WAL ends at or before the fork: nothing is discarded.
     Safe,
-    /// Local is ahead of the source by a small amount (≤ threshold), the
-    /// expected in-flight window. Proceed but record the divergence.
+    /// The tail past the fork fits the budget. Proceed and record its size.
     WithinTolerance { divergence_bytes: u64 },
-    /// Local has more WAL than the source by more than the threshold
-    /// allows — running `pg_rewind` here would discard ack'd commits.
-    /// Refuse and bubble up an error for the operator to inspect.
+    /// The tail exceeds the budget: rewinding could discard acknowledged
+    /// commits. Refuse for the operator to inspect.
     Refuse { divergence_bytes: u64 },
 }
 
-/// Pure decision logic for the rewind data-loss gate. Extracted from
-/// [`Supervisor::check_rewind_divergence_safe`] so the boundary cases
-/// can be exercised without a live `PostgreSQL`.
+/// Pure decision for the rewind data-loss gate: what `pg_rewind` discards is
+/// local WAL past the fork, never local WAL past the source's current
+/// position, which shrinks to nothing once the new leader writes enough.
 const fn rewind_divergence_decision(
-    local_lsn: u64,
-    source_lsn: u64,
-    threshold_bytes: u64,
+    local_end: u64,
+    fork: u64,
+    budget: RewindBudget,
 ) -> RewindDecision {
-    if local_lsn <= source_lsn {
+    if local_end <= fork {
         return RewindDecision::Safe;
     }
-    let divergence_bytes = local_lsn - source_lsn;
-    if divergence_bytes <= threshold_bytes {
-        RewindDecision::WithinTolerance { divergence_bytes }
-    } else {
-        RewindDecision::Refuse { divergence_bytes }
+    let divergence_bytes = local_end - fork;
+    match budget {
+        RewindBudget::Bytes(limit) if divergence_bytes > limit => {
+            RewindDecision::Refuse { divergence_bytes }
+        }
+        _ => RewindDecision::WithinTolerance { divergence_bytes },
     }
 }
 
@@ -1830,64 +1888,22 @@ host all all ::/0 {auth_method}
         parsed
     }
 
-    /// Refuse to run `pg_rewind` if the local WAL is ahead of the source by
-    /// more than [`PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`] (one 16 MiB WAL
-    /// segment). `pg_rewind` aligns local to source by discarding any local
-    /// WAL the source doesn't have — and that "extra" WAL is exactly where
-    /// acknowledged commits live if the local node was the previous primary
-    /// or a sync replica.
+    /// Refuse a rewind whose discard exceeds `budget`. What `pg_rewind`
+    /// discards is local WAL past the fork its dry run named, which may hold
+    /// acknowledged commits unless sync replication was in force
+    /// ([`RewindBudget`]).
     ///
-    /// The tolerance is only safe on the assumption that the surplus WAL is
-    /// *unacknowledged*. Under synchronous replication that holds: every
-    /// acked commit is on the sync standby, so WAL only this node has was
-    /// never acked, and discarding up to a segment of it (in-flight
-    /// transaction plus checkpoint/autovacuum/FPI background records on a
-    /// crashed primary) loses nothing a client was promised. During async
-    /// fallback (`synchronous_standby_names` empty) it does NOT hold: up to
-    /// the full threshold of client-acked WAL can be discarded here. That is
-    /// the published async RPO — the `WithinTolerance` warning below exists
-    /// so operators can see each such discard and its size.
-    ///
-    /// `pre_stop_local_lsn` is the local LSN captured by the caller while
-    /// PG was still up (the rewind paths stop PG before this check runs,
-    /// so the SQL probe cannot answer here). When `None` — PG was already
-    /// stopped when the flow began — fall back to a live probe.
-    ///
-    /// Returns Ok if the rewind is safe to proceed (local <= source, or
-    /// divergence ≤ `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`). Returns
-    /// `Error::RewindDataLossRisk` when divergence exceeds the threshold; the
-    /// caller stays out of the cluster pending operator inspection.
-    ///
-    /// Fails CLOSED on probe failure: if the local WAL position is unavailable,
-    /// or the source LSN cannot be read after `REWIND_GATE_LSN_RETRIES` bounded
-    /// retries, returns [`rewind_untouched`] rather than rewinding blind —
-    /// without both LSNs we cannot prove the rewind will not discard
-    /// client-acked WAL. The gate runs before `pg_rewind` modifies anything,
-    /// so recovery is a clean retry rather than a wedge: the in-recovery
-    /// reconcile loop re-runs the whole demote (re-capturing the pre-stop LSN
-    /// while PG is up), and a deposed primary restarts and rejoins. A transient
-    /// source blip is already absorbed by the bounded retries above, so failing
-    /// closed here does not deadlock joins.
-    ///
-    /// Pure comparison split into `rewind_divergence_decision` for unit
-    /// testing without a live PG.
-    async fn check_rewind_divergence_safe(
+    /// `pre_stop_local_lsn` is the local end captured while PG was still up
+    /// (the rewind paths stop it before this runs); `None` re-probes once.
+    /// Fails closed on a missing local end or an unreadable plan: nothing has
+    /// been touched, so the reconcile loop re-runs the whole demote. Every
+    /// discard that proceeds is logged with its size.
+    async fn check_rewind_discard(
         &self,
-        source_addr: SocketAddr,
         pre_stop_local_lsn: Option<u64>,
+        plan: Option<RewindPlan>,
+        budget: RewindBudget,
     ) -> Result<()> {
-        // Number of times to retry reading an LSN before failing closed.
-        // `wait_for_rewind_source` already confirmed the source is reachable, so
-        // a read miss here is transient and worth a few quick retries.
-        const REWIND_GATE_LSN_RETRIES: u32 = 3;
-        const REWIND_GATE_LSN_RETRY_DELAY_MS: u64 = 300;
-
-        // Local WAL position: captured pre-stop and passed in. If that failed we
-        // try once more, but PG is stopped by now so this usually fails too.
-        // Without the local LSN we CANNOT prove the rewind won't discard acked
-        // WAL, so we fail CLOSED rather than rewinding blind. The gate runs
-        // before pg_rewind modifies anything, so the reconcile loop retries the
-        // whole demote — re-capturing the pre-stop LSN while PG is up.
         let local_lsn = match pre_stop_local_lsn {
             Some(lsn) => lsn,
             None => self.capture_lsn_for_rewind_gate().await.ok_or_else(|| {
@@ -1899,47 +1915,27 @@ host all all ::/0 {auth_method}
             })?,
         };
 
-        // Source WAL position: retry a bounded number of times, then fail
-        // CLOSED. A read miss is precisely the state where the rewind's
-        // safety cannot be confirmed, so it must not proceed unchecked.
-        let mut source_lsn = None;
-        for attempt in 0..REWIND_GATE_LSN_RETRIES {
-            if let Some(lsn) = self.get_remote_lsn(source_addr).await {
-                source_lsn = Some(lsn);
-                break;
+        let fork = match plan {
+            Some(RewindPlan::Diverged { fork }) => fork,
+            Some(RewindPlan::NothingToDiscard) => return Ok(()),
+            None => {
+                metrics::counter!("pgbattery_pg_rewind_gate_probe_failed").increment(1);
+                return Err(rewind_untouched(
+                    "pg_rewind's dry run named no fork, refusing pg_rewind (cannot measure \
+                     what it would discard)",
+                ));
             }
-            if attempt + 1 < REWIND_GATE_LSN_RETRIES {
-                sleep(Duration::from_millis(REWIND_GATE_LSN_RETRY_DELAY_MS)).await;
-            }
-        }
-        let Some(source_lsn) = source_lsn else {
-            metrics::counter!("pgbattery_pg_rewind_gate_probe_failed").increment(1);
-            return Err(rewind_untouched(format!(
-                "could not read source LSN from {source_addr} after {REWIND_GATE_LSN_RETRIES} \
-                 attempts, refusing pg_rewind (cannot verify it will not discard acked WAL)"
-            )));
         };
 
-        match rewind_divergence_decision(
-            local_lsn,
-            source_lsn,
-            PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
-        ) {
+        match rewind_divergence_decision(local_lsn, fork, budget) {
             RewindDecision::Safe => Ok(()),
             RewindDecision::WithinTolerance { divergence_bytes } => {
-                // warn!, not debug!: the discarded surplus is provably unacked
-                // only under sync replication. During async fallback it can
-                // contain client-acked commits (the published async RPO), and
-                // operators need the byte count in the default log level to
-                // audit what a rewind threw away.
                 tracing::warn!(
                     local_lsn,
-                    source_lsn,
+                    fork,
                     divergence_bytes,
-                    threshold_bytes = PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
-                    "Local WAL ahead of rewind source within tolerance — proceeding with pg_rewind; \
-                     the discarded surplus is unacknowledged under sync replication, but during \
-                     async fallback it may include client-acked commits"
+                    ?budget,
+                    "Discarding local WAL past the fork with pg_rewind"
                 );
                 Ok(())
             }
@@ -1947,17 +1943,21 @@ host all all ::/0 {auth_method}
                 metrics::counter!("pgbattery_pg_rewind_refused_data_loss_risk").increment(1);
                 tracing::error!(
                     local_lsn,
-                    source_lsn,
+                    fork,
                     divergence_bytes,
-                    threshold_bytes = PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
-                    source = %source_addr,
-                    "Refusing pg_rewind: local WAL is ahead of source by more than the divergence threshold — rewinding would discard WAL the cluster may still need. Manual intervention required."
+                    ?budget,
+                    "Refusing pg_rewind: the local WAL past the fork exceeds what may be \
+                     discarded while sync replication was not in force. Manual intervention \
+                     required."
                 );
                 Err(Error::RewindDataLossRisk {
                     local_lsn_bytes: local_lsn,
-                    source_lsn_bytes: source_lsn,
+                    fork_lsn_bytes: fork,
                     divergence_bytes,
-                    threshold_bytes: PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+                    threshold_bytes: match budget {
+                        RewindBudget::Bytes(limit) => limit,
+                        RewindBudget::Unbounded => u64::MAX,
+                    },
                 })
             }
         }
@@ -2568,7 +2568,11 @@ host all all ::/0 {auth_method}
     /// dies; the streaming check keeps the cascade path fast by skipping the
     /// remote probe when streaming is healthy (timelines must match in that
     /// case by definition).
-    async fn repoint_standby(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
+    async fn repoint_standby(
+        &mut self,
+        new_leader_addr: SocketAddr,
+        budget: RewindBudget,
+    ) -> Result<()> {
         let needs_rewind = match self.decide_standby_action(new_leader_addr).await? {
             StandbyAction::NoOp | StandbyAction::Defer => return Ok(()),
             StandbyAction::RestartOnly => false,
@@ -2590,7 +2594,7 @@ host all all ::/0 {auth_method}
                 "Timeline mismatch detected while already in recovery - running pg_rewind"
             );
             if self
-                .rewind_onto_leader(new_leader_addr, pre_stop_lsn)
+                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, budget)
                 .await?
                 == RewindOutcome::Reprovisioned
             {
@@ -2624,7 +2628,7 @@ host all all ::/0 {auth_method}
                 "Standby did not open after re-pointing - rewinding onto the leader"
             );
             if self
-                .rewind_onto_leader(new_leader_addr, pre_stop_lsn)
+                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, budget)
                 .await?
                 == RewindOutcome::Rewound
             {
@@ -2682,8 +2686,12 @@ host all all ::/0 {auth_method}
         &mut self,
         new_leader_addr: SocketAddr,
         pre_stop_lsn: Option<u64>,
+        budget: RewindBudget,
     ) -> Result<RewindOutcome> {
-        if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
+        if let Err(e) = self
+            .run_pg_rewind(new_leader_addr, pre_stop_lsn, budget)
+            .await
+        {
             tracing::error!(error = %e, "pg_rewind failed while following new leader");
             match rewind_recovery(&e) {
                 RewindRecovery::RestartInPlace => {
@@ -2742,10 +2750,16 @@ host all all ::/0 {auth_method}
     ///   fails on a re-point escalates to the rewind it declined.
     /// - Currently a primary → full demote with `pg_rewind`.
     ///
+    /// `budget` bounds how much divergent WAL a rewind may discard.
+    ///
     /// # Errors
     /// Returns an error if the recovery-state probe fails, or the node cannot
     /// be reconfigured and restarted to follow `new_leader_addr`.
-    pub async fn demote(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
+    pub async fn demote(
+        &mut self,
+        new_leader_addr: SocketAddr,
+        budget: RewindBudget,
+    ) -> Result<()> {
         if self.postmaster_state()? == PostmasterState::NotRunning {
             return self.restart_or_repair_standby(new_leader_addr).await;
         }
@@ -2755,7 +2769,7 @@ host all all ::/0 {auth_method}
             ))
         })?;
         if in_recovery {
-            return self.repoint_standby(new_leader_addr).await;
+            return self.repoint_standby(new_leader_addr, budget).await;
         }
 
         tracing::info!(
@@ -2785,7 +2799,10 @@ host all all ::/0 {auth_method}
         // 2. Run pg_rewind to sync with new primary's timeline
         //    This is necessary because the former primary may have WAL on a different timeline
         tracing::info!("Running pg_rewind to sync timelines");
-        if let Err(e) = self.run_pg_rewind(new_leader_addr, pre_stop_lsn).await {
+        if let Err(e) = self
+            .run_pg_rewind(new_leader_addr, pre_stop_lsn, budget)
+            .await
+        {
             // Same recovery as the in-recovery path: a directory this leader
             // cannot be followed from in place is rebuilt from it, never left
             // stopped for someone to notice. See `rewind_recovery`.
@@ -3197,16 +3214,24 @@ host all all ::/0 {auth_method}
         pg_rewind: &Path,
         source_connstr: &str,
         budget_deadline: Instant,
+        dry_run: bool,
     ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
-        let mut child = Command::new(pg_rewind)
+        let mut command = Command::new(pg_rewind);
+        command
             .arg("-D")
             .arg(&self.config.pg_data_dir)
             .arg("--source-server")
             .arg(source_connstr)
             .arg("--progress")
+            // Its stderr is classified and parsed as English.
+            .env("LC_ALL", "C")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| rewind_untouched(format!("could not spawn pg_rewind: {e}")))?;
 
@@ -3260,6 +3285,7 @@ host all all ::/0 {auth_method}
         &self,
         source_addr: SocketAddr,
         pre_stop_local_lsn: Option<u64>,
+        budget: RewindBudget,
     ) -> Result<()> {
         let budget_deadline = Instant::now() + PG_REWIND_BUDGET;
 
@@ -3275,17 +3301,22 @@ host all all ::/0 {auth_method}
             // stopped → stale primary keeps answering → split-brain window.
             self.wait_for_rewind_source(source_addr).await?;
 
-            // Refuse to rewind if local has WAL the source doesn't —
-            // would silently discard ack'd writes. Runs after
-            // wait_for_rewind_source so the source LSN probe inside is
-            // against a known-reachable target.
-            self.check_rewind_divergence_safe(source_addr, pre_stop_local_lsn)
+            // Ask pg_rewind what the real run would discard before letting it:
+            // the dry run touches nothing and names the fork.
+            let (status, output) = self
+                .run_pg_rewind_attempt(&pg_rewind, &source_connstr, budget_deadline, true)
+                .await?;
+            let output = String::from_utf8_lossy(&output);
+            if !status.success() {
+                return Err(rewind_failure_error(&output, source_addr, true));
+            }
+            self.check_rewind_discard(pre_stop_local_lsn, parse_rewind_plan(&output), budget)
                 .await?;
 
             // Retry up to PG_REWIND_MAX_RETRIES times with delay (new leader needs time to start)
             for attempt in 1..=PG_REWIND_MAX_RETRIES {
                 let (status, stderr_buf) = self
-                    .run_pg_rewind_attempt(&pg_rewind, &source_connstr, budget_deadline)
+                    .run_pg_rewind_attempt(&pg_rewind, &source_connstr, budget_deadline, false)
                     .await?;
 
                 if status.success() {
@@ -3329,35 +3360,7 @@ host all all ::/0 {auth_method}
                     continue;
                 }
 
-                // A foreign lineage is its own error, not a string the caller
-                // has to grep for: it is the one rewind failure the caller can
-                // resolve, by re-provisioning a directory that cannot hold any
-                // write this cluster acknowledged.
-                if stderr
-                    .to_ascii_lowercase()
-                    .contains(REWIND_FOREIGN_LINEAGE_MARKER)
-                {
-                    metrics::counter!("pgbattery_pg_rewind_foreign_lineage").increment(1);
-                    tracing::error!(
-                        source = %source_addr,
-                        stderr = %stderr,
-                        "This data directory belongs to a different PostgreSQL cluster than the leader"
-                    );
-                    return Err(Error::ForeignDataDirectory {
-                        rewind_source: source_addr.to_string(),
-                        detail: stderr.trim().to_string(),
-                    });
-                }
-
-                // Terminal pre-copy, non-retryable error, or max attempts
-                // reached. This is the one place holding pg_rewind's own
-                // stderr, so the on-disk verdict is decided here and carried
-                // as data — a same-timeline failure stays untouched.
-                tracing::warn!(stderr = %stderr, "pg_rewind failed");
-                return Err(Error::RewindFailed {
-                    target_intact: pg_rewind_failure_is_pre_copy(&stderr),
-                    detail: stderr.trim().to_string(),
-                });
+                return Err(rewind_failure_error(&stderr, source_addr, false));
             }
 
             // Unreachable: the loop's last iteration cannot take the retry
@@ -4709,145 +4712,78 @@ mod tests {
         assert!(validate_pg_identifier("node\n2").is_err());
     }
 
-    // ── rewind_divergence_decision ────────────────────────────────────
+    // ── rewind discard gate ───────────────────────────────────────────
 
+    /// What `pg_rewind --dry-run` prints under `LC_ALL=C` for a diverged
+    /// former primary: the fork, not the source's current position, bounds
+    /// what the real run discards.
     #[test]
-    fn test_rewind_decision_local_behind_is_safe() {
-        // Local at LSN 50, source at LSN 100 — local needs to catch up,
-        // rewind has nothing to discard locally. Always safe.
-        let decision = rewind_divergence_decision(50, 100, 8_192);
-        assert_eq!(decision, RewindDecision::Safe);
-    }
-
-    #[test]
-    fn test_rewind_decision_local_equal_is_safe() {
-        // Same position on both sides — trivially safe.
-        let decision = rewind_divergence_decision(100, 100, 8_192);
-        assert_eq!(decision, RewindDecision::Safe);
-    }
-
-    #[test]
-    fn test_rewind_decision_within_tolerance() {
-        // Local 4 KiB ahead of source — within the one-WAL-block
-        // in-flight window. Proceed with pg_rewind.
-        let decision = rewind_divergence_decision(100_004_096, 100_000_000, 8_192);
+    fn the_dry_run_names_the_fork_point() {
+        let output = "pg_rewind: connected to server\n\
+                      pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\n\
+                      pg_rewind: rewinding from last common checkpoint at 0/2000060 on timeline 1\n\
+                      pg_rewind: Done!\n";
         assert_eq!(
-            decision,
-            RewindDecision::WithinTolerance {
-                divergence_bytes: 4_096
-            }
+            parse_rewind_plan(output),
+            Some(RewindPlan::Diverged { fork: 0x0300_0060 })
         );
     }
 
     #[test]
-    fn test_rewind_decision_exactly_at_threshold_proceeds() {
-        // Exactly at the threshold (≤ comparison): still proceeds.
-        // A `<` comparison would deadlock failover at boundary conditions.
-        let decision = rewind_divergence_decision(100_008_192, 100_000_000, 8_192);
+    fn a_target_already_on_the_source_history_discards_nothing() {
+        let output = "pg_rewind: servers diverged at WAL location 0/3000060 on timeline 1\n\
+                      pg_rewind: no rewind required\n";
         assert_eq!(
-            decision,
-            RewindDecision::WithinTolerance {
-                divergence_bytes: 8_192
-            }
-        );
-    }
-
-    #[test]
-    fn test_rewind_decision_refuse_beyond_threshold() {
-        // One byte over threshold — refuse. This is the protective
-        // direction: anything beyond the in-flight window represents
-        // ack'd commits that pg_rewind would silently erase.
-        let decision = rewind_divergence_decision(100_008_193, 100_000_000, 8_192);
-        assert_eq!(
-            decision,
-            RewindDecision::Refuse {
-                divergence_bytes: 8_193
-            }
-        );
-    }
-
-    #[test]
-    fn test_rewind_decision_refuse_megabyte_divergence() {
-        // Far over threshold — sync replica with the ack'd data is
-        // ahead of a freshly-elected async replica that didn't see
-        // those acks. The exact scenario the gate exists to refuse.
-        let decision = rewind_divergence_decision(116_777_216, 100_000_000, 8_192);
-        assert_eq!(
-            decision,
-            RewindDecision::Refuse {
-                divergence_bytes: 16_777_216
-            }
-        );
-    }
-
-    #[test]
-    fn test_rewind_decision_failover_inflight_window_within_tolerance() {
-        // A crashed primary is routinely some KB-to-MB ahead of the
-        // freshly-elected leader (uncommitted/background WAL). With the
-        // one-WAL-segment threshold that divergence is accepted so the node
-        // can auto-rejoin — regression for the 8 KiB threshold that refused
-        // it and left the deposed leader crash-looping on the fence gate.
-        let decision = rewind_divergence_decision(
-            100_000_000 + 256 * 1024,
-            100_000_000,
-            PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+            parse_rewind_plan(output),
+            Some(RewindPlan::Diverged { fork: 0x0300_0060 })
         );
         assert_eq!(
-            decision,
-            RewindDecision::WithinTolerance {
-                divergence_bytes: 256 * 1024
-            }
+            parse_rewind_plan("pg_rewind: no rewind required\n"),
+            Some(RewindPlan::NothingToDiscard)
         );
     }
 
     #[test]
-    fn test_rewind_decision_refuse_beyond_segment() {
-        // More than a full WAL segment ahead: genuine independent divergence,
-        // still refused for operator inspection.
-        let decision = rewind_divergence_decision(
-            100_000_000 + PG_REWIND_DIVERGENCE_THRESHOLD_BYTES + 1,
-            100_000_000,
-            PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+    fn unreadable_dry_run_output_is_not_a_plan() {
+        assert_eq!(parse_rewind_plan("pg_rewind: Done!\n"), None);
+        assert_eq!(
+            parse_rewind_plan("servers diverged at WAL location garbage on timeline 1"),
+            None
         );
-        assert!(matches!(decision, RewindDecision::Refuse { .. }));
     }
 
-    /// Pins the production threshold and the decision boundary AT that
-    /// threshold. The value is load-bearing in both directions: it is the
-    /// auto-rejoin allowance for a crashed primary's unacked surplus under
-    /// sync replication, and simultaneously the worst-case client-acked WAL
-    /// a rewind may discard during async fallback (the published async RPO).
-    /// A change to either the constant or the boundary comparison must be a
-    /// deliberate data-safety decision, not a drive-by.
+    /// The new leader writing more than the old primary diverged must not
+    /// hide the divergence: measured from the fork, 100 MiB past it is 100
+    /// MiB discarded, whatever the source has written since.
     #[test]
-    fn test_rewind_divergence_threshold_value_and_boundary() {
+    fn divergence_is_measured_from_the_fork() {
+        let fork = 100_000_000;
+        let local_end = fork + 100 * 1024 * 1024;
+        assert!(matches!(
+            rewind_divergence_decision(local_end, fork, RewindBudget::Bytes(16 * 1024 * 1024)),
+            RewindDecision::Refuse { .. }
+        ));
+    }
+
+    /// Under sync replication every acknowledged commit is on the new
+    /// leader, so a tail of any size is unacknowledged and may be discarded.
+    #[test]
+    fn a_sync_cluster_never_refuses_a_rewind() {
+        assert!(matches!(
+            rewind_divergence_decision(u64::MAX, 0, RewindBudget::Unbounded),
+            RewindDecision::WithinTolerance { .. }
+        ));
+    }
+
+    /// Pins the published async RPO. Changing it is a data-safety decision,
+    /// not a drive-by; the boundary itself is a property test below.
+    #[test]
+    fn test_rewind_divergence_threshold_value() {
+        use pgbattery_core::constants::PG_REWIND_DIVERGENCE_THRESHOLD_BYTES;
         assert_eq!(
             PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
             16 * 1024 * 1024,
             "threshold is one 16 MiB WAL segment — matches the documented async RPO"
-        );
-        let base: u64 = 100_000_000;
-        // Exactly at the threshold: proceeds (<= comparison).
-        assert_eq!(
-            rewind_divergence_decision(
-                base + PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
-                base,
-                PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
-            ),
-            RewindDecision::WithinTolerance {
-                divergence_bytes: PG_REWIND_DIVERGENCE_THRESHOLD_BYTES
-            }
-        );
-        // One byte past the threshold: refused.
-        assert_eq!(
-            rewind_divergence_decision(
-                base + PG_REWIND_DIVERGENCE_THRESHOLD_BYTES + 1,
-                base,
-                PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
-            ),
-            RewindDecision::Refuse {
-                divergence_bytes: PG_REWIND_DIVERGENCE_THRESHOLD_BYTES + 1
-            }
         );
     }
 
@@ -5106,7 +5042,7 @@ mod tests {
         assert_eq!(
             rewind_recovery(&Error::RewindDataLossRisk {
                 local_lsn_bytes: 100,
-                source_lsn_bytes: 50,
+                fork_lsn_bytes: 50,
                 divergence_bytes: 50,
                 threshold_bytes: 8,
             }),
@@ -5273,7 +5209,7 @@ mod tests {
         assert!(!matches!(
             Error::RewindDataLossRisk {
                 local_lsn_bytes: 200,
-                source_lsn_bytes: 100,
+                fork_lsn_bytes: 100,
                 divergence_bytes: 100,
                 threshold_bytes: 8_192,
             },
@@ -5759,15 +5695,16 @@ mod tests {
             /// slips through as `Proceed` while a smaller one is refused.
             #[test]
             fn prop_rewind_decision_monotone_in_divergence(
-                source in 0u64..u64::MAX / 2,
+                fork in 0u64..u64::MAX / 2,
                 threshold in 0u64..64 * 1024 * 1024,
                 lower_ahead in 0u64..256 * 1024 * 1024,
                 extra_ahead in 0u64..256 * 1024 * 1024,
             ) {
-                let lower = source.saturating_add(lower_ahead);
+                let budget = RewindBudget::Bytes(threshold);
+                let lower = fork.saturating_add(lower_ahead);
                 let higher = lower.saturating_add(extra_ahead);
-                let lower_decision = rewind_divergence_decision(lower, source, threshold);
-                let higher_decision = rewind_divergence_decision(higher, source, threshold);
+                let lower_decision = rewind_divergence_decision(lower, fork, budget);
+                let higher_decision = rewind_divergence_decision(higher, fork, budget);
                 prop_assert!(
                     severity(lower_decision) <= severity(higher_decision),
                     "local {lower} gave {lower_decision:?} but local {higher} \
@@ -5780,14 +5717,15 @@ mod tests {
             #[test]
             fn prop_rewind_decision_classification_is_exact(
                 local: u64,
-                source: u64,
+                fork: u64,
                 threshold: u64,
             ) {
-                let decision = rewind_divergence_decision(local, source, threshold);
-                if local <= source {
+                let decision =
+                    rewind_divergence_decision(local, fork, RewindBudget::Bytes(threshold));
+                if local <= fork {
                     prop_assert_eq!(decision, RewindDecision::Safe);
                 } else {
-                    let divergence_bytes = local - source;
+                    let divergence_bytes = local - fork;
                     let expected = if divergence_bytes <= threshold {
                         RewindDecision::WithinTolerance { divergence_bytes }
                     } else {
@@ -5802,31 +5740,32 @@ mod tests {
             /// conditions cannot deadlock failover), one byte further refuses.
             #[test]
             fn prop_rewind_decision_threshold_boundary(
-                source in 0u64..u64::MAX / 4,
+                fork in 0u64..u64::MAX / 4,
                 threshold in 1u64..64 * 1024 * 1024,
             ) {
+                let budget = RewindBudget::Bytes(threshold);
                 prop_assert_eq!(
-                    rewind_divergence_decision(source + threshold, source, threshold),
+                    rewind_divergence_decision(fork + threshold, fork, budget),
                     RewindDecision::WithinTolerance { divergence_bytes: threshold }
                 );
                 prop_assert_eq!(
-                    rewind_divergence_decision(source + threshold + 1, source, threshold),
+                    rewind_divergence_decision(fork + threshold + 1, fork, budget),
                     RewindDecision::Refuse { divergence_bytes: threshold + 1 }
                 );
             }
 
-            /// A local WAL position at or behind the source has nothing for
+            /// Local WAL ending at or before the fork has nothing for
             /// `pg_rewind` to discard, so it is unconditionally safe — no
-            /// threshold value may turn it into a refusal.
+            /// budget may turn it into a refusal.
             #[test]
-            fn prop_rewind_never_refuses_when_local_not_ahead(
+            fn prop_rewind_never_refuses_when_local_not_past_the_fork(
                 local: u64,
                 behind_by: u64,
                 threshold: u64,
             ) {
-                let source = local.saturating_add(behind_by);
+                let fork = local.saturating_add(behind_by);
                 prop_assert_eq!(
-                    rewind_divergence_decision(local, source, threshold),
+                    rewind_divergence_decision(local, fork, RewindBudget::Bytes(threshold)),
                     RewindDecision::Safe
                 );
             }

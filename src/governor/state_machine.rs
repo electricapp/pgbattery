@@ -955,6 +955,19 @@ impl ClusterState {
         (true, "LSN within acceptable range")
     }
 
+    /// How much divergent WAL a rewind may discard: without bound only while
+    /// the committed record says sync replication is in force, when every
+    /// acknowledged commit is on the new leader; otherwise the async RPO.
+    #[must_use]
+    pub const fn rewind_budget(&self) -> crate::supervisor::RewindBudget {
+        match self.sync_replication_active {
+            Some(true) => crate::supervisor::RewindBudget::Unbounded,
+            _ => crate::supervisor::RewindBudget::Bytes(
+                pgbattery_core::constants::PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
+            ),
+        }
+    }
+
     /// LSN catch-up threshold (bytes) for election/promotion gates, applying
     /// the fail-safe rule for [`ClusterState::sync_replication_active`]: only a
     /// *positively known* async mode (`Some(false)`) gets the loose threshold;
@@ -1034,6 +1047,21 @@ mod tests {
             CommandOutcome::OutOfOrder
         );
         assert!(!state.upgrade_frozen);
+    }
+
+    /// A rewind may discard without bound only while the committed record
+    /// says sync replication is in force; async and unknown both get the RPO.
+    #[test]
+    fn a_rewind_discards_freely_only_under_committed_sync() {
+        use crate::supervisor::RewindBudget;
+        let rpo =
+            RewindBudget::Bytes(pgbattery_core::constants::PG_REWIND_DIVERGENCE_THRESHOLD_BYTES);
+        let mut state = at_current_level();
+        assert_eq!(state.rewind_budget(), rpo);
+        state.apply(ClusterCommand::SetSyncMode { active: false });
+        assert_eq!(state.rewind_budget(), rpo);
+        state.apply(ClusterCommand::SetSyncMode { active: true });
+        assert_eq!(state.rewind_budget(), RewindBudget::Unbounded);
     }
 
     /// Raising the level admits the command set it names, and the level

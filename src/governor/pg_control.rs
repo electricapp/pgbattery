@@ -59,8 +59,13 @@ pub trait PgControl: Send + Sync {
     /// to empty would make the node acknowledge commits no standby holds.
     fn promote(&mut self, sync_standby_names: &str) -> impl Future<Output = Result<()>> + Send;
 
-    /// Reconfigure as a standby of `leader_addr`, rewinding if diverged.
-    fn demote(&mut self, leader_addr: SocketAddr) -> impl Future<Output = Result<()>> + Send;
+    /// Reconfigure as a standby of `leader_addr`, rewinding if diverged and
+    /// discarding no more divergent WAL than `budget` allows.
+    fn demote(
+        &mut self,
+        leader_addr: SocketAddr,
+        budget: crate::supervisor::RewindBudget,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Flip `default_transaction_read_only` and sever client backends.
     fn set_readonly(&self, readonly: bool) -> impl Future<Output = Result<()>> + Send;
@@ -115,8 +120,12 @@ impl PgControl for crate::supervisor::Supervisor {
         Self::promote(self, sync_standby_names).await
     }
 
-    async fn demote(&mut self, leader_addr: SocketAddr) -> Result<()> {
-        Self::demote(self, leader_addr).await
+    async fn demote(
+        &mut self,
+        leader_addr: SocketAddr,
+        budget: crate::supervisor::RewindBudget,
+    ) -> Result<()> {
+        Self::demote(self, leader_addr, budget).await
     }
 
     async fn set_readonly(&self, readonly: bool) -> Result<()> {
@@ -330,7 +339,11 @@ impl PgControl for ModelPg {
         Ok(())
     }
 
-    async fn demote(&mut self, leader_addr: SocketAddr) -> Result<()> {
+    async fn demote(
+        &mut self,
+        leader_addr: SocketAddr,
+        _budget: crate::supervisor::RewindBudget,
+    ) -> Result<()> {
         self.note(&format!("demote({leader_addr})"));
         if self.fails == Some(ModelOp::Demote) {
             return Err(pgbattery_core::Error::Postgres(
