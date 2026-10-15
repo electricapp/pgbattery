@@ -75,7 +75,7 @@ pub(crate) fn schema_digests_agree(donor: &str, recipient: &str) -> bool {
 /// The trigger could not be created.
 pub(crate) async fn install_ddl_freeze(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
     supervisor
-        .execute_sql(&install_sql())
+        .execute_transaction(&install_sql())
         .await
         .context("installing the DDL freeze trigger")?;
     info!("DDL freeze installed");
@@ -84,23 +84,27 @@ pub(crate) async fn install_ddl_freeze(supervisor: &crate::supervisor::Superviso
 
 /// The trigger refuses all DDL except a superuser session that marked itself
 /// exempt: the fence's own REVOKE/GRANT, which then never takes it down.
-fn install_sql() -> String {
+fn install_sql() -> [String; 3] {
     let exempt = super::client_fence::DDL_FREEZE_EXEMPT_GUC;
-    format!(
-        "CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}; \
-         CREATE OR REPLACE FUNCTION {FENCE_SCHEMA}.refuse_ddl() RETURNS event_trigger \
-           LANGUAGE plpgsql AS $pgb$ BEGIN \
-             IF current_setting('{exempt}', true) = 'on' \
-                AND (SELECT rolsuper FROM pg_roles WHERE rolname = session_user) THEN \
-               RETURN; \
-             END IF; \
-             RAISE EXCEPTION 'DDL is frozen: a pgbattery cutover is in progress'; \
-           END $pgb$; \
-         DO $pgb$ BEGIN \
-           CREATE EVENT TRIGGER {DDL_TRIGGER} ON ddl_command_start \
-             EXECUTE FUNCTION {FENCE_SCHEMA}.refuse_ddl(); \
-         EXCEPTION WHEN duplicate_object THEN NULL; END $pgb$;"
-    )
+    [
+        format!("CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}"),
+        format!(
+            "CREATE OR REPLACE FUNCTION {FENCE_SCHEMA}.refuse_ddl() RETURNS event_trigger \
+               LANGUAGE plpgsql AS $pgb$ BEGIN \
+                 IF current_setting('{exempt}', true) = 'on' \
+                    AND (SELECT rolsuper FROM pg_roles WHERE rolname = session_user) THEN \
+                   RETURN; \
+                 END IF; \
+                 RAISE EXCEPTION 'DDL is frozen: a pgbattery cutover is in progress'; \
+               END $pgb$"
+        ),
+        format!(
+            "DO $pgb$ BEGIN \
+               CREATE EVENT TRIGGER {DDL_TRIGGER} ON ddl_command_start \
+                 EXECUTE FUNCTION {FENCE_SCHEMA}.refuse_ddl(); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $pgb$"
+        ),
+    ]
 }
 
 /// Allow DDL again. Idempotent, and safe to call when nothing is installed.
@@ -151,7 +155,14 @@ mod tests {
     /// so the freeze never comes down for a fence move.
     #[test]
     fn the_freeze_exempts_only_superuser_fence_writers() {
-        let sql = install_sql();
+        let statements = install_sql();
+        for statement in &statements {
+            assert!(
+                crate::supervisor::one_statement(statement).is_ok(),
+                "{statement}"
+            );
+        }
+        let sql = statements.join(" ");
         assert!(
             sql.contains(&format!(
                 "current_setting('{}', true) = 'on'",

@@ -11,7 +11,7 @@
 
 pub use pgbattery_supervisor::backup::recover_interrupted_restore;
 pub use pgbattery_supervisor::{
-    BackupManager, FenceSession, FollowTerms, LineageTerm, PgWriteState, PostmasterState,
-    ReplicationStat, ReplicationState, RewindBudget, Supervisor, SupervisorConfig, SyncState,
-    TimelineInfo, read_system_identifier,
+    BackupManager, FenceSession, FollowTerms, LineageTerm, LivenessProbe, PgWriteState,
+    PostmasterState, ReadOnlyGuc, ReplicationStat, ReplicationState, RewindBudget, Supervisor,
+    SupervisorConfig, SyncState, TimelineInfo, one_statement, read_system_identifier,
 };

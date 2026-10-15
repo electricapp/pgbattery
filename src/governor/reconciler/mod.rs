@@ -580,7 +580,8 @@ impl NodeReconciler {
             return false;
         };
         publish_sync_durability(Some(state.sync_standbys), required);
-        if state.in_recovery || !state.read_only {
+        // Open only when a reload would not close it again.
+        if state.in_recovery || state.read_only.settled(false) {
             return false;
         }
         let committed_async = view.committed_sync == Some(false);
@@ -726,7 +727,7 @@ impl Driver {
                     &self.reconciler.client_fence,
                 );
                 let outcome = self.reconciler.pass(&mut *pg, &view).await;
-                let target = outcome.running.then(|| pg.local_psql_probe_params());
+                let target = outcome.running.then(|| pg.liveness_probe());
                 (outcome, target)
             };
             if outcome.died {
@@ -854,24 +855,10 @@ impl Driver {
     /// the cluster fails over. Returns whether the probe succeeded.
     async fn probe_liveness(
         &self,
-        (psql, port, user): (std::path::PathBuf, u16, String),
+        probe: crate::supervisor::LivenessProbe,
         failures: &mut u32,
     ) -> bool {
-        let conninfo =
-            format!("host=127.0.0.1 port={port} user={user} dbname=postgres connect_timeout=1");
-        let probe = tokio::time::timeout(
-            PG_PROBE_TIMEOUT,
-            tokio::process::Command::new(&psql)
-                .arg("-w")
-                .arg("-tAXq")
-                .arg("-c")
-                .arg("SELECT 1;")
-                .arg(&conninfo)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        if matches!(&probe, Ok(Ok(out)) if out.status.success()) {
+        if probe.answers(PG_PROBE_TIMEOUT).await {
             *failures = 0;
             return true;
         }

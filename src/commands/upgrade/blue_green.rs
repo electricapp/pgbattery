@@ -727,7 +727,7 @@ async fn refuse_unmanaged_databases(supervisor: &crate::supervisor::Supervisor) 
     if others.is_empty() {
         return Ok(());
     }
-    let (psql, port, user) = supervisor.local_psql_probe_params();
+    let (psql, port, user) = supervisor.local_psql_params();
     let mut probed = Vec::with_capacity(others.len());
     for db in &others {
         let conninfo = format!(

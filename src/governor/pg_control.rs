@@ -508,9 +508,13 @@ impl PgControl for ModelPg {
                 "model: nothing listening on the port".to_string(),
             ));
         }
+        let read_only = self.is_readonly();
         Ok(PgWriteState {
             in_recovery: self.in_recovery,
-            read_only: self.is_readonly(),
+            read_only: crate::supervisor::ReadOnlyGuc {
+                live: read_only,
+                on_reload: read_only,
+            },
             sync_list_empty: self
                 .sync_names
                 .lock()

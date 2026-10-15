@@ -16,36 +16,9 @@ use pgbattery_core::constants::{
 };
 use pgbattery_core::{Error, NodeId, PgAuthMode, ReplicationSlot, Result, WalLevel};
 
-/// Prefix of the per-query end marker echoed back by the persistent psql
-/// session. The full marker is `__PGBATTERY_SQL_END_<seq>__`.
-const END_MARKER_PREFIX: &str = "__PGBATTERY_SQL_END_";
-
-/// Whether a dead psql session's stderr shows the server answering.
-///
-/// The distinction decides how alarming an unfenceable node is. A session that
-/// ends carrying the server's own `ERROR:` — a corrupt catalog page, say — was
-/// answered, and a server that answers may still be serving writes, so that is
-/// a fence failure worth the split-brain marker. A session that ends with
-/// nothing from the server went away, and an absent server serves nothing.
-fn server_answered(stderr_tail: &str) -> bool {
-    (stderr_tail.contains("ERROR:") || stderr_tail.contains("FATAL:"))
-        && !server_declined_connections(stderr_tail)
-}
-
-/// Whether the server's own `FATAL` says it is not accepting connections:
-/// starting up, shutting down, in recovery. Such a server takes no writes, so
-/// it is absent for fencing purposes, not a fence that failed.
-fn server_declined_connections(stderr_tail: &str) -> bool {
-    stderr_tail.contains("FATAL:") && stderr_tail.contains("the database system is")
-}
-
-/// How long a read-only change waits for `pg_reload_conf()`'s SIGHUP to reach
-/// the backend that verifies it. Inside the caller's one-second lease-tick
-/// budget, with room for the psql spawn that issues the change.
-const READONLY_RELOAD_SETTLE: Duration = Duration::from_millis(300);
-
-/// Gap between verification reads while waiting for that reload.
-const READONLY_RELOAD_POLL: Duration = Duration::from_millis(25);
+use crate::session::{
+    FenceSession, LivenessProbe, PgWriteState, REPORTABLE_LSN_SQL, SessionTarget, SqlSession,
+};
 
 /// Hard wall-clock budget for the *entire* rewind sequence (pre-flight wait +
 /// retry loop + each command). Without this an unreachable source can stretch
@@ -84,377 +57,6 @@ fn bounded_peer_conninfo(addr: SocketAddr, user: &str) -> String {
         PEER_LIVENESS_TIMEOUT.as_millis(),
     )
 }
-
-/// Upper bound on a single newline-terminated line read from the persistent
-/// psql session. A wedged or garbage backend streaming an unterminated line
-/// would otherwise grow `line_buf` without limit; cap it so the session errors
-/// out instead of exhausting memory.
-const MAX_SQL_LINE_BYTES: usize = 8 * 1_024 * 1_024;
-
-/// How a line read from the persistent psql session relates to the end
-/// marker for the query currently being awaited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarkerLine {
-    /// Ordinary result data.
-    Data,
-    /// End marker for the awaited query — the buffered lines are its answer.
-    Current,
-    /// End marker for an earlier query whose `run_query` future was dropped
-    /// mid-read (caller-side timeout). Everything buffered so far belongs to
-    /// that stale response — discard it and keep reading.
-    Stale,
-    /// Marker with a sequence number that has not been issued yet — the
-    /// session stream is corrupt beyond recovery.
-    Corrupt,
-}
-
-/// Classify a stdout line against the end marker for `expected_seq`.
-///
-/// Pure so the stale-marker skip logic is testable without a live psql.
-/// Lines that merely resemble a marker (unparseable sequence, missing
-/// suffix) are treated as data: only an exact `__PGBATTERY_SQL_END_<n>__`
-/// shape is a marker.
-fn classify_marker_line(line: &str, expected_seq: u64) -> MarkerLine {
-    let Some(rest) = line.strip_prefix(END_MARKER_PREFIX) else {
-        return MarkerLine::Data;
-    };
-    let Some(seq_str) = rest.strip_suffix("__") else {
-        return MarkerLine::Data;
-    };
-    let Ok(seq) = seq_str.parse::<u64>() else {
-        return MarkerLine::Data;
-    };
-    match seq.cmp(&expected_seq) {
-        std::cmp::Ordering::Equal => MarkerLine::Current,
-        std::cmp::Ordering::Less => MarkerLine::Stale,
-        std::cmp::Ordering::Greater => MarkerLine::Corrupt,
-    }
-}
-
-/// Cap on the retained tail of psql's stderr. Error text psql emits right
-/// before dying is short; only the most recent bytes matter for diagnostics.
-const STDERR_TAIL_CAP: usize = 8 * 1024;
-
-struct LocalSqlClient {
-    child: Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
-    /// Tail of psql's stderr, continuously pulled off the pipe by
-    /// `stderr_task` into this bounded ring. Continuous draining is
-    /// load-bearing: stderr is never read during normal operation, so
-    /// sustained NOTICE/WARNING traffic would otherwise fill the ~64 KiB
-    /// pipe buffer and block psql's writes — wedging every SQL round trip
-    /// into its timeout. Older output past `STDERR_TAIL_CAP` is discarded.
-    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
-    /// Drainer task reading stderr until EOF; joined (bounded) by
-    /// `drain_stderr`, aborted on `shutdown`.
-    stderr_task: tokio::task::JoinHandle<()>,
-    /// Bytes of a stdout line that has not yet been fully received. Owned
-    /// by the session (not a `run_query` future) so a cancelled read never
-    /// loses a line prefix — see [`Self::next_line`].
-    line_buf: Vec<u8>,
-    /// Sequence number for the next query's end marker. Callers wrap
-    /// `execute_sql` in their own `tokio::time::timeout`, so a `run_query`
-    /// future can be dropped after the command was written but before its
-    /// response was consumed. The per-query marker lets the next reader
-    /// recognise the leftover response as stale and discard it instead of
-    /// returning it as its own answer.
-    next_seq: u64,
-}
-
-/// Build the psql input for one query: the SQL (`;`-terminated) plus the
-/// `\echo` of its end marker. Runs on every SQL probe — several per second,
-/// forever — so the budget is the one `String` returned.
-fn build_command(sql: &str, seq: u64) -> String {
-    use std::fmt::Write as _;
-    let sql = sql.trim_end();
-    // `;` + `\n` + `\echo ` + marker + up to 20 sequence digits + `__\n`.
-    let mut command = String::with_capacity(sql.len() + END_MARKER_PREFIX.len() + 32);
-    command.push_str(sql);
-    if !command.ends_with(';') {
-        command.push(';');
-    }
-    command.push('\n');
-    command.push_str("\\echo ");
-    command.push_str(END_MARKER_PREFIX);
-    let _ = write!(command, "{seq}");
-    command.push_str("__\n");
-    command
-}
-
-/// Split the first line — through `pos`, the index of its `\n` — off
-/// `line_buf`, lossily decoded, newline included. Runs on every stdout line
-/// of every SQL probe, so the budget is the one returned `String` for valid
-/// UTF-8 input.
-fn take_line(line_buf: &mut Vec<u8>, pos: usize) -> String {
-    let line = String::from_utf8_lossy(line_buf.get(..=pos).unwrap_or_default()).into_owned();
-    line_buf.drain(..=pos);
-    line
-}
-
-impl LocalSqlClient {
-    async fn run_query(&mut self, sql: &str) -> Result<String> {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-
-        let command = build_command(sql, seq);
-
-        self.stdin
-            .write_all(command.as_bytes())
-            .await
-            .map_err(|e| Error::Postgres(format!("Failed writing SQL to psql: {e}")))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| Error::Postgres(format!("Failed flushing SQL to psql: {e}")))?;
-
-        // The flag (not `result.is_empty()`) keeps an empty first line intact.
-        let mut result = String::new();
-        let mut has_lines = false;
-        loop {
-            let line = self.next_line().await.map_err(|e| {
-                Error::Postgres(format!("Failed reading SQL result from psql: {e}"))
-            })?;
-            let Some(line) = line else {
-                let detail = self.drain_stderr().await;
-                let text =
-                    format!("Local psql session closed while waiting for SQL result{detail}");
-                return Err(if server_answered(&detail) {
-                    Error::Postgres(text)
-                } else {
-                    Error::PostgresNotReady(text)
-                });
-            };
-
-            let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-            match classify_marker_line(trimmed, seq) {
-                MarkerLine::Data => {
-                    if has_lines {
-                        result.push('\n');
-                    }
-                    has_lines = true;
-                    result.push_str(trimmed);
-                }
-                MarkerLine::Current => break,
-                MarkerLine::Stale => {
-                    result.clear();
-                    has_lines = false;
-                }
-                MarkerLine::Corrupt => {
-                    return Err(Error::Postgres(format!(
-                        "Local psql session out of sync: saw {trimmed} while awaiting sequence {seq}"
-                    )));
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Read one newline-terminated stdout line, or `None` on EOF.
-    ///
-    /// Cancellation-safe, unlike `AsyncBufReadExt::read_line`: bytes are
-    /// staged into the session-owned `line_buf` via the cancel-safe
-    /// `fill_buf`, with no await point between observing and consuming a
-    /// chunk. A caller-side timeout that drops a `run_query` future
-    /// mid-line therefore cannot lose the line's prefix — the next reader
-    /// resumes exactly where the cancelled one stopped, which the
-    /// stale-marker resync in `run_query` depends on.
-    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
-        loop {
-            if let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
-                return Ok(Some(take_line(&mut self.line_buf, pos)));
-            }
-            let chunk = self.stdout.fill_buf().await?;
-            if chunk.is_empty() {
-                // EOF; any partial line left in `line_buf` is the torn tail
-                // of a dying session, not a result.
-                return Ok(None);
-            }
-            let consumed = chunk.len();
-            self.line_buf.extend_from_slice(chunk);
-            self.stdout.consume(consumed);
-            if self.line_buf.len() > MAX_SQL_LINE_BYTES {
-                // A backend streaming an unterminated line past the cap is
-                // wedged or emitting garbage; stop accumulating rather than
-                // grow the buffer unbounded.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("psql line exceeded {MAX_SQL_LINE_BYTES} bytes without a newline"),
-                ));
-            }
-        }
-    }
-
-    /// Format whatever psql wrote to stderr for appending to an error
-    /// message (empty when there is nothing).
-    ///
-    /// The session is dying or dead when this is called, so stderr is at (or
-    /// heading for) EOF: give the drainer task a bounded window to pull
-    /// psql's final output off the pipe, then snapshot the retained tail.
-    async fn drain_stderr(&mut self) -> String {
-        drop(tokio::time::timeout(Duration::from_millis(500), &mut self.stderr_task).await);
-        let bytes: Vec<u8> = {
-            let tail = self
-                .stderr_tail
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tail.iter().copied().collect()
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            String::new()
-        } else {
-            format!(": {trimmed}")
-        }
-    }
-
-    async fn shutdown(mut self) {
-        self.stderr_task.abort();
-        self.child.start_kill().ok();
-        self.child.wait().await.ok();
-    }
-}
-
-/// Where pgbattery's local psql sessions connect. Shared by the supervisor's
-/// session and the fence's, so a Track B retarget moves both.
-#[derive(Debug)]
-struct SessionTarget {
-    pg_bin_dir: std::sync::RwLock<PathBuf>,
-    pg_data_dir: std::sync::RwLock<PathBuf>,
-    pg_port: u16,
-    pg_user: String,
-    /// Carried by every pgbattery session, so the fence's client termination
-    /// spares them. Random per process: a client cannot claim it.
-    application_name: String,
-}
-
-impl SessionTarget {
-    fn new(config: &SupervisorConfig) -> Self {
-        use std::hash::{BuildHasher, Hasher};
-        let nonce = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        Self {
-            pg_bin_dir: std::sync::RwLock::new(config.pg_bin_dir.clone()),
-            pg_data_dir: std::sync::RwLock::new(config.pg_data_dir.clone()),
-            pg_port: config.pg_port,
-            pg_user: config.pg_user.clone(),
-            application_name: format!("pgbattery-{nonce:016x}"),
-        }
-    }
-
-    fn bin_dir(&self) -> PathBuf {
-        self.pg_bin_dir
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.pg_data_dir
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn psql(&self) -> PathBuf {
-        self.bin_dir().join("psql")
-    }
-}
-
-/// One persistent psql session to the local server, reconnected on failure.
-struct SqlSession {
-    target: std::sync::Arc<SessionTarget>,
-    client: tokio::sync::Mutex<Option<LocalSqlClient>>,
-}
-
-impl Drop for SqlSession {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.client.try_lock()
-            && let Some(mut existing) = guard.take()
-        {
-            existing.child.start_kill().ok();
-        }
-    }
-}
-
-/// The local server's write path, read and closed on a session of its own.
-///
-/// The lease loop fences through this, never through the supervisor's lock:
-/// a demote, a rewind or a Track B apply can hold that lock for minutes, and
-/// the fence must not wait behind any of them. It only closes; opening writes
-/// is the lock holder's, so nothing opens them in the middle of an operation.
-pub struct FenceSession {
-    session: SqlSession,
-}
-
-impl std::fmt::Debug for FenceSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FenceSession").finish_non_exhaustive()
-    }
-}
-
-impl FenceSession {
-    /// Role, read-only default and sync delivery in one round trip.
-    ///
-    /// # Errors
-    /// `PostgresNotReady` when nothing is serving on the port; any other
-    /// error when a server answered but the probe failed.
-    pub async fn probe(&self) -> Result<PgWriteState> {
-        self.session.probe_role_and_readonly().await
-    }
-
-    /// Force the read-only default on a primary and verify it took effect.
-    ///
-    /// # Errors
-    /// The recovery probe, the `ALTER SYSTEM`, or the verification failed.
-    pub async fn close(&self) -> Result<()> {
-        self.session.set_readonly(true).await
-    }
-
-    /// Sever every client session; pgbattery's own are spared.
-    ///
-    /// # Errors
-    /// The termination query failed.
-    pub async fn terminate_client_backends(&self) -> Result<String> {
-        self.session.terminate_client_backends().await
-    }
-
-    /// The running server's reportable WAL position, as
-    /// [`Supervisor::get_reportable_lsn`] reads it.
-    ///
-    /// # Errors
-    /// The server did not answer.
-    pub async fn reportable_lsn(&self) -> Result<String> {
-        let raw = self.session.execute_sql(REPORTABLE_LSN_SQL).await?;
-        Ok(raw.trim().to_string())
-    }
-
-    /// Whether there is a data directory at all.
-    #[must_use]
-    pub fn has_data_directory(&self) -> bool {
-        self.session.target.data_dir().join("PG_VERSION").exists()
-    }
-
-    /// Where the WAL ends while no server runs, if the last one shut down
-    /// cleanly: the control file's record, exact for a primary, the replay
-    /// position for a standby.
-    ///
-    /// # Errors
-    /// `pg_controldata` failed or timed out.
-    pub async fn stopped_wal_end(&self) -> Result<Option<u64>> {
-        let target = &self.session.target;
-        read_stopped_wal_end(&target.bin_dir(), &target.data_dir()).await
-    }
-}
-
-/// Receive (or replay, before the walreceiver starts) on a standby; write on
-/// a primary. One round trip, lazy CASE arms.
-const REPORTABLE_LSN_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() \
-     THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) \
-     ELSE pg_current_wal_lsn() END::text;";
 
 /// Whether two `synchronous_standby_names` values are semantically equal.
 ///
@@ -1234,10 +836,9 @@ async fn clear_dir_contents(dir: &Path) -> Result<()> {
 ///   directory), followed by a directory fsync so the entry itself is
 ///   durable. At every instant `path` names either the complete old content
 ///   or the complete new content — never a truncated file. An empty
-///   `pg_hba.conf` after a mid-write crash would otherwise cut off the
-///   supervisor's own Unix-socket psql session (the regenerated hba carries
-///   only the managed `host` rules), wedging every SQL probe until an
-///   operator intervenes.
+///   `pg_hba.conf` after a mid-write crash would otherwise cut off
+///   pgbattery's own sessions, wedging every SQL probe until an operator
+///   intervenes.
 /// * **Idempotent skip.** When the existing content already equals `bytes`,
 ///   nothing is written and no fsync is paid — callers such as
 ///   `configure_postgresql` regenerate identical config on every `start()`.
@@ -1338,7 +939,10 @@ pub async fn read_system_identifier(pg_bin_dir: &Path, pg_data_dir: &Path) -> Re
 ///
 /// # Errors
 /// `pg_controldata` failed or timed out.
-async fn read_stopped_wal_end(pg_bin_dir: &Path, pg_data_dir: &Path) -> Result<Option<u64>> {
+pub(crate) async fn read_stopped_wal_end(
+    pg_bin_dir: &Path,
+    pg_data_dir: &Path,
+) -> Result<Option<u64>> {
     if !pg_data_dir.join("global/pg_control").exists() {
         return Ok(None);
     }
@@ -1428,17 +1032,7 @@ impl Supervisor {
     ///
     /// Must be called while the postmaster is stopped.
     pub fn retarget_paths(&mut self, bin_dir: PathBuf, data_dir: PathBuf) {
-        let target = &self.session.target;
-        target
-            .pg_bin_dir
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&bin_dir);
-        target
-            .pg_data_dir
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&data_dir);
+        self.session.target().retarget(&bin_dir, &data_dir);
         self.config.pg_bin_dir = bin_dir;
         self.config.pg_data_dir = data_dir;
     }
@@ -1455,12 +1049,9 @@ impl Supervisor {
         &self.config.pg_bin_dir
     }
 
-    /// Connection parameters for spawning a one-shot psql against the
-    /// local Postgres. Used by health probes that must NOT go through the
-    /// supervisor's persistent psql client — which contends on the
-    /// supervisor `Mutex` with the lease enforcement loop, and gets stuck
-    /// when its already-established backend is on a hung postmaster.
-    pub fn local_psql_probe_params(&self) -> (PathBuf, u16, String) {
+    /// The psql binary, port and user for work the session cannot do: another
+    /// database, a remote donor, a dump restore.
+    pub fn local_psql_params(&self) -> (PathBuf, u16, String) {
         (
             self.config.pg_bin_dir.join("psql"),
             self.config.pg_port,
@@ -2714,7 +2305,7 @@ host all all ::/0 {auth_method}
     /// this is just a truth-source assertion. If the assertion fails, the
     /// caller should treat it as a hard failure rather than retrying on a
     /// timer (which would mask whatever's really wrong with `pg_ctl`'s wait
-    /// semantics or the persistent psql session).
+    /// semantics or the session).
     async fn confirm_promoted(&self) -> Result<()> {
         if self.is_in_recovery().await? {
             return Err(Error::Promotion(
@@ -3960,181 +3551,6 @@ host all all ::/0 {auth_method}
     }
 }
 
-impl SqlSession {
-    /// Skip a standby, which is read-only by recovery, then write the flag.
-    async fn set_readonly(&self, readonly: bool) -> Result<()> {
-        let in_recovery = match self.is_in_recovery().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to probe recovery state before set_readonly; refusing state change"
-                );
-                return Err(e);
-            }
-        };
-        if in_recovery {
-            tracing::debug!(
-                readonly = readonly,
-                "Skipping set_readonly on standby (inherently read-only)"
-            );
-            return Ok(());
-        }
-
-        self.write_readonly_guc(readonly).await
-    }
-
-    async fn is_in_recovery(&self) -> Result<bool> {
-        let result = self.execute_sql("SELECT pg_is_in_recovery();").await?;
-        Ok(result.trim() == "t")
-    }
-
-    /// See [`Supervisor::write_readonly_guc`].
-    async fn write_readonly_guc(&self, readonly: bool) -> Result<()> {
-        // Live-GUC idempotency: if the cluster setting already matches the
-        // intent, skip the ALTER SYSTEM + reload + verify round-trip. The
-        // 2s reconcile loop and the 100ms lease loop both call this every
-        // tick once the cluster reaches steady state; without this short-
-        // circuit each tick paid a psql spawn and a pg_reload_conf for no
-        // observable change. We read the truth source (live GUC), not a
-        // cache.
-        if let Ok(current) = self.query_readonly_status().await
-            && current == readonly
-        {
-            return Ok(());
-        }
-
-        let value = if readonly { "on" } else { "off" };
-        let alter_sql = format!("ALTER SYSTEM SET default_transaction_read_only = '{value}';");
-
-        // Run ALTER SYSTEM and pg_reload_conf as separate commands (not in a transaction)
-        // ALTER SYSTEM cannot run inside a transaction block.
-        //
-        // Bounded + `kill_on_drop(true)`, mirroring `set_sync_standby_names`:
-        // a wedged postmaster must not pin the caller, and a caller-side
-        // timeout that drops this future must also reap the psql — an
-        // orphaned unfence applying after a later emergency fence would make
-        // a fenced deposed primary writable.
-        let cmd = Command::new(self.target.psql())
-            .arg("-h")
-            .arg("127.0.0.1")
-            .arg("-p")
-            .arg(self.target.pg_port.to_string())
-            .arg("-U")
-            .arg(&self.target.pg_user)
-            .arg("-d")
-            .arg("postgres")
-            .env("PGAPPNAME", &self.target.application_name)
-            .arg("-c")
-            .arg(&alter_sql)
-            .arg("-c")
-            .arg("SELECT pg_reload_conf();")
-            .kill_on_drop(true)
-            .status();
-        let status = match tokio::time::timeout(
-            Duration::from_millis(pgbattery_core::constants::SYNC_WAIT_TIMEOUT_MS),
-            cmd,
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(Error::Postgres(format!(
-                    "Failed to set read-only mode: {e}"
-                )));
-            }
-            Err(_) => {
-                return Err(Error::Postgres(format!(
-                    "ALTER SYSTEM SET default_transaction_read_only timed out after {} ms (postmaster may be wedged)",
-                    pgbattery_core::constants::SYNC_WAIT_TIMEOUT_MS
-                )));
-            }
-        };
-
-        if !status.success() {
-            return Err(Error::Postgres("Failed to set read-only mode".to_string()));
-        }
-
-        // Verify the setting actually took effect — pg_reload_conf can silently no-op.
-        //
-        // Polled, because `pg_reload_conf()` only signals: it returns as soon
-        // as the postmaster has been told, and each backend adopts the new
-        // value at its next command boundary. Reading straight back therefore
-        // races the reload and returns the old value often enough to matter —
-        // it is what made the fence report a failure it had not had, on a
-        // marker the durability oracles treat as split-brain evidence.
-        let deadline = Instant::now() + READONLY_RELOAD_SETTLE;
-        let mut actual = self.query_readonly_status().await?;
-        while actual != readonly && Instant::now() < deadline {
-            sleep(READONLY_RELOAD_POLL).await;
-            actual = self.query_readonly_status().await?;
-        }
-        if actual != readonly {
-            return Err(Error::Postgres(format!(
-                "read-only fence verification failed: expected {readonly}, got {actual} after \
-                 {}ms",
-                READONLY_RELOAD_SETTLE.as_millis()
-            )));
-        }
-
-        tracing::info!(readonly = readonly, "PostgreSQL read-only mode changed");
-        Ok(())
-    }
-
-    /// Query current read-only status from `PostgreSQL`.
-    ///
-    /// Returns true if `default_transaction_read_only = on`, false otherwise.
-    /// Used by lease enforcement loop to verify `PostgreSQL` state.
-    ///
-    /// Uses `pg_settings` (not SHOW) because SHOW returns the per-session value
-    /// set by this connection, which never changes on a reload. `pg_settings`
-    /// gives the backend's effective value — still adopted at a command
-    /// boundary after SIGHUP, which is why `set_readonly` polls it rather than
-    /// reading it once.
-    ///
-    /// # Errors
-    /// Returns an error if the `pg_settings` query fails.
-    async fn query_readonly_status(&self) -> Result<bool> {
-        let result = self
-            .execute_sql(
-                "SELECT setting FROM pg_settings WHERE name = 'default_transaction_read_only';",
-            )
-            .await?;
-        let is_readonly = result.trim().eq_ignore_ascii_case("on");
-        Ok(is_readonly)
-    }
-
-    /// See [`Supervisor::probe_role_and_readonly`].
-    async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
-        let result = self
-            .execute_sql(
-                "SELECT pg_is_in_recovery()::text || ',' \
-                 || (SELECT setting FROM pg_settings \
-                     WHERE name = 'default_transaction_read_only') || ',' \
-                 || CASE WHEN current_setting('synchronous_standby_names') = '' \
-                         THEN 'empty' ELSE 'set' END || ',' \
-                 || (SELECT count(*) FROM pg_stat_replication \
-                     WHERE sync_state = 'sync')::text;",
-            )
-            .await?;
-        parse_role_readonly(&result)
-    }
-
-    /// `default_transaction_read_only` only changes the default: sessions
-    /// already open, or `BEGIN READ WRITE`, still write. Severing every
-    /// client backend closes both; pgbattery's own sessions, named by the
-    /// per-process `application_name`, are spared.
-    async fn terminate_client_backends(&self) -> Result<String> {
-        self.execute_sql(&format!(
-            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
-             WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() \
-             AND application_name <> '{}';",
-            self.target.application_name
-        ))
-        .await
-    }
-}
-
 impl Supervisor {
     /// The server's `server_version_num` (e.g. `170004`). Output shape is
     /// stable across every version this project can meet.
@@ -4149,21 +3565,44 @@ impl Supervisor {
             .map_err(|_| Error::Postgres(format!("Unexpected server_version_num: {result:?}")))
     }
 
-    /// Execute a SQL command with a 30-second timeout.
+    /// Execute one SQL statement with a 30-second timeout.
     ///
     /// # Errors
-    /// Returns an error if the connection cannot be established, the query
-    /// times out, or `PostgreSQL` returns an error.
+    /// Returns an error if `sql` is not exactly one statement, the connection
+    /// cannot be established, the query times out, or `PostgreSQL` returns an
+    /// error.
     pub async fn execute_sql(&self, sql: &str) -> Result<String> {
         self.session.execute_sql(sql).await
+    }
+
+    /// Execute `statements` in one transaction: all of them or none.
+    ///
+    /// # Errors
+    /// Returns an error if any element is not exactly one statement, or the
+    /// transaction fails; then nothing it did is kept.
+    pub async fn execute_transaction<S: AsRef<str> + Sync>(
+        &self,
+        statements: &[S],
+    ) -> Result<String> {
+        self.session.execute_transaction(statements).await
     }
 
     /// An independent session to the local server for the lease loop's fence.
     #[must_use]
     pub fn fence_session(&self) -> FenceSession {
-        FenceSession {
-            session: SqlSession::new(std::sync::Arc::clone(&self.session.target)),
-        }
+        FenceSession::new(std::sync::Arc::clone(self.session.target()))
+    }
+
+    /// A probe that opens a fresh connection each time, for the liveness
+    /// check that runs outside the supervisor lock.
+    #[must_use]
+    pub fn liveness_probe(&self) -> LivenessProbe {
+        LivenessProbe::new(std::sync::Arc::clone(self.session.target()))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn session(&self) -> &SqlSession {
+        &self.session
     }
 
     async fn invalidate_sql_client(&self) {
@@ -4176,150 +3615,6 @@ impl Supervisor {
     /// The termination query failed.
     pub async fn terminate_client_backends(&self) -> Result<String> {
         self.session.terminate_client_backends().await
-    }
-}
-
-impl SqlSession {
-    fn new(target: std::sync::Arc<SessionTarget>) -> Self {
-        Self {
-            target,
-            client: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    async fn execute_sql(&self, sql: &str) -> Result<String> {
-        const SQL_TIMEOUT: Duration = Duration::from_secs(30);
-
-        // Retry once after invalidating a stale connection (e.g. PostgreSQL restart).
-        for attempt in 0..2 {
-            self.get_or_connect().await?;
-
-            let query_future = async {
-                self.client
-                    .lock()
-                    .await
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::Postgres("Local psql session is not available".to_string())
-                    })?
-                    .run_query(sql)
-                    .await
-            };
-
-            let Ok(query_result) = tokio::time::timeout(SQL_TIMEOUT, query_future).await else {
-                tracing::error!(sql = %sql, "SQL query timed out after 30s");
-                self.invalidate().await;
-                return Err(Error::Postgres(format!(
-                    "SQL query timed out after {}s",
-                    SQL_TIMEOUT.as_secs()
-                )));
-            };
-
-            match query_result {
-                Ok(output) => return Ok(output),
-                Err(e) => {
-                    self.invalidate().await;
-                    if attempt == 1 {
-                        return Err(e);
-                    }
-                    tracing::debug!(error = %e, "Local psql session failed, reconnecting");
-                }
-            }
-        }
-
-        Err(Error::Postgres("SQL execution failed".to_string()))
-    }
-
-    async fn get_or_connect(&self) -> Result<()> {
-        let mut guard = self.client.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.connect()?);
-            tracing::debug!("Established local persistent psql session");
-        }
-        drop(guard);
-        Ok(())
-    }
-
-    fn connect(&self) -> Result<LocalSqlClient> {
-        let mut child = Command::new(self.target.psql())
-            .arg("-p")
-            .arg(self.target.pg_port.to_string())
-            .arg("-U")
-            .arg(&self.target.pg_user)
-            .env("PGAPPNAME", &self.target.application_name)
-            .arg("-X")
-            .arg("-A")
-            .arg("-t")
-            .arg("-q")
-            .arg("-v")
-            .arg("ON_ERROR_STOP=1")
-            .arg("postgres")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Piped so SQL error text survives: ON_ERROR_STOP=1 ends the
-            // session on the first error, and the stderr it left behind is
-            // the only diagnostic (e.g. `create_replication_slot` matching
-            // "already exists"). Bounded — psql exits right after writing it.
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::Postgres(format!("Failed to start local psql session: {e}")))?;
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            Error::Postgres("Failed to capture stdin for local psql session".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            Error::Postgres("Failed to capture stdout for local psql session".to_string())
-        })?;
-        let mut stderr = child.stderr.take().ok_or_else(|| {
-            Error::Postgres("Failed to capture stderr for local psql session".to_string())
-        })?;
-
-        // Continuously drain stderr into a bounded ring (see the field doc on
-        // `LocalSqlClient::stderr_tail`). The task ends at pipe EOF, i.e.
-        // when psql exits.
-        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::with_capacity(1024),
-        ));
-        let tail = std::sync::Arc::clone(&stderr_tail);
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = [0_u8; 4096];
-            loop {
-                match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut ring = tail
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        ring.extend(buf.iter().take(n).copied());
-                        while ring.len() > STDERR_TAIL_CAP {
-                            ring.pop_front();
-                        }
-                        drop(ring);
-                    }
-                }
-            }
-        });
-
-        Ok(LocalSqlClient {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            stderr_tail,
-            stderr_task,
-            line_buf: Vec::new(),
-            next_seq: 0,
-        })
-    }
-
-    async fn invalidate(&self) {
-        let existing = {
-            let mut guard = self.client.lock().await;
-            guard.take()
-        };
-
-        if let Some(client) = existing {
-            client.shutdown().await;
-        }
     }
 }
 
@@ -4604,13 +3899,35 @@ impl Supervisor {
         Ok(result.trim().to_string())
     }
 
+    /// `synchronous_standby_names` live, and as the configuration files would
+    /// set it on the next reload. Validated names hold no tab.
+    async fn sync_standby_names_now_and_on_reload(&self) -> Result<(String, String)> {
+        let raw = self
+            .execute_sql(
+                "SELECT current_setting('synchronous_standby_names') || chr(9) || \
+                 COALESCE((SELECT setting FROM pg_file_settings \
+                           WHERE name = 'synchronous_standby_names' AND error IS NULL \
+                           ORDER BY seqno DESC LIMIT 1), '');",
+            )
+            .await?;
+        let (live, on_reload) = raw.split_once('\t').ok_or_else(|| {
+            Error::Postgres(format!(
+                "Unexpected synchronous_standby_names probe: {raw:?}"
+            ))
+        })?;
+        Ok((live.trim().to_string(), on_reload.trim().to_string()))
+    }
+
     /// Set `synchronous_standby_names` dynamically (idempotent).
     ///
-    /// Reads the live GUC first; if it already matches `names` (after
-    /// canonicalisation), returns without issuing an ALTER SYSTEM. This
-    /// makes the caller side stateless — the reconciler calls this every
-    /// pass without keeping its own "last-applied" cache that could be
-    /// poisoned by an external `ALTER SYSTEM`.
+    /// Reads the live GUC and the value the configuration files hold; if both
+    /// already match `names` (after canonicalisation), returns without issuing
+    /// an ALTER SYSTEM. This makes the caller side stateless — the reconciler
+    /// calls this every pass without keeping its own "last-applied" cache
+    /// that could be poisoned by an external `ALTER SYSTEM`. The file value
+    /// counts because an earlier write whose reload never ran leaves it
+    /// apart from the live one, and anyone's next reload then applies it: an
+    /// empty list there would end synchronous durability unannounced.
     ///
     /// `pg_reload_conf()` returns as soon as the signal is sent to the
     /// postmaster, not after the config is actually re-read. Returning here
@@ -4624,8 +3941,6 @@ impl Supervisor {
     /// Returns an error if the `ALTER SYSTEM` + reload fails, or the live GUC
     /// does not reflect the requested value within the poll budget.
     pub async fn set_sync_standby_names(&self, names: &str) -> Result<()> {
-        let psql = self.config.pg_bin_dir.join("psql");
-
         // Defense-in-depth: validate all application names in the sync standby config
         // Format: "FIRST n (name1, name2, ...)" or "ANY n (name1, name2, ...)"
         // Extract names from within parentheses and validate each one
@@ -4642,74 +3957,17 @@ impl Supervisor {
             }
         }
 
-        // Idempotency check: live GUC is the truth source. If it already
-        // matches what we want, skip the round-trip entirely.
-        if let Ok(current) = self.get_sync_standby_names().await
-            && sync_names_equivalent(&current, names)
+        if let Ok((live, on_reload)) = self.sync_standby_names_now_and_on_reload().await
+            && sync_names_equivalent(&live, names)
+            && sync_names_equivalent(&on_reload, names)
         {
             tracing::trace!(names = %names, "synchronous_standby_names already current");
             return Ok(());
         }
 
-        let alter_sql = if names.is_empty() {
-            "ALTER SYSTEM SET synchronous_standby_names = '';".to_string()
-        } else {
-            format!(
-                "ALTER SYSTEM SET synchronous_standby_names = '{}';",
-                names.replace('\'', "''")
-            )
-        };
-
-        // Run ALTER SYSTEM and pg_reload_conf as separate commands (not in a transaction)
-        // ALTER SYSTEM cannot run inside a transaction block.
-        //
-        // Wrap the subprocess in a `tokio::time::timeout`: a wedged postmaster
-        // (e.g. SIGSTOP'd, blocked on disk) makes `psql -c` block forever and
-        // would pin the supervisor mutex indefinitely. Bound to
-        // `SYNC_WAIT_TIMEOUT_MS` — the operation should normally finish in
-        // single-digit ms; anything longer indicates trouble worth surfacing.
-        // `kill_on_drop(true)` ensures the spawned psql is reaped when the
-        // timeout drops the future — otherwise a wedged psql sits there
-        // holding a backend slot indefinitely once PG recovers.
-        let cmd = Command::new(&psql)
-            .arg("-h")
-            .arg("127.0.0.1")
-            .arg("-p")
-            .arg(self.config.pg_port.to_string())
-            .arg("-U")
-            .arg(&self.config.pg_user)
-            .arg("-c")
-            .arg(&alter_sql)
-            .arg("-c")
-            .arg("SELECT pg_reload_conf();")
-            .kill_on_drop(true)
-            .status();
-        let status = match tokio::time::timeout(
-            Duration::from_millis(pgbattery_core::constants::SYNC_WAIT_TIMEOUT_MS),
-            cmd,
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(Error::Postgres(format!(
-                    "Failed to set sync standby names: {e}"
-                )));
-            }
-            Err(_) => {
-                return Err(Error::Postgres(format!(
-                    "ALTER SYSTEM SET synchronous_standby_names timed out after {} ms (postmaster may be wedged)",
-                    pgbattery_core::constants::SYNC_WAIT_TIMEOUT_MS
-                )));
-            }
-        };
-
-        if !status.success() {
-            return Err(Error::Postgres(
-                "Failed to set sync standby names".to_string(),
-            ));
-        }
-
+        self.session
+            .alter_system("synchronous_standby_names", names)
+            .await?;
         self.wait_for_sync_standby_names_effective(names).await?;
 
         tracing::info!(names = %names, "Updated synchronous_standby_names (reload confirmed)");
@@ -4800,32 +4058,6 @@ impl Supervisor {
     }
 }
 
-/// What one lease tick needs to know about `PostgreSQL`'s write path.
-///
-/// Read in a single round trip so the fields describe one instant: deciding
-/// from a role read taken before a readonly read taken before a replication
-/// read would let the role change underneath the decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PgWriteState {
-    /// `pg_is_in_recovery()`. True for a standby.
-    pub in_recovery: bool,
-    /// `default_transaction_read_only`.
-    pub read_only: bool,
-    /// Whether `synchronous_standby_names` is empty — i.e. this primary
-    /// requires no standby acknowledgement at all: a lone voter, a committed
-    /// async fallback, or a list lost to a restart, which the write gate
-    /// tells apart through the committed sync mode.
-    pub sync_list_empty: bool,
-    /// Standbys `PostgreSQL` currently reports as `sync_state = 'sync'`.
-    ///
-    /// The count matters rather than the GUC text: a freshly promoted primary
-    /// can carry a correct, non-empty `synchronous_standby_names` and still
-    /// acknowledge commits no standby holds, because the wait is gated on
-    /// state that lags promotion. A standby designated `sync` is the point at
-    /// which the configured durability is actually being delivered.
-    pub sync_standbys: usize,
-}
-
 /// Whether a `postmaster.pid` entry can be positively confirmed stale.
 ///
 /// Fail closed: everything ambiguous returns `false`, leaving the file for
@@ -4877,55 +4109,6 @@ fn postmaster_pid_is_stale(
         // Unreadable or empty (a kernel thread) — not evidence either way.
         _ => false,
     }
-}
-
-/// Parse the combined write-state probe row produced by
-/// [`Supervisor::probe_role_and_readonly`]: `true,on,set,1` style.
-fn parse_role_readonly(raw: &str) -> Result<PgWriteState> {
-    let trimmed = raw.trim();
-    // The trailing `None` enforces exactly four fields.
-    let mut fields = trimmed.split(',');
-    let (Some(recovery), Some(readonly), Some(sync_list), Some(sync_count), None) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    ) else {
-        return Err(Error::Postgres(format!(
-            "Unexpected role/readonly probe result: {trimmed:?}"
-        )));
-    };
-    let in_recovery = match recovery.trim() {
-        "true" => true,
-        "false" => false,
-        other => {
-            return Err(Error::Postgres(format!(
-                "Unexpected pg_is_in_recovery value in role/readonly probe: {other:?}"
-            )));
-        }
-    };
-    let sync_list_empty = match sync_list.trim() {
-        "empty" => true,
-        "set" => false,
-        other => {
-            return Err(Error::Postgres(format!(
-                "Unexpected synchronous_standby_names marker in role/readonly probe: {other:?}"
-            )));
-        }
-    };
-    let sync_standbys = sync_count.trim().parse::<usize>().map_err(|_| {
-        Error::Postgres(format!(
-            "Unexpected sync standby count in role/readonly probe: {:?}",
-            sync_count.trim()
-        ))
-    })?;
-    Ok(PgWriteState {
-        in_recovery,
-        read_only: readonly.trim().eq_ignore_ascii_case("on"),
-        sync_list_empty,
-        sync_standbys,
-    })
 }
 
 /// `PostgreSQL` replication state from `pg_stat_replication`.
@@ -5245,58 +4428,6 @@ mod tests {
         );
     }
 
-    // ── fence session ─────────────────────────────────────────────────────
-
-    /// A server that says it is starting up or shutting down takes no writes;
-    /// its refusal is not a fence that failed on a writable server.
-    #[test]
-    fn a_server_declining_connections_did_not_answer() {
-        for state in ["starting up", "shutting down", "in recovery mode"] {
-            let stderr = format!(
-                "psql: error: connection to server on socket \"/tmp/.s.PGSQL.5434\" failed: \
-                 FATAL:  the database system is {state}"
-            );
-            assert!(!server_answered(&stderr), "{state}");
-        }
-        assert!(server_answered("ERROR:  relation \"x\" does not exist"));
-        assert!(server_answered(
-            "FATAL:  terminating connection due to administrator command"
-        ));
-        assert!(!server_answered(
-            "psql: error: connection to server on socket \"/tmp/.s.PGSQL.5434\" failed: \
-             No such file or directory"
-        ));
-    }
-
-    /// The fence severs clients, never pgbattery's own sessions: the
-    /// supervisor's may be mid-operation when the lease lapses.
-    #[test]
-    fn termination_spares_pgbattery_sessions() {
-        let config = SupervisorConfig {
-            pg_bin_dir: PathBuf::from("/nonexistent"),
-            pg_data_dir: PathBuf::from("/nonexistent"),
-            pg_port: 5_432,
-            pg_user: "postgres".to_string(),
-            wal_level: WalLevel::Replica,
-            node_id: 1,
-            pg_auth_mode: PgAuthMode::Trust,
-            wal_archive_dir: None,
-        };
-        let supervisor = Supervisor::new(config.clone());
-        let fence = supervisor.fence_session();
-        assert!(
-            std::sync::Arc::ptr_eq(&supervisor.session.target, &fence.session.target),
-            "the fence names its session as the supervisor names its own"
-        );
-        let name = &supervisor.session.target.application_name;
-        assert!(name.starts_with("pgbattery-"));
-        assert_ne!(
-            name,
-            &SessionTarget::new(&config).application_name,
-            "a client cannot know the name in advance"
-        );
-    }
-
     // ── born fenced ───────────────────────────────────────────────────────
 
     /// A former primary's `postgresql.auto.conf` holds the `off` the lease
@@ -5541,55 +4672,6 @@ mod tests {
         assert!(!SyncState::Async.is_sync_capable());
     }
 
-    // ── classify_marker_line ──────────────────────────────────────────────
-
-    #[test]
-    fn test_marker_data_lines() {
-        assert_eq!(classify_marker_line("0/16B3C90", 3), MarkerLine::Data);
-        assert_eq!(classify_marker_line("", 3), MarkerLine::Data);
-        // Marker prefix without the closing suffix is data.
-        assert_eq!(
-            classify_marker_line("__PGBATTERY_SQL_END_3", 3),
-            MarkerLine::Data
-        );
-        // Non-numeric sequence is data.
-        assert_eq!(
-            classify_marker_line("__PGBATTERY_SQL_END_x__", 3),
-            MarkerLine::Data
-        );
-    }
-
-    #[test]
-    fn test_marker_current() {
-        assert_eq!(
-            classify_marker_line("__PGBATTERY_SQL_END_3__", 3),
-            MarkerLine::Current
-        );
-        assert_eq!(
-            classify_marker_line("__PGBATTERY_SQL_END_0__", 0),
-            MarkerLine::Current
-        );
-    }
-
-    #[test]
-    fn test_marker_stale_then_current_resyncs() {
-        // A cancelled reader left query 2's response behind; query 3's
-        // reader must discard everything up to the stale marker and
-        // return only its own response.
-        assert_eq!(
-            classify_marker_line("__PGBATTERY_SQL_END_2__", 3),
-            MarkerLine::Stale
-        );
-    }
-
-    #[test]
-    fn test_marker_future_seq_is_corrupt() {
-        assert_eq!(
-            classify_marker_line("__PGBATTERY_SQL_END_4__", 3),
-            MarkerLine::Corrupt
-        );
-    }
-
     // ── pg_rewind failure classification ──────────────────────────────────
 
     #[test]
@@ -5776,27 +4858,6 @@ mod tests {
         ));
     }
 
-    /// Verbatim from a node whose catalog lost an un-fsynced page to a
-    /// `LazyFS` crash. The session died, but the server answered before it did
-    /// — so this is a server that may still be serving writes, not an absent
-    /// one.
-    const CORRUPT_CATALOG_STDERR: &str = "ERROR:  index \"pg_namespace_nspname_index\" contains \
-         unexpected zero page at block 0\nHINT:  Please REINDEX it.";
-
-    #[test]
-    fn a_session_that_died_carrying_a_server_error_counts_as_answered() {
-        assert!(server_answered(CORRUPT_CATALOG_STDERR));
-    }
-
-    #[test]
-    fn a_session_that_died_saying_nothing_counts_as_absent() {
-        assert!(!server_answered(""));
-        assert!(!server_answered(
-            ": psql: error: connection to server on socket \
-             \"/var/run/postgresql/.s.PGSQL.5434\" failed: No such file or directory"
-        ));
-    }
-
     /// `pg_rewind`'s exact wording when the target was never part of the
     /// source's cluster. Verbatim from a node whose data directory had been
     /// re-initdb'd while the cluster still listed it as a member.
@@ -5949,55 +5010,6 @@ mod tests {
     // its allocation budget as a number.
 
     #[test]
-    fn parse_role_readonly_is_allocation_free() {
-        let (parsed, stats) =
-            pgbattery_core::alloc_meter::measure(|| parse_role_readonly("false,on,set,1"));
-        assert_eq!(
-            parsed.unwrap(),
-            PgWriteState {
-                in_recovery: false,
-                read_only: true,
-                sync_list_empty: false,
-                sync_standbys: 1,
-            }
-        );
-        assert_eq!(
-            stats.count, 0,
-            "happy-path probe parse must not allocate: {stats:?}"
-        );
-    }
-
-    #[test]
-    fn take_line_budget_is_one_string() {
-        let mut buf = b"result line\nrest".to_vec();
-        let (line, stats) = pgbattery_core::alloc_meter::measure(|| take_line(&mut buf, 11));
-        assert_eq!(line, "result line\n");
-        assert_eq!(buf, b"rest");
-        assert!(
-            stats.count <= 1,
-            "line extraction budget is the returned String: {stats:?}"
-        );
-    }
-
-    #[test]
-    fn take_line_survives_invalid_utf8() {
-        let mut buf = b"bad\xFFline\nrest".to_vec();
-        let line = take_line(&mut buf, 8);
-        assert_eq!(line, "bad\u{FFFD}line\n");
-        assert_eq!(buf, b"rest");
-    }
-
-    #[test]
-    fn build_command_budget_is_one_string() {
-        let (cmd, stats) = pgbattery_core::alloc_meter::measure(|| build_command("SELECT 1", 42));
-        assert_eq!(cmd, "SELECT 1;\n\\echo __PGBATTERY_SQL_END_42__\n");
-        assert!(
-            stats.count <= 1,
-            "command build budget is the returned String: {stats:?}"
-        );
-    }
-
-    #[test]
     fn sync_names_equivalent_matches_canonical_oracle() {
         let cases = [
             "",
@@ -6030,98 +5042,6 @@ mod tests {
             stats.count, 0,
             "per-tick idempotency compare must not allocate: {stats:?}"
         );
-    }
-
-    #[test]
-    fn build_command_keeps_existing_semicolon() {
-        assert_eq!(
-            build_command("SELECT 1;  ", 7),
-            "SELECT 1;\n\\echo __PGBATTERY_SQL_END_7__\n"
-        );
-    }
-
-    // ── parse_role_readonly ───────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_role_readonly_primary_writable() {
-        assert_eq!(
-            parse_role_readonly("false,off,set,1").unwrap(),
-            PgWriteState {
-                in_recovery: false,
-                read_only: false,
-                sync_list_empty: false,
-                sync_standbys: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_role_readonly_primary_fenced() {
-        assert_eq!(
-            parse_role_readonly("false,on,set,0").unwrap(),
-            PgWriteState {
-                in_recovery: false,
-                read_only: true,
-                sync_list_empty: false,
-                sync_standbys: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_role_readonly_standby() {
-        // A standby reports an empty sync list of its own accord; that is not
-        // the async fallback, which is why the caller pairs it with the role.
-        assert_eq!(
-            parse_role_readonly("true,off,empty,0").unwrap(),
-            PgWriteState {
-                in_recovery: true,
-                read_only: false,
-                sync_list_empty: true,
-                sync_standbys: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_role_readonly_async_fallback() {
-        // An empty list: no ack required.
-        assert_eq!(
-            parse_role_readonly("false,off,empty,0").unwrap(),
-            PgWriteState {
-                in_recovery: false,
-                read_only: false,
-                sync_list_empty: true,
-                sync_standbys: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_role_readonly_whitespace() {
-        assert_eq!(
-            parse_role_readonly(" true,on,set,2 \n").unwrap(),
-            PgWriteState {
-                in_recovery: true,
-                read_only: true,
-                sync_list_empty: false,
-                sync_standbys: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_role_readonly_malformed() {
-        assert!(parse_role_readonly("").is_err());
-        assert!(parse_role_readonly("true").is_err());
-        assert!(parse_role_readonly("t,on,set,0").is_err());
-        assert!(parse_role_readonly("maybe,on,set,0").is_err());
-        // Short rows must not parse to a state that reads as evidence.
-        assert!(parse_role_readonly("false,off").is_err());
-        assert!(parse_role_readonly("false,off,set").is_err());
-        // An unreadable sync marker or count is a failed probe, not a default.
-        assert!(parse_role_readonly("false,off,maybe,0").is_err());
-        assert!(parse_role_readonly("false,off,set,many").is_err());
     }
 
     /// The distinction `restart_or_repair_standby` and the re-point escalation

@@ -2315,7 +2315,7 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
     // Probe before the gateway is unfrozen: held clients must be released
     // into a primary that answers, not one still in startup.
     supervisor
-        .execute_sql(PRIMARY_WRITE_PROBE_SQL)
+        .execute_transaction(&PRIMARY_WRITE_PROBE)
         .await
         .context("upgraded primary did not accept a write")?;
 
@@ -2570,17 +2570,18 @@ pub async fn rollback_local(
 /// A write the started primary accepts. It is born fenced, so the probe opts
 /// its own transaction out of the read-only default, and commits locally:
 /// the standbys are stopped, and a synchronous commit would wait for them.
-const PRIMARY_WRITE_PROBE_SQL: &str = "BEGIN READ WRITE; \
-     SET LOCAL synchronous_commit = local; \
-     CREATE TEMP TABLE pgbattery_write_probe(i int); \
-     INSERT INTO pgbattery_write_probe VALUES (1); \
-     DROP TABLE pgbattery_write_probe; \
-     COMMIT;";
+const PRIMARY_WRITE_PROBE: [&str; 5] = [
+    "SET TRANSACTION READ WRITE",
+    "SET LOCAL synchronous_commit = local",
+    "CREATE TEMP TABLE pgbattery_write_probe(i int)",
+    "INSERT INTO pgbattery_write_probe VALUES (1)",
+    "DROP TABLE pgbattery_write_probe",
+];
 
 async fn probe_rollback_write(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
     let mut last_err: Option<String> = None;
     for _ in 0..20 {
-        match supervisor.execute_sql(PRIMARY_WRITE_PROBE_SQL).await {
+        match supervisor.execute_transaction(&PRIMARY_WRITE_PROBE).await {
             Ok(_) => return Ok(()),
             Err(e) => last_err = Some(e.to_string()),
         }
@@ -2982,12 +2983,11 @@ mod tests {
     /// standbys.
     #[test]
     fn the_write_probe_opts_out_of_the_fenced_default() {
-        assert!(
-            PRIMARY_WRITE_PROBE_SQL.starts_with("BEGIN READ WRITE;"),
-            "{PRIMARY_WRITE_PROBE_SQL}"
-        );
-        assert!(PRIMARY_WRITE_PROBE_SQL.contains("SET LOCAL synchronous_commit = local;"));
-        assert!(PRIMARY_WRITE_PROBE_SQL.ends_with("COMMIT;"));
+        assert_eq!(PRIMARY_WRITE_PROBE[0], "SET TRANSACTION READ WRITE");
+        assert!(PRIMARY_WRITE_PROBE.contains(&"SET LOCAL synchronous_commit = local"));
+        for statement in PRIMARY_WRITE_PROBE {
+            crate::supervisor::one_statement(statement).unwrap();
+        }
     }
 
     fn fake_datadir(parent: &Path, name: &str, major: u32, control: bool) -> PathBuf {

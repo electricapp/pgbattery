@@ -32,9 +32,12 @@ const USER_SCHEMAS: &str = "n.nspname NOT IN ('pg_catalog','information_schema',
 /// so the fence's REVOKE/GRANT and snapshot DDL never take the freeze down.
 pub(crate) const DDL_FREEZE_EXEMPT_GUC: &str = "pgbattery.ddl_freeze_exempt";
 
-/// Wrap fence statements in one transaction the DDL freeze lets through.
-fn exempt_transaction(body: &str) -> String {
-    format!("BEGIN; SET LOCAL {DDL_FREEZE_EXEMPT_GUC} = 'on'; {body} COMMIT;")
+/// Fence statements, led by the setting that lets them through the DDL freeze
+/// for the one transaction they run in.
+fn exempt(statements: impl IntoIterator<Item = String>) -> Vec<String> {
+    std::iter::once(format!("SET LOCAL {DDL_FREEZE_EXEMPT_GUC} = 'on'"))
+        .chain(statements)
+        .collect()
 }
 
 /// The snapshot INSERT for one role. Rows are keyed by `cluster_id` so a
@@ -129,20 +132,16 @@ fn revoke_sql(escaped_role: &str) -> String {
     )
 }
 
-/// Snapshot then revoke, every role in one transaction.
-fn apply_sql(escaped_cluster: &str, escaped_roles: &[String]) -> String {
-    let mut body = fence_table_ddl();
+/// Snapshot then revoke, every role, run as one transaction.
+fn apply_sql(escaped_cluster: &str, escaped_roles: &[String]) -> Vec<String> {
+    let mut statements = Vec::from(fence_table_ddl());
     for role in escaped_roles {
-        body.push(' ');
-        body.push_str(&snapshot_insert_sql(escaped_cluster, role));
-        body.push(' ');
-        body.push_str(&default_snapshot_insert_sql(escaped_cluster, role));
-        body.push(' ');
-        body.push_str(&revoke_sql(role));
-        body.push(' ');
-        body.push_str(&default_revoke_sql(role));
+        statements.push(snapshot_insert_sql(escaped_cluster, role));
+        statements.push(default_snapshot_insert_sql(escaped_cluster, role));
+        statements.push(revoke_sql(role));
+        statements.push(default_revoke_sql(role));
     }
-    exempt_transaction(&body)
+    exempt(statements)
 }
 
 /// Revoke client DML from `app_roles`, recording exactly what was taken.
@@ -168,7 +167,7 @@ pub async fn apply_client_write_fence(
         escaped.push(role.replace('\'', "''"));
     }
     supervisor
-        .execute_sql(&apply_sql(&cluster_id.replace('\'', "''"), &escaped))
+        .execute_transaction(&apply_sql(&cluster_id.replace('\'', "''"), &escaped))
         .await
         .with_context(|| format!("fencing app roles {app_roles:?}"))?;
     info!(roles = ?app_roles, "Client-write fence applied");
@@ -178,8 +177,8 @@ pub async fn apply_client_write_fence(
 /// Restore and forget every grant this cluster recorded, whichever role it
 /// was taken from. Filtered to this cluster's own snapshot rows: replicated
 /// rows from another cluster's fence must never grant anything here.
-fn lift_sql(escaped_cluster: &str) -> String {
-    exempt_transaction(&format!(
+fn lift_sql(escaped_cluster: &str) -> Vec<String> {
+    exempt([format!(
         "DO $$ \
          DECLARE r record; \
          BEGIN \
@@ -217,7 +216,7 @@ fn lift_sql(escaped_cluster: &str) -> String {
            END LOOP; \
            DELETE FROM {FENCE_TABLE} WHERE cluster_id = '{escaped_cluster}'; \
          END $$;"
-    ))
+    )])
 }
 
 /// Restore exactly the grants [`apply_client_write_fence`] recorded. Only
@@ -230,7 +229,7 @@ pub async fn lift_client_write_fence(
     cluster_id: &str,
 ) -> Result<()> {
     supervisor
-        .execute_sql(&lift_sql(&cluster_id.replace('\'', "''")))
+        .execute_transaction(&lift_sql(&cluster_id.replace('\'', "''")))
         .await
         .context("restoring the grants the client fence recorded")?;
     info!("Client-write fence lifted");
@@ -555,10 +554,11 @@ fn parse_lsn_bytes(text: &str) -> Result<u64> {
 /// relation grant ('r', `rel_name` is the relation) from a default-ACL grant
 /// ('d', `rel_name` is the owning `defaclrole`), and is in the key because a
 /// role can share a name with a table.
-fn fence_table_ddl() -> String {
-    format!(
-        "CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}; \
-         CREATE TABLE IF NOT EXISTS {FENCE_TABLE} ( \
+fn fence_table_ddl() -> [String; 2] {
+    [
+        format!("CREATE SCHEMA IF NOT EXISTS {FENCE_SCHEMA}"),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {FENCE_TABLE} ( \
            cluster_id text NOT NULL, \
            role_name text NOT NULL, \
            schema_name text NOT NULL, \
@@ -567,8 +567,9 @@ fn fence_table_ddl() -> String {
            privilege text NOT NULL, \
            grant_kind \"char\" NOT NULL DEFAULT 'r', \
            PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege, grant_kind) \
-         );"
-    )
+         )"
+        ),
+    ]
 }
 
 fn validate_role_ident(role: &str) -> Result<()> {
@@ -675,13 +676,14 @@ mod tests {
     /// dropping the trigger for the move opened a DDL window inside SEALED.
     #[test]
     fn fence_moves_run_in_one_transaction_exempt_from_the_ddl_freeze() {
-        for sql in [apply_sql("blue", &["bg_app".to_string()]), lift_sql("blue")] {
-            assert!(sql.starts_with("BEGIN; "), "{sql}");
-            assert!(
-                sql.contains(&format!("SET LOCAL {DDL_FREEZE_EXEMPT_GUC} = 'on';")),
-                "{sql}"
+        for statements in [apply_sql("blue", &["bg_app".to_string()]), lift_sql("blue")] {
+            assert_eq!(
+                statements.first(),
+                Some(&format!("SET LOCAL {DDL_FREEZE_EXEMPT_GUC} = 'on'"))
             );
-            assert!(sql.ends_with(" COMMIT;"), "{sql}");
+            for statement in &statements {
+                crate::supervisor::one_statement(statement).unwrap();
+            }
         }
     }
 
@@ -746,7 +748,7 @@ mod tests {
     /// rows from ever colliding on apply.
     #[test]
     fn the_snapshot_table_keys_rows_by_cluster() {
-        let ddl = fence_table_ddl();
+        let ddl = fence_table_ddl().join(" ");
         assert!(ddl.contains("cluster_id text NOT NULL"));
         assert!(ddl.contains("PRIMARY KEY (cluster_id,"));
     }
@@ -768,7 +770,7 @@ mod tests {
         assert!(snap.contains("pg_default_acl"));
         assert!(snap.contains("defaclobjtype"));
         assert!(snap.contains("'d'"), "default rows must be marked: {snap}");
-        let lift = lift_sql("blue");
+        let lift = lift_sql("blue").join(" ");
         assert!(
             lift.contains("ALTER DEFAULT PRIVILEGES FOR ROLE"),
             "the lift must restore default-ACL grants: {lift}"
@@ -789,7 +791,7 @@ mod tests {
     /// would otherwise retry the same failure forever.
     #[test]
     fn the_lift_skips_dropped_relations_instead_of_failing() {
-        let sql = lift_sql("blue");
+        let sql = lift_sql("blue").join(" ");
         assert!(
             sql.contains("to_regclass"),
             "each relation grant must be guarded: {sql}"
@@ -801,7 +803,7 @@ mod tests {
     /// must tell them apart or a defaclrole named like a table collides.
     #[test]
     fn the_snapshot_ddl_keys_grant_kind() {
-        let ddl = fence_table_ddl();
+        let ddl = fence_table_ddl().join(" ");
         assert!(ddl.contains("grant_kind"));
         assert!(ddl.contains(
             "PRIMARY KEY (cluster_id, role_name, schema_name, rel_name, privilege, grant_kind)"
@@ -812,7 +814,7 @@ mod tests {
     /// and must never be deleted by this cluster's lift.
     #[test]
     fn the_lift_touches_only_this_clusters_rows() {
-        let sql = lift_sql("blue");
+        let sql = lift_sql("blue").join(" ");
         let filters = sql.matches("WHERE cluster_id = 'blue'").count();
         assert_eq!(
             filters, 2,

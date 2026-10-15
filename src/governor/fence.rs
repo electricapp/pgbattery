@@ -131,11 +131,8 @@ const fn action(lease_valid: bool, writable: bool, in_recovery: Option<bool>) ->
 /// writable sessions.
 async fn probe<F: PgFence>(session: &F) -> (Option<bool>, bool) {
     match tokio::time::timeout(TICK_SQL_BUDGET, session.probe()).await {
-        // A standby is never client-writable regardless of the default.
-        Ok(Ok(state)) => (
-            Some(state.in_recovery),
-            !state.in_recovery && !state.read_only,
-        ),
+        // Writable now, or after anyone's next reload; never on a standby.
+        Ok(Ok(state)) => (Some(state.in_recovery), state.client_writable()),
         Ok(Err(pgbattery_core::Error::PostgresNotReady(_))) => (None, false),
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "role/readonly probe failed; assuming writable (fail-closed)");
@@ -451,7 +448,7 @@ mod tests {
     fn an_unreachable_server_is_not_a_split_brain_signal() {
         assert!(!failure_is_split_brain_risk(
             &pgbattery_core::Error::PostgresNotReady(
-                "Local psql session closed while waiting for SQL result".to_string()
+                "local PostgreSQL did not answer: connection refused".to_string()
             )
         ));
     }

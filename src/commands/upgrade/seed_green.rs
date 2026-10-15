@@ -226,7 +226,7 @@ async fn donor_psql(
     donor_conninfo: &str,
     sql: &str,
 ) -> Result<String> {
-    let (psql, _port, _user) = supervisor.local_psql_probe_params();
+    let (psql, _port, _user) = supervisor.local_psql_params();
     // Password via the environment, never argv: ps shows argv to every
     // local user.
     let (sanitized, password) = split_conninfo_password(donor_conninfo);
@@ -390,7 +390,7 @@ pub(crate) async fn seed_from_donor(
     tokio::fs::write(&dump_path, &dump.stdout)
         .await
         .with_context(|| format!("writing the schema dump to {}", dump_path.display()))?;
-    let (psql, port, user) = supervisor.local_psql_probe_params();
+    let (psql, port, user) = supervisor.local_psql_params();
     let local_conninfo = format!("host=127.0.0.1 port={port} user={user} dbname=postgres");
     let restore = Command::new(&psql)
         .args(schema_restore_args(&local_conninfo, &dump_path))
