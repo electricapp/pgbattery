@@ -326,6 +326,34 @@ pub fn build_failover_error_response(message: &str) -> BytesMut {
 /// (`idle_session_timeout`).
 pub const SQLSTATE_IDLE_SESSION_TIMEOUT: &str = "57P05";
 
+/// The SQLSTATE (`C` field) of a backend `ErrorResponse`.
+#[must_use]
+pub fn error_sqlstate(msg: &[u8]) -> Option<&str> {
+    let mut fields = msg.get(5..)?;
+    while let Some((&code, rest)) = fields.split_first() {
+        if code == 0 {
+            return None;
+        }
+        let end = rest.iter().position(|&b| b == 0)?;
+        if code == b'C' {
+            return std::str::from_utf8(rest.get(..end)?).ok();
+        }
+        fields = rest.get(end + 1..)?;
+    }
+    None
+}
+
+/// Whether a backend that refused a session is merely not ready for it yet.
+///
+/// Starting up, shutting down, out of connections, or a standby still in
+/// recovery (25006) that the route named before its promotion.
+#[must_use]
+pub fn refusal_is_transient(sqlstate: &str) -> bool {
+    sqlstate.starts_with("08")
+        || sqlstate.starts_with("57P")
+        || matches!(sqlstate, "25006" | "53300")
+}
+
 /// A FATAL `ErrorResponse` carrying `sqlstate`; see
 /// [`build_failover_error_response`] for the wire layout.
 #[must_use]
@@ -697,5 +725,23 @@ mod tests {
             Some(TransactionStatus::Failed)
         );
         assert_eq!(extract_transaction_status(&[]), None);
+    }
+
+    #[test]
+    fn an_error_response_names_its_sqlstate() {
+        let msg = build_fatal_error_response("25006", "cannot execute LISTEN during recovery");
+        assert_eq!(error_sqlstate(&msg), Some("25006"));
+        assert_eq!(error_sqlstate(&[b'E', 0, 0, 0, 5, 0]), None);
+        assert_eq!(error_sqlstate(b"E\0\0\0\x09Mtruncated"), None);
+    }
+
+    #[test]
+    fn only_a_backend_not_ready_refuses_transiently() {
+        for transient in ["57P03", "57P01", "08006", "25006", "53300"] {
+            assert!(refusal_is_transient(transient), "{transient}");
+        }
+        for fatal in ["42601", "26000", "28000", "3D000", "42P05"] {
+            assert!(!refusal_is_transient(fatal), "{fatal}");
+        }
     }
 }

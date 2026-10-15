@@ -17,8 +17,9 @@ use crate::error::{Error, Result};
 use crate::gateway::connection::{ConnectionRegistry, ProxyMode, SharedConnectionState};
 use crate::gateway::protocol::{
     MAX_CANCEL_REQUEST_LEN, MessageType, PacketHeader, TransactionStatus,
-    build_failover_error_response, cancel_request_key, extract_transaction_status,
-    is_cancel_request, is_gssenc_request, is_ssl_request, startup_has_replication_option,
+    build_fatal_error_response, cancel_request_key, error_sqlstate, extract_transaction_status,
+    is_cancel_request, is_gssenc_request, is_ssl_request, refusal_is_transient,
+    startup_has_replication_option,
 };
 use crate::gateway::proxy::GatewayConfig;
 use crate::gateway::session_replay::{self, Ack, Awaited, CloseTarget, ReplayChange};
@@ -97,8 +98,19 @@ const fn reconnect_may_recover(error: &Error) -> bool {
             | Error::Connect { .. }
             | Error::ConnectionTimeout(_)
             | Error::BackendDisconnected
+            | Error::PostgresNotReady(_)
             | Error::Io(_)
     )
+}
+
+/// The SQLSTATE that tells a client why the gateway ended its session, for
+/// an ending nothing else announced.
+const fn ending_sqlstate(error: &Error) -> &'static str {
+    match error {
+        Error::Protocol(_) => "08P01",
+        Error::ChannelClosed => "57P01",
+        _ => crate::gateway::protocol::SQLSTATE_CONNECTION_FAILURE,
+    }
 }
 
 /// Maximum startup-packet length accepted.
@@ -165,6 +177,8 @@ pub struct ConnectionHandler {
     /// First 8 bytes of the client's initial message, already consumed by
     /// `negotiate_ssl` while classifying the connection opener.
     preread: Option<[u8; 8]>,
+    /// The client was sent a FATAL saying why its session ends.
+    client_told: bool,
 }
 
 impl std::fmt::Debug for ConnectionHandler {
@@ -176,6 +190,14 @@ impl std::fmt::Debug for ConnectionHandler {
             .field("extended_protocol_seen", &self.extended_protocol_seen)
             .finish_non_exhaustive()
     }
+}
+
+/// What `ConnectionHandler::read_until_ready` found before `ReadyForQuery`.
+enum WaitOutcome {
+    Ready,
+    AuthChallenge(i32),
+    /// The backend raised an error; its SQLSTATE.
+    Refused(String),
 }
 
 /// See `ConnectionHandler::batch_fence_snapshot`.
@@ -517,6 +539,7 @@ impl ConnectionHandler {
             extended_protocol_seen: false,
             lease,
             preread,
+            client_told: false,
         }
     }
 
@@ -558,28 +581,37 @@ impl ConnectionHandler {
                 "Rejecting streaming replication connection — connect directly to pg_internal_port"
             );
             metrics::counter!("pgbattery_gateway_replication_rejected").increment(1);
-            let err = build_failover_error_response(
+            // feature_not_supported: a retry through the gateway fails alike.
+            self.send_fatal(
+                "0A000",
                 "streaming replication via pgbattery gateway is not supported; \
                  connect to the node's internal PostgreSQL port directly",
-            );
-            self.client.write_all(&err).await.ok();
-            self.client.flush().await.ok();
+            )
+            .await;
             return Ok(());
         }
         let startup = startup.freeze();
         self.startup_params = Some(startup.clone());
 
-        // Get current leader and connect
+        let result = self.serve(&startup).await;
+        self.cleanup_backend_key();
+        // Every ending the session reaches is announced, once.
+        if let Err(e) = &result
+            && !self.client_told
+        {
+            self.send_fatal(ending_sqlstate(e), &format!("pgbattery: {e}"))
+                .await;
+        }
+        result
+    }
+
+    /// Connect to the route and proxy until the session ends.
+    async fn serve(&mut self, startup: &Bytes) -> Result<()> {
         let leader = self.get_leader()?;
         let mut backend = self.connect_to_backend(leader).await?;
-
         // Bounded so a backend that accepts but never drains can't pin us.
-        write_all_within_deadline(&mut backend, &startup, self.id).await?;
-
-        // Run the proxy loop, cleanup on exit
-        let result = self.proxy_loop(&mut backend).await;
-        self.cleanup_backend_key();
-        result
+        write_all_within_deadline(&mut backend, startup, self.id).await?;
+        self.proxy_loop(&mut backend).await
     }
 
     /// Clean up backend key registration when connection closes.
@@ -785,7 +817,14 @@ impl ConnectionHandler {
                     if result.is_err() {
                         return Err(Error::ChannelClosed);
                     }
-                    self.handle_leader_change(backend, &mut backend_buf, false).await?;
+                    // A failure that may recover came after the old backend
+                    // was shut down, so the session has lost it.
+                    if let Err(e) = self.handle_leader_change(backend, &mut backend_buf, false).await {
+                        if !reconnect_may_recover(&e) {
+                            return Err(e);
+                        }
+                        self.reroute_lost_backend(backend, &mut backend_buf).await?;
+                    }
                 }
 
                 result = self.fence_rx.changed() => {
@@ -810,7 +849,11 @@ impl ConnectionHandler {
                 }
 
                 result = backend.read_buf(&mut backend_buf) => {
-                    let n = result?;
+                    // A reset from a dying primary is a disconnect like EOF.
+                    let n = result.unwrap_or_else(|e| {
+                        tracing::debug!(conn_id = self.id, error = %e, "Backend read failed");
+                        0
+                    });
                     self.handle_backend_read_result(n, backend, &mut backend_buf, &mut last_activity)
                         .await?;
                 }
@@ -1120,21 +1163,7 @@ impl ConnectionHandler {
                 stale_backend = ?stale_backend,
                 "Backend disconnected — reconnecting to the session's route"
             );
-            return match self.recover_lost_backend(backend, backend_buf).await {
-                Ok(()) => {
-                    metrics::counter!("pgbattery_migrations_on_disconnect").increment(1);
-                    Ok(())
-                }
-                Err(Error::BackendDisconnected) => {
-                    self.send_failover_error_response(
-                        "pgbattery: backend disconnected and no primary accepted the session in time",
-                    )
-                    .await;
-                    Err(Error::BackendDisconnected)
-                }
-                // Every other ending already told the client why.
-                Err(e) => Err(e),
-            };
+            return self.reroute_lost_backend(backend, backend_buf).await;
         }
 
         // Non-migratable: tell the client why instead of silently dropping
@@ -1154,6 +1183,29 @@ impl ConnectionHandler {
         };
         self.send_failover_error_response(reason).await;
         Err(Error::BackendDisconnected)
+    }
+
+    /// Reconnect a session that lost its backend, or end it with 08006 when
+    /// no route accepts it in time.
+    async fn reroute_lost_backend(
+        &mut self,
+        backend: &mut TcpStream,
+        backend_buf: &mut BytesMut,
+    ) -> Result<()> {
+        match self.recover_lost_backend(backend, backend_buf).await {
+            Ok(()) => {
+                metrics::counter!("pgbattery_migrations_on_disconnect").increment(1);
+                Ok(())
+            }
+            Err(Error::BackendDisconnected) => {
+                self.send_failover_error_response(
+                    "pgbattery: backend disconnected and no primary accepted the session in time",
+                )
+                .await;
+                Err(Error::BackendDisconnected)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Drop the current `BackendKeyData` entry from the cancel routing table.
@@ -1216,7 +1268,8 @@ impl ConnectionHandler {
     /// Send a FATAL `ErrorResponse` with `sqlstate`, bounded by
     /// [`PROXY_WRITE_DEADLINE`]; the caller severs either way.
     async fn send_fatal(&mut self, sqlstate: &str, reason: &str) {
-        let msg = crate::gateway::protocol::build_fatal_error_response(sqlstate, reason);
+        self.client_told = true;
+        let msg = build_fatal_error_response(sqlstate, reason);
         let write = async {
             self.client.write_all(&msg).await?;
             self.client.flush().await
@@ -1986,10 +2039,17 @@ impl ConnectionHandler {
         }
 
         let Ok(new_leader) = self.get_leader() else {
-            // Debug: the backend-loss path retries this every backoff per
-            // session, and logs its own outcome.
-            tracing::debug!(conn_id = self.id, "No route during failover");
-            return Err(Error::NoLeader);
+            // An intact backend keeps the session: every later message
+            // re-checks the route before it is forwarded, and the next leader
+            // change moves it. A lost one has nowhere to go yet; the
+            // backend-loss path retries this every backoff and logs its own
+            // outcome.
+            tracing::debug!(conn_id = self.id, backend_lost, "No route during failover");
+            return if backend_lost {
+                Err(Error::NoLeader)
+            } else {
+                Ok(())
+            };
         };
 
         // One snapshot drives every decision below — re-reading the state
@@ -2208,58 +2268,32 @@ impl ConnectionHandler {
     /// code) can never be answered. It severs immediately (08006) instead
     /// of absorbing the challenge until the connection timeout expires.
     async fn wait_for_ready(&mut self, backend: &mut TcpStream, buf: &mut BytesMut) -> Result<()> {
-        /// What the message scan resolved to.
-        enum WaitOutcome {
-            Ready,
-            AuthChallenge(i32),
-        }
-
         let timeout_duration = Duration::from_millis(self.config.connection_timeout_ms);
-
-        let result = timeout(timeout_duration, async {
-            loop {
-                while buf.len() >= 5 {
-                    let Some(header) = PacketHeader::parse(buf) else {
-                        break;
-                    };
-                    self.validate_backend_header(header)?;
-
-                    let total_len = header.total_length();
-                    if buf.len() < total_len {
-                        break;
-                    }
-
-                    let msg = buf.split_to(total_len);
-
-                    match header.msg_type {
-                        MessageType::Authentication => {
-                            // Body is an int32 code; 0 = AuthenticationOk.
-                            let code = msg
-                                .get(5..9)
-                                .and_then(|b| <[u8; 4]>::try_from(b).ok())
-                                .map_or(-1, i32::from_be_bytes);
-                            if code != 0 {
-                                return Ok(WaitOutcome::AuthChallenge(code));
-                            }
-                        }
-                        // Absorb silently, but BackendKeyData still updates
-                        // the cancel-routing table.
-                        MessageType::BackendKeyData => self.handle_backend_key_data_message(&msg),
-                        MessageType::ReadyForQuery => return Ok(WaitOutcome::Ready),
-                        _ => {}
-                    }
-                }
-
-                let n = backend.read_buf(buf).await?;
-                if n == 0 {
-                    return Err(Error::BackendDisconnected);
-                }
-            }
-        })
-        .await;
-
+        let result = timeout(timeout_duration, self.read_until_ready(backend, buf)).await;
         match result {
             Ok(Ok(WaitOutcome::Ready)) => Ok(()),
+            Ok(Ok(WaitOutcome::Refused(sqlstate))) if refusal_is_transient(&sqlstate) => {
+                Err(Error::PostgresNotReady(format!(
+                    "backend refused the session with SQLSTATE {sqlstate}"
+                )))
+            }
+            Ok(Ok(WaitOutcome::Refused(sqlstate))) => {
+                tracing::warn!(
+                    conn_id = self.id,
+                    sqlstate,
+                    "New backend refused to restore the session; severing"
+                );
+                metrics::counter!("pgbattery_session_replay_failed").increment(1);
+                self.send_failover_error_response(&format!(
+                    "pgbattery: leader changed and the new primary refused to restore this \
+                     session (SQLSTATE {sqlstate})"
+                ))
+                .await;
+                Err(Error::ConnectionSevered {
+                    conn_id: self.id,
+                    reason: format!("session restore refused with SQLSTATE {sqlstate}"),
+                })
+            }
             Ok(Ok(WaitOutcome::AuthChallenge(code))) => {
                 tracing::error!(
                     conn_id = self.id,
@@ -2285,6 +2319,55 @@ impl ConnectionHandler {
                     .backend_addr
                     .unwrap_or(UNKNOWN_SOCKET_ADDR),
             )),
+        }
+    }
+
+    /// The scan behind [`Self::wait_for_ready`], unbounded.
+    async fn read_until_ready(
+        &self,
+        backend: &mut TcpStream,
+        buf: &mut BytesMut,
+    ) -> Result<WaitOutcome> {
+        let mut refused: Option<String> = None;
+        loop {
+            while let Some(header) = PacketHeader::parse(buf) {
+                self.validate_backend_header(header)?;
+                let total_len = header.total_length();
+                if buf.len() < total_len {
+                    break;
+                }
+                let msg = buf.split_to(total_len);
+                match header.msg_type {
+                    MessageType::Authentication => {
+                        // Body is an int32 code; 0 = AuthenticationOk.
+                        let code = msg
+                            .get(5..9)
+                            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                            .map_or(-1, i32::from_be_bytes);
+                        if code != 0 {
+                            return Ok(WaitOutcome::AuthChallenge(code));
+                        }
+                    }
+                    // Absorb silently, but BackendKeyData still updates the
+                    // cancel-routing table.
+                    MessageType::BackendKeyData => self.handle_backend_key_data_message(&msg),
+                    MessageType::ErrorResponse => {
+                        refused.get_or_insert_with(|| {
+                            error_sqlstate(&msg).unwrap_or("XX000").to_owned()
+                        });
+                    }
+                    MessageType::ReadyForQuery => {
+                        return Ok(refused.map_or(WaitOutcome::Ready, WaitOutcome::Refused));
+                    }
+                    _ => {}
+                }
+            }
+            if backend.read_buf(buf).await? == 0 {
+                // A FATAL error closes the session after it.
+                return refused
+                    .map(WaitOutcome::Refused)
+                    .ok_or(Error::BackendDisconnected);
+            }
         }
     }
 
@@ -2349,9 +2432,10 @@ impl ConnectionHandler {
     ///
     /// We re-send the original raw Parse bytes (name + query + param types,
     /// exactly as the client sent it) followed by a Sync to force a
-    /// `ReadyForQuery`. One failing statement logs + counts but doesn't abort
-    /// the rest — a client reusing that name will rediscover the error on
-    /// its next Execute.
+    /// `ReadyForQuery`. A statement the backend refuses ends the session
+    /// (`wait_for_ready`): the client believes it exists, and its next Bind
+    /// would otherwise fail with 26000. A backend not ready yet, or one that
+    /// went away, is retried from a fresh connection: replay is idempotent.
     async fn restore_prepared_statements(
         &mut self,
         backend: &mut TcpStream,
@@ -2375,23 +2459,9 @@ impl ConnectionHandler {
                     conn_id = self.id,
                     name = %name,
                     error = %e,
-                    "Failed to replay prepared statement on new backend; severing session"
+                    "Could not replay a prepared statement on the new backend"
                 );
-                metrics::counter!("pgbattery_session_replay_failed", "kind" => "parse")
-                    .increment(1);
-                // Don't continue: the client believes this statement exists, but
-                // it doesn't on the new backend, so a later Bind/Execute would get
-                // a confusing "prepared statement does not exist" mid-session.
-                // Sever (08006) so the driver re-prepares on reconnect — the same
-                // discipline applied to non-migratable sessions above.
-                self.send_failover_error_response(
-                    "pgbattery: leader changed; a prepared statement could not be re-established and the session was severed",
-                )
-                .await;
-                return Err(Error::ConnectionSevered {
-                    conn_id: self.id,
-                    reason: format!("prepared statement {name} replay failed"),
-                });
+                return Err(e);
             }
         }
 
@@ -3807,6 +3877,66 @@ mod tests {
         .await;
         assert!(!state.read().subscriptions.channels.contains("jobs"));
         assert!(state.read().not_migratable);
+    }
+
+    /// M16: a replayed Parse or LISTEN the new backend refused read as
+    /// replayed, and the client's next Bind hit 26000 with no warning.
+    #[tokio::test]
+    async fn a_replay_the_backend_refused_severs_the_session() {
+        use crate::gateway::connection::ConnectionState;
+        use tokio::io::AsyncReadExt as _;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, mut client, mut backend_peer) = proxied(state).await;
+        let mut answer = error_response("42601");
+        answer.extend_from_slice(&ready(b'I'));
+        backend_peer.write_all(&answer).await.unwrap();
+
+        let mut buf = BytesMut::new();
+        let waited = handler.wait_for_ready(&mut backend, &mut buf).await;
+        assert!(
+            matches!(waited, Err(Error::ConnectionSevered { .. })),
+            "{waited:?}"
+        );
+        let mut told = [0u8; 64];
+        let n = client.read(&mut told).await.unwrap();
+        assert_eq!(told.first(), Some(&b'E'));
+        assert!(told[..n].windows(5).any(|w| w == b"08006"));
+    }
+
+    /// A standby still in recovery refuses LISTEN with 25006 until it is
+    /// promoted: the migration is retried, not severed.
+    #[tokio::test]
+    async fn a_replay_refused_by_a_backend_not_yet_ready_is_retried() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, mut backend_peer) = proxied(state).await;
+        let mut answer = error_response("25006");
+        answer.extend_from_slice(&ready(b'I'));
+        backend_peer.write_all(&answer).await.unwrap();
+
+        let mut buf = BytesMut::new();
+        let waited = handler.wait_for_ready(&mut backend, &mut buf).await;
+        assert!(
+            waited.as_ref().is_err_and(reconnect_may_recover),
+            "{waited:?}"
+        );
+    }
+
+    /// With no route and its backend intact, a session stays where it is:
+    /// every later message re-checks the route before it is forwarded.
+    #[tokio::test]
+    async fn a_session_with_no_route_keeps_its_backend() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state).await;
+        let mut buf = BytesMut::new();
+        let moved = handler
+            .handle_leader_change(&mut backend, &mut buf, false)
+            .await;
+        assert!(moved.is_ok(), "{moved:?}");
     }
 
     #[tokio::test]
