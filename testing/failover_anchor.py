@@ -2,12 +2,11 @@
 """The failover anchor's lifecycle under coalesced watch transitions.
 
 `promote_local_postgres` withholds promotion for one lease duration measured
-from `failover_started_at`. The governor stamps that anchor on the leader-loss
-edge, clears it when another node is the stable leader, and re-stamps it when
-the metrics watch coalesces `Leader(other) -> None -> Leader(self)` and swallows
-the edge. A missed clear leaves an ancient anchor; a missed re-stamp leaves
-none. Both read as "the lease expired long ago", and the hold-down lets a
-promotion through while the deposed leader may still hold write authority.
+from the lease's failover anchor. The governor stamps that anchor on the
+leader-loss edge and every observed term, and clears it when another node is
+the stable leader; a promotion that finds none stamps its own. A missed clear
+leaves an ancient anchor, which reads as "the lease expired long ago" and lets
+a promotion through while the deposed leader may still hold write authority.
 
 The pure functions are unit-tested. This drives the live lifecycle: rapid
 leadership churn is what makes the watch coalesce, and `/debug/state` now

@@ -76,8 +76,8 @@ pub(super) struct StateResponse {
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
     pub node_count: usize,
-    /// Age of `ClusterState::failover_started_at`, or `None` when no failover
-    /// is being tracked. The promotion hold-down measures from this anchor, so
+    /// Age of the lease's promotion hold-down anchor, or `None` when no
+    /// failover is being tracked. The promotion hold-down measures from this anchor, so
     /// a stale one it should have cleared, or a missing one it should have
     /// re-stamped, both read as "the lease expired long ago" and let a
     /// promotion through immediately. Exposed so the lifecycle can be asserted
@@ -114,12 +114,15 @@ pub(super) async fn get_state(State(state): State<Arc<ManagementApiState>>) -> J
         let learners: Vec<u64> = membership.learner_ids().collect();
         (m.current_leader, voters, learners)
     };
-    let (node_count, failover_anchor_age_ms, sync_replication_active) = {
+    let failover_anchor_age_ms = {
+        let lease = state.lease.read();
+        lease.failover_anchor().map(|at| {
+            u64::try_from(lease.now().saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
+        })
+    };
+    let (node_count, sync_replication_active) = {
         let cluster = state.cluster_state.read();
-        let age = cluster
-            .failover_started_at
-            .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
-        (cluster.nodes.len(), age, cluster.sync_replication_active)
+        (cluster.nodes.len(), cluster.sync_replication_active)
     };
 
     Json(StateResponse {

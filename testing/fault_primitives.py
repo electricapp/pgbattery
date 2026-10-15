@@ -3552,13 +3552,13 @@ def clock_skew_at_lease_boundary(
     """Step a node's wall clock inside the live promotion hold-down window.
 
     PROVES: whether a decision the lease guards is taken on the monotonic clock
-    or on the wall clock. ``App::promote_local_postgres`` withholds promotion
-    until one full lease duration has passed since the locally-observed
-    leaderless edge. That hold-down now measures with ``Instant`` and
+    or on the wall clock. ``promote_local_postgres`` withholds promotion
+    until one full lease duration has passed since the newest observed term.
+    That hold-down measures with ``Instant`` and
     ``checked_duration_since(...).unwrap_or(ZERO)``
-    (``promotion_lease_holddown``, ``src/app.rs``), and ``failover_started_at``
-    is an ``Instant`` too — so a wall-clock step of either sign cannot shorten
-    it. It was not always so: the guard once compared ``unix_now_ms()`` against
+    (``promotion_lease_holddown``, ``src/governor/reconciler/follow.rs``), and
+    the lease's failover anchor is an ``Instant`` too — so a wall-clock step of
+    either sign cannot shorten it. It was not always so: the guard once compared ``unix_now_ms()`` against
     a wall-clock anchor while the lease it stood in for was monotonic, and a
     forward step of one lease duration applied to the election winner inside
     that window satisfied the guard while the deposed leader's lease was still

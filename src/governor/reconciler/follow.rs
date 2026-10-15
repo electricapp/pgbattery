@@ -129,10 +129,12 @@ pub(super) async fn promote_local_postgres<P: PgControl>(
     // Winning the election does not prove the deposed leader's lease expired:
     // the election timeout is shorter than the lease. Hold until one lease
     // after the term advance; the next pass re-checks.
-    let failover_started_at = cluster_state.read().failover_started_at;
+    let (anchor, now) = {
+        let mut lease = lease.write();
+        (lease.promotion_anchor(), lease.now())
+    };
     let lease_duration = crate::governor::DEFAULT_LEASE_DURATION;
-    let now = lease.read().now();
-    if let Some(elapsed) = promotion_lease_holddown(failover_started_at, now, lease_duration) {
+    if let Some(elapsed) = promotion_lease_holddown(Some(anchor), now, lease_duration) {
         info!(
             elapsed_ms = elapsed.as_millis(),
             lease_ms = lease_duration.as_millis(),
@@ -150,13 +152,10 @@ pub(super) async fn promote_local_postgres<P: PgControl>(
     };
     match pg.promote(&sync_standby_names).await {
         Ok(()) => {
-            if let Some(started_at) = failover_started_at {
-                // clock-lint: allow — histogram sample, not a gate.
-                let total_secs = started_at.elapsed().as_secs_f64();
-                metrics::histogram!("pgbattery_failover_total_seconds").record(total_secs);
-                info!(total_secs, "Failover total duration recorded");
-                cluster_state.write().failover_started_at = None;
-            }
+            let total_secs = now.duration_since(anchor).as_secs_f64();
+            metrics::histogram!("pgbattery_failover_total_seconds").record(total_secs);
+            info!(total_secs, "Failover total duration recorded");
+            lease.write().set_failover_anchor(None);
             Some(true)
         }
         Err(e) => {
@@ -239,11 +238,17 @@ mod tests {
 
     const LEASE: Duration = Duration::from_secs(2);
 
+    /// A deposed leader's lease long since expired.
     fn fixtures(model: ModelPg) -> (ModelPg, Arc<RwLock<ClusterState>>, SharedLeaseState) {
+        let mut lease = LeaseState::new();
+        let spent = lease
+            .now()
+            .checked_sub(crate::governor::DEFAULT_LEASE_DURATION * 2);
+        lease.set_failover_anchor(spent);
         (
             model,
             Arc::new(RwLock::new(ClusterState::default())),
-            Arc::new(RwLock::new(LeaseState::new())),
+            Arc::new(RwLock::new(lease)),
         )
     }
 
@@ -252,6 +257,23 @@ mod tests {
             in_recovery: true,
             ..ModelPg::default()
         }
+    }
+
+    /// M1: an anchor nobody stamped (a snapshot install wiped it, or a path
+    /// that never anchored) must hold for a lease, not read as long expired.
+    #[tokio::test]
+    async fn a_promotion_with_no_anchor_holds_for_a_lease() {
+        let (mut pg, cluster, lease) = fixtures(standby());
+        lease.write().set_failover_anchor(None);
+        assert_eq!(
+            promote_local_postgres(&mut pg, &cluster, &lease, 1).await,
+            Some(false)
+        );
+        assert!(
+            !pg.calls().iter().any(|c| c.starts_with("promote(")),
+            "promoted on an unknown anchor: {:?}",
+            pg.calls()
+        );
     }
 
     #[tokio::test]

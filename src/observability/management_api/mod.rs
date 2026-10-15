@@ -86,6 +86,8 @@ pub struct ManagementApiState {
     pub node_id: NodeId,
     pub raft: Arc<openraft::Raft<TypeConfig>>,
     pub cluster_state: Arc<RwLock<ClusterState>>,
+    /// This node's lease, which carries the promotion hold-down anchor.
+    pub lease: crate::governor::SharedLeaseState,
     /// `PostgreSQL` manager for creating replication slots (`None` for witness nodes)
     pub postgres_manager: Option<Arc<tokio::sync::Mutex<crate::supervisor::Supervisor>>>,
     /// Backup manager (None for witness nodes or if backups disabled)

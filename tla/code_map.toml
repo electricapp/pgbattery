@@ -5,12 +5,11 @@
 
 [lease_fencing]
 "governor/reconciler/follow.rs" = ["promotion_lease_holddown"]
-"governor/lease.rs" = ["expires_at", "is_valid", "quorum_ack_age", "renew"]
+"governor/lease.rs" = ["expires_at", "is_valid", "promotion_anchor", "quorum_ack_age", "renew"]
 "governor/raft.rs" = [
   "QUORUM_TIMEOUT_MS",
   "has_quorum",
   "millis_since_quorum_ack",
-  "should_anchor_coalesced_failover",
   "should_anchor_term_advance",
   "should_clear_stale_failover_anchor",
 ]

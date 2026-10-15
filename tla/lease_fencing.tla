@@ -67,11 +67,12 @@
  *      that actually ends a deposed leader's authority.
  *
  *   3. Promotion hold-down, anchored on the newest term this node has seen.
- *      CODE: app.rs promotion_lease_holddown(); governor/raft.rs
- *      should_anchor_term_advance and failover_started_at; docs/STATE_MACHINE.md §2.
+ *      CODE: governor/reconciler/follow.rs promotion_lease_holddown(); governor/raft.rs
+ *      should_anchor_term_advance; the anchor on governor/lease.rs; docs/STATE_MACHINE.md §2.
  *      Here: StartCampaign re-stamps holdDownRemaining = HoldDown, and
  *      EnablePgWrites is gated on holdDownRemaining = 0 (or on there being no
- *      anchor at all, which is what `promotion_lease_holddown(None, ..)` means).
+ *      anchor at all, which the model allows and the code does not: a
+ *      promotion with no anchor stamps one and holds).
  *
  * === WHY THE ANCHOR MOVES WITH THE TERM (mechanism 3, in full) ===
  *
@@ -159,7 +160,7 @@ VARIABLES
     quorumAckAge,       \* quorumAckAge[n]: ticks since n's last majority ack (capped)
     leaseRemaining,     \* leaseRemaining[n]: lease ticks left (0 = expired)
     holdDownRemaining,  \* holdDownRemaining[n]: hold-down ticks left (0 = cleared)
-    anchored,           \* anchored[n]: failover_started_at is stamped
+    anchored,           \* anchored[n]: the lease's failover anchor is stamped
     leaseIsLeader,      \* leaseIsLeader[n]: lease state thinks n is leader
     pgWritable          \* pgWritable[n]: PostgreSQL on n accepts writes
 
@@ -282,7 +283,7 @@ AbandonCampaign(n) ==
  *
  * The winner keeps the anchor it stamped when it began this candidacy; a winner
  * with no anchor (its leader→none edge was coalesced away) stamps one now.
- * CODE: governor/raft.rs should_anchor_coalesced_failover. *)
+ * CODE: governor/lease.rs promotion_anchor. *)
 WinElection(n, Q) ==
     /\ campaigning[n]
     /\ campaignAge[n] <= VoteDelay

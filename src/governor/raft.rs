@@ -180,6 +180,36 @@ struct GovernorRunState {
     /// at less than the recovery interval so multiple nodes don't all
     /// stampede into elections back-to-back.
     leaderless_recovery_last_fired_at: Option<Instant>,
+    /// When this node's current leaderless window began; the leaderless
+    /// watchdog measures from it.
+    leaderless_since: Option<Instant>,
+}
+
+impl GovernorRunState {
+    /// A node that boots without a leader is leaderless from its first
+    /// instant: the first metrics tick applies `elect(false)`, so nothing but
+    /// the watchdog will campaign for it.
+    fn at_boot(now: Instant, term: u64, has_leader: bool) -> Self {
+        Self {
+            prev_leader_id: None,
+            prev_is_leader: false,
+            prev_should_fence: None,
+            last_metrics_update: now,
+            leader_lost_at: None,
+            prev_term: term,
+            leaderless_recovery_last_fired_at: None,
+            leaderless_since: (!has_leader).then_some(now),
+        }
+    }
+
+    /// Carry the leaderless window while no leader is seen; end it when one is.
+    fn observe_leader(&mut self, has_leader: bool, now: Instant) {
+        self.leaderless_since = if has_leader {
+            None
+        } else {
+            Some(self.leaderless_since.unwrap_or(now))
+        };
+    }
 }
 
 impl Governor {
@@ -301,14 +331,13 @@ impl Governor {
 
         let mut metrics_rx = self.raft.metrics();
         let mut shutdown_rx = self.shutdown_rx.clone();
-        let mut runtime = GovernorRunState {
-            prev_leader_id: None,
-            prev_is_leader: false,
-            prev_should_fence: None,
-            last_metrics_update: self.lease.read().now(),
-            leader_lost_at: None,
-            prev_term: metrics_rx.borrow().current_term,
-            leaderless_recovery_last_fired_at: None,
+        let mut runtime = {
+            let metrics = metrics_rx.borrow();
+            GovernorRunState::at_boot(
+                self.lease.read().now(),
+                metrics.current_term,
+                metrics.current_leader.is_some(),
+            )
         };
         // Tick wakes the loop so the watchdogs run even when no Raft
         // metrics update arrives — the exact failure mode the leaderless
@@ -389,9 +418,10 @@ impl Governor {
             // Leader just disappeared — start the election timer. Stamped from
             // the lease's clock so the hold-down and the lease it guards can
             // never measure different time sources.
-            let lost_at = self.lease.read().now();
+            let mut lease = self.lease.write();
+            let lost_at = lease.now();
             runtime.leader_lost_at = Some(lost_at);
-            self.state.write().failover_started_at = Some(lost_at);
+            lease.set_failover_anchor(Some(lost_at));
         } else if leader_id.is_some() && tracking_election {
             // A new leader appeared while we were tracking an election.
             if let Some(lost_at) = runtime.leader_lost_at.take() {
@@ -410,31 +440,16 @@ impl Governor {
             }
         }
 
+        runtime.observe_leader(leader_id.is_some(), self.lease.read().now());
         let is_leader = leader_id == Some(self.node_id);
 
         // A different node is the stable leader — clear any anchor this node
-        // stamped for a failover it did not win, so it cannot later suppress
-        // the coalesced re-anchor below (see `should_clear_stale_failover_anchor`).
-        // Only take the write lock when there is actually something to clear.
-        if Self::should_clear_stale_failover_anchor(leader_id, is_leader)
-            && self.state.read().failover_started_at.is_some()
-        {
-            self.state.write().failover_started_at = None;
-        }
-
-        // The watch can coalesce Leader(other) → None → Leader(self), dropping
-        // the leader→none edge that stamps `failover_started_at` and skipping
-        // the promotion hold-down (split-brain risk). Re-stamp on the
-        // leader-acquisition edge of a real failover; `now` is later than the
-        // missed edge, so we only ever wait longer (the safe direction).
-        if Self::should_anchor_coalesced_failover(
-            runtime.prev_leader_id,
-            is_leader,
-            self.node_id,
-            self.state.read().failover_started_at.is_some(),
-        ) {
-            let anchor = self.lease.read().now();
-            self.state.write().failover_started_at = Some(anchor);
+        // stamped for a failover it did not win, so a later win cannot read it
+        // as long expired. A win with no anchor stamps one at its first
+        // promotion attempt, which also covers a watch that coalesced the
+        // leader→none edge away.
+        if Self::should_clear_stale_failover_anchor(leader_id, is_leader) {
+            self.lease.write().set_failover_anchor(None);
         }
 
         // A deposed leader keeps its quorum until a majority moves past its
@@ -448,8 +463,9 @@ impl Governor {
             leader_id,
             is_leader,
         ) {
-            let anchor = self.lease.read().now();
-            self.state.write().failover_started_at = Some(anchor);
+            let mut lease = self.lease.write();
+            let anchor = lease.now();
+            lease.set_failover_anchor(Some(anchor));
         }
         runtime.prev_term = metrics.current_term;
 
@@ -542,26 +558,6 @@ impl Governor {
         }
     }
 
-    /// Whether becoming leader must re-anchor the promotion hold-down because
-    /// the metrics watch may have coalesced away the leader→none edge. True
-    /// only for a real failover (a different prior leader, not yet anchored);
-    /// false for bootstrap, steady-state, or when not leader. Pure fn so the
-    /// coalescing cases are unit-testable.
-    const fn should_anchor_coalesced_failover(
-        prev_leader_id: Option<NodeId>,
-        is_leader: bool,
-        self_id: NodeId,
-        failover_already_anchored: bool,
-    ) -> bool {
-        if !is_leader || failover_already_anchored {
-            return false;
-        }
-        match prev_leader_id {
-            Some(prev) => prev != self_id,
-            None => false,
-        }
-    }
-
     /// Whether this tick's Raft term advance must (re-)stamp the promotion
     /// hold-down anchor.
     ///
@@ -593,19 +589,12 @@ impl Governor {
 
     /// Whether a stale promotion-hold-down anchor must be cleared this tick.
     ///
-    /// True when a *different* node is the stable leader. The anchor
-    /// (`failover_started_at`) is stamped on the locally-observed
-    /// leader→none edge, but it is only meaningful for a failover *this* node
-    /// goes on to win — it is consumed and cleared by `promote_local_postgres`.
-    /// If this node witnesses a failover it does not win, the anchor would
-    /// otherwise persist indefinitely (it is never cleared on the
-    /// other-becomes-leader edge) and, on a *later* election this node does win
-    /// via a coalesced `other→none→self` transition,
-    /// `should_anchor_coalesced_failover` refuses to re-anchor because an
-    /// anchor already exists — so the hold-down reads that ancient timestamp as
-    /// long-elapsed and promotes immediately, skipping the wait for the deposed
-    /// leader's lease to expire (split-brain). Clearing here keeps the anchor
-    /// describing only the in-progress failover this node might complete.
+    /// True when a *different* node is the stable leader. The anchor is only
+    /// meaningful for a failover *this* node goes on to win, and a promotion
+    /// clears it. One kept from a failover this node witnessed but lost would
+    /// read as long expired on a later win, and promote while the deposed
+    /// leader's lease may still be valid (split-brain). Cleared, a later win
+    /// with no anchor holds a full lease instead.
     const fn should_clear_stale_failover_anchor(
         leader_id: Option<NodeId>,
         is_leader: bool,
@@ -935,16 +924,13 @@ impl Governor {
             return;
         }
 
-        let Some(leader_lost_at) = runtime.leader_lost_at else {
-            // We never had a leader yet (cluster bootstrap window). Don't
-            // intervene — let openraft's normal election timers do their
-            // job.
+        let Some(leaderless_since) = runtime.leaderless_since else {
             return;
         };
 
         let threshold = Self::leaderless_threshold(rank, self.election_timeout_ms);
         let now = self.lease.read().now();
-        if now.duration_since(leader_lost_at) < threshold {
+        if now.duration_since(leaderless_since) < threshold {
             return;
         }
 
@@ -961,7 +947,7 @@ impl Governor {
             node_id = self.node_id,
             rank = rank,
             stall_ms =
-                u64::try_from(now.duration_since(leader_lost_at).as_millis()).unwrap_or(u64::MAX),
+                u64::try_from(now.duration_since(leaderless_since).as_millis()).unwrap_or(u64::MAX),
             threshold_ms = u64::try_from(threshold.as_millis()).unwrap_or(u64::MAX),
             "Cluster leaderless past threshold — forcing election to break openraft no-pre-vote deadlock"
         );
@@ -2754,6 +2740,21 @@ mod tests {
 
     // ---- Leaderless-recovery watchdog: rank-ordered, election-timeout-scaled ----
 
+    /// H16: a voter that boots with no leader has `elect(false)` applied on
+    /// its first tick, so openraft's own timers are off; unless the watchdog
+    /// measures from boot, a whole-cluster restart whose first election
+    /// splits never campaigns again.
+    #[test]
+    fn a_voter_that_boots_leaderless_is_watched_from_its_first_instant() {
+        let boot = Instant::now();
+        let runtime = GovernorRunState::at_boot(boot, 7, false);
+        assert_eq!(runtime.leaderless_since, Some(boot));
+        assert_eq!(
+            GovernorRunState::at_boot(boot, 7, true).leaderless_since,
+            None
+        );
+    }
+
     #[test]
     fn leaderless_threshold_orders_by_rank() {
         let et = 1_000u64; // election timeout (ms)
@@ -2857,65 +2858,7 @@ mod tests {
         assert!(Governor::fence_gate_needs_apply(Some(false), true));
     }
 
-    // ---- Coalesced-failover hold-down anchor ----
-
-    #[test]
-    fn coalesced_failover_anchors_holddown_on_direct_leader_takeover() {
-        // The watch collapsed Leader(7) → None → Leader(self=3): we observe a
-        // direct prior-leader→self transition with no anchor set yet. The
-        // hold-down MUST be (re)anchored so promotion waits out the deposed
-        // leader's lease.
-        assert!(Governor::should_anchor_coalesced_failover(
-            Some(7), // prev leader was a different node
-            true,    // we are now leader
-            3,       // self
-            false,   // no anchor set (the leader→none edge was coalesced away)
-        ));
-    }
-
-    #[test]
-    fn coalesced_failover_does_not_anchor_on_fresh_bootstrap() {
-        // No prior leader ever observed → genuine fresh-cluster bootstrap →
-        // promote immediately, no hold-down.
-        assert!(!Governor::should_anchor_coalesced_failover(
-            None, true, 3, false
-        ));
-    }
-
-    #[test]
-    fn coalesced_failover_does_not_anchor_in_steady_state() {
-        // We were already the leader (prev == self): a heartbeat tick, not a
-        // failover. Must not reset the anchor.
-        assert!(!Governor::should_anchor_coalesced_failover(
-            Some(3),
-            true,
-            3,
-            false
-        ));
-    }
-
-    #[test]
-    fn coalesced_failover_does_not_anchor_when_already_set() {
-        // The normal (non-coalesced) path already stamped the anchor on the
-        // leader→none edge — don't clobber it with a later instant.
-        assert!(!Governor::should_anchor_coalesced_failover(
-            Some(7),
-            true,
-            3,
-            true
-        ));
-    }
-
-    #[test]
-    fn coalesced_failover_does_not_anchor_when_not_leader() {
-        // Leadership went elsewhere — we aren't promoting, so nothing to anchor.
-        assert!(!Governor::should_anchor_coalesced_failover(
-            Some(7),
-            false,
-            3,
-            false
-        ));
-    }
+    // ---- Hold-down anchor lifecycle ----
 
     #[test]
     fn stale_anchor_cleared_when_another_node_leads() {
@@ -3046,28 +2989,24 @@ mod tests {
     fn witnessed_but_unwon_failover_does_not_skip_holddown_on_next_win() {
         // Regression for the stale-anchor split-brain. Node 3 witnesses two
         // failovers: it loses the first (node 7 wins) and wins the second via
-        // a coalesced 7→none→3 transition.
-        const SELF_ID: NodeId = 3;
+        // a coalesced 7→none→3 transition that stamps nothing.
+        use crate::governor::reconciler::follow::promotion_lease_holddown;
+        let lease_duration = crate::governor::DEFAULT_LEASE_DURATION;
 
-        // Failover #1: node 3 stamped an anchor on A→none, then node 7 won.
-        // On the tick where node 7 is the stable leader, node 3 clears the
-        // stale anchor instead of carrying it forever.
+        // Failover #1: node 3 stamped an anchor on A→none, then node 7 won,
+        // and the stable other leader clears it.
+        let mut lease = crate::governor::lease::LeaseState::new();
+        lease.set_failover_anchor(lease.now().checked_sub(lease_duration * 10));
         assert!(Governor::should_clear_stale_failover_anchor(
             Some(7),
             /* is_leader */ false
         ));
+        lease.set_failover_anchor(None);
 
-        // Failover #2 (coalesced 7→none→self): because the anchor was cleared,
-        // `failover_already_anchored` is false, so the re-anchor fires and the
-        // promotion hold-down is enforced against a *fresh* timestamp. A
-        // still-set stale anchor here would suppress the re-anchor and skip
-        // the hold-down — the double-promotion window this pairing prevents.
-        assert!(Governor::should_anchor_coalesced_failover(
-            Some(7),
-            /* is_leader */ true,
-            SELF_ID,
-            /* failover_already_anchored (post-clear) */ false,
-        ));
+        // Failover #2: the promotion finds no anchor and stamps its own, so
+        // it holds a full lease instead of reading an ancient one as spent.
+        let anchor = lease.promotion_anchor();
+        assert!(promotion_lease_holddown(Some(anchor), lease.now(), lease_duration).is_some());
     }
 
     // ---- Snapshot membership fidelity ----

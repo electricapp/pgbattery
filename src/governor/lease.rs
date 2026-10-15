@@ -47,6 +47,12 @@ pub struct LeaseState {
     /// Is this node currently the Raft leader?
     /// Updated by Governor, used for metrics/logging
     is_leader: bool,
+
+    /// The promotion hold-down anchor: the latest instant a deposed leader
+    /// could still hold quorum, stamped by the governor on this clock. Here
+    /// rather than on the replicated `ClusterState`, where a snapshot install
+    /// replaced it with nothing.
+    failover_anchor: Option<Instant>,
 }
 
 impl std::fmt::Debug for LeaseState {
@@ -55,6 +61,7 @@ impl std::fmt::Debug for LeaseState {
             .field("expires_at", &self.expires_at)
             .field("duration", &self.duration)
             .field("is_leader", &self.is_leader)
+            .field("failover_anchor", &self.failover_anchor)
             .field("clock", &"<dyn Clock>")
             .finish()
     }
@@ -78,6 +85,7 @@ impl LeaseState {
             expires_at,
             duration: DEFAULT_LEASE_DURATION,
             is_leader: false,
+            failover_anchor: None,
         }
     }
 
@@ -220,6 +228,25 @@ impl LeaseState {
     #[must_use]
     pub const fn valid_until(&self) -> Instant {
         self.expires_at
+    }
+
+    /// The promotion hold-down anchor, if one is stamped.
+    #[must_use]
+    pub const fn failover_anchor(&self) -> Option<Instant> {
+        self.failover_anchor
+    }
+
+    /// Stamp the hold-down anchor at `at`, or clear it.
+    pub const fn set_failover_anchor(&mut self, at: Option<Instant>) {
+        self.failover_anchor = at;
+    }
+
+    /// The anchor a promotion measures from, stamping now when none is
+    /// stamped: an unknown anchor holds for a lease rather than reading as
+    /// long expired.
+    pub fn promotion_anchor(&mut self) -> Instant {
+        let now = self.clock.now();
+        *self.failover_anchor.get_or_insert(now)
     }
 }
 

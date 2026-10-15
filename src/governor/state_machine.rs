@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Instant;
 
 /// Node identifier type.
 pub type NodeId = u64;
@@ -71,21 +70,6 @@ pub struct ClusterState {
     /// which recompute from `node_lsns`.
     pub max_cluster_lsn: u64,
 
-    /// Monotonic instant at which *this node* last observed the cluster losing
-    /// its leader. `None` outside an active failover.
-    ///
-    /// Monotonic because it anchors the promotion hold-down guarding the
-    /// deposed leader's lease, and that lease expires on monotonic time — a
-    /// wall-clock anchor would let a forward clock step release the gate while
-    /// the old lease is still valid.
-    ///
-    /// Local projection, not replicated: written by the governor on the
-    /// locally-observed leader→none edge, cleared by the app after promotion.
-    /// `serde(skip)` because an `Instant` is meaningless off the node that
-    /// produced it.
-    #[serde(skip)]
-    pub failover_started_at: Option<Instant>,
-
     /// Whether the leader currently has `synchronous_standby_names` set to a
     /// non-empty value, i.e. recent writes are protected by sync replication.
     ///
@@ -149,8 +133,7 @@ pub struct ClusterState {
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
 /// `pg_upgrade`. Postcard is positional, so the 0→1 store migration must
-/// decode old snapshots with exactly this field set. `failover_started_at` is
-/// `serde(skip)` on the live struct and so absent from the wire.
+/// decode old snapshots with exactly this field set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClusterStateV0 {
     pub nodes: HashMap<NodeId, NodeInfo>,
@@ -169,7 +152,6 @@ impl From<ClusterStateV0> for ClusterState {
             learner_ids: v0.learner_ids,
             node_lsns: v0.node_lsns,
             max_cluster_lsn: v0.max_cluster_lsn,
-            failover_started_at: None,
             sync_replication_active: v0.sync_replication_active,
             cutover: CutoverAuthorityState::default(),
             pg_upgrade: PgUpgradeState::default(),

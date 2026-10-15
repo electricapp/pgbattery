@@ -627,6 +627,7 @@ impl App {
         let mgmt_state = self.build_management_state(
             &raft,
             &cluster_state,
+            &lease_state,
             &postgres_manager,
             backup_manager,
             Arc::clone(&debug_events),
@@ -847,6 +848,7 @@ impl App {
         &self,
         raft: &Arc<openraft::Raft<crate::governor::raft::TypeConfig>>,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+        lease: &crate::governor::SharedLeaseState,
         postgres_manager: &Arc<tokio::sync::Mutex<Supervisor>>,
         backup_manager: Option<Arc<BackupManager>>,
         debug_events: Arc<crate::observability::debug_events::DebugEventBuffer>,
@@ -857,6 +859,7 @@ impl App {
             node_id: self.config.node_id,
             raft: raft.clone(),
             cluster_state: cluster_state.clone(),
+            lease: lease.clone(),
             postgres_manager: Some(postgres_manager.clone()),
             backup_manager,
             management_api_token: self.config.management_api_token.clone(),

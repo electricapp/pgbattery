@@ -123,7 +123,7 @@ pub fn choose_yield_target(candidates: &[YieldCandidate]) -> Option<NodeId> {
 /// not-leader to leader edge and cleared the moment leadership goes away —
 /// rather than being written once at a transition and trusted afterwards. The
 /// reconciler's async-fallback grace reads the same tenure, and it is what
-/// makes the anchor survive the restart that `failover_started_at` does
+/// makes the anchor survive the restart that the hold-down anchor does
 /// not: a node that comes back up and wins an election has a fresh edge, and
 /// the wedge this exists to catch is reached exactly that way.
 #[derive(Debug, Default)]
