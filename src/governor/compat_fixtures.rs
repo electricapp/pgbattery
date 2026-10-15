@@ -85,6 +85,7 @@ fn sample_state_current() -> ClusterState {
             fenced_app_roles: vec!["app".to_string()],
         },
         upgrade_frozen: true,
+        applied_index: Some(42),
         ..ClusterState::from(sample_state_v0())
     }
 }

@@ -1403,19 +1403,6 @@ pub struct StateMachineStore {
     /// install), so `apply()` can read it without a redb transaction per
     /// batch. Atomic because the snapshot builder clones the struct.
     applied_end: Arc<std::sync::atomic::AtomicU64>,
-    /// Serializes `build_snapshot` against `install_snapshot`.
-    ///
-    /// openraft serializes `apply`/`install_snapshot`, but `build_snapshot`
-    /// runs on its own task and races them. `install_snapshot` writes redb
-    /// (`last_applied` + membership) and then swaps `self.state` in two steps;
-    /// a builder observing the redb write but the pre-swap state would emit a
-    /// snapshot whose meta is ahead of its data (dropped committed entries on
-    /// install). Holding this lock across the redb-write+state-swap in the
-    /// installer and across the meta-read+state-clone in the builder makes the
-    /// (meta, state) pair atomic to the builder. `apply` needs no lock: it
-    /// updates state *before* redb, so the builder only ever sees data at or
-    /// ahead of meta (safe — `ClusterCommand` re-application is idempotent).
-    snapshot_consistency: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The applied position and membership `RaftStateMachine::applied_state` reports.
@@ -1431,13 +1418,12 @@ impl StateMachineStore {
     /// `applied_end` starts at 0 (nothing applied); openraft calls
     /// `applied_state` before any `apply`, which seeds it from redb. Exists so
     /// `openraft::testing::Suite` can exercise this type rather than a mirror of
-    /// it — notably including the `snapshot_consistency` lock.
+    /// it.
     pub(crate) fn new(state: Arc<RwLock<ClusterState>>, storage: RedbLogStorage) -> Self {
         Self {
             state,
             storage,
             applied_end: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1535,7 +1521,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
             match entry.payload {
                 EntryPayload::Normal(req) => {
-                    let outcome = self.apply_normal_entry(req);
+                    let outcome = self.apply_normal_entry(entry.log_id.index, req);
                     responses.push(ClusterResponse {
                         success: true,
                         outcome,
@@ -1553,6 +1539,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                     responses.push(ClusterResponse::applied());
                 }
                 EntryPayload::Blank => {
+                    self.state.write().note_applied(entry.log_id.index);
                     responses.push(ClusterResponse::applied());
                 }
             }
@@ -1572,7 +1559,6 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             state: self.state.clone(),
             storage: self.storage.clone(),
             applied_end: self.applied_end.clone(),
-            snapshot_consistency: self.snapshot_consistency.clone(),
         })
     }
 
@@ -1603,6 +1589,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // snapshot cannot corrupt in-memory or on-disk data.
         let state: ClusterState =
             postcard::from_bytes(&data).map_err(|e| storage_read_err(&Error::Serialization(e)))?;
+        let state = state_at_snapshot_position(state, meta.last_log_id.map(|l| l.index))
+            .map_err(|e| storage_read_err(&e))?;
 
         let snapshot_meta = SnapshotMeta {
             last_applied: log_id_to_last_applied(meta.last_log_id),
@@ -1613,11 +1601,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         };
         let installed_end = meta.last_log_id.map_or(0, |l| l.index.saturating_add(1));
 
-        // Hold the snapshot-consistency lock across BOTH the redb write and the
-        // in-memory swap so a concurrent `build_snapshot` (separate task) cannot
-        // observe the intermediate state where redb records this snapshot's
-        // position but `self.state` is still the previous machine.
-        let _consistency = self.snapshot_consistency.lock().await;
+        // State first, durable position second, as on every apply path: a
+        // builder between the two captures data ahead of its recorded
+        // position, which re-delivery skips, never a position its data lacks.
+        *self.state.write() = state;
 
         // Persist data, metadata, and the snapshot's applied position +
         // membership in ONE transaction. The install replaces the state
@@ -1631,12 +1618,6 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         })
         .await
         .map_err(|e| storage_write_err(&e))?;
-
-        // Only after durable persistence succeeds do we swap the in-memory
-        // mirrors: the state machine itself and the applied-range cache that
-        // the duplicate-entry guard reads. A crash before this point leaves
-        // the previous snapshot intact on disk.
-        *self.state.write() = state;
         self.applied_end
             .store(installed_end, std::sync::atomic::Ordering::Relaxed);
 
@@ -1690,10 +1671,22 @@ impl StateMachineStore {
         true
     }
 
-    fn apply_normal_entry(&self, req: ClusterRequest) -> CommandOutcome {
+    fn apply_normal_entry(&self, index: u64, req: ClusterRequest) -> CommandOutcome {
         let mut state = self.state.write();
         tracing::debug!(command = ?req.command, "Applied cluster command");
-        state.apply(req.command)
+        state.apply_entry(index, req.command)
+    }
+
+    /// Refuse to make durable a position the in-memory state does not yet
+    /// reflect. Every writer of the durable position goes through here, so a
+    /// snapshot builder can never record a position ahead of its data.
+    fn ensure_state_reflects(&self, index: u64) -> Result<()> {
+        if self.state.read().reflects(index) {
+            return Ok(());
+        }
+        Err(Error::Storage(format!(
+            "refusing to persist applied index {index} ahead of the state it describes"
+        )))
     }
 
     async fn apply_membership_entry_atomic(
@@ -1707,6 +1700,14 @@ impl StateMachineStore {
 
         let configs_len = local_membership.configs.len();
         let nodes_len = local_membership.nodes.len();
+        {
+            let mut state = self.state.write();
+            if !state.reflects(log_id.index) {
+                sync_membership_into(&mut state, &voters, &learners);
+                state.note_applied(log_id.index);
+            }
+        }
+        self.ensure_state_reflects(log_id.index)?;
         storage_io(&self.storage, move |s| {
             s.save_applied_membership_and_last_applied(&local_membership, &last_applied_state)
         })
@@ -1717,7 +1718,6 @@ impl StateMachineStore {
             log_id.index.saturating_add(1),
             std::sync::atomic::Ordering::Relaxed,
         );
-        sync_membership_into(&mut self.state.write(), &voters, &learners);
         tracing::info!(
             configs = configs_len,
             nodes = nodes_len,
@@ -1748,6 +1748,7 @@ impl StateMachineStore {
             return Ok(());
         }
 
+        self.ensure_state_reflects(log_id.index)?;
         let last_applied_state = log_id_to_last_applied(Some(log_id));
         storage_io(&self.storage, move |s| {
             s.save_last_applied(&last_applied_state)
@@ -1827,51 +1828,23 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        // Capture a (membership, last_applied, state) triple for the snapshot.
-        // Two concurrent writers race this builder; only `install_snapshot`
-        // takes `snapshot_consistency`, `apply` never does.
-        //
-        //  * A NORMAL `apply` writes `self.state` *before* redb `last_applied`,
-        //    so the cloned state is at or ahead of the captured `last_applied`
-        //    (data-ahead-of-meta); idempotent re-application on install
-        //    converges. Reading `applied_membership` BEFORE `last_applied`
-        //    keeps the captured membership at or below `last_applied` — never a
-        //    membership from the future — since both redb indices only advance.
-        //  * A MEMBERSHIP `apply` (`apply_membership_entry_atomic`) is the
-        //    exception: it persists redb (`applied_membership` + `last_applied`)
-        //    FIRST, then updates `self.state` via `sync_membership_into`. That
-        //    redb-first order is deliberate for crash-consistency and must not
-        //    be flipped, so the cloned state's membership projection can lag the
-        //    captured meta by one generation (meta-ahead-of-data on the
-        //    membership dimension only). This is safe: `meta.last_membership` is
-        //    authoritative for Raft — install writes redb membership from it —
-        //    and the cloned `voter_ids` is re-derived from `RaftMetrics` every
-        //    metrics tick by `sync_voter_ids`, self-healing within ~one tick;
-        //    `nodes`/`learner_ids` reconcile on the next membership apply. An
-        //    installing node is a follower that acts on none of these until
-        //    healed. A future leader-side decision made from `nodes`/
-        //    `learner_ids` right after install would need its own re-derivation.
-        //  * `install_snapshot` writes redb then swaps `self.state` in two
-        //    steps; a builder spanning them could read the new redb position
-        //    with the old state (meta-ahead-of-data → dropped entries). The
-        //    `snapshot_consistency` lock, also held by the installer across
-        //    both steps, makes that pair atomic here.
-        //
-        // Hold the lock across the redb reads and the state clone, then release
-        // it before the (potentially large) postcard serialization.
-        let (last_applied, persisted_membership, state_snapshot) = {
-            let _consistency = self.snapshot_consistency.lock().await;
-            let persisted_membership = self
-                .storage
-                .load_applied_membership()
-                .map_err(|e| storage_read_err(&e))?;
-            let last_applied = self
-                .storage
-                .load_last_applied()
-                .map_err(|e| storage_read_err(&e))?;
-            let state_snapshot: ClusterState = self.state.read().clone();
-            (last_applied, persisted_membership, state_snapshot)
-        };
+        // Durable position first, state second. Every writer moves the state
+        // before the position (`ensure_state_reflects`), so the clone is at or
+        // ahead of the position it is recorded under, and re-delivery skips
+        // whatever it already reflects. The position and its membership come
+        // from one read transaction, so they always belong together.
+        let (last_applied, persisted_membership) = self
+            .storage
+            .load_applied_position()
+            .map_err(|e| storage_read_err(&e))?;
+        let state_snapshot: ClusterState = self.state.read().clone();
+        if let Some(index) = last_applied.last_applied_index
+            && !state_snapshot.reflects(index)
+        {
+            return Err(storage_read_err(&Error::Storage(format!(
+                "state machine is behind its durable position {index}"
+            ))));
+        }
         let data = postcard::to_allocvec(&state_snapshot)
             .map_err(|e| storage_write_err(&Error::Serialization(e)))?;
 
@@ -2305,6 +2278,31 @@ fn split_membership_nodes(local: &LocalStoredMembership) -> (MembershipNodes, Me
         .partition(|(id, _)| voter_ids.contains(id))
 }
 
+/// Reconcile snapshot data with the position its metadata records.
+///
+/// Data captured ahead of its position is expected and harmless: re-delivery
+/// skips what it reflects. Data that does not record a position predates the
+/// field and reflects exactly its metadata. Data behind its position would
+/// silently drop the entries in between, so it is refused.
+fn state_at_snapshot_position(
+    mut state: ClusterState,
+    position: Option<u64>,
+) -> Result<ClusterState> {
+    let Some(position) = position else {
+        return Ok(state);
+    };
+    match state.applied_index {
+        None => state.applied_index = Some(position),
+        Some(applied) if applied < position => {
+            return Err(Error::Storage(format!(
+                "snapshot data reflects index {applied} but its metadata records {position}"
+            )));
+        }
+        Some(_) => {}
+    }
+    Ok(state)
+}
+
 /// Load the persisted state-machine snapshot as the startup rebuild base.
 ///
 /// Returns the deserialized state plus the first log index whose effects are
@@ -2318,11 +2316,9 @@ fn load_snapshot_state(storage: &RedbLogStorage) -> Result<(ClusterState, u64)> 
         Error::Storage("snapshot metadata present without snapshot data".to_string())
     })?;
     let state: ClusterState = postcard::from_bytes(&data)?;
-    let replay_from = meta
-        .last_applied
-        .last_applied_index
-        .map_or(0, |i| i.saturating_add(1));
-    Ok((state, replay_from))
+    let position = meta.last_applied.last_applied_index;
+    let state = state_at_snapshot_position(state, position)?;
+    Ok((state, position.map_or(0, |i| i.saturating_add(1))))
 }
 
 /// Re-apply the effects of log entries in `[from, last_applied]` to `state`.
@@ -2349,13 +2345,16 @@ fn replay_applied_entries(
             LogEntryPayload::Normal(cmd) => {
                 // Replay only rebuilds state; an out-of-phase entry was
                 // already a no-op when it was first applied.
-                let _outcome = state.apply(cmd);
+                let _outcome = state.apply_entry(entry.index, cmd);
             }
             LogEntryPayload::Membership(membership) => {
-                let (voters, learners) = split_membership_nodes(&membership);
-                sync_membership_into(state, &voters, &learners);
+                if !state.reflects(entry.index) {
+                    let (voters, learners) = split_membership_nodes(&membership);
+                    sync_membership_into(state, &voters, &learners);
+                    state.note_applied(entry.index);
+                }
             }
-            LogEntryPayload::Blank => {}
+            LogEntryPayload::Blank => state.note_applied(entry.index),
         }
     }
     Ok(())
@@ -3244,8 +3243,7 @@ mod tests {
     /// `build_snapshot` must emit a self-consistent meta: the membership index
     /// never ahead of `last_applied` (openraft requires
     /// `last_membership.log_id <= last_log_id`), and the serialized data must
-    /// round-trip. Guards the read ordering (membership before `last_applied`)
-    /// and the meta construction the concurrency fix relies on.
+    /// round-trip.
     #[tokio::test]
     async fn build_snapshot_meta_is_self_consistent() {
         use std::sync::atomic::AtomicU64;
@@ -3288,12 +3286,12 @@ mod tests {
         state.apply(ClusterCommand::AddNode(test_node_info(1)));
         state.apply(ClusterCommand::AddNode(test_node_info(2)));
         state.apply(ClusterCommand::AddNode(test_node_info(3)));
+        state.note_applied(7);
 
         let mut sm = StateMachineStore {
             state: Arc::new(RwLock::new(state)),
             storage,
             applied_end: Arc::new(AtomicU64::new(8)),
-            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let snap = sm.build_snapshot().await.unwrap();
@@ -3311,14 +3309,12 @@ mod tests {
         assert_eq!(restored.nodes.len(), 3);
     }
 
-    /// Fixture for the two `snapshot_consistency` tests: redb at `last_applied`
-    /// 7 with a 3-node state, plus the meta and bytes of a 5-node snapshot
-    /// claiming index 99. Node count alone distinguishes before from after.
-    fn snapshot_lock_fixture() -> (
+    /// A store whose durable position and state both sit at index 7 with three
+    /// nodes, plus the meta of a snapshot at index 99.
+    fn store_at_seven_and_meta_at_99() -> (
         tempfile::TempDir,
         StateMachineStore,
         OpenRaftSnapshotMeta<NodeId, BasicNode>,
-        Vec<u8>,
     ) {
         use std::sync::atomic::AtomicU64;
 
@@ -3331,22 +3327,15 @@ mod tests {
                 last_applied_leader_node_id: 1,
             })
             .unwrap();
-
-        let mut before = ClusterState::new();
+        let mut state = ClusterState::new();
         for id in 1..=3 {
-            before.apply(ClusterCommand::AddNode(test_node_info(id)));
+            state.apply(ClusterCommand::AddNode(test_node_info(id)));
         }
-        let mut after = ClusterState::new();
-        for id in 1..=5 {
-            after.apply(ClusterCommand::AddNode(test_node_info(id)));
-        }
-        let incoming = postcard::to_allocvec(&after).unwrap();
-
+        state.note_applied(7);
         let sm = StateMachineStore {
-            state: Arc::new(RwLock::new(before)),
+            state: Arc::new(RwLock::new(state)),
             storage,
             applied_end: Arc::new(AtomicU64::new(8)),
-            snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
         };
         let meta = OpenRaftSnapshotMeta::<NodeId, BasicNode> {
             last_log_id: Some(LogId::new(CommittedLeaderId::new(1, 1), 99)),
@@ -3354,88 +3343,71 @@ mod tests {
                 None,
                 openraft::Membership::new(vec![(1..=5).collect()], None),
             ),
-            snapshot_id: "lock-discipline".to_owned(),
+            snapshot_id: "position-invariant".to_owned(),
         };
-        (dir, sm, meta, incoming)
+        (dir, sm, meta)
     }
 
-    /// How long a blocked task is given to prove it is actually blocked.
-    ///
-    /// Proving a negative needs a bound, and this is a test, not a state gate:
-    /// the assertion is "made no progress", which has no edge to wait on.
-    const LOCK_BLOCK_GRACE: Duration = Duration::from_millis(200);
+    /// Five nodes, reflecting log index `applied`.
+    fn five_nodes_at(applied: u64) -> Vec<u8> {
+        let mut state = ClusterState::new();
+        for id in 1..=5 {
+            state.apply(ClusterCommand::AddNode(test_node_info(id)));
+        }
+        state.note_applied(applied);
+        postcard::to_allocvec(&state).unwrap()
+    }
 
-    /// `install_snapshot` must hold `snapshot_consistency` across BOTH the redb
-    /// write and the in-memory state swap.
-    ///
-    /// If it held the lock across only one, a builder could read the new redb
-    /// position while cloning the pre-install state and emit a snapshot whose
-    /// meta is ahead of its data — a node installing that silently drops every
-    /// entry in between.
-    ///
-    /// Asserted by holding the lock from the test and requiring the installer to
-    /// make *no observable change*: neither redb nor the in-memory state may move
-    /// while the critical section is occupied. Racing two tasks and hoping to
-    /// catch the interleaving does not work here — the window between the two
-    /// writes is a few instructions with no await point, so the race never fires
-    /// and the test passes just as happily with the lock removed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn install_snapshot_holds_the_lock_across_redb_write_and_state_swap() {
-        let (_dir, mut sm, meta, incoming) = snapshot_lock_fixture();
-        let state = sm.state.clone();
-        let storage = sm.storage.clone();
-
-        let held = sm.snapshot_consistency.clone().lock_owned().await;
-        let handle = tokio::spawn(async move {
-            sm.install_snapshot(&meta, Box::new(Cursor::new(incoming)))
-                .await
-        });
-
-        tokio::time::sleep(LOCK_BLOCK_GRACE).await;
-        assert!(
-            !handle.is_finished(),
-            "install_snapshot completed while the consistency lock was held"
-        );
+    /// The durable position has one writer, and it will not run ahead of the
+    /// state: a builder could otherwise record a position its data lacks.
+    #[tokio::test]
+    async fn the_durable_position_never_runs_ahead_of_the_state() {
+        let (_dir, sm, _meta) = store_at_seven_and_meta_at_99();
+        let refused = sm.persist_last_applied(make_log_id(1, 1, 9)).await;
+        assert!(refused.is_err(), "persisted index 9 over a state at 7");
         assert_eq!(
-            storage.load_last_applied().unwrap().last_applied_index,
-            Some(7),
-            "the redb write escaped the critical section"
+            sm.storage.load_last_applied().unwrap().last_applied_index,
+            Some(7)
         );
-        assert_eq!(
-            state.read().nodes.len(),
-            3,
-            "the state swap escaped the critical section"
-        );
+    }
 
-        drop(held);
-        handle.await.unwrap().unwrap();
+    /// A builder refuses to emit a snapshot whose data trails its position.
+    #[tokio::test]
+    async fn a_builder_refuses_state_behind_its_durable_position() {
+        let (_dir, mut sm, _meta) = store_at_seven_and_meta_at_99();
+        sm.state.write().applied_index = Some(3);
+        assert!(sm.build_snapshot().await.is_err());
+    }
+
+    /// An installed snapshot leaves state and durable position together.
+    #[tokio::test]
+    async fn an_install_moves_state_and_position_together() {
+        let (_dir, mut sm, meta) = store_at_seven_and_meta_at_99();
+        sm.install_snapshot(&meta, Box::new(Cursor::new(five_nodes_at(99))))
+            .await
+            .unwrap();
+        assert_eq!(sm.state.read().nodes.len(), 5);
+        assert!(sm.state.read().reflects(99));
         assert_eq!(
-            storage.load_last_applied().unwrap().last_applied_index,
+            sm.storage.load_last_applied().unwrap().last_applied_index,
             Some(99)
         );
-        assert_eq!(state.read().nodes.len(), 5);
     }
 
-    /// `build_snapshot` must take the same lock before reading the redb meta and
-    /// cloning the state, or the installer's two writes are not atomic to it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn build_snapshot_waits_for_the_consistency_lock() {
-        let (_dir, mut sm, _meta, _incoming) = snapshot_lock_fixture();
-        let held = sm.snapshot_consistency.clone().lock_owned().await;
-        let mut builder = sm.get_snapshot_builder().await;
-        let handle = tokio::spawn(async move { builder.build_snapshot().await });
-
-        tokio::time::sleep(LOCK_BLOCK_GRACE).await;
-        assert!(
-            !handle.is_finished(),
-            "build_snapshot read the meta and state without taking the lock"
+    /// Snapshot data behind its metadata would silently drop the entries in
+    /// between, so the install refuses it and changes nothing.
+    #[tokio::test]
+    async fn an_install_refuses_data_behind_its_metadata() {
+        let (_dir, mut sm, meta) = store_at_seven_and_meta_at_99();
+        let refused = sm
+            .install_snapshot(&meta, Box::new(Cursor::new(five_nodes_at(50))))
+            .await;
+        assert!(refused.is_err());
+        assert_eq!(sm.state.read().nodes.len(), 3);
+        assert_eq!(
+            sm.storage.load_last_applied().unwrap().last_applied_index,
+            Some(7)
         );
-
-        drop(held);
-        let snap = handle.await.unwrap().unwrap();
-        assert_eq!(snap.meta.last_log_id.map(|l| l.index), Some(7));
-        let restored: ClusterState = postcard::from_bytes(snap.snapshot.get_ref()).unwrap();
-        assert_eq!(restored.nodes.len(), 3);
     }
 
     /// With no snapshot, the rebuild replays the whole applied log prefix.
@@ -3484,6 +3456,119 @@ mod tests {
         replay_applied_entries(&storage, &mut state, replay_from).unwrap();
         assert!(state.nodes.is_empty());
         assert!(state.node_lsns.is_empty());
+    }
+
+    /// An arm and an abort: together they move the epoch once, and they are
+    /// not idempotent, because arming is legal again from ABORTED.
+    fn arm_then_abort() -> Vec<ClusterCommand> {
+        vec![
+            ClusterCommand::CutoverArmed {
+                target_cluster_id: "green".to_string(),
+                local_cluster_id: "blue".to_string(),
+            },
+            ClusterCommand::CutoverAbortUnseal {
+                local_cluster_id: "blue".to_string(),
+            },
+        ]
+    }
+
+    fn normal_entries(commands: &[ClusterCommand]) -> Vec<Entry<TypeConfig>> {
+        (1..)
+            .zip(commands)
+            .map(|(index, command)| Entry {
+                log_id: make_log_id(1, 1, index),
+                payload: EntryPayload::Normal(ClusterRequest {
+                    command: command.clone(),
+                }),
+            })
+            .collect()
+    }
+
+    /// A store that has applied `arm_then_abort` while the batch's durable
+    /// position is not yet written: the window a concurrent builder can see.
+    async fn store_with_position_not_yet_durable() -> (tempfile::TempDir, StateMachineStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = RedbLogStorage::new(dir.path().join("raft.db")).unwrap();
+        let mut sm = StateMachineStore::new(Arc::new(RwLock::new(ClusterState::new())), storage);
+        sm.applied_state().await.unwrap();
+        sm.apply(normal_entries(&arm_then_abort())).await.unwrap();
+        sm.storage
+            .save_last_applied(&LastAppliedState::default())
+            .unwrap();
+        (dir, sm)
+    }
+
+    /// A snapshot can capture state ahead of the position it records. The
+    /// installing follower is then re-sent every entry after that position,
+    /// and must not apply the ones its state already reflects.
+    #[tokio::test]
+    async fn a_snapshot_ahead_of_its_position_does_not_reapply_entries() {
+        let (_leader_dir, mut leader) = store_with_position_not_yet_durable().await;
+        let epoch = leader.state.read().cutover.epoch;
+        let snapshot = leader
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let follower_dir = tempfile::tempdir().unwrap();
+        let follower_storage = RedbLogStorage::new(follower_dir.path().join("raft.db")).unwrap();
+        let mut follower =
+            StateMachineStore::new(Arc::new(RwLock::new(ClusterState::new())), follower_storage);
+        follower.applied_state().await.unwrap();
+        follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        follower
+            .apply(normal_entries(&arm_then_abort()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            follower.state.read().cutover.epoch,
+            epoch,
+            "the follower re-applied entries its snapshot already reflected"
+        );
+    }
+
+    /// The same snapshot, rebuilt at boot: replay from the recorded position
+    /// must not re-apply entries the snapshot data already reflects.
+    #[tokio::test]
+    async fn boot_replay_over_a_snapshot_ahead_of_its_position_does_not_reapply() {
+        let (_dir, mut sm) = store_with_position_not_yet_durable().await;
+        let epoch = sm.state.read().cutover.epoch;
+        sm.get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let log: Vec<LogEntry> = (1..)
+            .zip(arm_then_abort())
+            .map(|(index, command)| LogEntry {
+                index,
+                term: 1,
+                leader_node_id: 1,
+                payload: LogEntryPayload::Normal(command),
+            })
+            .collect();
+        sm.storage.append_entries(&log).unwrap();
+        sm.storage
+            .save_last_applied(&LastAppliedState {
+                last_applied_term: Some(1),
+                last_applied_index: Some(2),
+                last_applied_leader_node_id: 1,
+            })
+            .unwrap();
+
+        let (mut state, replay_from) = load_snapshot_state(&sm.storage).unwrap();
+        replay_applied_entries(&sm.storage, &mut state, replay_from).unwrap();
+
+        assert_eq!(
+            state.cutover.epoch, epoch,
+            "boot replay re-applied entries the snapshot already reflected"
+        );
     }
 
     #[test]

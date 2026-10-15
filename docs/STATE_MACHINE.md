@@ -120,6 +120,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 
 - **Shape**: `ClusterState` — replicated: members, `node_lsns`, `max_cluster_lsn`, sync-mode flag, etc. **Local only** (`serde(skip)`): `failover_started_at`. Leadership is not stored on `ClusterState`.
 - **SoT (replicated fields)**: Raft log via `ClusterCommand` `apply()`. Leadership: `RaftMetrics` (§1); address wakeup: `leader_rx`.
+- **Applied position**: `ClusterState.applied_index`, the last entry the state reflects. Re-delivery at or below it is a no-op (`ClusterState::apply_entry`), which install and boot replay rely on: cutover commands are not idempotent. Every path moves the state before the durable `last_applied`, and its one writer refuses to run ahead of the state (`ensure_state_reflects`); the snapshot builder reads position and membership in one transaction, then clones the state. Snapshot data is therefore at or ahead of its recorded position, never behind, with no lock between builder, apply and install.
 - **Commands** (`ClusterCommand`):
   - `AddNode` — register in `nodes` (always with `NodeRole::Follower`; the role field is dead wire metadata).
   - `RemoveNode` — drop record and `node_lsns` entry.

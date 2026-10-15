@@ -122,6 +122,12 @@ pub struct ClusterState {
     /// so it survives a restart and clears only by a committed entry.
     #[serde(default)]
     pub upgrade_frozen: bool,
+
+    /// Index of the last log entry this state reflects; `None` when unknown.
+    /// Re-delivery at or below it is a no-op, so a snapshot captured ahead of
+    /// its recorded position converges: cutover commands are not idempotent.
+    #[serde(default)]
+    pub applied_index: Option<u64>,
 }
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
@@ -150,6 +156,7 @@ impl From<ClusterStateV0> for ClusterState {
             sync_replication_active: v0.sync_replication_active,
             cutover: CutoverAuthorityState::default(),
             upgrade_frozen: false,
+            applied_index: None,
         }
     }
 }
@@ -401,6 +408,31 @@ impl ClusterState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this state already reflects the log entry at `index`.
+    #[must_use]
+    pub fn reflects(&self, index: u64) -> bool {
+        self.applied_index.is_some_and(|applied| index <= applied)
+    }
+
+    /// Record that this state reflects the log entry at `index`.
+    pub fn note_applied(&mut self, index: u64) {
+        if !self.reflects(index) {
+            self.applied_index = Some(index);
+        }
+    }
+
+    /// Apply the command committed at log `index`, once.
+    ///
+    /// A re-delivered entry the state already reflects reports `Applied`
+    /// without changing anything; no client waits on a re-delivery.
+    pub fn apply_entry(&mut self, index: u64, cmd: ClusterCommand) -> CommandOutcome {
+        if self.reflects(index) {
+            return CommandOutcome::Applied;
+        }
+        self.applied_index = Some(index);
+        self.apply(cmd)
     }
 
     /// Apply a command to the state machine.

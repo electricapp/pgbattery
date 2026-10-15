@@ -1089,6 +1089,40 @@ impl RedbLogStorage {
             Err(e) => Err(Error::Storage(format!("Failed to get last applied: {e}"))),
         }
     }
+
+    /// The durable applied position and the membership applied with it, from
+    /// one read transaction: two reads could pair an index with the membership
+    /// of a different one.
+    ///
+    /// # Errors
+    /// Returns an error if the read transaction or deserialization fails.
+    pub fn load_applied_position(
+        &self,
+    ) -> Result<(LastAppliedState, Option<LocalStoredMembership>)> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| Error::Storage(format!("Failed to begin read: {e}")))?;
+        let table = read_txn
+            .open_table(META_TABLE)
+            .map_err(|e| Error::Storage(format!("Failed to open table: {e}")))?;
+
+        let last_applied = match table.get("last_applied") {
+            Ok(Some(value)) => decode(value.value(), "last-applied state")?,
+            Ok(None) => LastAppliedState::default(),
+            Err(e) => return Err(Error::Storage(format!("Failed to get last applied: {e}"))),
+        };
+        let membership = match table.get("applied_membership") {
+            Ok(Some(value)) => Some(decode(value.value(), "applied membership")?),
+            Ok(None) => None,
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Failed to get applied membership: {e}"
+                )));
+            }
+        };
+        Ok((last_applied, membership))
+    }
 }
 
 impl Clone for RedbLogStorage {
@@ -2076,10 +2110,9 @@ mod tests {
     /// contracts far more thoroughly than hand-written cases.
     ///
     /// The suite drives the same types `Governor::new` builds, through the same
-    /// constructors, so nothing here can drift from production. Coverage gap:
-    /// `install_snapshot` and `build_snapshot` are only ever called
-    /// sequentially by the suite, so the `snapshot_consistency` mutex is taken
-    /// but never contended — the race it exists to prevent is not reached.
+    /// constructors, so nothing here can drift from production. It calls
+    /// `install_snapshot` and `build_snapshot` sequentially; the position
+    /// invariant that makes them safe to race is pinned in `raft.rs` tests.
     mod conformance {
         use super::*;
         use crate::governor::raft::{LogStorageAdapter, StateMachineStore, TypeConfig};
