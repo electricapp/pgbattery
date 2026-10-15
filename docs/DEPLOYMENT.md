@@ -32,9 +32,9 @@ pgbattery join --peer <leader-mgmt> --write-config node2.toml --node-id 2
 pgbattery --config node2.toml run
 ```
 
-Repeat for node3, node4, etc. The `join` workflow runs `pg_basebackup`, puts
-the node in learner mode, and auto-promotes once LSN lag drops below the
-threshold.
+Repeat for node3, node4, etc. The `join` workflow runs `pg_basebackup` and
+puts the node in learner mode; with `--voter` the leader promotes it once LSN
+lag drops below the threshold.
 
 ## Operational Commands
 

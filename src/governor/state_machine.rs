@@ -133,6 +133,12 @@ pub struct ClusterState {
     /// Commands above it are no-ops (`ClusterCommand::required_feature_level`).
     #[serde(default)]
     pub feature_level: u32,
+
+    /// Nodes meant to be voters, sorted. The leader promotes each one that is
+    /// a caught-up learner (`management_api::cluster::promote_intended_voters`),
+    /// so the intent outlives the joiner that asked and any leader change.
+    #[serde(default)]
+    pub voter_intent: Vec<NodeId>,
 }
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
@@ -163,6 +169,7 @@ impl From<ClusterStateV0> for ClusterState {
             pg_upgrade: PgUpgradeState::default(),
             applied_index: None,
             feature_level: 0,
+            voter_intent: Vec::new(),
         }
     }
 }
@@ -509,6 +516,10 @@ pub enum ClusterCommand {
     /// Applies only while frozen: after SERVE a standby's data may be a major
     /// the primary no longer runs, and rejoining is the only way back.
     PgUpgradeAbort,
+
+    /// `node_id` is meant to be a voter; the leader promotes it once it is a
+    /// caught-up learner.
+    IntendVoter { node_id: NodeId },
 }
 
 /// Highest cluster feature level this binary decodes.
@@ -536,6 +547,7 @@ impl ClusterCommand {
             | Self::PgUpgradeServe
             | Self::PgUpgradeRejoined { .. }
             | Self::PgUpgradeAbort
+            | Self::IntendVoter { .. }
             | Self::CutoverDrainObserved
             | Self::CutoverTransfer { .. }
             | Self::CutoverAbortUnseal { .. }
@@ -616,8 +628,15 @@ impl ClusterState {
                 self.nodes.remove(&id);
                 self.node_lsns.remove(&id);
                 self.recalculate_max_cluster_lsn();
-                // A removed node never rejoins; the upgrade must not wait on it.
+                // A removed node never rejoins; the upgrade must not wait on
+                // it, and the leader must not promote it.
                 self.pg_upgrade.awaiting_rejoin.retain(|n| *n != id);
+                self.voter_intent.retain(|n| *n != id);
+            }
+            ClusterCommand::IntendVoter { node_id } => {
+                if let Err(at) = self.voter_intent.binary_search(&node_id) {
+                    self.voter_intent.insert(at, node_id);
+                }
             }
             // Wire-compat only: never issued in production. Does not affect
             // Raft leadership (`RaftMetrics::current_leader`).
@@ -1256,6 +1275,22 @@ mod tests {
             CommandOutcome::OutOfOrder
         );
         assert_eq!(state.pg_upgrade.awaiting_rejoin, vec![2]);
+    }
+
+    /// Voter intent is a set: repeating it changes nothing, and it outlives
+    /// whichever joiner or leader recorded it — only removal ends it.
+    #[test]
+    fn voter_intent_is_a_set_that_only_removal_clears() {
+        let mut state = at_current_level();
+        for id in [3, 2, 3] {
+            assert_eq!(
+                state.apply(ClusterCommand::IntendVoter { node_id: id }),
+                CommandOutcome::Applied
+            );
+        }
+        assert_eq!(state.voter_intent, vec![2, 3]);
+        state.apply(ClusterCommand::RemoveNode(3));
+        assert_eq!(state.voter_intent, vec![2]);
     }
 
     /// A standby removed from the cluster can never rejoin; the upgrade

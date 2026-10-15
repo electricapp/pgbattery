@@ -87,6 +87,10 @@ pub struct JoinRequest {
     /// predate feature levels, which decode level 0.
     #[serde(default)]
     pub feature_level: u32,
+    /// Record the joiner as an intended voter: the leader promotes it once it
+    /// is a caught-up learner.
+    #[serde(default)]
+    pub voter: bool,
 }
 
 impl JoinRequest {
@@ -101,6 +105,7 @@ impl JoinRequest {
             mgmt_addr: addrs.mgmt_addr.to_string(),
             metrics_addr: addrs.metrics_addr.to_string(),
             feature_level: crate::governor::state_machine::FEATURE_LEVEL,
+            voter: false,
         }
     }
 
@@ -161,6 +166,7 @@ mod tests {
             mgmt_addr: "10.0.0.1:9091".to_string(),
             metrics_addr: "10.0.0.1:9090".to_string(),
             feature_level: 0,
+            voter: false,
         };
 
         let addrs = req.to_advertised();
@@ -182,6 +188,7 @@ mod tests {
             mgmt_addr: "10.0.0.1:9091".to_string(),
             metrics_addr: "10.0.0.1:9090".to_string(),
             feature_level: 0,
+            voter: false,
         };
 
         assert!(req.to_advertised().is_none());
@@ -240,6 +247,7 @@ mod tests {
             mgmt_addr: "10.0.0.2:9091".to_string(),
             metrics_addr: "10.0.0.2:9090".to_string(),
             feature_level: 0,
+            voter: false,
         };
         assert!(req.to_advertised().is_none());
     }
@@ -255,6 +263,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.feature_level, 0);
+        assert!(
+            !old.voter,
+            "a request without the flag asks for no promotion"
+        );
         assert!(old.feature_level_refusal(0).is_none());
         assert!(old.feature_level_refusal(1).is_some());
         let current = JoinRequest {

@@ -2922,9 +2922,13 @@ impl App {
         &self,
         client: &reqwest::Client,
         leader_mgmt_addr: &str,
+        voter: bool,
     ) -> Result<()> {
-        info!("Registering as learner with leader...");
-        let join_request = crate::cluster::JoinRequest::from_config(&self.config);
+        info!(voter, "Registering as learner with leader...");
+        let join_request = crate::cluster::JoinRequest {
+            voter,
+            ..crate::cluster::JoinRequest::from_config(&self.config)
+        };
         let join_url = format!("http://{leader_mgmt_addr}/api/v1/cluster/join");
         debug!(url = %join_url, request = ?join_request, "Sending join request to leader");
 
@@ -3087,166 +3091,6 @@ impl App {
         Ok(())
     }
 
-    /// Spawn the background auto-promotion task and return its handle so the
-    /// caller can abort it when the node stops. The task must not outlive the
-    /// node: a detached task would keep `POSTing` `/promote` during teardown and
-    /// survive process shutdown.
-    fn spawn_auto_promotion(
-        node_id: u64,
-        leader_mgmt_addr: String,
-        management_api_token: Option<String>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            info!(
-                node_id = node_id,
-                "Auto-promotion enabled, waiting for replication to sync..."
-            );
-            if let Err(e) =
-                Self::run_auto_promotion(node_id, &leader_mgmt_addr, management_api_token).await
-            {
-                warn!(node_id = node_id, error = %e, "Auto-promotion request failed");
-            }
-        })
-    }
-
-    async fn run_auto_promotion(
-        node_id: u64,
-        leader_mgmt_addr: &str,
-        management_api_token: Option<String>,
-    ) -> Result<()> {
-        let client = Self::build_management_http_client(
-            Duration::from_secs(10),
-            management_api_token.as_deref(),
-        )?;
-
-        if !Self::wait_for_sync(&client, leader_mgmt_addr, node_id).await? {
-            warn!(
-                node_id = node_id,
-                "Auto-promotion aborted: replica did not reach synced state"
-            );
-            return Ok(());
-        }
-
-        info!(node_id = node_id, "Attempting auto-promotion to voter");
-        let promote_url = format!("http://{leader_mgmt_addr}/api/v1/cluster/promote/{node_id}");
-        let retry_delay = Duration::from_secs(2);
-
-        // Retry transient errors indefinitely. Bail only on permanent errors
-        // (auth failure, node not in cluster, etc.). A node stuck retrying is
-        // better than silently giving up and remaining a learner forever.
-        loop {
-            match client.post(&promote_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    info!(node_id = node_id, "Successfully promoted to voter");
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    // Permanent errors: 401/403 (auth), 400 (malformed), 404 (node gone)
-                    let permanent = matches!(status.as_u16(), 400 | 401 | 403 | 404);
-                    if permanent {
-                        warn!(
-                            node_id = node_id,
-                            status = %status,
-                            body = %body,
-                            "Auto-promotion failed permanently"
-                        );
-                        return Ok(());
-                    }
-                    debug!(
-                        node_id = node_id,
-                        status = %status,
-                        "Auto-promotion transient error, retrying"
-                    );
-                }
-                Err(e) => {
-                    debug!(
-                        node_id = node_id,
-                        error = %e,
-                        "Auto-promotion request error, retrying"
-                    );
-                }
-            }
-            tokio::time::sleep(retry_delay).await;
-        }
-    }
-
-    async fn wait_for_sync(
-        client: &reqwest::Client,
-        leader_mgmt_addr: &str,
-        node_id: u64,
-    ) -> Result<bool> {
-        #[derive(serde::Deserialize)]
-        struct LagResponse {
-            lag_bytes: u64,
-            is_synced: bool,
-        }
-
-        let lag_url = format!("http://{leader_mgmt_addr}/api/v1/cluster/node/{node_id}/lag");
-        let max_attempts = 60;
-        let mut attempts = 0;
-        let mut last_lag_mb = 0.0;
-
-        loop {
-            attempts += 1;
-            // Probe first, sleep only on retry: a freshly-started replica that
-            // is already in sync should not eat a 2s delay before completing
-            // the join.
-            if attempts > 1 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-
-            match client.get(&lag_url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(lag_info) = resp.json::<LagResponse>().await {
-                        #[allow(
-                            clippy::cast_precision_loss,
-                            reason = "lag_bytes display; exact precision not needed"
-                        )]
-                        let lag_mb = lag_info.lag_bytes as f64 / 1_048_576.0;
-                        if (lag_mb - last_lag_mb).abs() > 0.1 || attempts % 5 == 0 {
-                            if lag_info.is_synced {
-                                info!(
-                                    node_id = node_id,
-                                    lag_mb = format!("{:.2}", lag_mb),
-                                    "Replication synced!"
-                                );
-                            } else {
-                                info!(
-                                    node_id = node_id,
-                                    lag_mb = format!("{:.2}", lag_mb),
-                                    "Syncing..."
-                                );
-                            }
-                            last_lag_mb = lag_mb;
-                        }
-                        if lag_info.is_synced {
-                            return Ok(true);
-                        }
-                    }
-                }
-                Ok(_) => {
-                    debug!(
-                        node_id = node_id,
-                        "Lag endpoint returned non-success, node may not be registered yet"
-                    );
-                }
-                Err(e) => {
-                    debug!(node_id = node_id, error = %e, "Failed to query lag, retrying...");
-                }
-            }
-
-            if attempts >= max_attempts {
-                warn!(
-                    node_id = node_id,
-                    "Timeout waiting for sync after {} attempts; skipping auto-promotion", attempts
-                );
-                return Ok(false);
-            }
-        }
-    }
-
     /// Join an existing cluster as a new node.
     ///
     /// This is the main entry point for adding nodes to a running cluster.
@@ -3259,7 +3103,8 @@ impl App {
     /// 4. Run `pg_basebackup` from leader to get `PostgreSQL` data
     /// 5. Setup standby.signal for recovery mode
     /// 6. Start the node and begin replicating
-    /// 7. Auto-promote to voter if `auto_promote` is true
+    /// 7. With `auto_promote`, the leader promotes it to voter once caught up
+    ///    (committed voter intent, recorded at registration)
     ///
     /// For WITNESS nodes:
     /// 1. Discover leader from peer
@@ -3364,7 +3209,8 @@ impl App {
 
         let leader_lineage = self.peer_cluster_lineage(&client, &leader.mgmt_addr).await;
         self.ensure_join_data_dir_ready(leader_lineage).await?;
-        self.register_as_learner(&client, &leader.mgmt_addr).await?;
+        self.register_as_learner(&client, &leader.mgmt_addr, auto_promote)
+            .await?;
 
         if let Err(e) = self.clone_from_leader(&leader).await {
             warn!(
@@ -3382,26 +3228,7 @@ impl App {
             "Join preparation complete, starting node"
         );
 
-        let auto_promotion = auto_promote.then(|| {
-            Self::spawn_auto_promotion(
-                self.config.node_id,
-                leader.mgmt_addr.clone(),
-                self.config
-                    .management_api_token
-                    .as_ref()
-                    .map(|s| s.as_str().to_string()),
-            )
-        });
-
-        // `run_data_node` blocks for the node's whole lifetime; when it returns
-        // (graceful shutdown or fatal error) the auto-promotion task must stop
-        // too, so it can't keep hitting the leader during teardown or outlive
-        // the process.
-        let result = self.run_data_node(false).await;
-        if let Some(handle) = auto_promotion {
-            handle.abort();
-        }
-        result
+        self.run_data_node(false).await
     }
 }
 

@@ -20,7 +20,7 @@ use axum::{
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
 use openraft::{BasicNode, ChangeMembers};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cluster::{AdvertisedAddresses, FinalizeUpgradeResponse, JoinRequest, MemberRole};
 use crate::config::constants::{
@@ -590,6 +590,26 @@ pub(super) async fn join_cluster(
     }
 
     create_replication_slot_for_joined_node(&state, req.node_id).await;
+    if req.voter
+        && let Err(err) = crate::governor::propose::propose(
+            &state.raft,
+            &state.cluster_state,
+            crate::governor::state_machine::ClusterCommand::IntendVoter {
+                node_id: req.node_id,
+            },
+        )
+        .await
+    {
+        return membership_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            format!(
+                "Node {} added as learner, but its voter intent did not commit: {err}",
+                req.node_id
+            ),
+            get_current_members(&state),
+        );
+    }
     let message = if resume {
         format!("Node {} join resumed (already a learner)", req.node_id)
     } else {
@@ -682,7 +702,70 @@ pub(super) async fn promote_node(
     Path(node_id): Path<u64>,
 ) -> impl IntoResponse {
     info!(node_id = node_id, "Processing promote request");
+    promote(&state, node_id).await
+}
 
+/// How often the leader looks for intended voters still waiting as learners.
+const VOTER_INTENT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The intended voters that are learners now, in intent order.
+fn intended_learners(intent: &[NodeId], learners: &BTreeSet<NodeId>) -> Vec<NodeId> {
+    intent
+        .iter()
+        .copied()
+        .filter(|id| learners.contains(id))
+        .collect()
+}
+
+/// Carry out the committed voter intent: promote each intended voter that is
+/// a learner, through the same gate as `/promote`.
+///
+/// Runs on every node and acts only while this node leads, so the intent is
+/// carried out whichever node leads and survives the joiner that asked for
+/// it. A gate refusal — the learner's WAL still behind — waits for the next
+/// pass.
+pub(super) async fn promote_intended_voters(
+    state: Arc<ManagementApiState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(VOTER_INTENT_INTERVAL) => {}
+            _ = shutdown_rx.changed() => return,
+        }
+        let (leads, learners) = {
+            let metrics = state.raft.metrics();
+            let m = metrics.borrow();
+            let v = (
+                m.current_leader == Some(state.node_id),
+                m.membership_config
+                    .membership()
+                    .learner_ids()
+                    .collect::<BTreeSet<_>>(),
+            );
+            drop(m);
+            v
+        };
+        if !leads {
+            continue;
+        }
+        let intent = state.cluster_state.read().voter_intent.clone();
+        for node_id in intended_learners(&intent, &learners) {
+            let (status, Json(resp)) = promote(&state, node_id).await;
+            if status.is_success() {
+                info!(node_id, "Intended voter promoted");
+            } else {
+                debug!(node_id, %status, message = %resp.message, "Intended voter not promoted yet");
+            }
+        }
+    }
+}
+
+/// Validate and commit one learner's promotion.
+async fn promote(
+    state: &ManagementApiState,
+    node_id: NodeId,
+) -> (StatusCode, Json<MembershipResponse>) {
     // Serialize with other membership mutations so the voter set we compute
     // below reflects every prior committed join/promote/remove (see
     // `ManagementApiState::membership_lock`). The snapshot must be read inside
@@ -700,7 +783,7 @@ pub(super) async fn promote_node(
         v
     };
     let new_voters = match validate_promote_membership(
-        &state,
+        state,
         current_leader,
         membership_config.membership(),
         node_id,
@@ -729,12 +812,12 @@ pub(super) async fn promote_node(
                         message: format!(
                             "Node {node_id} promote timed out waiting for membership apply"
                         ),
-                        members: get_current_members(&state),
+                        members: get_current_members(state),
                     }),
                 );
             }
 
-            let members = get_current_members(&state);
+            let members = get_current_members(state);
 
             (
                 StatusCode::OK,
@@ -1592,6 +1675,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    /// Only an intended voter that is a learner now is promoted: a voter is
+    /// already what was intended, and a node not yet a member has nothing to
+    /// promote.
+    #[test]
+    fn only_intended_voters_that_are_learners_are_promoted() {
+        let learners = BTreeSet::from([4, 5]);
+        assert_eq!(intended_learners(&[2, 4, 7], &learners), vec![4]);
+        assert_eq!(intended_learners(&[], &learners), Vec::<NodeId>::new());
+    }
 
     /// A target that answers and refuses is retryable, and the caller decides
     /// that from the status alone. Reporting it as 502 — which the trigger

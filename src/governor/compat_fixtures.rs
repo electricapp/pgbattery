@@ -90,6 +90,7 @@ fn sample_state_current() -> ClusterState {
         },
         applied_index: Some(42),
         feature_level: 1,
+        voter_intent: vec![2],
         ..ClusterState::from(sample_state_v0())
     }
 }
@@ -139,6 +140,7 @@ fn sample_log_entries() -> Vec<LogEntry> {
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeServe),
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeRejoined { node_id: 2 }),
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeAbort),
+        LogEntryPayload::Normal(ClusterCommand::IntendVoter { node_id: 2 }),
     ];
     commands
         .into_iter()

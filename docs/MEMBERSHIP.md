@@ -34,8 +34,10 @@ Under the hood:
 
 1. The new node registers as a learner via `/api/v1/cluster/join`.
 2. It runs `pg_basebackup` and streams WAL until within the catch-up threshold.
-3. The leader auto-promotes it to voter if `--voter` was passed or the operator
-   runs `cluster promote`.
+3. With `--voter`, the join commits a voter intent for the node, and the
+   leader promotes it once its WAL is within the catch-up threshold — whichever
+   node leads by then, and across restarts of either side. Without it, the
+   operator runs `cluster promote`.
 
 ## Removing a Node
 

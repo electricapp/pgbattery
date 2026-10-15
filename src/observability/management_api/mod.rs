@@ -498,6 +498,7 @@ pub async fn start_management_api(
             StdDuration::from_secs(MGMT_API_REQUEST_TIMEOUT_SECS),
         ));
 
+    let promoter_state = Arc::clone(&state);
     let app = timed_routes
         .merge(backup_routes)
         // Body limit applies to every route (create/restore bodies are tiny).
@@ -505,16 +506,24 @@ pub async fn start_management_api(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Lives and dies with the server: it acts through the same state and
+    // membership lock as the /promote handler.
+    let promoter = tokio::spawn(cluster::promote_intended_voters(
+        promoter_state,
+        shutdown_rx.clone(),
+    ));
     info!(
         addr = %addr,
         "Management API server started (use reverse proxy for rate limiting in production)"
     );
 
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.changed().await;
         })
-        .await?;
+        .await;
+    promoter.abort();
+    served?;
 
     info!("Management API server stopped");
     Ok(())
