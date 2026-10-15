@@ -523,6 +523,22 @@ pub(super) async fn join_cluster(
         Err(resp) => return resp,
     };
 
+    // Node info commits before the membership entry, so applying that entry
+    // always finds the member's addresses; a failure here changes nothing.
+    if let Err(err) = replicate_node_info(&state, &req, &addrs).await {
+        error!(
+            node_id = req.node_id,
+            error = %err,
+            "Failed to replicate node info through Raft"
+        );
+        return membership_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            format!("Failed to replicate node metadata in Raft: {err}"),
+            get_current_members(&state),
+        );
+    }
+
     if resume {
         info!(
             node_id = req.node_id,
@@ -549,26 +565,12 @@ pub(super) async fn join_cluster(
     }
 
     // The voter-set serialization the lock exists for is complete once the
-    // learner add has been submitted; the remaining steps (node-info replicate,
-    // membership apply-wait, slot creation) are idempotent and Raft-serialized.
-    // Releasing the lock here rather than holding it across the multi-second
-    // apply-wait keeps a slow or stuck join from freezing promote/remove on the
-    // control plane.
+    // learner add has been submitted; the remaining steps (membership
+    // apply-wait, slot creation) are idempotent and Raft-serialized. Releasing
+    // the lock here rather than holding it across the multi-second apply-wait
+    // keeps a slow or stuck join from freezing promote/remove on the control
+    // plane.
     drop(membership_guard);
-
-    if let Err(err) = replicate_node_info(&state, &req, &addrs).await {
-        error!(
-            node_id = req.node_id,
-            error = %err,
-            "Failed to replicate node info through Raft"
-        );
-        return membership_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            false,
-            format!("Failed to replicate node metadata in Raft: {err}"),
-            get_current_members(&state),
-        );
-    }
 
     let applied = wait_for_membership_applied(
         &state.raft,

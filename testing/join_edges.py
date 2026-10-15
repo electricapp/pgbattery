@@ -7,6 +7,9 @@
 - ``learner-crash`` — learner dies mid-join; no phantom voter.
 - ``bootstrap-wiped`` — wiped bootstrap node returns on the cluster lineage;
   peers must not wipe Raft on its interim answers.
+
+Across the run: no membership entry applies before the node's committed node
+info, and every node joined with ``--voter`` ends a voter (committed intent).
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import contextlib
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
@@ -127,11 +131,50 @@ def has_pg_version(node: str) -> bool:
 
 def member_ids(token: str) -> set[int]:
     """Node ids the cluster currently lists as members."""
+    members = _members()
+    return set() if members is None else members.node_ids
+
+
+def _members() -> api_models.Members | None:
     rc, out = _sh("curl -s -m 5 http://127.0.0.1:9081/api/v1/cluster/members", timeout=15.0)
+    return None if rc != 0 else api_models.parse_or_none(api_models.Members, out)
+
+
+ORPHAN_MEMBER_MARKER: Final[str] = "not found in ClusterState"
+"""Logged when a membership entry applies for a node with no committed node
+info. The leader commits a joiner's addresses before its membership entry, so
+any line is a broken join, never the normal order."""
+
+VOTER_INTENT_TIMEOUT_S: Final[float] = 120.0
+
+
+def run_wide_failures(since: str) -> list[str]:
+    """Invariants every edge must leave behind: no member applied before its
+    node info, and every node joined with `--voter` back to a voter."""
+    failures: list[str] = []
+    rc, out = _sh(f"docker compose logs --no-color --since {since}", timeout=60.0)
     if rc != 0:
-        return set()
-    parsed = api_models.parse_or_none(api_models.Members, out)
-    return set() if parsed is None else parsed.node_ids
+        failures.append("compose logs unreadable; the orphan-member check cannot run")
+    orphans = [line.strip() for line in out.splitlines() if ORPHAN_MEMBER_MARKER in line]
+    if orphans:
+        failures.append(
+            f"{len(orphans)} member(s) applied before their node info: {orphans[0][:200]}"
+        )
+    learners: list[int] = []
+    deadline = time.monotonic() + VOTER_INTENT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        members = _members()
+        learners = (
+            []
+            if members is None
+            else sorted(m.node_id for m in members.members if m.role != "voter")
+        )
+        if members is not None and not learners:
+            break
+        time.sleep(2.0)
+    if learners:
+        failures.append(f"nodes joined with --voter still learners after the edges: {learners}")
+    return failures
 
 
 def run_orphan_slot(timings: fp.SystemTimings) -> Result:
@@ -494,6 +537,7 @@ def run(
 ) -> None:
     """Drive the join and rejoin edges."""
     timings = fp.read_system_timings()
+    since = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     selected = list(Case) if case == "all" else [Case(case)]
     results: list[Result] = []
     for chosen in selected:
@@ -524,7 +568,10 @@ def run(
         table.add_row(r.case.value, "[green]PASS[/]" if r.ok else "[red]FAIL[/]", r.detail)
     console.print(table)
 
-    if [r for r in results if not r.ok]:
+    wide = run_wide_failures(since)
+    for failure in wide:
+        console.print(f"[red]FAIL[/] run-wide: {failure}")
+    if wide or not all(r.ok for r in results):
         raise typer.Exit(code=1)
 
 
