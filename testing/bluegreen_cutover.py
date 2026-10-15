@@ -1167,6 +1167,15 @@ def main(
     # reverse wiring, where zero growth is the only legal answer.
     blue_rows_before = int(_psql(blue_leader, "SELECT count(*)::text FROM bg_kv;"))
     relayed = _write_burst(blue_leader.gateway_port, 10, "post")
+    # A follower's gateway relays too: its backend is green, never its own
+    # leader, and a staleness check against the leader severed every batch.
+    blue_follower = next(n for n in blue if n.service != blue_leader.service)
+    try:
+        relayed |= _write_burst(blue_follower.gateway_port, 10, "post-f")
+    except psycopg.Error as exc:
+        raise ContractFailure(
+            f"blue follower {blue_follower.service}'s gateway did not relay: {exc}"
+        ) from exc
     on_green = int(_psql(green_leader, "SELECT count(*)::text FROM bg_kv WHERE k LIKE 'post-%';"))
     if on_green != len(relayed):
         raise ContractFailure(

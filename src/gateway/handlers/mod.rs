@@ -35,6 +35,57 @@ use crate::governor::raft::FenceState;
 /// gone or hostile, so the connection is severed.
 const PROXY_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Pause between reconnect attempts after a backend loss, when no leader or
+/// fence change arrives first.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Where a session's queries go: the one routing answer every decision in
+/// this module reads (`STATE_MACHINE` §6).
+///
+/// Once another cluster holds committed write authority this gateway relays
+/// to it, so connection strings survive a cutover. Falling back to the local
+/// leader there would route clients into the cluster that gave authority
+/// away, so no relay while authority is elsewhere means no route: hold.
+const fn route(fence: &FenceState, leader: Option<SocketAddr>) -> Option<SocketAddr> {
+    if let Some(addr) = fence.authority_pg_addr {
+        return Some(addr);
+    }
+    if fence.local_client_writes_fenced() {
+        return None;
+    }
+    leader
+}
+
+/// Whether a follower's open backend no longer matches its session's route.
+fn follower_backend_stale(
+    is_leader: bool,
+    fence: &FenceState,
+    leader: Option<SocketAddr>,
+    backend: Option<SocketAddr>,
+) -> bool {
+    !is_leader && route(fence, leader) != backend
+}
+
+/// Whether the session must (re)connect to `target`. A lost backend always
+/// does: a primary restarted in place keeps its address.
+fn needs_migration(current: Option<SocketAddr>, target: SocketAddr, backend_lost: bool) -> bool {
+    backend_lost || current != Some(target)
+}
+
+/// Whether a failed reconnect may succeed on a later try: the route had no
+/// target yet, or the target was not accepting sessions yet. Anything else
+/// already told the client why it ended.
+const fn reconnect_may_recover(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NoLeader
+            | Error::Connect { .. }
+            | Error::ConnectionTimeout(_)
+            | Error::BackendDisconnected
+            | Error::Io(_)
+    )
+}
+
 /// Maximum startup-packet length accepted.
 ///
 /// Matches libpq's `PQ_MAX_STARTUP_PACKET_LENGTH`. The startup packet carries
@@ -652,20 +703,10 @@ impl ConnectionHandler {
     }
 
     /// Where this connection's queries go.
-    ///
-    /// Once another cluster holds committed write authority this gateway is a
-    /// relay to it, so connection strings survive a cutover. Falling back to
-    /// the local Raft leader there would route clients into the cluster that
-    /// gave authority away, so no relay means no leader and the caller holds.
     fn get_leader(&self) -> Result<SocketAddr> {
         let fence = *self.fence_rx.borrow();
-        if let Some(addr) = fence.authority_pg_addr {
-            return Ok(addr);
-        }
-        if fence.local_client_writes_fenced() {
-            return Err(Error::NoLeader);
-        }
-        self.leader_rx.borrow().ok_or(Error::NoLeader)
+        let leader = *self.leader_rx.borrow();
+        route(&fence, leader).ok_or(Error::NoLeader)
     }
 
     async fn connect_to_backend(&self, addr: SocketAddr) -> Result<TcpStream> {
@@ -717,7 +758,7 @@ impl ConnectionHandler {
                     if result.is_err() {
                         return Err(Error::ChannelClosed);
                     }
-                    self.handle_leader_change(backend, &mut backend_buf).await?;
+                    self.handle_leader_change(backend, &mut backend_buf, false).await?;
                 }
 
                 result = self.fence_rx.changed() => {
@@ -872,42 +913,35 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    /// Wait until cluster state has moved past `stale_backend`.
+    /// Reconnect a migratable session whose backend went away, to wherever the
+    /// session routes now.
     ///
-    /// Called from the backend-disconnect path. A TCP FIN from the backend is
-    /// only a *hint* that a failover is underway — it races with the
-    /// authoritative signals (`leader_rx`, `fence_rx`), which need Raft to
-    /// notice the missing heartbeat (~election-timeout). Acting on the hint
-    /// before those signals settle is what causes the disconnect → stale
-    /// `leader_rx` → `current_backend == new_leader` → re-read → EOF → spin.
-    ///
-    /// Returns `Ok(())` as soon as either:
-    /// - `fence_rx.fenced` becomes true (Raft sees cluster-state change), or
-    /// - `leader_rx` points to an address different from `stale_backend`.
-    ///
-    /// Returns `Err(BackendDisconnected)` on timeout so the caller can sever
-    /// the client instead of waiting forever when cluster state never
-    /// advances (e.g. the node is truly isolated).
-    async fn wait_for_failover_signal(&mut self, stale_backend: Option<SocketAddr>) -> Result<()> {
-        if self.fence_rx.borrow().upgrade_frozen {
-            return self.hold_for_upgrade_freeze_after_disconnect().await;
-        }
-        if self.has_failover_progress(stale_backend) {
-            return Ok(());
-        }
-
+    /// Level-triggered: each attempt re-reads the route and reconnects even to
+    /// an unchanged address, since a primary restarted in place keeps it.
+    /// Between failed attempts it waits for a leader or fence change or a
+    /// short backoff, so a backend still down is retried, never spun on. A
+    /// stale leader view routes the session where a new connection would go
+    /// right now, and the next leader change moves it on. Bounded by
+    /// `FENCE_WAIT_TIMEOUT_SECS`; `Err(BackendDisconnected)` means no route
+    /// recovered in time.
+    async fn recover_lost_backend(
+        &mut self,
+        backend: &mut TcpStream,
+        backend_buf: &mut BytesMut,
+    ) -> Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(FENCE_WAIT_TIMEOUT_SECS);
-        tracing::debug!(
-            conn_id = self.id,
-            stale_backend = ?stale_backend,
-            timeout_secs = FENCE_WAIT_TIMEOUT_SECS,
-            "Waiting for failover signal before attempting migration"
-        );
-
         loop {
+            if self.fence_rx.borrow().upgrade_frozen {
+                self.hold_for_upgrade_freeze_after_disconnect().await?;
+            }
+            match self.handle_leader_change(backend, backend_buf, true).await {
+                Ok(()) => return Ok(()),
+                Err(e) if reconnect_may_recover(&e) => {
+                    tracing::debug!(conn_id = self.id, error = %e, "Reconnect after backend loss failed; retrying");
+                }
+                Err(e) => return Err(e),
+            }
             tokio::select! {
-                biased;
-
                 res = self.leader_rx.changed() => {
                     if res.is_err() {
                         return Err(Error::ChannelClosed);
@@ -918,28 +952,18 @@ impl ConnectionHandler {
                         return Err(Error::ChannelClosed);
                     }
                 }
+                () = tokio::time::sleep(RECONNECT_BACKOFF) => {}
                 () = tokio::time::sleep_until(deadline) => {
-                    tracing::warn!(
-                        conn_id = self.id,
-                        stale_backend = ?stale_backend,
-                        "Cluster state did not advance after backend disconnect; severing"
-                    );
+                    tracing::warn!(conn_id = self.id, "No route recovered after backend loss; severing");
                     return Err(Error::BackendDisconnected);
                 }
-            }
-
-            if self.fence_rx.borrow().upgrade_frozen {
-                return self.hold_for_upgrade_freeze_after_disconnect().await;
-            }
-            if self.has_failover_progress(stale_backend) {
-                return Ok(());
             }
         }
     }
 
     /// The backend vanished under a committed upgrade freeze: the primary is
     /// being swapped, not failing over. Hold up to `upgrade_hold_timeout_ms`;
-    /// when the freeze lifts the caller migrates (the upgraded primary keeps
+    /// when the freeze lifts the caller reconnects (the upgraded primary keeps
     /// its address), and a timeout gets the clean upgrade-shaped error
     /// instead of "cluster did not elect a new leader in time".
     async fn hold_for_upgrade_freeze_after_disconnect(&mut self) -> Result<()> {
@@ -965,30 +989,6 @@ impl ConnectionHandler {
             }
         }
         Ok(())
-    }
-
-    /// True if cluster state has advanced past the given dead backend.
-    ///
-    /// The two authoritative signals that failover is underway:
-    /// - The fence has been raised (Raft detected a cluster-state change).
-    /// - `leader_rx` points to some address that is NOT the dead backend.
-    ///
-    /// `leader_rx == None` means we genuinely don't know who the leader is —
-    /// keep waiting. `leader_rx == Some(stale)` means Raft hasn't caught up
-    /// yet — also keep waiting.
-    fn has_failover_progress(&self, stale_backend: Option<SocketAddr>) -> bool {
-        if self.fence_rx.borrow().fenced {
-            return true;
-        }
-        // Bind the watch guard to a local so the borrow is dropped before we
-        // match — `match (*self.leader_rx.borrow(), ..)` holds the watch
-        // lock across the arms and can deadlock against the sender task.
-        let current_leader = *self.leader_rx.borrow();
-        match (current_leader, stale_backend) {
-            (Some(leader), Some(stale)) => leader != stale,
-            (Some(_), None) => true,
-            _ => false,
-        }
     }
 
     fn idle_timeout_error(&self) -> Error {
@@ -1088,35 +1088,26 @@ impl ConnectionHandler {
         };
 
         if migratable {
-            // A backend FIN is only a HINT that failover is underway —
-            // authoritative signals (`leader_rx`, `fence_rx`) take another
-            // election-timeout to settle. Wait for cluster state to actually
-            // advance first: migration must not short-circuit on a stale
-            // `leader_rx` and spin against repeated `read_buf == 0`.
             tracing::info!(
                 conn_id = self.id,
                 stale_backend = ?stale_backend,
-                "Backend disconnected — waiting for cluster-state update"
+                "Backend disconnected — reconnecting to the session's route"
             );
-            if let Err(e) = self.wait_for_failover_signal(stale_backend).await {
-                if matches!(e, Error::Fenced) {
-                    // The upgrade-hold path already sent its own clean error;
-                    // a second, failover-shaped one would mislead.
-                    return Err(e);
+            return match self.recover_lost_backend(backend, backend_buf).await {
+                Ok(()) => {
+                    metrics::counter!("pgbattery_migrations_on_disconnect").increment(1);
+                    Ok(())
                 }
-                tracing::warn!(
-                    conn_id = self.id,
-                    error = %e,
-                    "No failover signal before backend-disconnect timeout"
-                );
-                self.send_failover_error_response(
-                    "pgbattery: backend disconnected and cluster did not elect a new leader in time",
-                )
-                .await;
-                return Err(Error::BackendDisconnected);
-            }
-            metrics::counter!("pgbattery_migrations_on_disconnect").increment(1);
-            return self.handle_leader_change(backend, backend_buf).await;
+                Err(Error::BackendDisconnected) => {
+                    self.send_failover_error_response(
+                        "pgbattery: backend disconnected and no primary accepted the session in time",
+                    )
+                    .await;
+                    Err(Error::BackendDisconnected)
+                }
+                // Every other ending already told the client why.
+                Err(e) => Err(e),
+            };
         }
 
         // Non-migratable: tell the client why instead of silently dropping
@@ -1253,11 +1244,13 @@ impl ConnectionHandler {
             (lease.is_leader(), lease.valid_until())
         };
         // Follower staleness: the unbiased `select!` may service a client
-        // write before the loop observes `leader_rx.changed()`; if leadership
+        // write before the loop observes `leader_rx.changed()`; if the route
         // moved, `backend` is stale and the leader lease gate does not run.
         // See docs/STATE_MACHINE.md section 6.
+        let fence = *self.fence_rx.borrow();
+        let leader = *self.leader_rx.borrow();
         let follower_backend_stale =
-            !is_leader && *self.leader_rx.borrow() != self.state.read().backend_addr;
+            follower_backend_stale(is_leader, &fence, leader, self.state.read().backend_addr);
         BatchFenceSnapshot {
             is_leader,
             lease_valid_until,
@@ -1952,10 +1945,13 @@ impl ConnectionHandler {
         clippy::too_many_lines,
         reason = "linear decision tree; splitting obscures control flow"
     )]
+    /// Move the session to its route if it must: the route changed, or
+    /// `backend_lost` says the current backend is gone.
     async fn handle_leader_change(
         &mut self,
         backend: &mut TcpStream,
         backend_buf: &mut BytesMut,
+        backend_lost: bool,
     ) -> Result<()> {
         // During a leadership transfer the leader watch is transiently `None`
         // (quorum-lost state between the old leader stepping down and the new
@@ -1969,7 +1965,9 @@ impl ConnectionHandler {
         }
 
         let Ok(new_leader) = self.get_leader() else {
-            tracing::warn!(conn_id = self.id, "No leader during failover");
+            // Debug: the backend-loss path retries this every backoff per
+            // session, and logs its own outcome.
+            tracing::debug!(conn_id = self.id, "No route during failover");
             return Err(Error::NoLeader);
         };
 
@@ -1985,8 +1983,7 @@ impl ConnectionHandler {
             )
         };
 
-        if current_backend == Some(new_leader) {
-            // Same leader, no change needed
+        if !needs_migration(current_backend, new_leader, backend_lost) {
             return Ok(());
         }
 
@@ -2865,6 +2862,100 @@ mod tests {
         // A hold lifted with authority still local (upgrade unfroze, or an
         // aborted cutover) resumes on the existing backend.
         assert!(ConnectionHandler::hold_exit_resumes(&FenceState::unfenced()));
+    }
+
+    fn relaying_to(addr: &str) -> FenceState {
+        FenceState {
+            client_write_authority: false,
+            authority_pg_addr: Some(addr.parse().unwrap()),
+            ..FenceState::unfenced()
+        }
+    }
+
+    /// One routing answer: the relay once authority is elsewhere, nowhere
+    /// while it is in transit, the local leader otherwise.
+    #[test]
+    fn a_session_routes_to_the_relay_then_the_leader_and_holds_in_transit() {
+        let leader: SocketAddr = "10.0.0.1:5434".parse().unwrap();
+        let green: SocketAddr = "10.0.0.9:5434".parse().unwrap();
+        assert_eq!(
+            route(&relaying_to("10.0.0.9:5434"), Some(leader)),
+            Some(green)
+        );
+        let in_transit = FenceState {
+            client_write_authority: false,
+            ..FenceState::unfenced()
+        };
+        assert_eq!(route(&in_transit, Some(leader)), None);
+        assert_eq!(route(&FenceState::unfenced(), Some(leader)), Some(leader));
+        assert_eq!(route(&FenceState::unfenced(), None), None);
+    }
+
+    /// A follower relaying to the recipient has the recipient as its
+    /// backend, never its own leader. Comparing against the leader marked
+    /// every relayed batch stale and severed every session on a follower
+    /// gateway (H9).
+    #[test]
+    fn a_relayed_backend_on_a_follower_is_not_stale() {
+        let leader: SocketAddr = "10.0.0.1:5434".parse().unwrap();
+        let green: SocketAddr = "10.0.0.9:5434".parse().unwrap();
+        let relay = relaying_to("10.0.0.9:5434");
+        assert!(!follower_backend_stale(
+            false,
+            &relay,
+            Some(leader),
+            Some(green)
+        ));
+        assert!(follower_backend_stale(
+            false,
+            &relay,
+            Some(leader),
+            Some(leader)
+        ));
+        let local = FenceState::unfenced();
+        assert!(follower_backend_stale(
+            false,
+            &local,
+            Some(leader),
+            Some(green)
+        ));
+        assert!(!follower_backend_stale(
+            true,
+            &local,
+            Some(leader),
+            Some(green)
+        ));
+    }
+
+    /// A backend that went away must be reconnected even when the route did
+    /// not move: a primary restarted in place (a Track B datadir swap, a
+    /// crash-restart) keeps its address. Skipping the reconnect left the
+    /// session reading EOF from a dead socket until it was severed (H13), or
+    /// spinning on it until the idle timeout when relayed (H10).
+    #[test]
+    fn a_lost_backend_reconnects_even_to_an_unchanged_route() {
+        let primary: SocketAddr = "10.0.0.1:5434".parse().unwrap();
+        let other: SocketAddr = "10.0.0.2:5434".parse().unwrap();
+        assert!(needs_migration(Some(primary), primary, true));
+        assert!(!needs_migration(Some(primary), primary, false));
+        assert!(needs_migration(Some(primary), other, false));
+        assert!(needs_migration(None, primary, false));
+    }
+
+    /// Only "not reachable yet" retries; a refusal that already answered the
+    /// client (severed, fenced) ends the session once, never twice.
+    #[test]
+    fn only_an_unreachable_route_is_retried_after_backend_loss() {
+        let addr: SocketAddr = "10.0.0.1:5434".parse().unwrap();
+        assert!(reconnect_may_recover(&Error::NoLeader));
+        assert!(reconnect_may_recover(&Error::ConnectionTimeout(addr)));
+        assert!(reconnect_may_recover(&Error::BackendDisconnected));
+        assert!(!reconnect_may_recover(&Error::Fenced));
+        assert!(!reconnect_may_recover(&Error::ConnectionSevered {
+            conn_id: 1,
+            reason: "x".into(),
+        }));
+        assert!(!reconnect_may_recover(&Error::ChannelClosed));
     }
 
     #[tokio::test]

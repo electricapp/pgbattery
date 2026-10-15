@@ -80,7 +80,8 @@
         "async-degraded-durability",
         "ddl-failover",
         "lsn-over-report-rejected",
-        "gateway-connection-survival"
+        "gateway-connection-survival",
+        "gateway-session-survives-restart-in-place"
       ]
     },
     "ha-assert-sanity": {
@@ -2025,6 +2026,79 @@
         {
           "type": "sql",
           "comment": "End-to-end oracle: how many held sessions wrote on their original connection after the leader changed.",
+          "file": "gateway-migration-assert.sql",
+          "node": "leader"
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "gateway-session-survives-restart-in-place",
+      "contracts": [
+        "S2"
+      ],
+      "description": "Idle gateway sessions survive a primary that restarts in place. Three genuinely idle sessions are held through node2's gateway to leader node1, then node1's checkpointer is SIGKILLed: the postmaster terminates every backend and reinitializes at the same address, with no leader change. The route never moves, so a gateway that reconnects only when the route changes reads EOF from the dead backend until it severs the session; the held sessions must instead complete an INSERT on their ORIGINAL client connections. The fault's effect is asserted (node1 logs the reinitialization), the leader is asserted unchanged, and node2's pgbattery_connections_migrated must rise.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 60
+        },
+        {
+          "type": "sql",
+          "comment": "Landing table for the writes the held sessions make after the restart.",
+          "file": "gateway-migration-setup.sql",
+          "node": 1
+        },
+        {
+          "type": "cmd",
+          "comment": "Hold 3 idle sessions through node2's gateway; each writes its row 25s later on the same connection, well after the restart has completed.",
+          "cmd": "docker compose exec -T node2 sh -lc 'for i in 1 2 3; do ( { printf \"SELECT 1;\\n\"; sleep 25; printf \"INSERT INTO ci_gateway_migration(session_id) VALUES (%s);\\n\" \"$i\"; sleep 5; } | psql -U postgres -h 127.0.0.1 -p 5432 -d postgres >/tmp/ci_gw_idle_$i.out 2>&1 & ); done; sleep 2; echo held'"
+        },
+        {
+          "type": "cmd",
+          "comment": "Gate on node2 reporting 3 idle gateway connections before the fault.",
+          "cmd": "for i in $(seq 1 20); do IDLE=$(curl -s http://localhost:9092/metrics | awk '/^pgbattery_connections_idle/{print $2}' | head -1); IDLE=${IDLE:-0}; IDLE=${IDLE%%.*}; echo \"attempt $i: node2 idle=$IDLE\"; [ \"$IDLE\" -ge 3 ] && exit 0; sleep 1; done; echo 'FAIL: node2 never reported 3 idle gateway connections'; exit 1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Crash-restart node1's PostgreSQL in place: a dead checkpointer makes the postmaster end every backend and reinitialize, keeping its address.",
+          "cmd": "docker compose exec -T node1 pkill -9 -f 'postgres: checkpointer'"
+        },
+        {
+          "type": "cmd",
+          "comment": "Assert the fault's effect, not the request: node1's postmaster logged the reinitialization.",
+          "cmd": "for i in $(seq 1 30); do docker compose logs --no-color node1 2>&1 | grep -q 'all server processes terminated; reinitializing' && { echo \"reinitialized after ${i}s\"; exit 0; }; sleep 1; done; echo 'FAIL: node1 never reinitialized; the fault did not land'; exit 1"
+        },
+        {
+          "type": "cmd",
+          "comment": "The route did not move: node1 still leads.",
+          "cmd": "for i in $(seq 1 30); do curl -s http://localhost:9082/api/v1/cluster/leader | grep -q '\"leader_id\":1' && exit 0; sleep 1; done; echo 'FAIL: leadership moved; this case needs an in-place restart'; curl -s http://localhost:9082/api/v1/cluster/leader; exit 1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Migration oracle: node2 reconnected at least one held session to the unchanged route.",
+          "cmd": "for i in $(seq 1 30); do MIG=$(curl -s http://localhost:9092/metrics | awk '/^pgbattery_connections_migrated/{print $2}' | head -1); MIG=${MIG:-0}; MIG=${MIG%%.*}; if [ \"$MIG\" -ge 1 ]; then echo \"node2 migrated=$MIG after ${i}s\"; exit 0; fi; sleep 1; done; echo 'FAIL: no held session was reconnected after the in-place restart'; curl -s http://localhost:9092/metrics | grep -E '^pgbattery_connections'; exit 1"
+        },
+        {
+          "type": "cmd",
+          "comment": "Wait for the held sessions' INSERTs (25s after they opened) to land.",
+          "cmd": "for i in $(seq 1 60); do N=$(docker compose exec -T node2 psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -tAc 'SELECT count(*) FROM ci_gateway_migration;' 2>/dev/null | tr -d '[:space:]'); echo \"attempt $i: rows=${N:-unreadable}\"; [ \"${N:-0}\" -ge 1 ] && exit 0; sleep 1; done; echo 'no row from any held session'; docker compose exec -T node2 sh -lc 'for f in /tmp/ci_gw_idle_*.out; do echo \"--- $f\"; cat $f; done' || true; exit 1"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "sql",
+          "comment": "End-to-end oracle: how many held sessions wrote on their original connection after the restart.",
           "file": "gateway-migration-assert.sql",
           "node": "leader"
         },
