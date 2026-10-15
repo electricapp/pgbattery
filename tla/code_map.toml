@@ -43,6 +43,7 @@
   "CutoverAuthorityReceived",
   "CutoverAuthorityState",
   "CutoverPhase",
+  "NameCluster",
   "holds_client_write_authority",
 ]
 "governor/raft.rs" = [

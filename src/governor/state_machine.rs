@@ -192,16 +192,30 @@ pub struct CutoverAuthorityState {
     /// again. Cleared when authority returns; the lift needs no roles.
     #[serde(default)]
     pub fenced_app_roles: Vec<String>,
+
+    /// The name this cluster committed for itself (`NameCluster`). Config
+    /// seeds it; once committed, a node configured with another name holds
+    /// no authority.
+    #[serde(default)]
+    pub cluster_id: Option<String>,
 }
 
 impl CutoverAuthorityState {
     /// Whether `local_cluster_id` may accept client writes.
     ///
-    /// Authority in transit (SEALING through DRAINING) belongs to nobody, and
-    /// an authority naming another cluster excludes this one whatever its own
-    /// Raft group thinks.
+    /// Authority in transit (SEALING through DRAINING) belongs to nobody, an
+    /// authority naming another cluster excludes this one whatever its own
+    /// Raft group thinks, and a node whose configured name is not the one its
+    /// cluster committed holds nothing.
     #[must_use]
     pub fn holds_client_write_authority(&self, local_cluster_id: &str) -> bool {
+        if self
+            .cluster_id
+            .as_deref()
+            .is_some_and(|named| named != local_cluster_id)
+        {
+            return false;
+        }
         match self.phase {
             CutoverPhase::Sealing | CutoverPhase::Sealed | CutoverPhase::Draining => false,
             CutoverPhase::Idle
@@ -212,6 +226,39 @@ impl CutoverAuthorityState {
                 .as_deref()
                 .is_none_or(|id| id == local_cluster_id),
         }
+    }
+
+    /// Whether a node configured with `cluster_id` and `awaits` has a
+    /// `NameCluster` to commit: no name yet, or a recipient's boot fence that
+    /// can still land. A different committed name is never re-proposed.
+    #[must_use]
+    pub fn needs_naming(&self, cluster_id: &str, awaits: Option<&str>) -> bool {
+        self.cluster_id.as_deref().is_none_or(|named| {
+            named == cluster_id && awaits.is_some() && self.boot_fence_may_land()
+        })
+    }
+
+    /// NAME: set once; a recipient's boot fence names the donor as the
+    /// authority, only before any cutover entry recorded one.
+    fn name(&mut self, cluster_id: String, awaits: Option<String>) -> CommandOutcome {
+        if self
+            .cluster_id
+            .as_ref()
+            .is_some_and(|named| *named != cluster_id)
+        {
+            return CommandOutcome::OutOfOrder;
+        }
+        if let Some(donor) = awaits
+            && self.boot_fence_may_land()
+        {
+            self.authority_cluster_id = Some(donor);
+        }
+        self.cluster_id = Some(cluster_id);
+        CommandOutcome::Applied
+    }
+
+    fn boot_fence_may_land(&self) -> bool {
+        self.phase == CutoverPhase::Idle && self.authority_cluster_id.is_none()
     }
 
     /// ABORT: authority back to the local cluster in a new epoch.
@@ -482,6 +529,14 @@ pub enum ClusterCommand {
     /// later is refused, so no leader can rewrite which data is the
     /// cluster's.
     SetLineage { system_identifier: u64 },
+
+    /// Track C: commit the cluster's name, and for a recipient the donor it
+    /// awaits write authority from, so no node's config decides either. The
+    /// name is set once; the boot fence lands only before any cutover entry.
+    NameCluster {
+        cluster_id: String,
+        awaits_authority_from: Option<String>,
+    },
 }
 
 /// Highest cluster feature level this binary decodes.
@@ -511,6 +566,7 @@ impl ClusterCommand {
             | Self::PgUpgradeAbort
             | Self::IntendVoter { .. }
             | Self::SetLineage { .. }
+            | Self::NameCluster { .. }
             | Self::CutoverDrainObserved
             | Self::CutoverTransfer { .. }
             | Self::CutoverAbortUnseal { .. }
@@ -665,12 +721,11 @@ impl ClusterState {
                 local_cluster_id,
             } => {
                 let may_arm = match self.cutover.phase {
-                    CutoverPhase::Idle | CutoverPhase::Aborted => true,
-                    // A cluster that took authority may hand it on — that is
-                    // the reverse cutover. One that gave authority away is
-                    // also TRANSFERRED, and must not re-arm itself back into
-                    // authority without a handoff.
-                    CutoverPhase::Transferred => {
+                    // Arming records authority for the local cluster, so only
+                    // a holder may: a boot-fenced recipient may not elect
+                    // itself, and a donor that gave authority away (also
+                    // TRANSFERRED) may not take it back without a handoff.
+                    CutoverPhase::Idle | CutoverPhase::Aborted | CutoverPhase::Transferred => {
                         self.cutover.holds_client_write_authority(&local_cluster_id)
                     }
                     CutoverPhase::Armed
@@ -753,6 +808,10 @@ impl ClusterState {
                 self.cutover.transfer_forced = false;
                 self.cutover.fenced_app_roles.clear();
             }
+            ClusterCommand::NameCluster {
+                cluster_id,
+                awaits_authority_from,
+            } => return self.cutover.name(cluster_id, awaits_authority_from),
             // Non-cutover commands are handled by `apply`, which only routes
             // the cutover variants here.
             other => {
@@ -1224,6 +1283,100 @@ mod tests {
         assert_eq!(outcome, CommandOutcome::OutOfOrder);
         assert_eq!(state.cutover.phase, CutoverPhase::Transferred);
         assert_eq!(state.cutover.authority_cluster_id.as_deref(), Some(GREEN));
+    }
+
+    fn name(state: &mut ClusterState, cluster_id: &str, awaits: Option<&str>) -> CommandOutcome {
+        state.apply(ClusterCommand::NameCluster {
+            cluster_id: cluster_id.into(),
+            awaits_authority_from: awaits.map(Into::into),
+        })
+    }
+
+    /// M15: a recipient's boot fence lived only in each node's config and
+    /// arming from IDLE was unchecked, so a node configured without the fence
+    /// could arm its cluster into authority while the donor still held it.
+    #[test]
+    fn a_committed_boot_fence_refuses_a_self_arm_on_every_node() {
+        let mut green = at_current_level();
+        assert_eq!(name(&mut green, GREEN, Some(BLUE)), CommandOutcome::Applied);
+        assert!(!green.cutover.holds_client_write_authority(GREEN));
+        assert_eq!(
+            green.apply(ClusterCommand::CutoverArmed {
+                target_cluster_id: BLUE.into(),
+                local_cluster_id: GREEN.into(),
+            }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(green.cutover.phase, CutoverPhase::Idle);
+
+        green.apply(ClusterCommand::CutoverAuthorityReceived {
+            epoch: 1,
+            from_cluster_id: BLUE.into(),
+            local_cluster_id: GREEN.into(),
+        });
+        assert!(green.cutover.holds_client_write_authority(GREEN));
+    }
+
+    /// Once the cluster's name is committed, a node configured with another
+    /// holds nothing: after a handoff, a donor node misnamed as the recipient
+    /// would otherwise read the recipient's authority as its own.
+    #[test]
+    fn a_misnamed_node_holds_no_authority() {
+        let mut blue = at_current_level();
+        name(&mut blue, BLUE, None);
+        assert!(blue.cutover.holds_client_write_authority(BLUE));
+        assert!(!blue.cutover.holds_client_write_authority(GREEN));
+
+        armed(&mut blue);
+        sealed(&mut blue, 10);
+        blue.apply(ClusterCommand::CutoverDrainObserved);
+        blue.apply(ClusterCommand::CutoverTransfer {
+            target_cluster_id: GREEN.into(),
+            target_pg_addr: "172.30.0.21:5434".into(),
+            forced: false,
+        });
+        assert!(
+            !blue.cutover.holds_client_write_authority(GREEN),
+            "a donor node configured with the recipient's name"
+        );
+    }
+
+    #[test]
+    fn a_cluster_is_named_once() {
+        let mut state = at_current_level();
+        assert!(state.cutover.needs_naming(BLUE, None));
+        assert_eq!(name(&mut state, BLUE, None), CommandOutcome::Applied);
+        assert!(!state.cutover.needs_naming(BLUE, None));
+        assert!(
+            !state.cutover.needs_naming(GREEN, None),
+            "a misnamed node does not re-propose"
+        );
+        assert_eq!(name(&mut state, GREEN, None), CommandOutcome::OutOfOrder);
+        assert_eq!(state.cutover.cluster_id.as_deref(), Some(BLUE));
+        assert_eq!(name(&mut state, BLUE, None), CommandOutcome::Applied);
+    }
+
+    /// A recipient configured after its cluster was named still commits its
+    /// fence, until a cutover entry moves authority.
+    #[test]
+    fn a_boot_fence_configured_later_is_still_committed() {
+        let mut green = at_current_level();
+        name(&mut green, GREEN, None);
+        assert!(green.cutover.needs_naming(GREEN, Some(BLUE)));
+        name(&mut green, GREEN, Some(BLUE));
+        assert!(!green.cutover.needs_naming(GREEN, Some(BLUE)));
+        assert!(!green.cutover.holds_client_write_authority(GREEN));
+    }
+
+    /// The boot fence lands only before any cutover entry: once authority has
+    /// moved, the log answers and no config reassigns it.
+    #[test]
+    fn a_boot_fence_lands_only_before_any_cutover() {
+        let mut blue = at_current_level();
+        armed(&mut blue);
+        assert_eq!(name(&mut blue, BLUE, Some(GREEN)), CommandOutcome::Applied);
+        assert_eq!(blue.cutover.cluster_id.as_deref(), Some(BLUE));
+        assert!(blue.cutover.holds_client_write_authority(BLUE));
     }
 
     /// Blue hands to green, then green hands back. Each cluster keeps its own

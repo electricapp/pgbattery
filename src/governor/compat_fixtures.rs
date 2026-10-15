@@ -83,6 +83,7 @@ fn sample_state_current() -> ClusterState {
             target_pg_addr: Some("172.28.1.11:5434".to_string()),
             transfer_forced: false,
             fenced_app_roles: vec!["app".to_string()],
+            cluster_id: Some("green".to_string()),
         },
         pg_upgrade: PgUpgradeState {
             frozen: false,
@@ -146,6 +147,10 @@ fn sample_log_entries() -> Vec<LogEntry> {
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeRejoined { node_id: 2 }),
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeAbort),
         LogEntryPayload::Normal(ClusterCommand::IntendVoter { node_id: 2 }),
+        LogEntryPayload::Normal(ClusterCommand::NameCluster {
+            cluster_id: "green".to_string(),
+            awaits_authority_from: Some("blue".to_string()),
+        }),
     ];
     commands
         .into_iter()

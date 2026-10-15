@@ -144,6 +144,43 @@ pub(crate) async fn level_client_fence(
     }
 }
 
+/// What the log says of this node's configured name and boot fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    /// Nothing to commit: recorded, or below the level that records it.
+    Settled,
+    /// The log lacks the name, or a boot fence it can still take; a leader
+    /// commits them from its config.
+    Due,
+    /// The committed name is another, so this node holds no write authority
+    /// until its config is corrected.
+    Misnamed,
+}
+
+impl Naming {
+    fn read(state: &ClusterState, config: &ClientFenceConfig) -> Self {
+        let admitted = ClusterCommand::NameCluster {
+            cluster_id: String::new(),
+            awaits_authority_from: None,
+        }
+        .required_feature_level()
+            <= state.feature_level;
+        let awaits = config.awaits_write_authority_from.as_deref();
+        if state
+            .cutover
+            .cluster_id
+            .as_deref()
+            .is_some_and(|named| named != &*config.cluster_id)
+        {
+            Self::Misnamed
+        } else if admitted && state.cutover.needs_naming(&config.cluster_id, awaits) {
+            Self::Due
+        } else {
+            Self::Settled
+        }
+    }
+}
+
 /// This node's Raft role, from one `RaftMetrics::current_leader` read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -175,6 +212,7 @@ struct View {
     /// primary's postmaster, and a standby it awaits stays stopped.
     pg_upgrade: PgUpgradeState,
     lineage_unrecorded: bool,
+    naming: Naming,
     committed_sync: Option<bool>,
     client_fence: WantedClientFence,
 }
@@ -210,6 +248,7 @@ impl View {
         };
         let follow_terms = state.follow_terms();
         Self {
+            naming: Naming::read(&state, client_fence),
             role,
             has_quorum,
             raft_voters,
@@ -235,6 +274,8 @@ enum Effect {
     CommitSyncMode(bool),
     /// Commit this primary's lineage as the cluster's.
     CommitLineage(u64),
+    /// Commit this node's configured name and boot fence as the cluster's.
+    NameCluster,
     /// Report this node's WAL position to its leader's book.
     ReportLsn { lsn: u64, to: SocketAddr },
     /// Hand leadership to `target` through this node's own transfer endpoint.
@@ -363,6 +404,13 @@ impl NodeReconciler {
             Err(e) => error!(error = %e, "Failed to check PostgreSQL health"),
         }
 
+        if view.naming == Naming::Misnamed {
+            error!(
+                configured = %self.client_fence.cluster_id,
+                "This cluster committed a different name than this node is configured with; \
+                 it holds no write authority until cluster_id is corrected"
+            );
+        }
         let primary = match view.role {
             Role::NoLeader => {
                 debug!("No leader; nothing to follow");
@@ -376,6 +424,9 @@ impl NodeReconciler {
                     && let Err(e) = pg.start().await
                 {
                     warn!(error = %e, "Leader could not start its PostgreSQL");
+                }
+                if view.naming == Naming::Due {
+                    out.propose(view, Effect::NameCluster);
                 }
                 let primary = follow::promote_local_postgres(
                     pg,
@@ -796,6 +847,29 @@ impl Driver {
                     Err(_) => warn!("Committing the cluster lineage missed its deadline; retrying"),
                 }
             }
+            Effect::NameCluster => {
+                let fence = &self.reconciler.client_fence;
+                let command = ClusterCommand::NameCluster {
+                    cluster_id: fence.cluster_id.to_string(),
+                    awaits_authority_from: fence
+                        .awaits_write_authority_from
+                        .as_deref()
+                        .map(str::to_string),
+                };
+                match commit(command).await {
+                    Ok(Ok(resp)) if resp.outcome.applied() => {
+                        info!(cluster_id = %fence.cluster_id, "Committed the cluster's name");
+                    }
+                    Ok(Ok(_)) => warn!(
+                        cluster_id = %fence.cluster_id,
+                        "The cluster already committed a different name"
+                    ),
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Could not commit the cluster's name; retrying");
+                    }
+                    Err(_) => warn!("Committing the cluster's name missed its deadline; retrying"),
+                }
+            }
             Effect::ReportLsn { lsn, to } => {
                 if self.report_lsn_to_leader(to, lsn).await {
                     let now = self.reconciler.lease.read().now();
@@ -982,6 +1056,7 @@ mod tests {
             follow_terms: ClusterState::default().follow_terms(),
             pg_upgrade: PgUpgradeState::default(),
             lineage_unrecorded: false,
+            naming: Naming::Settled,
             committed_sync: Some(true),
             client_fence: WantedClientFence {
                 fenced: false,
@@ -1090,9 +1165,73 @@ mod tests {
         view.has_quorum = false;
         view.committed_sync = None;
         view.lineage_unrecorded = true;
+        view.naming = Naming::Due;
 
         let out = node.pass(&mut pg, &view).await;
         assert!(out.effects.is_empty(), "{:?}", out.effects);
+    }
+
+    /// M15: the cluster's name and a recipient's boot fence come from the
+    /// leader's config once, then from the log on every node.
+    #[tokio::test]
+    async fn a_leader_commits_its_clusters_name_once() {
+        let mut pg = ModelPg::default();
+        let mut node = reconciler(Duration::from_secs(5));
+        let mut view = leading();
+        view.naming = Naming::Due;
+        let out = node.pass(&mut pg, &view).await;
+        assert!(
+            out.effects.contains(&Effect::NameCluster),
+            "{:?}",
+            out.effects
+        );
+
+        for settled in [Naming::Settled, Naming::Misnamed] {
+            view.naming = settled;
+            let out = node.pass(&mut pg, &view).await;
+            assert!(
+                !out.effects.contains(&Effect::NameCluster),
+                "{settled:?}: {:?}",
+                out.effects
+            );
+        }
+    }
+
+    #[test]
+    fn a_cluster_is_named_only_where_the_log_admits_it() {
+        let config = ClientFenceConfig {
+            roles: Vec::new(),
+            cluster_id: Arc::from("green"),
+            awaits_write_authority_from: Some(Arc::from("blue")),
+        };
+        assert_eq!(
+            Naming::read(&ClusterState::default(), &config),
+            Naming::Settled,
+            "below the feature level nothing is proposed"
+        );
+        let mut state = ClusterState {
+            feature_level: FEATURE_LEVEL,
+            ..ClusterState::default()
+        };
+        assert_eq!(Naming::read(&state, &config), Naming::Due);
+        state.apply(ClusterCommand::NameCluster {
+            cluster_id: "green".into(),
+            awaits_authority_from: Some("blue".into()),
+        });
+        assert_eq!(Naming::read(&state, &config), Naming::Settled);
+        let unconfigured = ClientFenceConfig {
+            awaits_write_authority_from: None,
+            ..config.clone()
+        };
+        assert!(
+            WantedClientFence::derive(&state, &unconfigured).fenced,
+            "a node configured without the fence is fenced by the log"
+        );
+        let misnamed = ClientFenceConfig {
+            cluster_id: Arc::from("blue"),
+            ..config
+        };
+        assert_eq!(Naming::read(&state, &misnamed), Naming::Misnamed);
     }
 
     #[tokio::test]

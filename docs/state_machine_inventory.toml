@@ -27,6 +27,7 @@ enums.ClusterCommand = [
   "PgUpgradeAbort",
   "IntendVoter",
   "SetLineage",
+  "NameCluster",
   "SetFeatureLevel",
 ]
 enums.CutoverPhase = ["Idle", "Armed", "Sealing", "Sealed", "Draining", "Transferred", "Aborted"]

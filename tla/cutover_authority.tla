@@ -99,7 +99,8 @@ TypeOK ==
 
 -----------------------------------------------------------------------------
 \* Initial: blue holds epoch 0 write authority; green is fenced read-only by
-\* config (awaits_write_authority_from) before any entry exists.
+\* its committed NameCluster entry, which its leader seeds from
+\* awaits_write_authority_from (and config fences each node until it commits).
 
 Init ==
     /\ blueEpoch = 0
