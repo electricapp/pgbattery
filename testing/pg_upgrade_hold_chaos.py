@@ -159,21 +159,23 @@ def _await_new_leader(survivors: list[Node], dead: Node, budget: float = 90.0) -
 
 
 def _set_freeze(topo: Topology, frozen: bool, timeout: float = 120.0) -> None:
-    """Commit the freeze. Any node can propose it once a leader exists.
+    """Commit the record's freeze (no standbys stopped) or its serve step.
 
-    Retried across the whole window because the unfreeze after a chaos kill
-    has to wait out an election, and leaving the cluster frozen would wedge
-    every case that runs after this one.
+    Only the leader commits; the rest answer 503. Retried across the whole
+    window because the release after a chaos kill has to wait out an
+    election, and leaving the cluster frozen would wedge every case that runs
+    after this one.
     """
+    step = {"step": "freeze", "standbys": []} if frozen else {"step": "serve"}
     deadline = time.monotonic() + timeout
     last = ""
     while time.monotonic() < deadline:
         for n in topo.nodes:
             try:
                 r = httpx.post(
-                    f"http://127.0.0.1:{n.mgmt_port}/api/v1/admin/postgres-upgrade/freeze",
+                    f"http://127.0.0.1:{n.mgmt_port}/api/v1/admin/postgres-upgrade/record",
                     headers=_headers(),
-                    json={"frozen": frozen},
+                    json=step,
                     timeout=30.0,
                 )
                 if r.status_code == 200:

@@ -30,7 +30,7 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// See `UPGRADE_CHECKLIST.md` step 1.
 ///
 /// Schema 1: snapshots serialize the current `ClusterState` (with `cutover`
-/// and `upgrade_frozen`); schema 0 snapshots carry the shorter v0 layout and
+/// and `pg_upgrade`); schema 0 snapshots carry the shorter v0 layout and
 /// are rewritten on open. The schema covers postcard-encoded record layouts,
 /// not just table shapes — postcard is positional, so any field change in a
 /// stored type is a schema change.
@@ -1229,7 +1229,10 @@ mod tests {
         assert!(state.nodes.contains_key(&1));
         assert_eq!(state.voter_ids, std::collections::HashSet::from([1]));
         assert_eq!(state.cutover, CutoverAuthorityState::default());
-        assert!(!state.upgrade_frozen);
+        assert_eq!(
+            state.pg_upgrade,
+            crate::governor::state_machine::PgUpgradeState::default()
+        );
 
         // Records written by the old binary still decode, and the store is
         // stamped with the current schema so an old binary now refuses it.

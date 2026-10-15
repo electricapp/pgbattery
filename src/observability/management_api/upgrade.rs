@@ -19,6 +19,7 @@ use super::ManagementApiState;
 use crate::commands::upgrade::blue_green::run_local_blue_green_preflight;
 use crate::commands::upgrade::postgres::{probe_local_bins, run_local_preflight};
 use crate::commands::{SelfUpgradeRequest, perform_self_upgrade};
+use crate::governor::state_machine::{ClusterCommand, NodeId, PgUpgradeState};
 
 // Re-export Track B / C DTOs so HTTP clients import from management_api.
 pub use crate::commands::{
@@ -505,80 +506,107 @@ pub(super) async fn blue_green_preflight(
     }
 }
 
+/// One step of the Track B upgrade record (`STATE_MACHINE` §8b).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpgradeFreezeRequest {
-    pub frozen: bool,
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum UpgradeRecordStep {
+    /// Hold clients; `standbys` stay stopped until each rejoins.
+    Freeze { standbys: Vec<NodeId> },
+    /// Release held clients.
+    Serve,
+    /// `node_id` follows the primary again.
+    Rejoined { node_id: NodeId },
+    /// Undo a freeze whose apply failed before the primary served.
+    Abort,
+}
+
+impl UpgradeRecordStep {
+    fn command(self) -> ClusterCommand {
+        match self {
+            Self::Freeze { standbys } => ClusterCommand::PgUpgradeFreeze { standbys },
+            Self::Serve => ClusterCommand::PgUpgradeServe,
+            Self::Rejoined { node_id } => ClusterCommand::PgUpgradeRejoined { node_id },
+            Self::Abort => ClusterCommand::PgUpgradeAbort,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpgradeFreezeResponse {
+pub struct UpgradeRecordResponse {
     pub success: bool,
-    pub upgrade_frozen: bool,
+    pub record: PgUpgradeState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
-/// Whether a freeze request must be proposed to the Raft log.
+/// Commit one step of the Track B upgrade record for the whole cluster.
 ///
-/// This node's APPLIED state lags commit: "already in the requested state"
-/// read locally can be a stale answer on a lagging node, and an unfreeze
-/// acked from that read may never commit — leaving every gateway holding
-/// while the CLI reports success. Applying the entry is idempotent, so the
-/// proposal costs one log entry.
-const fn freeze_needs_proposal(applied_frozen: bool, requested_frozen: bool) -> bool {
-    let _ = (applied_frozen, requested_frozen);
-    true
-}
-
-/// Set or clear the Track B upgrade freeze for the whole cluster.
-///
-/// Committed to the Raft log, not latched per node: the gateways derive the
-/// hold from it every metrics tick, so one call covers every node and a
-/// restart re-derives the same answer instead of thawing.
-pub(super) async fn set_upgrade_freeze(
+/// Committed to the Raft log, not latched per node: gateways and supervisors
+/// derive their behaviour from it, so one call covers every node and a
+/// restart re-derives the same answer. Always proposed — this node's applied
+/// state lags commit — and every step is a goal state, so a retry is a no-op.
+/// 409 is a refusal from the record itself; 503 means this node could not
+/// commit (not the leader, no quorum) and another may.
+pub(super) async fn commit_upgrade_step(
     State(state): State<Arc<ManagementApiState>>,
-    Json(body): Json<UpgradeFreezeRequest>,
+    Json(step): Json<UpgradeRecordStep>,
 ) -> impl IntoResponse {
-    let applied = state.cluster_state.read().upgrade_frozen;
-    if !freeze_needs_proposal(applied, body.frozen) {
-        return (
-            StatusCode::OK,
-            Json(UpgradeFreezeResponse {
-                success: true,
-                upgrade_frozen: body.frozen,
-                message: Some("Already in the requested freeze state".into()),
+    let described = format!("{step:?}");
+    let answer = |code, success, message| {
+        (
+            code,
+            Json(UpgradeRecordResponse {
+                success,
+                record: state.cluster_state.read().pg_upgrade.clone(),
+                message,
             }),
-        );
-    }
-    match crate::governor::propose::propose(
-        &state.raft,
-        &state.cluster_state,
-        crate::governor::state_machine::ClusterCommand::SetUpgradeFreeze {
-            frozen: body.frozen,
-        },
-    )
-    .await
+        )
+    };
+    match crate::governor::propose::propose(&state.raft, &state.cluster_state, step.command()).await
     {
-        Ok(_) => {
-            info!(upgrade_frozen = body.frozen, "Upgrade freeze committed");
-            (
-                StatusCode::OK,
-                Json(UpgradeFreezeResponse {
-                    success: true,
-                    upgrade_frozen: body.frozen,
-                    message: None,
-                }),
-            )
+        Ok(resp) if resp.outcome.applied() => {
+            info!(step = %described, "Upgrade record step committed");
+            answer(StatusCode::OK, true, None)
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(UpgradeFreezeResponse {
-                success: false,
-                upgrade_frozen: state.cluster_state.read().upgrade_frozen,
-                message: Some(format!("Freeze not committed: {e}")),
-            }),
+        Ok(_) => answer(
+            StatusCode::CONFLICT,
+            false,
+            Some(format!(
+                "Committed but not applied: the upgrade record does not take \
+                 {described} from where it stands"
+            )),
+        ),
+        Err(e) => answer(
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            Some(format!("{described} not committed here: {e}")),
         ),
     }
+}
+
+/// Why this node may not run the primary-side apply, if it may not.
+///
+/// Read from the committed record and Raft leadership, here rather than
+/// trusted from the caller: the apply runs `pg_upgrade` on this data
+/// directory, and on a standby that destroys a copy the cluster still needs.
+fn apply_refusal(record: &PgUpgradeState, is_leader: bool, node_id: NodeId) -> Option<String> {
+    if !record.frozen {
+        return Some("the upgrade freeze is not committed".into());
+    }
+    if !is_leader {
+        return Some("this node is not the Raft leader, so not the primary".into());
+    }
+    if record.leaves_stopped(node_id) {
+        return Some("the upgrade record lists this node as a standby".into());
+    }
+    None
+}
+
+/// Why this node may not be rejoined, if it may not: the rejoin wipes the
+/// data directory, so only a standby the committed record awaits may.
+fn rejoin_refusal(record: &PgUpgradeState, node_id: NodeId) -> Option<String> {
+    (!record.leaves_stopped(node_id))
+        .then(|| "the upgrade record does not list this node for rejoin".to_string())
 }
 
 /// Stop the local postmaster cleanly (standbys during Track B freeze).
@@ -678,12 +706,18 @@ async fn postgres_upgrade_apply_inner(
         };
         paths.clone()
     };
-    if !state.cluster_state.read().upgrade_frozen {
+    let is_leader = state.raft.metrics().borrow().current_leader == Some(state.node_id);
+    let refusal = apply_refusal(
+        &state.cluster_state.read().pg_upgrade,
+        is_leader,
+        state.node_id,
+    );
+    if let Some(why) = refusal {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
             Json(PostgresUpgradeApplyResponse {
                 success: false,
-                message: Some("Refusing apply: upgrade freeze is not committed".into()),
+                message: Some(format!("Refusing apply: {why}")),
                 from_major: 0,
                 to_major: body.to_major,
             }),
@@ -806,6 +840,16 @@ pub(super) async fn postgres_upgrade_rejoin(
             }),
         );
     };
+    let refusal = rejoin_refusal(&state.cluster_state.read().pg_upgrade, state.node_id);
+    if let Some(why) = refusal {
+        return (
+            StatusCode::CONFLICT,
+            Json(PostgresUpgradeRejoinResponse {
+                success: false,
+                message: Some(format!("Refusing rejoin: {why}")),
+            }),
+        );
+    }
     let Ok(_lock) = state.upgrade_lock.try_lock() else {
         return (
             StatusCode::CONFLICT,
@@ -1108,8 +1152,12 @@ pub(super) async fn postgres_upgrade_rollback(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "test assertions on known-good values")]
 mod tests {
-    use super::{freeze_needs_proposal, self_upgrade_refused_on_leader};
+    use super::{
+        PgUpgradeState, UpgradeRecordStep, apply_refusal, rejoin_refusal,
+        self_upgrade_refused_on_leader,
+    };
 
     /// Restarting the current leader of a multi-voter cluster drops
     /// leadership mid-write-path; a single-voter cluster has nowhere to
@@ -1123,18 +1171,40 @@ mod tests {
         assert!(!self_upgrade_refused_on_leader(false, 3));
     }
 
-    /// A node's APPLIED state lags commit, so a locally-matching freeze
-    /// state is no proof the cluster committed the requested one. An
-    /// unfreeze acked from that stale read may never commit, leaving every
-    /// gateway holding while the CLI reports success — so every request is
-    /// proposed (apply is idempotent).
-    #[test]
-    fn every_freeze_request_is_proposed_regardless_of_applied_state() {
-        for (applied, requested) in [(false, false), (false, true), (true, false), (true, true)] {
-            assert!(
-                freeze_needs_proposal(applied, requested),
-                "applied={applied} requested={requested}"
-            );
+    fn frozen_with(standbys: &[u64]) -> PgUpgradeState {
+        PgUpgradeState {
+            frozen: true,
+            awaiting_rejoin: standbys.to_vec(),
         }
+    }
+
+    /// `pg_upgrade` on a standby's data directory destroys a copy the
+    /// cluster still needs. The apply runs only on the frozen leader, and
+    /// never on a node the record lists as a standby.
+    #[test]
+    fn the_apply_runs_only_on_the_frozen_leader() {
+        assert_eq!(apply_refusal(&frozen_with(&[2, 3]), true, 1), None);
+        assert!(apply_refusal(&PgUpgradeState::default(), true, 1).is_some());
+        assert!(apply_refusal(&frozen_with(&[2, 3]), false, 1).is_some());
+        assert!(apply_refusal(&frozen_with(&[2, 3]), true, 2).is_some());
+    }
+
+    /// The rejoin wipes the data directory; a stray call must not reach a
+    /// healthy standby or the primary.
+    #[test]
+    fn only_a_standby_the_record_awaits_may_be_rejoined() {
+        assert_eq!(rejoin_refusal(&frozen_with(&[2]), 2), None);
+        assert!(rejoin_refusal(&frozen_with(&[2]), 3).is_some());
+        assert!(rejoin_refusal(&PgUpgradeState::default(), 2).is_some());
+    }
+
+    /// The wire shape the orchestrator and harnesses send.
+    #[test]
+    fn record_steps_are_tagged_by_name() {
+        let freeze: UpgradeRecordStep =
+            serde_json::from_str(r#"{"step":"freeze","standbys":[2,3]}"#).unwrap();
+        assert!(matches!(freeze, UpgradeRecordStep::Freeze { standbys } if standbys == [2, 3]));
+        let abort: UpgradeRecordStep = serde_json::from_str(r#"{"step":"abort"}"#).unwrap();
+        assert!(matches!(abort, UpgradeRecordStep::Abort));
     }
 }

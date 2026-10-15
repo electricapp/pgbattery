@@ -22,6 +22,7 @@ use tracing::info;
 use crate::cluster::ClusterClient;
 use crate::commands::doctor::require_doctor_strict;
 use crate::config::Config;
+use crate::observability::management_api::UpgradeRecordStep;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_CONFIG_PATH: &str = "pgbattery.toml";
@@ -225,6 +226,8 @@ pub struct PostgresUpgradeParams {
     pub experimental: bool,
     pub confirm: bool,
     pub rollback: bool,
+    /// Commit the record's abort for an upgrade left frozen.
+    pub abort: bool,
     pub node: Option<String>,
     pub allow_no_backup: bool,
     pub accept_no_rollback: bool,
@@ -268,8 +271,11 @@ pub async fn run_postgres_upgrade(params: PostgresUpgradeParams) -> Result<()> {
         return crate::commands::upgrade::blue_green::run_blue_green_preflight(params).await;
     }
 
-    if params.confirm && params.rollback {
-        bail!("Refusing: --confirm and --rollback are mutually exclusive");
+    if u8::from(params.confirm) + u8::from(params.rollback) + u8::from(params.abort) > 1 {
+        bail!("Refusing: --confirm, --rollback and --abort are mutually exclusive");
+    }
+    if params.abort {
+        return run_abort(params).await;
     }
     if params.confirm {
         return run_confirm(params).await;
@@ -375,25 +381,28 @@ async fn apply_experimental(
     transfer_mode: &str,
     config_path: Option<&str>,
 ) -> Result<()> {
-    info!("Committing the Track B upgrade freeze");
-    client.set_upgrade_freeze(leader_mgmt, true).await?;
-
     let standbys: Vec<_> = nodes
         .iter()
         .filter(|n| Some(n.node_id) != leader_id)
         .collect();
-    let mut stopped: Vec<&crate::cluster::client::NodeInfo> = Vec::new();
+    info!("Committing the Track B upgrade record: freeze");
+    commit_step(
+        client,
+        nodes,
+        UpgradeRecordStep::Freeze {
+            standbys: standbys.iter().map(|n| n.node_id).collect(),
+        },
+    )
+    .await?;
     for n in &standbys {
         info!(
             node_id = n.node_id,
             "Stopping standby PostgreSQL for upgrade"
         );
         if let Err(e) = client.stop_postgres(&n.mgmt_addr).await {
-            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
-            unfreeze_after_serving_primary_logging(client, nodes).await;
+            abort_after_serving_primary(client, nodes).await;
             bail!("Failed to stop standby {}: {e}", n.node_id);
         }
-        stopped.push(n);
     }
 
     let apply_body = crate::observability::management_api::PostgresUpgradeApplyRequest {
@@ -413,62 +422,29 @@ async fn apply_experimental(
             );
         }
         Ok(r) => {
-            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
-            unfreeze_after_serving_primary_logging(client, nodes).await;
+            abort_after_serving_primary(client, nodes).await;
             bail!(
                 "Primary apply failed: {}",
                 r.message.unwrap_or_else(|| "no detail".into())
             );
         }
         Err(e) => {
-            restart_stopped_standbys(client, &stopped, leader_mgmt).await;
-            unfreeze_after_serving_primary_logging(client, nodes).await;
+            abort_after_serving_primary(client, nodes).await;
             return Err(e);
         }
     }
 
     // Probed, not assumed: the apply's own write probe ran inside the
-    // handler, and the unfreeze must not trust a response over a primary
-    // that has since died. Standbys are still stopped, so durability is
-    // briefly ASYNC and the status output says so.
+    // handler, and the release must not trust a response over a primary
+    // that has since died. Standbys stay stopped until each rejoins, so
+    // durability is briefly ASYNC and the status output says so.
     wait_for_serving_primary(client, nodes).await?;
-    unfreeze_all(client, nodes).await?;
-    info!("Unfrozen after primary upgrade (standbys still stopped; durability briefly ASYNC)");
+    commit_step(client, nodes, UpgradeRecordStep::Serve).await?;
+    info!(
+        "Clients released after primary upgrade (standbys still stopped; durability briefly ASYNC)"
+    );
 
-    let leader = client.get_leader_info(leader_mgmt).await?;
-    let Some(leader_pg) = leader.leader_pg_addr else {
-        bail!("No leader_pg_addr after primary upgrade");
-    };
-    let (host, port) = split_host_port(&leader_pg)?;
-    let pg_user = PG_SUPERUSER.to_string();
-
-    for (i, n) in standbys.iter().enumerate() {
-        info!(
-            node_id = n.node_id,
-            index = i,
-            "Re-basebacking standby from upgraded primary"
-        );
-        let body = crate::observability::management_api::PostgresUpgradeRejoinRequest {
-            to_major,
-            leader_pg_host: host.clone(),
-            leader_pg_port: port,
-            pg_user: pg_user.clone(),
-        };
-        match client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await {
-            Ok(r) if r.success => {}
-            Ok(r) => {
-                bail!(
-                    "Standby {} rejoin failed: {}",
-                    n.node_id,
-                    r.message.unwrap_or_else(|| "no detail".into())
-                );
-            }
-            Err(e) => return Err(e),
-        }
-        // Wait until this standby is streaming before starting the next
-        // (restore SYNC candidate before second standby).
-        wait_standby_streaming(client, leader_mgmt, n.node_id).await?;
-    }
+    rejoin_standbys(client, nodes, leader_mgmt, &standbys, to_major).await?;
 
     info!("Primary upgraded and standbys re-basebacked. Running verification gate.");
     verify_post_upgrade(client, nodes, leader_mgmt, to_major, config_path).await?;
@@ -589,12 +565,22 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
         bail!("No leader for rollback");
     };
 
-    info!("Freezing cluster for rollback");
-    client.set_upgrade_freeze(&leader_mgmt, true).await?;
-    for n in &membership.nodes {
-        if Some(n.node_id) != leader.leader_id
-            && let Err(e) = client.stop_postgres(&n.mgmt_addr).await
-        {
+    let nodes = &membership.nodes;
+    let standbys: Vec<_> = nodes
+        .iter()
+        .filter(|n| Some(n.node_id) != leader.leader_id)
+        .collect();
+    info!("Committing the Track B upgrade record for rollback: freeze");
+    commit_step(
+        &client,
+        nodes,
+        UpgradeRecordStep::Freeze {
+            standbys: standbys.iter().map(|n| n.node_id).collect(),
+        },
+    )
+    .await?;
+    for n in &standbys {
+        if let Err(e) = client.stop_postgres(&n.mgmt_addr).await {
             tracing::warn!(node_id = n.node_id, error = %e, "stop during rollback");
         }
     }
@@ -605,14 +591,14 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
     {
         Ok(resp) if resp.success => resp,
         Ok(resp) => {
-            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
+            abort_after_serving_primary(&client, nodes).await;
             bail!(
                 "Primary rollback failed: {}",
                 resp.message.unwrap_or_else(|| "no detail".into())
             );
         }
         Err(e) => {
-            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
+            abort_after_serving_primary(&client, nodes).await;
             return Err(e);
         }
     };
@@ -620,39 +606,77 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
         info!(%msg, "Primary rolled back");
     }
 
-    let leader_info = client.get_leader_info(&leader_mgmt).await?;
-    let Some(leader_pg) = leader_info.leader_pg_addr else {
-        unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
-        bail!("No leader_pg_addr after rollback");
+    // The standbys still hold the new major while the primary runs the old
+    // one, so they stay stopped until each rejoins; clients go first, as in
+    // the apply.
+    wait_for_serving_primary(&client, nodes).await?;
+    commit_step(&client, nodes, UpgradeRecordStep::Serve).await?;
+    let from_major = resp.from_major;
+    rejoin_standbys(&client, nodes, &leader_mgmt, &standbys, from_major).await?;
+    require_doctor_strict(Some(leader_mgmt.clone()), params.config_path.clone()).await?;
+    info!(from_major, "Rollback complete; cluster on old major");
+    Ok(())
+}
+
+/// Re-basebackup each standby from the primary, one at a time, committing
+/// its rejoin once it streams. A failure stops there: that standby and the
+/// rest stay stopped, listed in the record for a later rejoin.
+async fn rejoin_standbys(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+    leader_mgmt: &str,
+    standbys: &[&crate::cluster::client::NodeInfo],
+    major: u32,
+) -> Result<()> {
+    let leader = client.get_leader_info(leader_mgmt).await?;
+    let Some(leader_pg) = leader.leader_pg_addr else {
+        bail!("No leader_pg_addr to rejoin the standbys to; they stay stopped awaiting rejoin");
     };
     let (host, port) = split_host_port(&leader_pg)?;
-    let from_major = resp.from_major;
-    for n in membership
-        .nodes
-        .iter()
-        .filter(|n| Some(n.node_id) != leader.leader_id)
-    {
+    for n in standbys {
+        info!(
+            node_id = n.node_id,
+            major, "Re-basebacking standby from the primary"
+        );
         let body = crate::observability::management_api::PostgresUpgradeRejoinRequest {
-            to_major: from_major,
+            to_major: major,
             leader_pg_host: host.clone(),
             leader_pg_port: port,
             pg_user: PG_SUPERUSER.into(),
         };
-        let rejoined = async {
-            client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await?;
-            wait_standby_streaming(&client, &leader_mgmt, n.node_id).await
+        let r = client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await?;
+        if !r.success {
+            bail!(
+                "Standby {} rejoin failed: {}",
+                n.node_id,
+                r.message.unwrap_or_else(|| "no detail".into())
+            );
         }
-        .await;
-        if let Err(e) = rejoined {
-            unfreeze_after_serving_primary_logging(&client, &membership.nodes).await;
-            return Err(e);
-        }
+        // Streaming before the next one starts: the first rejoined standby
+        // restores a SYNC candidate before the second goes down.
+        wait_standby_streaming(client, leader_mgmt, n.node_id).await?;
+        commit_step(
+            client,
+            nodes,
+            UpgradeRecordStep::Rejoined { node_id: n.node_id },
+        )
+        .await?;
     }
+    Ok(())
+}
 
+/// Explicit `--abort`: clear an upgrade left frozen by a dead orchestrator.
+///
+/// The record refuses it once the primary has served, because a stopped
+/// standby's data may then be a major the primary no longer runs; resume by
+/// rejoining those standbys instead.
+async fn run_abort(params: PostgresUpgradeParams) -> Result<()> {
+    let (client, entry, _) =
+        cluster_client_and_entry(params.node.clone(), params.config_path.as_deref()).await?;
+    let membership = client.get_nodes(&entry).await?;
     wait_for_serving_primary(&client, &membership.nodes).await?;
-    unfreeze_all(&client, &membership.nodes).await?;
-    require_doctor_strict(Some(leader_mgmt.clone()), params.config_path.clone()).await?;
-    info!(from_major, "Rollback complete; cluster on old major");
+    commit_step(&client, &membership.nodes, UpgradeRecordStep::Abort).await?;
+    info!("Upgrade aborted: clients released, stopped standbys restart on their own");
     Ok(())
 }
 
@@ -741,112 +765,53 @@ async fn wait_for_serving_primary(
     }
 }
 
-/// Unfreeze only once a primary is confirmed serving; otherwise leave the
-/// cluster frozen and say so. Releasing held clients into a cluster with no
-/// primary turns a recoverable abort into an outage.
-async fn unfreeze_after_serving_primary_logging(
+/// Abort the record once a primary is confirmed serving, on an error path
+/// where the caller is already failing. Without one, leave the cluster frozen
+/// and say so: releasing held clients into a cluster with no primary turns a
+/// recoverable abort into an outage. The abort also releases the stopped
+/// standbys, whose data still matches the primary, to their supervisors.
+async fn abort_after_serving_primary(
     client: &ClusterClient,
     nodes: &[crate::cluster::client::NodeInfo],
 ) {
-    match wait_for_serving_primary(client, nodes).await {
-        Ok(()) => unfreeze_all_logging(client, nodes).await,
-        Err(e) => tracing::error!(
+    let aborted = match wait_for_serving_primary(client, nodes).await {
+        Ok(()) => commit_step(client, nodes, UpgradeRecordStep::Abort).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = aborted {
+        tracing::error!(
             error = %e,
-            "Cluster left FROZEN: no serving primary to release held clients into"
-        ),
+            "Cluster left FROZEN; once a primary serves, run \
+             `pgbattery upgrade postgres --abort`"
+        );
     }
 }
 
-/// Clear the cluster-wide freeze.
+/// Commit one upgrade record step through whichever node can.
 ///
-/// The freeze is one committed entry, so one node accepting the call clears
-/// it everywhere. Every node failing means client connections stay held until
-/// the hold timeout severs them, which the caller must be told about.
-async fn unfreeze_all(
+/// The record is one committed entry, so the leader accepting it covers every
+/// node; a follower answers 503 and the next node is asked. A 409 is the
+/// record itself refusing the step, which no other node would answer
+/// differently.
+async fn commit_step(
     client: &ClusterClient,
     nodes: &[crate::cluster::client::NodeInfo],
+    step: UpgradeRecordStep,
 ) -> Result<()> {
-    let mut last_error = None;
+    let mut last = String::from("no nodes");
     for n in nodes {
-        match client.set_upgrade_freeze(&n.mgmt_addr, false).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(node_id = n.node_id, error = %e, "Unfreeze call failed");
-                last_error = Some(e);
-            }
-        }
-    }
-    bail!(
-        "Could not clear the upgrade freeze on any node; gateways will hold \
-         clients until the hold timeout: {}",
-        last_error.map_or_else(|| "no nodes".into(), |e| e.to_string())
-    )
-}
-
-/// Put standbys stopped for an upgrade back into replication after an abort.
-///
-/// Their data directories are still the old major and the primary never
-/// changed, so a plain rejoin against the unchanged primary is correct. Left
-/// out, an aborted upgrade leaves a single-copy cluster with no signal. The
-/// rejoin major is the primary's probed active major, never the upgrade's
-/// target: the abort means the primary did not upgrade.
-async fn restart_stopped_standbys(
-    client: &ClusterClient,
-    stopped: &[&crate::cluster::client::NodeInfo],
-    leader_mgmt: &str,
-) {
-    if stopped.is_empty() {
-        return;
-    }
-    let Ok(leader) = client.get_leader_info(leader_mgmt).await else {
-        tracing::error!("Cannot resolve leader to restart standbys; they stay stopped");
-        return;
-    };
-    let Some(leader_pg) = leader.leader_pg_addr else {
-        tracing::error!("Leader reports no PG address; standbys stay stopped");
-        return;
-    };
-    let Ok((host, port)) = split_host_port(&leader_pg) else {
-        tracing::error!(%leader_pg, "Unparseable leader PG address; standbys stay stopped");
-        return;
-    };
-    let primary_major = match client.get_postgres_status(leader_mgmt).await {
-        Ok(st) => st.active_major,
-        Err(e) => {
-            tracing::error!(error = %e, "Cannot probe primary major; standbys stay stopped");
-            return;
-        }
-    };
-    let Some(primary_major) = primary_major else {
-        tracing::error!("Primary reports no active major; standbys stay stopped");
-        return;
-    };
-    for n in stopped {
-        let body = crate::observability::management_api::PostgresUpgradeRejoinRequest {
-            to_major: primary_major,
-            leader_pg_host: host.clone(),
-            leader_pg_port: port,
-            pg_user: PG_SUPERUSER.into(),
-        };
-        match client.postgres_upgrade_rejoin(&n.mgmt_addr, &body).await {
-            Ok(r) if r.success => info!(node_id = n.node_id, "Standby restarted after abort"),
-            Ok(r) => tracing::error!(
-                node_id = n.node_id,
-                message = ?r.message,
-                "Standby did not restart after abort"
+        match client.commit_upgrade_step(&n.mgmt_addr, &step).await {
+            Ok((status, _)) if status.is_success() => return Ok(()),
+            Ok((status, resp)) if status == reqwest::StatusCode::CONFLICT => bail!(
+                "{}; the record stands at {:?}",
+                resp.message.unwrap_or_else(|| format!("{step:?} refused")),
+                resp.record
             ),
-            Err(e) => {
-                tracing::error!(node_id = n.node_id, error = %e, "Standby restart failed");
-            }
+            Ok((_, resp)) => last = resp.message.unwrap_or_default(),
+            Err(e) => last = e.to_string(),
         }
     }
-}
-
-/// Best-effort unfreeze on an error path, where the caller is already failing.
-async fn unfreeze_all_logging(client: &ClusterClient, nodes: &[crate::cluster::client::NodeInfo]) {
-    if let Err(e) = unfreeze_all(client, nodes).await {
-        tracing::error!(error = %e, "Cluster left frozen");
-    }
+    bail!("No node committed {step:?}: {last}")
 }
 
 /// Refuse `--accept-no-rollback` combined with `--allow-no-backup`: link

@@ -33,7 +33,7 @@ use super::network::{
 };
 use super::state_machine::{
     ClusterCommand, ClusterState, ClusterStateV0, CutoverAuthorityState, CutoverPhase, NodeId,
-    NodeInfo, NodeRole,
+    NodeInfo, NodeRole, PgUpgradeState,
 };
 use super::storage::{
     LastAppliedState, LocalStoredMembership, LogEntry, LogEntryPayload, RedbLogStorage,
@@ -84,7 +84,10 @@ fn sample_state_current() -> ClusterState {
             transfer_forced: false,
             fenced_app_roles: vec!["app".to_string()],
         },
-        upgrade_frozen: true,
+        pg_upgrade: PgUpgradeState {
+            frozen: false,
+            awaiting_rejoin: vec![2],
+        },
         applied_index: Some(42),
         feature_level: 1,
         ..ClusterState::from(sample_state_v0())
@@ -114,7 +117,7 @@ fn sample_log_entries() -> Vec<LogEntry> {
             local_cluster_id: "blue".to_string(),
         }),
         LogEntryPayload::Normal(ClusterCommand::CutoverSeal { final_lsn: 8_192 }),
-        LogEntryPayload::Normal(ClusterCommand::SetUpgradeFreeze { frozen: true }),
+        LogEntryPayload::Normal(ClusterCommand::PgUpgradeFreeze { standbys: vec![2] }),
         LogEntryPayload::Normal(ClusterCommand::CutoverDrainObserved),
         LogEntryPayload::Normal(ClusterCommand::CutoverTransfer {
             target_cluster_id: "green".to_string(),
@@ -133,6 +136,9 @@ fn sample_log_entries() -> Vec<LogEntry> {
         LogEntryPayload::Normal(ClusterCommand::CutoverSealing {
             app_roles: vec!["app".to_string()],
         }),
+        LogEntryPayload::Normal(ClusterCommand::PgUpgradeServe),
+        LogEntryPayload::Normal(ClusterCommand::PgUpgradeRejoined { node_id: 2 }),
+        LogEntryPayload::Normal(ClusterCommand::PgUpgradeAbort),
     ];
     commands
         .into_iter()
@@ -457,7 +463,7 @@ fn supported_schema0_store_migrates_and_decodes() {
     assert_eq!(state.sync_replication_active, Some(true));
     assert!(state.nodes.contains_key(&1));
     assert_eq!(state.cutover, CutoverAuthorityState::default());
-    assert!(!state.upgrade_frozen);
+    assert_eq!(state.pg_upgrade, PgUpgradeState::default());
 
     let vote = storage.load_vote().expect("vote must decode");
     assert_eq!(vote.term, 3);
@@ -495,7 +501,7 @@ fn supported_schema1_store_opens_and_decodes() {
         postcard::from_bytes(&data).expect("snapshot must decode as current ClusterState");
     assert_eq!(state.cutover.epoch, 2);
     assert_eq!(state.cutover.phase, CutoverPhase::Transferred);
-    assert!(state.upgrade_frozen);
+    assert_eq!(state.pg_upgrade.awaiting_rejoin, vec![2]);
 }
 
 /// The committed snapshot bytes ARE the store schema: any field change in

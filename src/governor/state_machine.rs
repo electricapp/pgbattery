@@ -118,10 +118,10 @@ pub struct ClusterState {
     #[serde(default)]
     pub cutover: CutoverAuthorityState,
 
-    /// Track B: gateways hold client queries for a major upgrade. Replicated
-    /// so it survives a restart and clears only by a committed entry.
+    /// Track B major upgrade in flight (§8b). Replicated so it survives a
+    /// restart and moves only by a committed entry.
     #[serde(default)]
-    pub upgrade_frozen: bool,
+    pub pg_upgrade: PgUpgradeState,
 
     /// Index of the last log entry this state reflects; `None` when unknown.
     /// Re-delivery at or below it is a no-op, so a snapshot captured ahead of
@@ -136,7 +136,7 @@ pub struct ClusterState {
 }
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
-/// `upgrade_frozen`. Postcard is positional, so the 0→1 store migration must
+/// `pg_upgrade`. Postcard is positional, so the 0→1 store migration must
 /// decode old snapshots with exactly this field set. `failover_started_at` is
 /// `serde(skip)` on the live struct and so absent from the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +160,7 @@ impl From<ClusterStateV0> for ClusterState {
             failover_started_at: None,
             sync_replication_active: v0.sync_replication_active,
             cutover: CutoverAuthorityState::default(),
-            upgrade_frozen: false,
+            pg_upgrade: PgUpgradeState::default(),
             applied_index: None,
             feature_level: 0,
         }
@@ -270,6 +270,58 @@ impl CutoverAuthorityState {
         self.target_pg_addr = None;
         self.transfer_forced = false;
         self.fenced_app_roles.clear();
+        CommandOutcome::Applied
+    }
+}
+
+/// Track B major upgrade in flight: the orchestrator's intent, committed so
+/// every node acts on it and a dead orchestrator leaves a record behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PgUpgradeState {
+    /// Gateways hold clients: the primary's data directory is being swapped.
+    pub frozen: bool,
+    /// Standbys stopped for the upgrade and not yet rejoined to the primary.
+    /// Their supervisors leave them stopped, and only they may be rejoined.
+    pub awaiting_rejoin: Vec<NodeId>,
+}
+
+impl PgUpgradeState {
+    /// Whether `node`'s stopped `PostgreSQL` is the orchestrator's to restart:
+    /// its data directory may be a major the primary no longer runs.
+    #[must_use]
+    pub fn leaves_stopped(&self, node: NodeId) -> bool {
+        self.awaiting_rejoin.contains(&node)
+    }
+
+    /// Every step names a goal state, so a step the record already reflects
+    /// is a no-op and a retried step converges.
+    fn apply(&mut self, cmd: ClusterCommand) -> CommandOutcome {
+        match cmd {
+            ClusterCommand::PgUpgradeFreeze { standbys } => {
+                if self.frozen && self.awaiting_rejoin == standbys {
+                    return CommandOutcome::Applied;
+                }
+                if self.frozen || !self.awaiting_rejoin.is_empty() {
+                    return CommandOutcome::OutOfOrder;
+                }
+                self.frozen = true;
+                self.awaiting_rejoin = standbys;
+            }
+            ClusterCommand::PgUpgradeServe => self.frozen = false,
+            ClusterCommand::PgUpgradeRejoined { node_id } => {
+                self.awaiting_rejoin.retain(|n| *n != node_id);
+            }
+            ClusterCommand::PgUpgradeAbort => {
+                if !self.frozen && !self.awaiting_rejoin.is_empty() {
+                    return CommandOutcome::OutOfOrder;
+                }
+                *self = Self::default();
+            }
+            other => {
+                debug_assert!(false, "PgUpgradeState::apply reached by {other:?}");
+                return CommandOutcome::OutOfOrder;
+            }
+        }
         CommandOutcome::Applied
     }
 }
@@ -398,13 +450,15 @@ pub enum ClusterCommand {
     /// one.
     CutoverSeal { final_lsn: u64 },
 
-    /// Track B: gateways hold client queries for a major upgrade.
+    /// Track B: begin an upgrade — gateways hold, and `standbys` (stopped by
+    /// the orchestrator) stay stopped until each rejoins. Refused while one
+    /// is in flight.
     ///
     /// Replicated rather than a per-node flag: an orchestrator that dies
-    /// between freeze and unfreeze would otherwise leave each gateway
-    /// latched with nothing able to clear it, and a node that restarts would
-    /// silently thaw into a cluster mid-`pg_upgrade`.
-    SetUpgradeFreeze { frozen: bool },
+    /// mid-upgrade would otherwise leave each gateway latched with nothing
+    /// able to clear it, and a node that restarts would silently thaw into a
+    /// cluster mid-`pg_upgrade`.
+    PgUpgradeFreeze { standbys: Vec<NodeId> },
 
     /// Track C: recipient drain observed (recipient still read-only).
     CutoverDrainObserved,
@@ -442,6 +496,19 @@ pub enum ClusterCommand {
     /// The primary's reconciler revokes from the committed record, so a node
     /// promoted mid-seal applies the same fence without being told again.
     CutoverSealing { app_roles: Vec<String> },
+
+    /// Track B: the primary serves again; release held clients. Standbys
+    /// still awaiting rejoin stay stopped.
+    PgUpgradeServe,
+
+    /// Track B: `node_id` rejoined the primary; its supervisor may run it.
+    PgUpgradeRejoined { node_id: NodeId },
+
+    /// Track B: the apply failed before the primary served; release clients
+    /// and every stopped standby, whose data still matches the primary.
+    /// Applies only while frozen: after SERVE a standby's data may be a major
+    /// the primary no longer runs, and rejoining is the only way back.
+    PgUpgradeAbort,
 }
 
 /// Highest cluster feature level this binary decodes.
@@ -465,7 +532,10 @@ impl ClusterCommand {
             Self::CutoverArmed { .. }
             | Self::CutoverSealing { .. }
             | Self::CutoverSeal { .. }
-            | Self::SetUpgradeFreeze { .. }
+            | Self::PgUpgradeFreeze { .. }
+            | Self::PgUpgradeServe
+            | Self::PgUpgradeRejoined { .. }
+            | Self::PgUpgradeAbort
             | Self::CutoverDrainObserved
             | Self::CutoverTransfer { .. }
             | Self::CutoverAbortUnseal { .. }
@@ -546,6 +616,8 @@ impl ClusterState {
                 self.nodes.remove(&id);
                 self.node_lsns.remove(&id);
                 self.recalculate_max_cluster_lsn();
+                // A removed node never rejoins; the upgrade must not wait on it.
+                self.pg_upgrade.awaiting_rejoin.retain(|n| *n != id);
             }
             // Wire-compat only: never issued in production. Does not affect
             // Raft leadership (`RaftMetrics::current_leader`).
@@ -590,12 +662,10 @@ impl ClusterState {
             ClusterCommand::SetSyncMode { active } => {
                 self.sync_replication_active = Some(active);
             }
-            ClusterCommand::SetUpgradeFreeze { frozen } => {
-                if self.upgrade_frozen == frozen {
-                    return CommandOutcome::OutOfOrder;
-                }
-                self.upgrade_frozen = frozen;
-            }
+            upgrade @ (ClusterCommand::PgUpgradeFreeze { .. }
+            | ClusterCommand::PgUpgradeServe
+            | ClusterCommand::PgUpgradeRejoined { .. }
+            | ClusterCommand::PgUpgradeAbort) => return self.pg_upgrade.apply(upgrade),
             cutover => return self.apply_cutover(cutover),
         }
         CommandOutcome::Applied
@@ -1075,10 +1145,127 @@ mod tests {
         assert_eq!(outcome, CommandOutcome::OutOfOrder);
         assert_eq!(state.cutover.phase, CutoverPhase::Idle);
         assert_eq!(
-            state.apply(ClusterCommand::SetUpgradeFreeze { frozen: true }),
+            state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![2] }),
             CommandOutcome::OutOfOrder
         );
-        assert!(!state.upgrade_frozen);
+        assert_eq!(state.pg_upgrade, PgUpgradeState::default());
+    }
+
+    fn frozen_with(standbys: &[NodeId]) -> ClusterState {
+        let mut state = at_current_level();
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeFreeze {
+                standbys: standbys.to_vec(),
+            }),
+            CommandOutcome::Applied
+        );
+        state
+    }
+
+    /// Between SERVE and a standby's rejoin, its data directory is the old
+    /// major and the primary runs the new one. The supervisor's auto-start
+    /// would race the rejoin with the old binaries, so the record keeps the
+    /// standby stopped until its own rejoin is committed.
+    #[test]
+    fn a_standby_stays_stopped_from_freeze_until_its_own_rejoin() {
+        let mut state = frozen_with(&[2, 3]);
+        assert!(state.pg_upgrade.frozen);
+        assert!(state.pg_upgrade.leaves_stopped(2));
+        assert!(!state.pg_upgrade.leaves_stopped(1));
+
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeServe),
+            CommandOutcome::Applied
+        );
+        assert!(!state.pg_upgrade.frozen);
+        assert!(
+            state.pg_upgrade.leaves_stopped(2),
+            "serving is not rejoined"
+        );
+
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeRejoined { node_id: 2 }),
+            CommandOutcome::Applied
+        );
+        assert!(!state.pg_upgrade.leaves_stopped(2));
+        assert!(state.pg_upgrade.leaves_stopped(3));
+        state.apply(ClusterCommand::PgUpgradeRejoined { node_id: 3 });
+        assert_eq!(state.pg_upgrade, PgUpgradeState::default());
+    }
+
+    /// Every step names a goal state, so an orchestrator retrying a step
+    /// whose response it lost converges instead of failing.
+    #[test]
+    fn a_retried_upgrade_step_is_a_no_op() {
+        let mut state = frozen_with(&[2]);
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![2] }),
+            CommandOutcome::Applied
+        );
+        state.apply(ClusterCommand::PgUpgradeServe);
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeServe),
+            CommandOutcome::Applied
+        );
+        state.apply(ClusterCommand::PgUpgradeRejoined { node_id: 2 });
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeRejoined { node_id: 2 }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeAbort),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.pg_upgrade, PgUpgradeState::default());
+    }
+
+    /// A failed apply leaves the primary and its stopped standbys on the same
+    /// major, so abort releases them all to the supervisors' normal start.
+    /// After SERVE it may not: a standby's data can be a major the primary no
+    /// longer runs.
+    #[test]
+    fn abort_releases_the_standbys_only_while_frozen() {
+        let mut state = frozen_with(&[2, 3]);
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeAbort),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.pg_upgrade, PgUpgradeState::default());
+
+        let mut served = frozen_with(&[2]);
+        served.apply(ClusterCommand::PgUpgradeServe);
+        assert_eq!(
+            served.apply(ClusterCommand::PgUpgradeAbort),
+            CommandOutcome::OutOfOrder
+        );
+        assert!(served.pg_upgrade.leaves_stopped(2));
+    }
+
+    /// One upgrade at a time: a second freeze while a standby still awaits
+    /// its rejoin would forget that standby.
+    #[test]
+    fn a_freeze_is_refused_while_an_upgrade_is_in_flight() {
+        let mut state = frozen_with(&[2]);
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![3] }),
+            CommandOutcome::OutOfOrder
+        );
+        state.apply(ClusterCommand::PgUpgradeServe);
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![3] }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(state.pg_upgrade.awaiting_rejoin, vec![2]);
+    }
+
+    /// A standby removed from the cluster can never rejoin; the upgrade
+    /// record must not wait on it forever.
+    #[test]
+    fn removing_a_node_drops_it_from_the_rejoin_list() {
+        let mut state = frozen_with(&[2, 3]);
+        state.apply(ClusterCommand::PgUpgradeServe);
+        state.apply(ClusterCommand::RemoveNode(2));
+        assert_eq!(state.pg_upgrade.awaiting_rejoin, vec![3]);
     }
 
     /// A rewind may discard without bound only while the committed record
@@ -1107,7 +1294,7 @@ mod tests {
         );
         assert_eq!(state.feature_level, 1);
         assert_eq!(
-            state.apply(ClusterCommand::SetUpgradeFreeze { frozen: true }),
+            state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![] }),
             CommandOutcome::Applied
         );
         assert_eq!(

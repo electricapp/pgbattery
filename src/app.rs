@@ -1476,13 +1476,13 @@ impl App {
 
         // node_id → pg_addr is membership data (Raft-replicated, static per
         // node), not leadership data, so the nodes map is the right source.
-        // upgrade_frozen rides the same committed-state read: the Track B
-        // freeze decides below whether a stopped standby is left alone.
-        let (leader_pg_addr, upgrade_frozen, rewind_budget) = {
+        // The Track B record rides the same committed-state read: it decides
+        // below whether a stopped standby is left alone.
+        let (leader_pg_addr, awaits_rejoin, rewind_budget) = {
             let state = cluster_state.read();
             (
                 state.nodes.get(&leader_id).map(|n| n.pg_addr),
-                state.upgrade_frozen,
+                state.pg_upgrade.leaves_stopped(node_id),
                 state.rewind_budget(),
             )
         };
@@ -1509,7 +1509,7 @@ impl App {
             &mut *pg,
             addr,
             "follow leader",
-            upgrade_frozen,
+            awaits_rejoin,
             rewind_budget,
         )
         .await;
@@ -1847,7 +1847,7 @@ impl App {
         pg: &mut P,
         leader_addr: SocketAddr,
         context: &str,
-        upgrade_frozen: bool,
+        awaits_rejoin: bool,
         rewind_budget: crate::supervisor::RewindBudget,
     ) {
         // We log + count per-cause failures here rather than propagating: the
@@ -1863,25 +1863,26 @@ impl App {
         // `demote` is timeout-bounded, though bounded is not brief (~20 min
         // worst case); the lease fence runs on its own session meanwhile.
         //
-        // Logged once per freeze so the 2 s tick does not flood the log.
-        static FREEZE_SKIP_LOGGED: std::sync::atomic::AtomicBool =
+        // Logged once per upgrade so the 2 s tick does not flood the log.
+        static REJOIN_SKIP_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
 
-        // A stopped standby stays stopped while the committed upgrade freeze
-        // is on: the orchestrator stopped it and rejoins it itself, and an
-        // auto-start here races that rejoin.
-        if Self::reconcile_leaves_stopped_standby(upgrade_frozen, pg.has_postmaster()) {
-            if !FREEZE_SKIP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // A stopped standby the committed upgrade record lists stays stopped:
+        // the orchestrator stopped it and rejoins it itself, and an auto-start
+        // here races that rejoin with binaries for a major the primary may no
+        // longer run.
+        if Self::reconcile_leaves_stopped_standby(awaits_rejoin, pg.has_postmaster()) {
+            if !REJOIN_SKIP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 info!(
                     %leader_addr,
-                    "Upgrade freeze committed: leaving the stopped standby to the \
+                    "Upgrade record lists this standby: leaving it stopped for the \
                      upgrade orchestrator (further skips not logged)"
                 );
             }
             return;
         }
-        if !upgrade_frozen {
-            FREEZE_SKIP_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
+        if !awaits_rejoin {
+            REJOIN_SKIP_LOGGED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
         // The fence applies only to a (possibly) writable primary — see
         // `should_fence_before_demote`. A steady-state follower takes the
@@ -2288,13 +2289,13 @@ impl App {
         has_postmaster && !matches!(in_recovery, Some(true))
     }
 
-    /// Pure decision for `demote_to_leader`: while the committed Track B
-    /// upgrade freeze is on, a stopped standby stays stopped. The upgrade
-    /// orchestrator stopped it deliberately and rejoins it with a wipe plus
-    /// basebackup from the upgraded primary; a reconcile-tick auto-start
-    /// races that rejoin with the pre-upgrade binaries.
-    const fn reconcile_leaves_stopped_standby(upgrade_frozen: bool, has_postmaster: bool) -> bool {
-        upgrade_frozen && !has_postmaster
+    /// Pure decision for `demote_to_leader`: a stopped standby the committed
+    /// Track B record awaits stays stopped. The upgrade orchestrator stopped
+    /// it deliberately and rejoins it with a wipe plus basebackup from the
+    /// upgraded primary; a reconcile-tick auto-start races that rejoin with
+    /// the pre-upgrade binaries.
+    const fn reconcile_leaves_stopped_standby(awaits_rejoin: bool, has_postmaster: bool) -> bool {
+        awaits_rejoin && !has_postmaster
     }
 
     /// Pure decision for `lease_enforcement_tick`, given the post-probe lease
@@ -4967,9 +4968,9 @@ mod tests {
     /// The upgrade orchestrator stops standbys and rejoins them itself; a
     /// reconcile-tick auto-start races the orchestrated rejoin with the
     /// pre-upgrade binaries. A running standby is still reconciled normally,
-    /// and everything reconciles once the freeze clears.
+    /// and a standby reconciles once its rejoin is committed.
     #[test]
-    fn the_reconcile_loop_leaves_a_stopped_standby_alone_while_frozen() {
+    fn the_reconcile_loop_leaves_a_stopped_standby_alone_until_rejoined() {
         assert!(App::reconcile_leaves_stopped_standby(true, false));
 
         assert!(!App::reconcile_leaves_stopped_standby(true, true));

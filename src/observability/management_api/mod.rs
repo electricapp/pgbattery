@@ -75,7 +75,7 @@ pub use upgrade::{
     PostgresUpgradePreflightRequest, PostgresUpgradePreflightResponse,
     PostgresUpgradeRejoinRequest, PostgresUpgradeRejoinResponse, PostgresUpgradeRollbackRequest,
     PostgresUpgradeRollbackResponse, SelfUpgradeHttpRequest, SelfUpgradeResponse,
-    UpgradeFreezeRequest, UpgradeFreezeResponse,
+    UpgradeRecordResponse, UpgradeRecordStep,
 };
 
 /// Re-export `JoinRequest` from cluster module
@@ -441,8 +441,8 @@ pub async fn start_management_api(
             post(cutover::advance_sequences),
         )
         .route(
-            "/api/v1/admin/postgres-upgrade/freeze",
-            post(upgrade::set_upgrade_freeze),
+            "/api/v1/admin/postgres-upgrade/record",
+            post(upgrade::commit_upgrade_step),
         )
         .route("/api/v1/admin/postgres/stop", post(upgrade::stop_postgres))
         .route(

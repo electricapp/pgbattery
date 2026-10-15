@@ -668,7 +668,7 @@ impl Governor {
                 &self.cluster_id,
                 self.awaits_authority_from.as_deref(),
             );
-            (authority, relay, state.upgrade_frozen)
+            (authority, relay, state.pg_upgrade.frozen)
         };
         self.fence_tx.send_if_modified(|current| {
             let new_fence = FenceState {

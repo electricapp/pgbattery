@@ -21,7 +21,10 @@ enums.ClusterCommand = [
   "CutoverTransfer",
   "CutoverAbortUnseal",
   "CutoverAuthorityReceived",
-  "SetUpgradeFreeze",
+  "PgUpgradeFreeze",
+  "PgUpgradeServe",
+  "PgUpgradeRejoined",
+  "PgUpgradeAbort",
   "SetFeatureLevel",
 ]
 enums.CutoverPhase = ["Idle", "Armed", "Sealing", "Sealed", "Draining", "Transferred", "Aborted"]
@@ -49,6 +52,8 @@ enums.StatementClass = ["Modeled", "Unmodeled"]
 types = [
   "ClusterState",
   "ClusterCommand",
+  "PgUpgradeState",
+  "UpgradeRecordStep",
   "CutoverAuthorityState",
   "CutoverPhase",
   "CommandOutcome",

@@ -697,33 +697,41 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
-    /// Set or clear Track B upgrade freeze (`POST .../postgres-upgrade/freeze`).
+    /// Commit one Track B upgrade record step
+    /// (`POST .../postgres-upgrade/record`). A refusal by the record (409)
+    /// and a node that could not commit (503) both come back as the parsed
+    /// answer, so the caller can tell "wrong step" from "try another node".
     ///
     /// # Errors
-    /// Unreachable or unauthorized.
-    pub async fn set_upgrade_freeze(
+    /// Unreachable, unauthorized, or an unparseable answer.
+    pub async fn commit_upgrade_step(
         &self,
         addr: &str,
-        frozen: bool,
-    ) -> Result<crate::observability::management_api::UpgradeFreezeResponse> {
-        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/freeze");
-        let body = crate::observability::management_api::UpgradeFreezeRequest { frozen };
+        step: &crate::observability::management_api::UpgradeRecordStep,
+    ) -> Result<(
+        reqwest::StatusCode,
+        crate::observability::management_api::UpgradeRecordResponse,
+    )> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/record");
         let resp = self
-            .add_management_token(self.client.post(&url).json(&body))
+            .add_management_token(self.client.post(&url).json(step))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err_body = read_error_body(resp).await;
-            anyhow::bail!(management_api_failure(
-                "Upgrade freeze",
-                status,
-                &err_body,
-                self.management_api_token.is_some()
-            ));
+        let status = resp.status();
+        if status.is_success()
+            || status == reqwest::StatusCode::CONFLICT
+            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Ok((status, resp.json().await?));
         }
-        Ok(resp.json().await?)
+        let err_body = read_error_body(resp).await;
+        anyhow::bail!(management_api_failure(
+            "Upgrade record step",
+            status,
+            &err_body,
+            self.management_api_token.is_some()
+        ))
     }
 
     /// Stop `PostgreSQL` on a node (`POST /api/v1/admin/postgres/stop`).

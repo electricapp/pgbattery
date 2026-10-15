@@ -399,6 +399,11 @@ pub enum UpgradeSubcommand {
         #[arg(long)]
         rollback: bool,
 
+        /// Abort an upgrade left frozen (orchestrator died before the
+        /// primary served): release held clients and the stopped standbys
+        #[arg(long)]
+        abort: bool,
+
         /// Track C: logical blue/green major upgrade. --check runs catalog
         /// preflight; --experimental runs the cutover against an already
         /// seeded green cluster (provisioning and seeding are not implemented)
