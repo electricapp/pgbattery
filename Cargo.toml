@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99"
 license = "AGPL-3.0-only"
 repository = "https://github.com/electricapp/pgbattery"
 
@@ -109,7 +109,7 @@ rustls-pemfile = "2"
 figment = { version = "0.10", features = ["toml", "env"] }
 # Format/comment-preserving keyed edits of the node's own config file
 # (Track B durable retarget of pg_bin_dir / pg_data_dir).
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 # Observability
 tracing = "0.1"

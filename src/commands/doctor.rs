@@ -904,7 +904,7 @@ mod tests {
             message: "Reachability latency from this host: 250ms".to_string(),
             details: None,
         };
-        assert!(strict_gate_violations(&[check]).is_empty());
+        assert_eq!(strict_gate_violations(&[check]), Vec::<String>::new());
     }
 
     #[test]
@@ -933,7 +933,7 @@ mod tests {
                 .to_string(),
             details: None,
         };
-        assert!(strict_gate_violations(&[check]).is_empty());
+        assert_eq!(strict_gate_violations(&[check]), Vec::<String>::new());
     }
 
     #[test]

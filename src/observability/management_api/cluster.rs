@@ -277,7 +277,7 @@ fn validate_join_request(
 async fn add_learner_with_retry(
     state: &ManagementApiState,
     req: &JoinRequest,
-) -> Result<u32, AddLearnerError> {
+) -> Result<u32, Box<AddLearnerError>> {
     let node = BasicNode {
         addr: req.raft_addr.clone(),
     };
@@ -308,7 +308,7 @@ async fn add_learner_with_retry(
                     );
                     tokio::time::sleep(retry_delay).await;
                 } else {
-                    return Err(err);
+                    return Err(Box::new(err));
                 }
             }
         }

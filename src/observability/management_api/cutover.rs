@@ -1201,7 +1201,7 @@ async fn donor_claim(
 async fn await_donor_quorum(
     state: &ManagementApiState,
     body: &CutoverReceiveAuthorityRequest,
-) -> Result<usize, (StatusCode, Json<CutoverActionResponse>)> {
+) -> Result<usize, Box<(StatusCode, Json<CutoverActionResponse>)>> {
     let client = reqwest::Client::builder()
         .timeout(DONOR_CLAIM_TIMEOUT)
         .build()
@@ -1251,7 +1251,7 @@ async fn await_donor_quorum(
                     if answer.claim == DonorClaim::Confirms
                         && !donor_list_covers_majority(listed, voters)
                     {
-                        return Err(refuse(
+                        return Err(Box::new(refuse(
                             state,
                             StatusCode::CONFLICT,
                             format!(
@@ -1260,14 +1260,14 @@ async fn await_donor_quorum(
                                  against — a majority of the real donor cluster cannot \
                                  fit in that list. Pass the donor's full node set."
                             ),
-                        ));
+                        )));
                     }
                 }
                 return Ok(confirming);
             }
             DonorPollVerdict::Retry => tokio::time::sleep(DONOR_POLL_INTERVAL).await,
             DonorPollVerdict::Expired => {
-                return Err(refuse(
+                return Err(Box::new(refuse(
                     state,
                     StatusCode::CONFLICT,
                     format!(
@@ -1280,7 +1280,7 @@ async fn await_donor_quorum(
                         body.epoch,
                         DONOR_QUORUM_BUDGET.as_secs(),
                     ),
-                ));
+                )));
             }
         }
     }
@@ -1337,7 +1337,7 @@ pub(super) async fn cutover_receive_authority(
                 donor_nodes = body.donor_mgmt_addrs.len(),
                 "Donor quorum confirms the handoff"
             ),
-            Err(refusal) => return refusal,
+            Err(refusal) => return *refusal,
         }
     }
 
@@ -1539,7 +1539,7 @@ mod tests {
     fn zero_slots_is_no_confirmation_at_all() {
         let resp = parse_donor_retention_line("0|0|0||").unwrap();
         assert_eq!(resp.min_confirmed_flush_lsn, None);
-        assert!(resp.slot_names.is_empty());
+        assert_eq!(resp.slot_names, Vec::<String>::new());
     }
 
     /// A malformed reply is an error the handler must report — the previous

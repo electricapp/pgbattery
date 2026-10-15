@@ -1366,7 +1366,7 @@ mod tests {
         // Grace elapsed with replicas still absent: the genuine
         // all-replicas-dead case must still fall back to async.
         let (plan, fallback) = planned_sync_names(&voters, 0, true, false);
-        assert!(plan.is_empty());
+        assert_eq!(plan, "");
         assert!(fallback);
 
         // A healthy replica during grace behaves as normal sync.
@@ -1381,7 +1381,7 @@ mod tests {
     fn test_single_node_has_empty_sync_list() {
         for in_grace in [false, true] {
             let (plan, fallback) = planned_sync_names(&[], 0, true, in_grace);
-            assert!(plan.is_empty());
+            assert_eq!(plan, "");
             assert!(!fallback, "no standby exists whose ack we are giving up");
         }
     }

@@ -565,8 +565,8 @@ mod tests {
         let required = vec!["bg_app".to_string(), "reporter".to_string()];
         let present = vec!["bg_app".to_string()];
         assert_eq!(missing_roles(&required, &present), vec!["reporter"]);
-        assert!(missing_roles(&required, &required).is_empty());
-        assert!(missing_roles(&[], &[]).is_empty());
+        assert_eq!(missing_roles(&required, &required), Vec::<String>::new());
+        assert_eq!(missing_roles(&[], &[]), Vec::<String>::new());
     }
 
     /// The password never enters a child argv: ps shows argv to every local

@@ -4611,15 +4611,13 @@ mod tests {
         );
         // DISCARD PLANS / SEQUENCES / TEMP leave prepared statements and
         // LISTEN registrations alone.
-        assert!(
-            ConnectionHandler::analyze_query("DISCARD PLANS")
-                .session_changes
-                .is_empty()
+        assert_eq!(
+            ConnectionHandler::analyze_query("DISCARD PLANS").session_changes,
+            Vec::<SessionChange>::new()
         );
-        assert!(
-            ConnectionHandler::analyze_query("DISCARD SEQUENCES")
-                .session_changes
-                .is_empty()
+        assert_eq!(
+            ConnectionHandler::analyze_query("DISCARD SEQUENCES").session_changes,
+            Vec::<SessionChange>::new()
         );
     }
 

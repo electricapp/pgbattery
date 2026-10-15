@@ -1285,7 +1285,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(r.sequence_count, 0);
-        assert!(r.replica_identity_failures.is_empty());
+        assert_eq!(r.replica_identity_failures, Vec::<String>::new());
     }
 
     /// `GRANT INSERT ON t TO PUBLIC` fences nobody: REVOKE on the named roles
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn a_clean_acl_world_passes_coverage() {
-        assert!(coverage_gap_failures(&[], &[]).is_empty());
+        assert_eq!(coverage_gap_failures(&[], &[]), Vec::<String>::new());
     }
 
     /// A row the classifier cannot parse is a refusal, never silently dropped.
@@ -1508,7 +1508,10 @@ mod tests {
             obs("green1", true, 3, Some("green")),
             obs("green2", true, 3, Some("green")),
         ];
-        assert!(authority_mismatches(&donors, &recipients, "green", 3).is_empty());
+        assert_eq!(
+            authority_mismatches(&donors, &recipients, "green", 3),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1534,7 +1537,10 @@ mod tests {
         ];
         let findings = unmanaged_database_findings(&rows);
         assert_eq!(findings, vec!["analytics (12 user relations)"]);
-        assert!(unmanaged_database_findings(&[("d".into(), 0)]).is_empty());
+        assert_eq!(
+            unmanaged_database_findings(&[("d".into(), 0)]),
+            Vec::<String>::new()
+        );
     }
 
     /// The database sweep must skip templates and unconnectable databases,

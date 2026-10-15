@@ -286,6 +286,10 @@ impl ModelPg {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "the model defers its side effects to the await, as the real Supervisor does"
+)]
 impl PgControl for ModelPg {
     fn has_postmaster(&self) -> bool {
         self.has_postmaster

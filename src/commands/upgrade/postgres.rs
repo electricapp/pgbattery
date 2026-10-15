@@ -3427,7 +3427,10 @@ Bytes per WAL segment:                16777216\n";
             vec!["missing_ext".to_string()]
         );
         let present_only = vec!["ok".to_string()];
-        assert!(missing_controls_in_sharedir(dir.path(), &present_only).is_empty());
+        assert_eq!(
+            missing_controls_in_sharedir(dir.path(), &present_only),
+            Vec::<String>::new()
+        );
     }
 
     /// Drives the refusing function (the previous version formatted a copy

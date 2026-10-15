@@ -1121,6 +1121,10 @@ pub struct LogStorageAdapter {
     storage: RedbLogStorage,
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "returns openraft's StorageError, the error type its storage traits fix"
+)]
 impl LogStorageAdapter {
     /// Wrap a log store.
     ///
@@ -1130,14 +1134,10 @@ impl LogStorageAdapter {
     pub(crate) const fn new(storage: RedbLogStorage) -> Self {
         Self { storage }
     }
-}
 
-impl RaftLogReader<TypeConfig> for LogStorageAdapter {
-    async fn try_get_log_entries<
-        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
-    >(
-        &mut self,
-        range: RB,
+    fn entries_in<RB: std::ops::RangeBounds<u64>>(
+        &self,
+        range: &RB,
     ) -> std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
         let start = match range.start_bound() {
             std::ops::Bound::Included(&n) => n,
@@ -1157,14 +1157,8 @@ impl RaftLogReader<TypeConfig> for LogStorageAdapter {
 
         Ok(entries.into_iter().map(log_entry_to_openraft).collect())
     }
-}
 
-impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
-    type LogReader = Self;
-
-    async fn get_log_state(
-        &mut self,
-    ) -> std::result::Result<LogState<TypeConfig>, StorageError<NodeId>> {
+    fn log_state(&self) -> std::result::Result<LogState<TypeConfig>, StorageError<NodeId>> {
         let last = self
             .storage
             .last_entry()
@@ -1192,8 +1186,8 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
         })
     }
 
-    async fn read_vote(
-        &mut self,
+    fn stored_vote(
+        &self,
     ) -> std::result::Result<Option<OpenRaftVote<NodeId>>, StorageError<NodeId>> {
         let vote = self.storage.load_vote().map_err(|e| storage_read_err(&e))?;
 
@@ -1236,6 +1230,37 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
         );
         Ok(Some(result))
     }
+}
+
+impl RaftLogReader<TypeConfig> for LogStorageAdapter {
+    fn try_get_log_entries<
+        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
+    >(
+        &mut self,
+        range: RB,
+    ) -> impl Future<Output = std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>>> + Send
+    {
+        std::future::ready(self.entries_in(&range))
+    }
+}
+
+impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
+    type LogReader = Self;
+
+    fn get_log_state(
+        &mut self,
+    ) -> impl Future<Output = std::result::Result<LogState<TypeConfig>, StorageError<NodeId>>> + Send
+    {
+        std::future::ready(self.log_state())
+    }
+
+    fn read_vote(
+        &mut self,
+    ) -> impl Future<
+        Output = std::result::Result<Option<OpenRaftVote<NodeId>>, StorageError<NodeId>>,
+    > + Send {
+        std::future::ready(self.stored_vote())
+    }
 
     async fn save_vote(
         &mut self,
@@ -1257,10 +1282,10 @@ impl RaftLogStorage<TypeConfig> for LogStorageAdapter {
             .map_err(|e| storage_write_err(&e))
     }
 
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        Self {
+    fn get_log_reader(&mut self) -> impl Future<Output = Self::LogReader> + Send {
+        std::future::ready(Self {
             storage: self.storage.clone(),
-        }
+        })
     }
 
     /// Appends are durable before the flush callback fires, and the fsync is
@@ -1393,6 +1418,13 @@ pub struct StateMachineStore {
     snapshot_consistency: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// The applied position and membership `RaftStateMachine::applied_state` reports.
+type AppliedState = (Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>);
+
+#[allow(
+    clippy::result_large_err,
+    reason = "returns openraft's StorageError, the error type its storage traits fix"
+)]
 impl StateMachineStore {
     /// Build a state machine over `state` and `storage`.
     ///
@@ -1408,17 +1440,8 @@ impl StateMachineStore {
             snapshot_consistency: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
-}
 
-impl RaftStateMachine<TypeConfig> for StateMachineStore {
-    type SnapshotBuilder = Self;
-
-    async fn applied_state(
-        &mut self,
-    ) -> std::result::Result<
-        (Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>),
-        StorageError<NodeId>,
-    > {
+    fn load_applied_state(&self) -> std::result::Result<AppliedState, StorageError<NodeId>> {
         // Load last applied state using proper Option semantics
         let last_applied = self
             .storage
@@ -1467,6 +1490,16 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         );
 
         Ok((log_id, membership))
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for StateMachineStore {
+    type SnapshotBuilder = Self;
+
+    fn applied_state(
+        &mut self,
+    ) -> impl Future<Output = std::result::Result<AppliedState, StorageError<NodeId>>> + Send {
+        std::future::ready(self.load_applied_state())
     }
 
     async fn apply<I>(
@@ -1534,19 +1567,20 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         Ok(responses)
     }
 
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        Self {
+    fn get_snapshot_builder(&mut self) -> impl Future<Output = Self::SnapshotBuilder> + Send {
+        std::future::ready(Self {
             state: self.state.clone(),
             storage: self.storage.clone(),
             applied_end: self.applied_end.clone(),
             snapshot_consistency: self.snapshot_consistency.clone(),
-        }
+        })
     }
 
-    async fn begin_receiving_snapshot(
+    fn begin_receiving_snapshot(
         &mut self,
-    ) -> std::result::Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> impl Future<Output = std::result::Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>>> + Send
+    {
+        std::future::ready(Ok(Box::new(Cursor::new(Vec::new()))))
     }
 
     async fn install_snapshot(
@@ -1937,7 +1971,11 @@ impl NetworkFactory {
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = NetworkConnection;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+    fn new_client(
+        &mut self,
+        target: NodeId,
+        node: &BasicNode,
+    ) -> impl Future<Output = Self::Network> + Send {
         // Use the address from openraft's membership (node.addr) first,
         // fall back to our peers config if parsing fails
         let addr = node.addr.parse::<SocketAddr>().ok().or_else(|| {
@@ -1947,12 +1985,12 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
                 .map(|p| p.raft_addr)
         });
 
-        NetworkConnection {
+        std::future::ready(NetworkConnection {
             target_addr: addr,
             rpc_client: self.rpc_client.clone(),
             conn: None,
             heartbeat: self.heartbeat,
-        }
+        })
     }
 }
 

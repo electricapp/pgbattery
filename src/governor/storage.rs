@@ -2098,21 +2098,32 @@ mod tests {
         /// removes the `raft.db` when the case ends.
         struct Builder;
 
+        #[allow(
+            clippy::result_large_err,
+            reason = "returns openraft's StorageError, the error type StoreBuilder fixes"
+        )]
+        fn build_stores() -> std::result::Result<
+            (TempDir, LogStorageAdapter, StateMachineStore),
+            StorageError<NodeId>,
+        > {
+            let dir = tempdir().map_err(|e| build_err(&e))?;
+            let storage =
+                RedbLogStorage::new(dir.path().join("raft.db")).map_err(|e| build_err(&e))?;
+            let state_machine =
+                StateMachineStore::new(Arc::new(RwLock::new(ClusterState::new())), storage.clone());
+            Ok((dir, LogStorageAdapter::new(storage), state_machine))
+        }
+
         impl StoreBuilder<TypeConfig, LogStorageAdapter, StateMachineStore, TempDir> for Builder {
-            async fn build(
+            fn build(
                 &self,
-            ) -> std::result::Result<
-                (TempDir, LogStorageAdapter, StateMachineStore),
-                StorageError<NodeId>,
-            > {
-                let dir = tempdir().map_err(|e| build_err(&e))?;
-                let storage =
-                    RedbLogStorage::new(dir.path().join("raft.db")).map_err(|e| build_err(&e))?;
-                let state_machine = StateMachineStore::new(
-                    Arc::new(RwLock::new(ClusterState::new())),
-                    storage.clone(),
-                );
-                Ok((dir, LogStorageAdapter::new(storage), state_machine))
+            ) -> impl Future<
+                Output = std::result::Result<
+                    (TempDir, LogStorageAdapter, StateMachineStore),
+                    StorageError<NodeId>,
+                >,
+            > + Send {
+                std::future::ready(build_stores())
             }
         }
 
