@@ -139,6 +139,12 @@ pub struct ClusterState {
     /// so the intent outlives the joiner that asked and any leader change.
     #[serde(default)]
     pub voter_intent: Vec<NodeId>,
+
+    /// The cluster's `PostgreSQL` lineage (database system identifier),
+    /// committed once by the first leader whose primary serves. A standby
+    /// follows, rewinds onto and clones only a leader that serves it.
+    #[serde(default)]
+    pub lineage: Option<u64>,
 }
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
@@ -170,6 +176,7 @@ impl From<ClusterStateV0> for ClusterState {
             applied_index: None,
             feature_level: 0,
             voter_intent: Vec::new(),
+            lineage: None,
         }
     }
 }
@@ -314,7 +321,7 @@ impl PgUpgradeState {
                 self.frozen = true;
                 self.awaiting_rejoin = standbys;
             }
-            ClusterCommand::PgUpgradeServe => self.frozen = false,
+            ClusterCommand::PgUpgradeServe { .. } => self.frozen = false,
             ClusterCommand::PgUpgradeRejoined { node_id } => {
                 self.awaiting_rejoin.retain(|n| *n != node_id);
             }
@@ -505,8 +512,13 @@ pub enum ClusterCommand {
     CutoverSealing { app_roles: Vec<String> },
 
     /// Track B: the primary serves again; release held clients. Standbys
-    /// still awaiting rejoin stay stopped.
-    PgUpgradeServe,
+    /// still awaiting rejoin stay stopped. `lineage` is the swapped data
+    /// directory's system identifier, which `pg_upgrade` mints anew; it
+    /// becomes the cluster's lineage in this same entry.
+    PgUpgradeServe {
+        #[serde(default)]
+        lineage: Option<u64>,
+    },
 
     /// Track B: `node_id` rejoined the primary; its supervisor may run it.
     PgUpgradeRejoined { node_id: NodeId },
@@ -520,6 +532,11 @@ pub enum ClusterCommand {
     /// `node_id` is meant to be a voter; the leader promotes it once it is a
     /// caught-up learner.
     IntendVoter { node_id: NodeId },
+
+    /// Record the cluster's `PostgreSQL` lineage. Set once; a different value
+    /// later is refused, so no leader can rewrite which data is the
+    /// cluster's.
+    SetLineage { system_identifier: u64 },
 }
 
 /// Highest cluster feature level this binary decodes.
@@ -544,10 +561,11 @@ impl ClusterCommand {
             | Self::CutoverSealing { .. }
             | Self::CutoverSeal { .. }
             | Self::PgUpgradeFreeze { .. }
-            | Self::PgUpgradeServe
+            | Self::PgUpgradeServe { .. }
             | Self::PgUpgradeRejoined { .. }
             | Self::PgUpgradeAbort
             | Self::IntendVoter { .. }
+            | Self::SetLineage { .. }
             | Self::CutoverDrainObserved
             | Self::CutoverTransfer { .. }
             | Self::CutoverAbortUnseal { .. }
@@ -638,6 +656,24 @@ impl ClusterState {
                     self.voter_intent.insert(at, node_id);
                 }
             }
+            ClusterCommand::SetLineage { system_identifier } => match self.lineage {
+                Some(current) if current != system_identifier => {
+                    return CommandOutcome::OutOfOrder;
+                }
+                _ => self.lineage = Some(system_identifier),
+            },
+            // pg_upgrade gives the swapped data directory a new identifier:
+            // the lineage moves with the release of a frozen upgrade, in the
+            // same entry, so no standby ever sees the swapped primary as
+            // foreign and no stray write can move it otherwise.
+            ClusterCommand::PgUpgradeServe {
+                lineage: Some(swapped),
+            } if self.pg_upgrade.frozen => {
+                self.lineage = Some(swapped);
+                return self
+                    .pg_upgrade
+                    .apply(ClusterCommand::PgUpgradeServe { lineage: None });
+            }
             // Wire-compat only: never issued in production. Does not affect
             // Raft leadership (`RaftMetrics::current_leader`).
             ClusterCommand::UpdateNode { id, role } => {
@@ -682,7 +718,7 @@ impl ClusterState {
                 self.sync_replication_active = Some(active);
             }
             upgrade @ (ClusterCommand::PgUpgradeFreeze { .. }
-            | ClusterCommand::PgUpgradeServe
+            | ClusterCommand::PgUpgradeServe { .. }
             | ClusterCommand::PgUpgradeRejoined { .. }
             | ClusterCommand::PgUpgradeAbort) => return self.pg_upgrade.apply(upgrade),
             cutover => return self.apply_cutover(cutover),
@@ -1082,6 +1118,23 @@ impl ClusterState {
         }
     }
 
+    /// What the committed record lets a standby do to follow a leader.
+    #[must_use]
+    pub const fn follow_terms(&self) -> crate::supervisor::FollowTerms {
+        let records_lineage = ClusterCommand::SetLineage {
+            system_identifier: 0,
+        }
+        .required_feature_level();
+        crate::supervisor::FollowTerms {
+            rewind_budget: self.rewind_budget(),
+            lineage: if self.feature_level >= records_lineage {
+                crate::supervisor::LineageTerm::Committed(self.lineage)
+            } else {
+                crate::supervisor::LineageTerm::Unenforced
+            },
+        }
+    }
+
     /// LSN catch-up threshold (bytes) for election/promotion gates, applying
     /// the fail-safe rule for [`ClusterState::sync_replication_active`]: only a
     /// *positively known* async mode (`Some(false)`) gets the loose threshold;
@@ -1193,7 +1246,7 @@ mod tests {
         assert!(!state.pg_upgrade.leaves_stopped(1));
 
         assert_eq!(
-            state.apply(ClusterCommand::PgUpgradeServe),
+            state.apply(ClusterCommand::PgUpgradeServe { lineage: None }),
             CommandOutcome::Applied
         );
         assert!(!state.pg_upgrade.frozen);
@@ -1221,9 +1274,9 @@ mod tests {
             state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![2] }),
             CommandOutcome::Applied
         );
-        state.apply(ClusterCommand::PgUpgradeServe);
+        state.apply(ClusterCommand::PgUpgradeServe { lineage: None });
         assert_eq!(
-            state.apply(ClusterCommand::PgUpgradeServe),
+            state.apply(ClusterCommand::PgUpgradeServe { lineage: None }),
             CommandOutcome::Applied
         );
         state.apply(ClusterCommand::PgUpgradeRejoined { node_id: 2 });
@@ -1252,7 +1305,7 @@ mod tests {
         assert_eq!(state.pg_upgrade, PgUpgradeState::default());
 
         let mut served = frozen_with(&[2]);
-        served.apply(ClusterCommand::PgUpgradeServe);
+        served.apply(ClusterCommand::PgUpgradeServe { lineage: None });
         assert_eq!(
             served.apply(ClusterCommand::PgUpgradeAbort),
             CommandOutcome::OutOfOrder
@@ -1269,12 +1322,87 @@ mod tests {
             state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![3] }),
             CommandOutcome::OutOfOrder
         );
-        state.apply(ClusterCommand::PgUpgradeServe);
+        state.apply(ClusterCommand::PgUpgradeServe { lineage: None });
         assert_eq!(
             state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![3] }),
             CommandOutcome::OutOfOrder
         );
         assert_eq!(state.pg_upgrade.awaiting_rejoin, vec![2]);
+    }
+
+    /// The lineage is set once. A leader serving different data — a wiped
+    /// node that initdb'd a fresh cluster under a live id — cannot rewrite
+    /// which data is the cluster's.
+    #[test]
+    fn the_cluster_lineage_is_set_once_and_never_rewritten() {
+        let mut state = at_current_level();
+        assert_eq!(
+            state.apply(ClusterCommand::SetLineage {
+                system_identifier: 7
+            }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.lineage, Some(7));
+        assert_eq!(
+            state.apply(ClusterCommand::SetLineage {
+                system_identifier: 7
+            }),
+            CommandOutcome::Applied,
+            "a retried commit of the same lineage converges"
+        );
+        assert_eq!(
+            state.apply(ClusterCommand::SetLineage {
+                system_identifier: 9
+            }),
+            CommandOutcome::OutOfOrder
+        );
+        assert_eq!(state.lineage, Some(7));
+        assert_eq!(
+            state.follow_terms().lineage,
+            crate::supervisor::LineageTerm::Committed(Some(7))
+        );
+    }
+
+    /// Below the feature level that records a lineage no member can commit
+    /// one, so the gate is off: enforcing it would leave every follower
+    /// deferring forever on a lineage nobody may write.
+    #[test]
+    fn the_lineage_gate_waits_for_the_feature_level_that_records_one() {
+        use crate::supervisor::LineageTerm;
+        assert_eq!(
+            ClusterState::default().follow_terms().lineage,
+            LineageTerm::Unenforced
+        );
+        assert_eq!(
+            at_current_level().follow_terms().lineage,
+            LineageTerm::Committed(None)
+        );
+    }
+
+    /// `pg_upgrade` mints a new identifier for the swapped directory. The
+    /// lineage moves with the release of the frozen upgrade, in one entry, so
+    /// no standby sees the swapped primary as foreign; a release that is not
+    /// of a frozen upgrade moves nothing.
+    #[test]
+    fn the_lineage_moves_only_with_the_release_of_a_frozen_upgrade() {
+        let mut state = at_current_level();
+        state.apply(ClusterCommand::SetLineage {
+            system_identifier: 7,
+        });
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeServe { lineage: Some(9) }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.lineage, Some(7), "nothing was frozen");
+
+        state.apply(ClusterCommand::PgUpgradeFreeze { standbys: vec![2] });
+        assert_eq!(
+            state.apply(ClusterCommand::PgUpgradeServe { lineage: Some(9) }),
+            CommandOutcome::Applied
+        );
+        assert_eq!(state.lineage, Some(9));
+        assert!(!state.pg_upgrade.frozen);
+        assert!(state.pg_upgrade.leaves_stopped(2));
     }
 
     /// Voter intent is a set: repeating it changes nothing, and it outlives
@@ -1298,7 +1426,7 @@ mod tests {
     #[test]
     fn removing_a_node_drops_it_from_the_rejoin_list() {
         let mut state = frozen_with(&[2, 3]);
-        state.apply(ClusterCommand::PgUpgradeServe);
+        state.apply(ClusterCommand::PgUpgradeServe { lineage: None });
         state.apply(ClusterCommand::RemoveNode(2));
         assert_eq!(state.pg_upgrade.awaiting_rejoin, vec![3]);
     }

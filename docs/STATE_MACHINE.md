@@ -87,6 +87,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 
 - Unanswered probes → `Defer`. Never stop/rewind/discard on an unanswered question.
 - Both demote paths `Defer` on `TimelineCheck::Unknown` (unreachable leader). Node is already fenced; staying up can still serve WAL the leader needs.
+- **Follow only the committed lineage**: `demote(addr, FollowTerms)` carries the rewind budget and the committed lineage (§3a). The leader probe reads timeline and system identifier in one round trip; a leader address serving anything but the committed lineage — or with none committed — is `TimelineCheck::Foreign`, and both demote paths `Defer` on it. `reprovision_from`, the one place local data is discarded, re-reads the source's identifier and refuses unless it is the committed lineage. A stale leader view can name an address that now serves a wiped node's fresh `initdb`; "a different cluster" then describes the source, and a standby that trusted the address discarded the real data to clone it.
 - **`Reprovision` doors** (no restart repairs these):
   1. Directory `PostgreSQL` will not open → clone (`restart_or_repair_standby`); skip `pg_rewind` (needs a running local WAL position).
   2. WAL hole leader cannot fill → `streaming_gap_action` / `replay_can_continue`.
@@ -101,6 +102,8 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 
 - **SoT**: control-file `Database system identifier` via `pg_controldata` (`read_system_identifier`). Shared iff shared data history. `None` on witness / unprovisioned.
 - **Never cached.** Re-provision changes it.
+- **Committed lineage**: `ClusterState.lineage` names which history is the cluster's. The first leader whose primary serves commits its identifier (`SetLineage`, set once; a different value is refused). Below the feature level that records it no member can, so `LineageTerm::Unenforced` turns the gate off there rather than leave every follower deferring on a lineage nobody may write. `pg_upgrade` mints a new identifier, so a Track B release carries the swapped primary's (`PgUpgradeServe { lineage }`), and the lineage moves only in that entry, only out of a frozen record. Standbys follow and clone only a leader serving it (§3).
+- **Bootstrap guard**: a `--bootstrap` node with no Raft membership first asks its configured peers; when one's committed membership lists it, it does not mint a new cluster but waits for that cluster's leader to replicate to it. A wiped bootstrap node otherwise initdb'd a fresh lineage and became a one-node leader under a live id, on the address its peers' stale leader views still named. If every peer is silent it bootstraps (a first start), and the lineage gate keeps that impostor from touching any peer's data.
 - **Published**: `GET /api/v1/cluster/identity` (no auth), from control file (either end may not be serving yet).
 - **Gates**:
   - Resume with local Raft: ask peer if still in membership; wipe own Raft state if not. Attribute the answer with `peer_speaks_for_lineage` (unknown ≠ mismatch).

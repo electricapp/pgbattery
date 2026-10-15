@@ -26,6 +26,7 @@ enums.ClusterCommand = [
   "PgUpgradeRejoined",
   "PgUpgradeAbort",
   "IntendVoter",
+  "SetLineage",
   "SetFeatureLevel",
 ]
 enums.CutoverPhase = ["Idle", "Armed", "Sealing", "Sealed", "Draining", "Transferred", "Aborted"]
@@ -37,7 +38,8 @@ enums.DonorRisk = ["Continue", "Abort"]
 enums.PostmasterState = ["Running", "NotRunning", "Exited"]
 # Wire-compat labels on NodeInfo — not live Raft leadership (see STATE_MACHINE §5).
 enums.NodeRole = ["Leader", "Follower"]
-enums.TimelineCheck = ["Match", "Mismatch", "Unknown"]
+enums.TimelineCheck = ["Match", "Mismatch", "Unknown", "Foreign"]
+enums.LineageTerm = ["Unenforced", "Committed"]
 enums.SessionChange = [
   "Deallocate",
   "DeallocateAll",
@@ -54,6 +56,7 @@ types = [
   "ClusterState",
   "ClusterCommand",
   "PgUpgradeState",
+  "FollowTerms",
   "UpgradeRecordStep",
   "CutoverAuthorityState",
   "CutoverPhase",

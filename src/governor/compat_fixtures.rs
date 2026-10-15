@@ -137,7 +137,12 @@ fn sample_log_entries() -> Vec<LogEntry> {
         LogEntryPayload::Normal(ClusterCommand::CutoverSealing {
             app_roles: vec!["app".to_string()],
         }),
-        LogEntryPayload::Normal(ClusterCommand::PgUpgradeServe),
+        LogEntryPayload::Normal(ClusterCommand::PgUpgradeServe {
+            lineage: Some(9_000),
+        }),
+        LogEntryPayload::Normal(ClusterCommand::SetLineage {
+            system_identifier: 7_000,
+        }),
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeRejoined { node_id: 2 }),
         LogEntryPayload::Normal(ClusterCommand::PgUpgradeAbort),
         LogEntryPayload::Normal(ClusterCommand::IntendVoter { node_id: 2 }),

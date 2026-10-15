@@ -59,12 +59,13 @@ pub trait PgControl: Send + Sync {
     /// to empty would make the node acknowledge commits no standby holds.
     fn promote(&mut self, sync_standby_names: &str) -> impl Future<Output = Result<()>> + Send;
 
-    /// Reconfigure as a standby of `leader_addr`, rewinding if diverged and
-    /// discarding no more divergent WAL than `budget` allows.
+    /// Reconfigure as a standby of `leader_addr` on the committed `terms`:
+    /// rewind no further than their budget, and stop for nothing that does
+    /// not serve their lineage.
     fn demote(
         &mut self,
         leader_addr: SocketAddr,
-        budget: crate::supervisor::RewindBudget,
+        terms: crate::supervisor::FollowTerms,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Flip `default_transaction_read_only` and sever client backends.
@@ -72,6 +73,9 @@ pub trait PgControl: Send + Sync {
 
     /// The LSN this node reports to the cluster — what it holds on disk.
     fn get_reportable_lsn(&self) -> impl Future<Output = Result<String>> + Send;
+
+    /// This data directory's lineage (database system identifier).
+    fn system_identifier(&self) -> impl Future<Output = Result<Option<u64>>> + Send;
 
     /// `(in_recovery, read_only)` in one round trip, for the lease tick.
     fn probe_role_and_readonly(&self) -> impl Future<Output = Result<PgWriteState>> + Send;
@@ -171,9 +175,9 @@ impl PgControl for crate::supervisor::Supervisor {
     async fn demote(
         &mut self,
         leader_addr: SocketAddr,
-        budget: crate::supervisor::RewindBudget,
+        terms: crate::supervisor::FollowTerms,
     ) -> Result<()> {
-        Self::demote(self, leader_addr, budget).await
+        Self::demote(self, leader_addr, terms).await
     }
 
     async fn set_readonly(&self, readonly: bool) -> Result<()> {
@@ -182,6 +186,10 @@ impl PgControl for crate::supervisor::Supervisor {
 
     async fn get_reportable_lsn(&self) -> Result<String> {
         Self::get_reportable_lsn(self).await
+    }
+
+    async fn system_identifier(&self) -> Result<Option<u64>> {
+        crate::supervisor::read_system_identifier(self.bin_dir(), self.data_dir()).await
     }
 
     async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
@@ -232,6 +240,10 @@ impl PgControl for crate::supervisor::Supervisor {
 /// Compiled only for tests. It was briefly unconditional on the grounds that
 /// "future simulation harnesses" would need it, but a test double in the
 /// shipping binary earns its place when something ships it, not before.
+/// The lineage every model data directory reports.
+#[cfg(test)]
+pub const MODEL_LINEAGE: u64 = 7_000;
+
 #[cfg(test)]
 #[derive(Debug)]
 pub struct ModelPg {
@@ -387,7 +399,7 @@ impl PgControl for ModelPg {
     async fn demote(
         &mut self,
         leader_addr: SocketAddr,
-        _budget: crate::supervisor::RewindBudget,
+        _terms: crate::supervisor::FollowTerms,
     ) -> Result<()> {
         self.note(&format!("demote({leader_addr})"));
         if self.fails == Some(ModelOp::Demote) {
@@ -415,6 +427,11 @@ impl PgControl for ModelPg {
     async fn get_reportable_lsn(&self) -> Result<String> {
         self.note("get_reportable_lsn");
         Ok("0/1000000".to_string())
+    }
+
+    async fn system_identifier(&self) -> Result<Option<u64>> {
+        self.note("system_identifier");
+        Ok(Some(MODEL_LINEAGE))
     }
 
     async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {

@@ -828,6 +828,24 @@ impl ClusterClient {
         Ok(resp.json().await?)
     }
 
+    /// A node's `PostgreSQL` lineage, read from its control file
+    /// (`GET /api/v1/cluster/identity`).
+    ///
+    /// # Errors
+    /// Unreachable, or an unparseable answer.
+    pub async fn get_cluster_lineage(&self, addr: &str) -> Result<Option<u64>> {
+        let url = format!("http://{addr}/api/v1/cluster/identity");
+        let resp: crate::observability::management_api::ClusterIdentityResponse = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?
+            .json()
+            .await?;
+        Ok(resp.cluster_lineage)
+    }
+
     /// Active `PostgreSQL` major / paths (`GET /api/v1/postgres/status`,
     /// token-gated).
     ///

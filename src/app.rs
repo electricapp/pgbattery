@@ -595,6 +595,20 @@ impl App {
             .map_err(|e| anyhow::anyhow!("Failed to read Raft membership from storage: {e}"))?;
 
         if bootstrap && !has_membership {
+            // A bootstrap node that lost its state must not mint a second
+            // cluster under an id a live one still lists, on the address its
+            // peers follow: a peer whose leader view is stale would then
+            // follow the impostor. It waits for that cluster's leader to
+            // replicate to it instead.
+            if let Some(peer) = self.peer_listing_this_node().await {
+                warn!(
+                    node_id = self.config.node_id,
+                    %peer,
+                    "A configured peer's cluster lists this node; waiting for its leader \
+                     instead of bootstrapping a new cluster"
+                );
+                return Ok(());
+            }
             let mut initial_membership = std::collections::BTreeMap::new();
             initial_membership.insert(
                 self.config.node_id,
@@ -616,6 +630,22 @@ impl App {
             warn!("No Raft membership found - node may need to rejoin cluster");
         }
         Ok(())
+    }
+
+    /// The first configured peer whose committed membership lists this node.
+    async fn peer_listing_this_node(&self) -> Option<SocketAddr> {
+        let client = Self::build_management_http_client(Duration::from_secs(3), None).ok()?;
+        for peer in &self.config.peers {
+            let addr = peer.get_mgmt_addr();
+            if matches!(
+                self.is_in_committed_membership(&client, &addr.to_string())
+                    .await,
+                Ok(true)
+            ) {
+                return Some(addr);
+            }
+        }
+        None
     }
 
     fn create_backup_manager(&self) -> Option<Arc<BackupManager>> {
@@ -1468,6 +1498,11 @@ impl App {
         if leader_id == node_id {
             let pg_primary =
                 Self::promote_local_postgres(&mut *pg, cluster_state, lease, node_id).await;
+            let unrecorded = cluster_state.read().follow_terms().lineage
+                == crate::supervisor::LineageTerm::Committed(None);
+            if unrecorded && pg_primary == Some(true) {
+                Self::commit_lineage(&*pg, raft, cluster_state).await;
+            }
             return LeadershipObservation {
                 is_raft_leader: true,
                 pg_primary,
@@ -1478,12 +1513,12 @@ impl App {
         // node), not leadership data, so the nodes map is the right source.
         // The Track B record rides the same committed-state read: it decides
         // below whether a stopped standby is left alone.
-        let (leader_pg_addr, awaits_rejoin, rewind_budget) = {
+        let (leader_pg_addr, awaits_rejoin, follow_terms) = {
             let state = cluster_state.read();
             (
                 state.nodes.get(&leader_id).map(|n| n.pg_addr),
                 state.pg_upgrade.leaves_stopped(node_id),
-                state.rewind_budget(),
+                state.follow_terms(),
             )
         };
         let Some(addr) = leader_pg_addr else {
@@ -1505,14 +1540,7 @@ impl App {
             return LeadershipObservation::not_leading();
         }
 
-        Self::demote_to_leader(
-            &mut *pg,
-            addr,
-            "follow leader",
-            awaits_rejoin,
-            rewind_budget,
-        )
-        .await;
+        Self::demote_to_leader(&mut *pg, addr, "follow leader", awaits_rejoin, follow_terms).await;
         LeadershipObservation::not_leading()
     }
 
@@ -1833,6 +1861,34 @@ impl App {
         }
     }
 
+    /// Commit this primary's lineage as the cluster's, once. Standbys follow
+    /// and clone only a leader serving it; a failure retries next tick.
+    async fn commit_lineage<P: crate::governor::pg_control::PgControl>(
+        pg: &P,
+        raft: &openraft::Raft<crate::governor::raft::TypeConfig>,
+        cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
+    ) {
+        let system_identifier = match pg.system_identifier().await {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "Could not read this primary's lineage to commit it");
+                return;
+            }
+        };
+        let cmd = ClusterCommand::SetLineage { system_identifier };
+        match crate::governor::propose::propose(raft, cluster_state, cmd).await {
+            Ok(resp) if resp.outcome.applied() => {
+                info!(lineage = system_identifier, "Committed the cluster lineage");
+            }
+            Ok(_) => warn!(
+                lineage = system_identifier,
+                "The cluster already records a different lineage than this primary serves"
+            ),
+            Err(e) => warn!(error = %e, "Could not commit the cluster lineage; retrying"),
+        }
+    }
+
     /// Reconfigure local PG as a standby of `leader_addr`, fencing first when
     /// local PG is (or may be) a writable primary.
     ///
@@ -1848,7 +1904,7 @@ impl App {
         leader_addr: SocketAddr,
         context: &str,
         awaits_rejoin: bool,
-        rewind_budget: crate::supervisor::RewindBudget,
+        follow_terms: crate::supervisor::FollowTerms,
     ) {
         // We log + count per-cause failures here rather than propagating: the
         // caller is the reconcile loop, which retries on the next tick (every
@@ -1904,7 +1960,7 @@ impl App {
                     .await,
             );
         }
-        if let Err(e) = pg.demote(leader_addr, rewind_budget).await {
+        if let Err(e) = pg.demote(leader_addr, follow_terms).await {
             metrics::counter!("pgbattery_demote_apply_failures").increment(1);
             error!(error = %e, "Failed to configure standby for new leader");
         }

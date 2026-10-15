@@ -554,6 +554,52 @@ pub(crate) enum TimelineCheck {
     Match,
     Mismatch,
     Unknown,
+    /// The leader's address answers with data that is not proven to be the
+    /// cluster's committed lineage: a stale leader view, or a wiped node that
+    /// initdb'd a fresh cluster there. Never stop to follow it.
+    Foreign,
+}
+
+/// What the committed cluster record lets a standby do to follow a leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowTerms {
+    /// How much divergent WAL a rewind may discard.
+    pub rewind_budget: RewindBudget,
+    /// Which lineage a followed or cloned source must serve.
+    pub lineage: LineageTerm,
+}
+
+/// Which `PostgreSQL` lineage a standby may follow or clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageTerm {
+    /// The cluster has not committed the feature level that records a
+    /// lineage, so no member can; followers act as before one existed.
+    Unenforced,
+    /// The committed lineage; `None` until the first serving leader records
+    /// it, which proves nothing about any source.
+    Committed(Option<u64>),
+}
+
+/// Whether `source` is proven to serve the cluster's committed lineage.
+///
+/// The address a leader view names is a proxy for "this cluster's primary";
+/// the lineage is the fact. Unknown on either side proves nothing, and a
+/// node that cannot prove it waits rather than stops or discards.
+const fn serves_cluster_lineage(term: LineageTerm, source: Option<u64>) -> bool {
+    match term {
+        LineageTerm::Unenforced => true,
+        LineageTerm::Committed(committed) => {
+            matches!((committed, source), (Some(c), Some(s)) if c == s)
+        }
+    }
+}
+
+/// The leader probe's reply: `<walfile>|<system identifier>`, where the
+/// walfile's first 8 hex digits are the leader's live write timeline.
+fn parse_leader_probe(reply: &str) -> Option<(u64, u64)> {
+    let (walfile, lineage) = reply.trim().split_once('|')?;
+    let timeline = u64::from_str_radix(walfile.get(..8)?, 16).ok()?;
+    Some((timeline, lineage.trim().parse().ok()?))
 }
 
 /// What a former primary should do about a demote request.
@@ -573,7 +619,7 @@ pub(crate) enum FormerPrimaryAction {
 const fn former_primary_action(timeline: TimelineCheck) -> FormerPrimaryAction {
     match timeline {
         TimelineCheck::Match | TimelineCheck::Mismatch => FormerPrimaryAction::Rewind,
-        TimelineCheck::Unknown => FormerPrimaryAction::Defer,
+        TimelineCheck::Unknown | TimelineCheck::Foreign => FormerPrimaryAction::Defer,
     }
 }
 
@@ -2579,49 +2625,56 @@ host all all ::/0 {auth_method}
     /// logic — no `stop()`, no config writes, no `pg_rewind` — so the caller
     /// can act atomically once it has the answer. See [`StandbyAction`] for
     /// the outcomes and `demote()` for the decision table.
-    async fn decide_standby_action(&self, new_leader_addr: SocketAddr) -> Result<StandbyAction> {
+    async fn decide_standby_action(
+        &self,
+        new_leader_addr: SocketAddr,
+        lineage: LineageTerm,
+    ) -> Result<StandbyAction> {
         let config_changed = self.standby_config_would_change(new_leader_addr).await?;
 
         if config_changed {
             // Config IS changing. Probe timeline so we know whether to rewind
             // or just restart with new conninfo.
-            return Ok(match self.check_timeline_state(new_leader_addr).await {
-                TimelineCheck::Match => StandbyAction::RestartOnly,
-                TimelineCheck::Mismatch => {
-                    // A timeline mismatch alone is NOT divergence. A
-                    // just-promoted leader is one timeline ahead of a clean
-                    // follower that hasn't switched yet (the local timeline here
-                    // is the lagging `pg_controldata` checkpoint TLI, while the
-                    // leader's is its live write TLI), and such a follower can
-                    // adopt the new timeline by streaming
-                    // (`recovery_target_timeline='latest'`) with NO rewind. Only
-                    // rewind when this node's replayed WAL is actually ahead of
-                    // the leader — i.e. it holds WAL on the old timeline the
-                    // leader forked away from. If it is at-or-behind, re-point
-                    // and stream (RestartOnly). A misclassification is safe: a
-                    // still-diverged node fails to stream and the next tick's
-                    // config-unchanged `Mismatch -> Rewind` path catches it, and
-                    // the `pg_rewind` divergence gate is the final data-loss
-                    // backstop regardless.
-                    let action = Self::standby_action_for_mismatch(
-                        self.local_ahead_of_leader(new_leader_addr).await,
-                    );
-                    if action == StandbyAction::Defer {
+            return Ok(
+                match self.check_timeline_state(new_leader_addr, lineage).await {
+                    TimelineCheck::Match => StandbyAction::RestartOnly,
+                    TimelineCheck::Mismatch => {
+                        // A timeline mismatch alone is NOT divergence. A
+                        // just-promoted leader is one timeline ahead of a clean
+                        // follower that hasn't switched yet (the local timeline here
+                        // is the lagging `pg_controldata` checkpoint TLI, while the
+                        // leader's is its live write TLI), and such a follower can
+                        // adopt the new timeline by streaming
+                        // (`recovery_target_timeline='latest'`) with NO rewind. Only
+                        // rewind when this node's replayed WAL is actually ahead of
+                        // the leader — i.e. it holds WAL on the old timeline the
+                        // leader forked away from. If it is at-or-behind, re-point
+                        // and stream (RestartOnly). A misclassification is safe: a
+                        // still-diverged node fails to stream and the next tick's
+                        // config-unchanged `Mismatch -> Rewind` path catches it, and
+                        // the `pg_rewind` divergence gate is the final data-loss
+                        // backstop regardless.
+                        let action = Self::standby_action_for_mismatch(
+                            self.local_ahead_of_leader(new_leader_addr).await,
+                        );
+                        if action == StandbyAction::Defer {
+                            tracing::debug!(
+                                new_leader = %new_leader_addr,
+                                "Timeline mismatch but local-vs-leader LSN probe inconclusive; deferring"
+                            );
+                        }
+                        action
+                    }
+                    TimelineCheck::Unknown => {
                         tracing::debug!(
                             new_leader = %new_leader_addr,
-                            "Timeline mismatch but local-vs-leader LSN probe inconclusive; deferring"
+                            "Leader unreachable for timeline probe; deferring demote work"
                         );
+                        StandbyAction::Defer
                     }
-                    action
-                }
-                TimelineCheck::Unknown => {
-                    tracing::debug!(
-                        new_leader = %new_leader_addr,
-                        "Leader unreachable for timeline probe; deferring demote work"
-                    );
-                    StandbyAction::Defer
-                }
-            });
+                    TimelineCheck::Foreign => StandbyAction::Defer,
+                },
+            );
         }
 
         // Config matches. Skip the remote timeline probe when streaming is
@@ -2637,7 +2690,7 @@ host all all ::/0 {auth_method}
         // Streaming broken with unchanged config. Either transient (PG will
         // retry) or timeline divergence (e.g. after backup restore). Probe
         // the leader to decide.
-        match self.check_timeline_state(new_leader_addr).await {
+        match self.check_timeline_state(new_leader_addr, lineage).await {
             TimelineCheck::Mismatch => Ok(StandbyAction::Rewind),
             TimelineCheck::Unknown => {
                 tracing::debug!(
@@ -2646,6 +2699,7 @@ host all all ::/0 {auth_method}
                 );
                 Ok(StandbyAction::Defer)
             }
+            TimelineCheck::Foreign => Ok(StandbyAction::Defer),
             TimelineCheck::Match => Ok(self.classify_streaming_gap(new_leader_addr).await),
         }
     }
@@ -2779,13 +2833,18 @@ host all all ::/0 {auth_method}
     async fn repoint_standby(
         &mut self,
         new_leader_addr: SocketAddr,
-        budget: RewindBudget,
+        terms: FollowTerms,
     ) -> Result<()> {
-        let needs_rewind = match self.decide_standby_action(new_leader_addr).await? {
+        let needs_rewind = match self
+            .decide_standby_action(new_leader_addr, terms.lineage)
+            .await?
+        {
             StandbyAction::NoOp | StandbyAction::Defer => return Ok(()),
             StandbyAction::RestartOnly => false,
             StandbyAction::Rewind => true,
-            StandbyAction::Reprovision => return self.reprovision_from(new_leader_addr).await,
+            StandbyAction::Reprovision => {
+                return self.reprovision_from(new_leader_addr, terms.lineage).await;
+            }
         };
 
         // The divergence gate's local-LSN input must be read while PG is
@@ -2802,7 +2861,7 @@ host all all ::/0 {auth_method}
                 "Timeline mismatch detected while already in recovery - running pg_rewind"
             );
             if self
-                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, budget)
+                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, terms)
                 .await?
                 == RewindOutcome::Reprovisioned
             {
@@ -2836,7 +2895,7 @@ host all all ::/0 {auth_method}
                 "Standby did not open after re-pointing - rewinding onto the leader"
             );
             if self
-                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, budget)
+                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, terms)
                 .await?
                 == RewindOutcome::Rewound
             {
@@ -2860,7 +2919,11 @@ host all all ::/0 {auth_method}
     /// leader address to repair against until Raft has started. So it leaves
     /// `PostgreSQL` down and the reconcile loop, which does know the leader,
     /// arrives here.
-    async fn restart_or_repair_standby(&mut self, new_leader_addr: SocketAddr) -> Result<()> {
+    async fn restart_or_repair_standby(
+        &mut self,
+        new_leader_addr: SocketAddr,
+        lineage: LineageTerm,
+    ) -> Result<()> {
         self.configure_standby(new_leader_addr).await?;
         match self.start().await {
             Ok(()) => return Ok(()),
@@ -2885,7 +2948,7 @@ host all all ::/0 {auth_method}
             new_leader = %new_leader_addr,
             "PostgreSQL will not open on this data directory — rebuilding it from the leader"
         );
-        self.reprovision_from(new_leader_addr).await
+        self.reprovision_from(new_leader_addr, lineage).await
     }
 
     /// `pg_rewind` this stopped standby onto `new_leader_addr`, resolving a
@@ -2894,10 +2957,10 @@ host all all ::/0 {auth_method}
         &mut self,
         new_leader_addr: SocketAddr,
         pre_stop_lsn: Option<u64>,
-        budget: RewindBudget,
+        terms: FollowTerms,
     ) -> Result<RewindOutcome> {
         if let Err(e) = self
-            .run_pg_rewind(new_leader_addr, pre_stop_lsn, budget)
+            .run_pg_rewind(new_leader_addr, pre_stop_lsn, terms.rewind_budget)
             .await
         {
             tracing::error!(error = %e, "pg_rewind failed while following new leader");
@@ -2923,7 +2986,8 @@ host all all ::/0 {auth_method}
                                 "PostgreSQL will not open after a failed pg_rewind — rebuilding \
                                  from the leader"
                             );
-                            self.reprovision_from(new_leader_addr).await?;
+                            self.reprovision_from(new_leader_addr, terms.lineage)
+                                .await?;
                             return Ok(RewindOutcome::Reprovisioned);
                         }
                         Err(restart) => tracing::warn!(
@@ -2938,7 +3002,8 @@ host all all ::/0 {auth_method}
                     tracing::error!(
                         "pg_rewind left a data directory that cannot follow this leader; rebuilding from it"
                     );
-                    self.reprovision_from(new_leader_addr).await?;
+                    self.reprovision_from(new_leader_addr, terms.lineage)
+                        .await?;
                     return Ok(RewindOutcome::Reprovisioned);
                 }
             }
@@ -2958,18 +3023,17 @@ host all all ::/0 {auth_method}
     ///   fails on a re-point escalates to the rewind it declined.
     /// - Currently a primary → full demote with `pg_rewind`.
     ///
-    /// `budget` bounds how much divergent WAL a rewind may discard.
+    /// `terms` bound how much divergent WAL a rewind may discard and name the
+    /// lineage a leader must serve before this node stops to follow it.
     ///
     /// # Errors
     /// Returns an error if the recovery-state probe fails, or the node cannot
     /// be reconfigured and restarted to follow `new_leader_addr`.
-    pub async fn demote(
-        &mut self,
-        new_leader_addr: SocketAddr,
-        budget: RewindBudget,
-    ) -> Result<()> {
+    pub async fn demote(&mut self, new_leader_addr: SocketAddr, terms: FollowTerms) -> Result<()> {
         if self.postmaster_state()? == PostmasterState::NotRunning {
-            return self.restart_or_repair_standby(new_leader_addr).await;
+            return self
+                .restart_or_repair_standby(new_leader_addr, terms.lineage)
+                .await;
         }
         let in_recovery = self.is_in_recovery().await.map_err(|e| {
             Error::Postgres(format!(
@@ -2977,7 +3041,7 @@ host all all ::/0 {auth_method}
             ))
         })?;
         if in_recovery {
-            return self.repoint_standby(new_leader_addr, budget).await;
+            return self.repoint_standby(new_leader_addr, terms).await;
         }
 
         tracing::info!(
@@ -2986,8 +3050,10 @@ host all all ::/0 {auth_method}
         );
 
         // Reach the leader before stopping for it — see `former_primary_action`.
-        if former_primary_action(self.check_timeline_state(new_leader_addr).await)
-            == FormerPrimaryAction::Defer
+        if former_primary_action(
+            self.check_timeline_state(new_leader_addr, terms.lineage)
+                .await,
+        ) == FormerPrimaryAction::Defer
         {
             metrics::counter!("pgbattery_demote_deferred_unreachable_leader").increment(1);
             tracing::warn!(
@@ -3008,7 +3074,7 @@ host all all ::/0 {auth_method}
         //    This is necessary because the former primary may have WAL on a different timeline
         tracing::info!("Running pg_rewind to sync timelines");
         if let Err(e) = self
-            .run_pg_rewind(new_leader_addr, pre_stop_lsn, budget)
+            .run_pg_rewind(new_leader_addr, pre_stop_lsn, terms.rewind_budget)
             .await
         {
             // Same recovery as the in-recovery path: a directory this leader
@@ -3018,7 +3084,7 @@ host all all ::/0 {auth_method}
                 RewindRecovery::RestartInPlace => return Err(e),
                 RewindRecovery::Reprovision => {
                     metrics::counter!("pgbattery_pg_rewind_target_compromised").increment(1);
-                    return self.reprovision_from(new_leader_addr).await;
+                    return self.reprovision_from(new_leader_addr, terms.lineage).await;
                 }
             }
         }
@@ -3167,18 +3233,33 @@ host all all ::/0 {auth_method}
     /// **Why this can't fail-safe to `Mismatch`**: when the leader is
     /// unreachable, `pg_rewind` would also fail. Treating Unknown as
     /// Mismatch would loop forever trying to rewind from a dead source.
-    async fn check_timeline_state(&self, leader_addr: SocketAddr) -> TimelineCheck {
+    async fn check_timeline_state(
+        &self,
+        leader_addr: SocketAddr,
+        lineage: LineageTerm,
+    ) -> TimelineCheck {
         let Some(local) = self.get_local_timeline().await else {
             tracing::warn!("Unable to determine local timeline");
             return TimelineCheck::Unknown;
         };
-        let Some(remote) = self.get_remote_timeline(leader_addr).await else {
+        let Some((remote, remote_lineage)) = self.probe_leader(leader_addr).await else {
             tracing::debug!(
                 leader = %leader_addr,
                 "Leader timeline probe failed - leader likely unreachable"
             );
             return TimelineCheck::Unknown;
         };
+        if !serves_cluster_lineage(lineage, Some(remote_lineage)) {
+            metrics::counter!("pgbattery_follow_refused_foreign_leader").increment(1);
+            tracing::warn!(
+                leader = %leader_addr,
+                leader_lineage = remote_lineage,
+                cluster_lineage = ?lineage,
+                "The leader's address serves data that is not the cluster's committed lineage; \
+                 not stopping to follow it"
+            );
+            return TimelineCheck::Foreign;
+        }
         if local == remote {
             tracing::debug!(timeline = local, "Timelines match");
             TimelineCheck::Match
@@ -3222,21 +3303,41 @@ host all all ::/0 {auth_method}
             .and_then(|value| value.parse::<u64>().ok())
     }
 
-    /// Leader's CURRENT writing timeline, derived from its WAL filename.
+    /// Leader's CURRENT writing timeline and its lineage, in one round trip.
     ///
     /// `pg_walfile_name(pg_current_wal_lsn())` returns e.g.
     /// `000000050000000000000004` where the first 8 hex chars are the
     /// timeline. This reflects the active write timeline, unlike
     /// `pg_control_checkpoint().timeline_id` which lags behind until the
-    /// first post-promotion checkpoint.
+    /// first post-promotion checkpoint. The lineage is the server's database
+    /// system identifier.
     ///
     /// Fast-fail: single attempt with a hard 1-second wall-clock budget
-    /// (libpq `connect_timeout=1` + tokio outer timeout). The probe is on
-    /// the hot `ensure_follows` path — every supervisor tick — so we cannot
-    /// afford to wait seconds when the leader is gone. Returns `None` on
+    /// (libpq `connect_timeout=1` + tokio outer timeout). Returns `None` on
     /// any failure; callers treat that as `TimelineCheck::Unknown` and
     /// retry next tick.
-    async fn get_remote_timeline(&self, addr: SocketAddr) -> Option<u64> {
+    async fn probe_leader(&self, addr: SocketAddr) -> Option<(u64, u64)> {
+        let output = self
+            .query_peer(
+                addr,
+                "SELECT pg_walfile_name(pg_current_wal_lsn()) || '|' || system_identifier \
+                 FROM pg_control_system();",
+            )
+            .await?;
+        parse_leader_probe(&output)
+    }
+
+    /// A peer server's lineage, or `None` when it does not answer.
+    async fn peer_lineage(&self, addr: SocketAddr) -> Option<u64> {
+        self.query_peer(addr, "SELECT system_identifier FROM pg_control_system();")
+            .await?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// One bounded psql query against a peer's server; its trimmed stdout.
+    async fn query_peer(&self, addr: SocketAddr, sql: &str) -> Option<String> {
         let psql = self.config.pg_bin_dir.join("psql");
         let conninfo = format!(
             "host={} port={} user={} dbname=postgres connect_timeout=1",
@@ -3249,7 +3350,7 @@ host all all ::/0 {auth_method}
             .arg("-w")
             .arg("-tAXq")
             .arg("-c")
-            .arg("SELECT pg_walfile_name(pg_current_wal_lsn());")
+            .arg(sql)
             .arg(&conninfo)
             .kill_on_drop(true)
             .output();
@@ -3260,14 +3361,7 @@ host all all ::/0 {auth_method}
         if !output.status.success() {
             return None;
         }
-        let walfile = String::from_utf8_lossy(&output.stdout);
-        let walfile = walfile.trim();
-        // `.get(..8)` (not `[..8]`): the length guard is a *byte* check, so on
-        // pathological output where byte 8 falls inside a multibyte char (e.g.
-        // a U+FFFD replacement from `from_utf8_lossy` on binary garbage) the
-        // slice `[..8]` would panic. `.get` returns None on a non-char-boundary.
-        let tli_hex = walfile.get(..8)?;
-        u64::from_str_radix(tli_hex, 16).ok()
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     /// Create an empty `standby.signal` file in the data directory if it isn't
@@ -3351,7 +3445,24 @@ host all all ::/0 {auth_method}
     /// `PostgreSQL` is already stopped when this runs (the demote path stops
     /// it before rewinding), and the caller holds the supervisor lock, so no
     /// lease tick can observe a half-replaced directory.
-    async fn reprovision_from(&mut self, source_addr: SocketAddr) -> Result<()> {
+    async fn reprovision_from(
+        &mut self,
+        source_addr: SocketAddr,
+        lineage: LineageTerm,
+    ) -> Result<()> {
+        // The one place local data is discarded: only for a copy of the
+        // cluster's committed lineage, read from the source itself. A stale
+        // leader view can name an address now serving a fresh initdb, and
+        // "a different cluster" then describes the source, not this node.
+        let source_lineage = self.peer_lineage(source_addr).await;
+        if !serves_cluster_lineage(lineage, source_lineage) {
+            metrics::counter!("pgbattery_reprovision_refused_foreign_source").increment(1);
+            return Err(Error::Postgres(format!(
+                "refusing to discard {} for a copy of {source_addr}: it serves lineage \
+                 {source_lineage:?}, the cluster's committed lineage is {lineage:?}",
+                self.config.pg_data_dir.display()
+            )));
+        }
         metrics::counter!("pgbattery_reprovision_foreign_data_dir").increment(1);
         tracing::warn!(
             source = %source_addr,
@@ -6091,6 +6202,43 @@ mod tests {
             former_primary_action(TimelineCheck::Unknown),
             FormerPrimaryAction::Defer
         );
+    }
+
+    /// A wiped bootstrap node initdb's a fresh cluster on the address a
+    /// stale leader view still names. A standby that stopped to rewind onto
+    /// it found "a different cluster" and discarded its own copy of the real
+    /// data to clone the impostor's. Only a source proven to serve the
+    /// committed lineage is followed or cloned.
+    #[test]
+    fn only_a_source_serving_the_committed_lineage_is_followed() {
+        let committed = |lineage| LineageTerm::Committed(lineage);
+        assert!(serves_cluster_lineage(committed(Some(7)), Some(7)));
+        assert!(!serves_cluster_lineage(committed(Some(7)), Some(9)));
+        assert!(!serves_cluster_lineage(committed(Some(7)), None));
+        assert!(!serves_cluster_lineage(committed(None), Some(7)));
+        assert!(!serves_cluster_lineage(committed(None), None));
+        // A cluster below the feature level that records a lineage cannot
+        // commit one; its followers act as they did before it existed.
+        assert!(serves_cluster_lineage(LineageTerm::Unenforced, Some(9)));
+        assert!(serves_cluster_lineage(LineageTerm::Unenforced, None));
+        assert_eq!(
+            former_primary_action(TimelineCheck::Foreign),
+            FormerPrimaryAction::Defer,
+            "a former primary does not stop for a foreign source either"
+        );
+    }
+
+    /// The leader probe answers timeline and lineage in one row; anything
+    /// else reads as no answer, never as a lineage.
+    #[test]
+    fn the_leader_probe_reads_timeline_and_lineage() {
+        assert_eq!(
+            parse_leader_probe("000000050000000000000004|7696920521815543832\n"),
+            Some((5, 7_696_920_521_815_543_832))
+        );
+        assert_eq!(parse_leader_probe("000000050000000000000004"), None);
+        assert_eq!(parse_leader_probe("00000005|x"), None);
+        assert_eq!(parse_leader_probe(""), None);
     }
 
     #[test]

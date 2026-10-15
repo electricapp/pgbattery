@@ -512,8 +512,12 @@ pub(super) async fn blue_green_preflight(
 pub enum UpgradeRecordStep {
     /// Hold clients; `standbys` stay stopped until each rejoins.
     Freeze { standbys: Vec<NodeId> },
-    /// Release held clients.
-    Serve,
+    /// Release held clients; `lineage` is the swapped primary's new system
+    /// identifier, committed with the release.
+    Serve {
+        #[serde(default)]
+        lineage: Option<u64>,
+    },
     /// `node_id` follows the primary again.
     Rejoined { node_id: NodeId },
     /// Undo a freeze whose apply failed before the primary served.
@@ -524,7 +528,7 @@ impl UpgradeRecordStep {
     fn command(self) -> ClusterCommand {
         match self {
             Self::Freeze { standbys } => ClusterCommand::PgUpgradeFreeze { standbys },
-            Self::Serve => ClusterCommand::PgUpgradeServe,
+            Self::Serve { lineage } => ClusterCommand::PgUpgradeServe { lineage },
             Self::Rejoined { node_id } => ClusterCommand::PgUpgradeRejoined { node_id },
             Self::Abort => ClusterCommand::PgUpgradeAbort,
         }

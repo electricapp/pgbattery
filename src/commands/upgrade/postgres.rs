@@ -439,7 +439,7 @@ async fn apply_experimental(
     // that has since died. Standbys stay stopped until each rejoins, so
     // durability is briefly ASYNC and the status output says so.
     wait_for_serving_primary(client, nodes).await?;
-    commit_step(client, nodes, UpgradeRecordStep::Serve).await?;
+    serve_swapped_primary(client, nodes, leader_mgmt).await?;
     info!(
         "Clients released after primary upgrade (standbys still stopped; durability briefly ASYNC)"
     );
@@ -610,12 +610,33 @@ async fn run_rollback(params: PostgresUpgradeParams) -> Result<()> {
     // one, so they stay stopped until each rejoins; clients go first, as in
     // the apply.
     wait_for_serving_primary(&client, nodes).await?;
-    commit_step(&client, nodes, UpgradeRecordStep::Serve).await?;
+    serve_swapped_primary(&client, nodes, &leader_mgmt).await?;
     let from_major = resp.from_major;
     rejoin_standbys(&client, nodes, &leader_mgmt, &standbys, from_major).await?;
     require_doctor_strict(Some(leader_mgmt.clone()), params.config_path.clone()).await?;
     info!(from_major, "Rollback complete; cluster on old major");
     Ok(())
+}
+
+/// Release held clients, committing the swapped primary's lineage with the
+/// release: `pg_upgrade` gives the new data directory its own system
+/// identifier, and a standby only ever follows the committed one.
+async fn serve_swapped_primary(
+    client: &ClusterClient,
+    nodes: &[crate::cluster::client::NodeInfo],
+    leader_mgmt: &str,
+) -> Result<()> {
+    let Some(lineage) = client.get_cluster_lineage(leader_mgmt).await? else {
+        bail!("The serving primary reports no lineage; the record stays frozen");
+    };
+    commit_step(
+        client,
+        nodes,
+        UpgradeRecordStep::Serve {
+            lineage: Some(lineage),
+        },
+    )
+    .await
 }
 
 /// Re-basebackup each standby from the primary, one at a time, committing
