@@ -280,14 +280,15 @@ fn first_statement_keyword(query: &str) -> Option<&str> {
 /// (`""` doubling honored), dollar-quoted string (`$tag$ … $tag$`), `--`
 /// line comment, and (nested) `/* */` block comment.
 ///
-/// One pass, no allocation. Deliberately conservative in the safe
-/// direction: an escaped quote it does not model (`E'\''`) makes it think a
-/// literal closed early, so a `;` inside that literal reads as top-level —
-/// an over-trigger that only costs a C parse. It can never invent an open
-/// literal that isn't one, so a real top-level `;` is never masked. An
+/// One pass, no allocation. Errs only toward `true`, which costs a C parse:
+/// a backslash in a literal answers `true` outright, since whether it escapes
+/// the quote depends on an `E` prefix and `standard_conforming_strings`; and
+/// a `$` continuing an identifier (`a$b`) never opens a dollar quote. An
 /// unterminated construct swallows the rest of the text, which is a server
 /// side syntax error anyway (the analyzer's parse would yield nothing).
 fn has_top_level_semicolon(text: &str) -> bool {
+    let continues_identifier =
+        |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
     let raw = text.as_bytes();
     let len = raw.len();
     let mut pos = 0usize;
@@ -299,14 +300,12 @@ fn has_top_level_semicolon(text: &str) -> bool {
             Some(b'\'') => {
                 pos += 1;
                 while pos < len {
-                    if raw.get(pos) == Some(&b'\'') {
-                        if raw.get(pos + 1) == Some(&b'\'') {
-                            pos += 2;
-                            continue;
-                        }
-                        break;
+                    match raw.get(pos) {
+                        Some(b'\\') => return true,
+                        Some(b'\'') if raw.get(pos + 1) == Some(&b'\'') => pos += 2,
+                        Some(b'\'') => break,
+                        _ => pos += 1,
                     }
-                    pos += 1;
                 }
                 pos += 1;
             }
@@ -326,13 +325,17 @@ fn has_top_level_semicolon(text: &str) -> bool {
                 pos += 1;
             }
             // Dollar quoting: `$` + optional identifier (not digit-leading —
-            // `$1` is a parameter) + `$`, closed by the identical tag.
+            // `$1` is a parameter) + `$`, closed by the identical tag. A `$`
+            // continuing an identifier is part of its name.
+            Some(b'$') if pos > 0 && raw.get(pos - 1).is_some_and(|&c| continues_identifier(c)) => {
+                pos += 1;
+            }
             Some(b'$') => {
                 let tag_start = pos + 1;
                 let mut tag_end = tag_start;
                 while raw
                     .get(tag_end)
-                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+                    .is_some_and(|&c| c != b'$' && continues_identifier(c))
                 {
                     tag_end += 1;
                 }
@@ -3966,6 +3969,30 @@ mod tests {
         assert!(ConnectionHandler::might_contain_session_state_command(
             "update t set note = 'a;b'; discard all"
         ));
+    }
+
+    /// M16: the scanner read `E'a\'b'` as closing at `\'`, then took the real
+    /// closing quote for an opening one and swallowed `; SET …`; and it read
+    /// `a$b$c` as a dollar quote that never closes. Either way the session
+    /// SET went unseen and a migration silently dropped it.
+    #[test]
+    fn a_top_level_semicolon_is_never_masked() {
+        for masked in [
+            r"SELECT E'a\'b'; SET search_path = x",
+            r"SELECT E'\''; SET search_path = x",
+            r"SELECT 'a\'; SET search_path = x",
+            "SELECT a$b$c FROM t; SET search_path = x",
+            "SELECT 1 AS x$y; PREPARE p AS SELECT 1",
+        ] {
+            assert!(has_top_level_semicolon(masked), "{masked}");
+            assert!(
+                ConnectionHandler::might_contain_session_state_command(masked),
+                "{masked}"
+            );
+        }
+        // Dollar quotes still hide their own semicolons, whatever the tag.
+        assert!(!has_top_level_semicolon("SELECT $fn$a;b$fn$"));
+        assert!(!has_top_level_semicolon("SELECT $é$a;b$é$"));
     }
 
     #[test]
