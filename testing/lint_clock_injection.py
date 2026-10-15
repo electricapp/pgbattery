@@ -17,10 +17,12 @@ HTTP request or stamp a log line and are none of this lint's business. What it
 guards is the set of modules where a clock read decides whether this node may
 accept writes:
 
-    src/governor/lease.rs               lease expiry
-    src/governor/raft.rs                metrics watchdog fence, leaderless recovery
-    src/governor/replication_manager.rs async fallback grace
-    src/app.rs                          promotion hold-down
+    src/governor/lease.rs                     lease expiry
+    src/governor/raft.rs                      metrics watchdog fence, leaderless recovery
+    src/governor/fence.rs                     the lease fence
+    src/governor/reconciler/mod.rs            write gate, async fallback grace
+    src/governor/reconciler/follow.rs         promotion hold-down
+    src/governor/reconciler/replication.rs    replica disconnect hysteresis
 
 `src/governor/state_machine.rs` is deliberately absent. LSN staleness rides in
 replicated Raft state and snapshots, where a monotonic `Instant` is meaningless
@@ -49,8 +51,10 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 GUARDED: Final[tuple[str, ...]] = (
     "src/governor/lease.rs",
     "src/governor/raft.rs",
-    "src/governor/replication_manager.rs",
-    "src/app.rs",
+    "src/governor/fence.rs",
+    "src/governor/reconciler/mod.rs",
+    "src/governor/reconciler/follow.rs",
+    "src/governor/reconciler/replication.rs",
 )
 
 CLOCK_READ: Final[re.Pattern[str]] = re.compile(r"\b(?:Instant|SystemTime)::now\(\)")

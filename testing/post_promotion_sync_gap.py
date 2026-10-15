@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --project testing python
 """RW-2: the post-promotion window, entered on protocol state rather than a sleep.
 
-Between `pg_ctl promote` and the replication manager's next tick, whatever sits
+Between `pg_ctl promote` and the reconciler's next pass, whatever sits
 in `synchronous_standby_names` is the durability contract the new primary runs
 under. If nothing is holding the commit, a crash there loses an acknowledged
 write (W1, R2).

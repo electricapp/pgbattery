@@ -708,7 +708,7 @@ class SystemTimings:
     leadership_transfer_lease_safety_ms: int
     slot_ensure_interval_ms: int
     replica_check_interval_ms: int
-    """How often the replication manager reconciles the sync list. Also the
+    """How often the reconciler levels the sync list. Also the
     period in which it re-commits `SetSyncMode` after a leadership change or a
     mode transition, so it bounds how long the replicated flag may trail the
     live GUC."""

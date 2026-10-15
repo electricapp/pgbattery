@@ -112,8 +112,8 @@ PG_DBNAME: Final[str] = "postgres"
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_ROUND_PERIOD_S: Final[float] = 0.05
-"""Target cadence. Chosen below the 100 ms fence-enforcement tick in
-`src/app.rs` so a single-tick dual-write window cannot fall between rounds."""
+"""Target cadence. Chosen below the 100 ms lease fence tick in
+`src/governor/fence.rs` so a single-tick dual-write window cannot fall between rounds."""
 
 ATTEMPT_TIMEOUT_FRACTION: Final[float] = 0.6
 """Per-attempt deadline as a fraction of the round period. Bounded well under
@@ -1707,7 +1707,7 @@ def run(
         DEFAULT_ROUND_PERIOD_S * 1000,
         "--round-ms",
         help="Round period in milliseconds. 50 ms sits under the 100 ms "
-        "fence-enforcement tick in src/app.rs.",
+        "lease fence tick in src/governor/fence.rs.",
     ),
     attempt_ms: float = typer.Option(
         0.0,

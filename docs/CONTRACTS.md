@@ -163,7 +163,7 @@ disconnected; the client is responsible for reconnection.
 
 Physical replication slots for departed or crashed nodes must not accumulate
 indefinitely. Orphaned slots that block WAL recycling must be cleaned up
-automatically by the replication manager.
+automatically by the leader's reconciler.
 
 **Violation**: pg_replication_slots contains inactive physical slots after
 a node restarts or is removed.

@@ -59,10 +59,9 @@ fn unix_now_secs() -> u64 {
 /// budget elapses.
 async fn leader_current_write_lsn(state: &ManagementApiState) -> Option<u64> {
     /// Follower reports arrive ~1/s per node and this probe contends on the
-    /// supervisor lock with the 100 ms lease-enforcement loop, so it matches
-    /// the lease tick's 1 s SQL budget (`App::LEASE_TICK_SQL_BUDGET`): enough
-    /// for a healthy local query, and a slow postmaster delays a lease tick
-    /// by at most one budget instead of two.
+    /// supervisor lock with the reconciler, so it matches the tick budget
+    /// (`governor::fence::TICK_SQL_BUDGET`): enough for a healthy local query,
+    /// and a slow postmaster delays a pass by at most one budget.
     const LSN_PROBE_BUDGET: Duration = Duration::from_secs(1);
     /// One round trip: the recovery check and the LSN read in a single
     /// statement. Splitting them doubles the lock-hold time and races a

@@ -121,9 +121,9 @@ pub fn choose_yield_target(candidates: &[YieldCandidate]) -> Option<NodeId> {
 ///
 /// `leader_since` is re-derived from `RaftMetrics` on every pass — set on the
 /// not-leader to leader edge and cleared the moment leadership goes away —
-/// rather than being written once at a transition and trusted afterwards. It is
-/// the same discipline `ReplicationManager::leader_since` follows, and it is
-/// what makes the anchor survive the restart that `failover_started_at` does
+/// rather than being written once at a transition and trusted afterwards. The
+/// reconciler's async-fallback grace reads the same tenure, and it is what
+/// makes the anchor survive the restart that `failover_started_at` does
 /// not: a node that comes back up and wins an election has a fresh edge, and
 /// the wedge this exists to catch is reached exactly that way.
 #[derive(Debug, Default)]

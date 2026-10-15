@@ -4,7 +4,7 @@
 # this file is the machine registry.
 
 [lease_fencing]
-"app.rs" = ["promotion_lease_holddown"]
+"governor/reconciler/follow.rs" = ["promotion_lease_holddown"]
 "governor/lease.rs" = ["expires_at", "is_valid", "quorum_ack_age", "renew"]
 "governor/raft.rs" = [
   "QUORUM_TIMEOUT_MS",

@@ -2143,7 +2143,7 @@
         {
           "type": "sleep",
           "seconds": 10,
-          "comment": "allow replication manager to detect and clean any orphaned slots"
+          "comment": "allow the reconciler to detect and clean any orphaned slots"
         }
       ],
       "assertions": [
@@ -4103,7 +4103,7 @@
         },
         {
           "type": "sleep",
-          "comment": "Give replication manager time to converge sync standby list",
+          "comment": "Give the reconciler time to converge the sync standby list",
           "seconds": 10
         }
       ],
@@ -4190,7 +4190,7 @@
         },
         {
           "type": "sleep",
-          "comment": "Let replication_manager detect node2 gone and re-evaluate sync list",
+          "comment": "Let the reconciler detect node2 gone and re-evaluate the sync list",
           "seconds": 10
         },
         {
@@ -4416,7 +4416,7 @@
         "R2",
         "V1"
       ],
-      "description": "After killing a follower's PostgreSQL, the leader's per-replica sync gauge must NOT keep reporting two Sync replicas. PG drops the walsender from pg_stat_replication within ~1s; the gauge must mirror that source-of-truth and not linger on the cached Sync value for `disconnect_timeout`. Pre-fix, replication_manager only flipped sync_state=Async after the grace window; post-fix, it flips immediately on absence from pg_stat_replication.",
+      "description": "After killing a follower's PostgreSQL, the leader's per-replica sync gauge must NOT keep reporting two Sync replicas. PG drops the walsender from pg_stat_replication within ~1s; the gauge must mirror that source-of-truth and not linger on the cached Sync value for `disconnect_timeout`. The gauge flips to async immediately on absence from pg_stat_replication, not after the grace window.",
       "actions": [
         {
           "type": "record_leader",

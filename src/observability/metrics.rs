@@ -117,10 +117,6 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     );
     describe_gauge!("pgbattery_healthy_replicas", "Number of healthy replicas");
     describe_counter!("pgbattery_promotions", "Number of promotions to primary");
-    describe_counter!(
-        "pgbattery_sync_standby_updates",
-        "Number of synchronous_standby_names updates"
-    );
     describe_gauge!(
         "pgbattery_node_id",
         "Node identifier exposed via metrics for discovery"
@@ -153,11 +149,11 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     );
     describe_gauge!(
         "pgbattery_replication_sync",
-        "1.0 if the replication manager's plan installs a non-empty synchronous_standby_names, else 0.0. Intent, not evidence: see pgbattery_sync_standbys_confirmed"
+        "1.0 if the reconciler's plan installs a non-empty synchronous_standby_names, else 0.0. Intent, not evidence: see pgbattery_sync_standbys_confirmed"
     );
     describe_gauge!(
         SYNC_STANDBYS_CONFIRMED_GAUGE,
-        "Standbys PostgreSQL reports sync_state=sync, from the lease tick's write-gate probe (0 when the probe did not answer)"
+        "Standbys PostgreSQL reports sync_state=sync, from the reconciler's write-gate probe (0 when the probe did not answer)"
     );
     describe_gauge!(
         SYNC_STANDBYS_REQUIRED_GAUGE,
@@ -205,7 +201,7 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     );
     describe_counter!(
         "pgbattery_sync_mode_commit_failures",
-        "Failed attempts by the replication manager to commit a sync-mode transition to the Raft log"
+        "Failed attempts by the reconciler to commit a sync-mode transition to the Raft log"
     );
     describe_counter!(
         "pgbattery_promotion_standby_signal_remove_failures",
@@ -213,11 +209,11 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     );
     describe_counter!(
         "pgbattery_promotion_fence_failures",
-        "Failed attempts to fence a freshly promoted primary read-only until synchronous replication is in force; the lease loop fences on its next tick"
+        "Failed attempts to fence a freshly promoted primary read-only until synchronous replication is in force; the lease fence closes it on its next tick"
     );
     describe_counter!(
         "pgbattery_promotion_sync_reset_failures",
-        "Failed attempts to clear synchronous_standby_names on the freshly promoted primary; replication manager will rewrite on its next tick"
+        "Failed attempts to install synchronous_standby_names on a freshly promoted primary; the reconciler rewrites it on its next pass"
     );
     describe_counter!(
         "pgbattery_log_append_failures",
@@ -226,14 +222,6 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     describe_counter!(
         "pgbattery_raft_storage_durability_pin_failures",
         "Attempts to pin redb durability to Immediate that returned an error; surface to detect any future redb default change"
-    );
-    describe_counter!(
-        "pgbattery_sync_state_verifications",
-        "Successful confirmations that synchronous_standby_names was applied"
-    );
-    describe_counter!(
-        "pgbattery_sync_state_verification_timeouts",
-        "Timeouts while waiting for synchronous_standby_names to apply"
     );
 
     // LSN tracking — used by L3 (LSN-safe election) gate

@@ -2516,7 +2516,7 @@ pub async fn rollback_local(
     // `synchronous_commit = local` proves local liveness without waiting on a
     // standby ack: the rolled-back primary's former standbys were upgraded to
     // the new major and diverged ahead, so they cannot stream to it, and the
-    // replication manager still lists them in `synchronous_standby_names` for
+    // reconciler still lists them in `synchronous_standby_names` for
     // RPO=0. Durable (synchronous_commit=on) client writes therefore block
     // until those standbys are re-basebackup'd from this old-major primary,
     // which the caller must drive after a rollback the way it does after a
@@ -2562,7 +2562,7 @@ pub async fn rollback_local(
 /// `synchronous_commit = local` proves local liveness without waiting on a
 /// standby ack: the rolled-back primary's former standbys were upgraded to the
 /// new major and diverged ahead, so they cannot stream to it, and the
-/// replication manager still lists them in `synchronous_standby_names` for
+/// reconciler still lists them in `synchronous_standby_names` for
 /// RPO=0. Durable (`synchronous_commit=on`) client writes therefore block until
 /// those standbys are re-basebackup'd from this old-major primary, which the
 /// caller must drive after a rollback the way it does after a forward apply.

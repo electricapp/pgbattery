@@ -364,8 +364,8 @@ impl Governor {
         // openraft emits a `RaftMetrics` update on every heartbeat and on
         // every match-index advance, so this code path runs many times per
         // second. `send_if_modified` only wakes subscribers when the leader
-        // address actually changes — without it, `App::ensure_follows`
-        // would fire (and re-probe PG) on every heartbeat, generating log
+        // address actually changes — without it, the reconciler would
+        // pass (and re-probe PG) on every heartbeat, generating log
         // spam and unnecessary psql round-trips. The stored value is
         // always brought up-to-date, so a late subscriber still observes
         // the current leader. See docs/STATE_MACHINE.md.
@@ -2994,7 +2994,11 @@ mod tests {
         // the defect, stated as the arithmetic that produces it.
         let retry_at = campaign_at + lease + Duration::from_millis(10);
         assert_eq!(
-            crate::app::promotion_lease_holddown(Some(lost_at), retry_at, lease),
+            crate::governor::reconciler::follow::promotion_lease_holddown(
+                Some(lost_at),
+                retry_at,
+                lease
+            ),
             None,
             "the first observation has counted out; promoting on it is the split-brain"
         );
@@ -3011,11 +3015,15 @@ mod tests {
 
         // The gate now measures the winning candidacy and holds through it.
         assert_eq!(
-            crate::app::promotion_lease_holddown(Some(retry_at), retry_at, lease),
+            crate::governor::reconciler::follow::promotion_lease_holddown(
+                Some(retry_at),
+                retry_at,
+                lease
+            ),
             Some(Duration::ZERO)
         );
         assert!(
-            crate::app::promotion_lease_holddown(
+            crate::governor::reconciler::follow::promotion_lease_holddown(
                 Some(retry_at),
                 retry_at + lease.saturating_sub(Duration::from_millis(1)),
                 lease
@@ -3024,7 +3032,11 @@ mod tests {
             "the hold-down must still be running one millisecond short of a lease"
         );
         assert_eq!(
-            crate::app::promotion_lease_holddown(Some(retry_at), retry_at + lease, lease),
+            crate::governor::reconciler::follow::promotion_lease_holddown(
+                Some(retry_at),
+                retry_at + lease,
+                lease
+            ),
             None,
             "and must release at exactly one lease duration, not later"
         );

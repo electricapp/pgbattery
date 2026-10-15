@@ -1,13 +1,8 @@
 //! The `PostgreSQL` seam.
 //!
-//! `src/app.rs` holds the split-brain-prevention core — `ensure_follows`,
-//! `promote_local_postgres`, `demote_to_leader` — and is the least-tested large
-//! file in the repo, because every path through it reaches a live `PostgreSQL`.
-//! That is backwards: the most safety-critical logic gets the slowest and least
-//! reproducible verification.
-//!
-//! This trait is the seam that fixes it. The orchestration functions are
-//! generic over it, so a model implementation can drive them through
+//! The node reconciler and the lease fence are the split-brain-prevention
+//! core, and every path through them reaches a live `PostgreSQL`. Generic
+//! over this trait, a model implementation can drive them through
 //! interleavings a Docker cluster cannot be made to produce on demand — a
 //! promotion racing a demotion, a `verify_promotion_safe` that fails on the
 //! third call, a node whose `is_in_recovery` disagrees with what we just told
@@ -42,6 +37,12 @@ pub trait PgControl: Send + Sync {
     /// started one, stopped one, or reaped one that exited — in every case
     /// there is no server to probe or set a GUC on.
     fn has_postmaster(&self) -> bool;
+
+    /// The postmaster this node owns: running, never started, or exited.
+    ///
+    /// # Errors
+    /// The process status could not be read.
+    fn postmaster_state(&mut self) -> Result<crate::supervisor::PostmasterState>;
 
     /// `pg_is_in_recovery()`. True for a standby.
     fn is_in_recovery(&self) -> impl Future<Output = Result<bool>> + Send;
@@ -105,6 +106,13 @@ pub trait PgControl: Send + Sync {
     fn list_physical_replication_slots(
         &self,
     ) -> impl Future<Output = Result<std::collections::HashSet<String>>> + Send;
+
+    /// Bring the DDL freeze and the client-write fence in line with `wanted`.
+    fn level_client_fence(
+        &self,
+        wanted: &crate::governor::reconciler::WantedClientFence,
+        cluster_id: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// The write path the lease loop fences, on a session of its own.
@@ -158,6 +166,10 @@ impl<P: PgControl> PgFence for std::sync::Arc<tokio::sync::Mutex<P>> {
 impl PgControl for crate::supervisor::Supervisor {
     fn has_postmaster(&self) -> bool {
         Self::has_postmaster(self)
+    }
+
+    fn postmaster_state(&mut self) -> Result<crate::supervisor::PostmasterState> {
+        Self::postmaster_state(self)
     }
 
     async fn is_in_recovery(&self) -> Result<bool> {
@@ -219,6 +231,14 @@ impl PgControl for crate::supervisor::Supervisor {
     async fn list_physical_replication_slots(&self) -> Result<std::collections::HashSet<String>> {
         Self::list_physical_replication_slots(self).await
     }
+
+    async fn level_client_fence(
+        &self,
+        wanted: &crate::governor::reconciler::WantedClientFence,
+        cluster_id: &str,
+    ) -> anyhow::Result<()> {
+        crate::governor::reconciler::level_client_fence(self, wanted, cluster_id).await
+    }
 }
 
 /// A scriptable `PostgreSQL` for tests.
@@ -246,6 +266,10 @@ pub const MODEL_LINEAGE: u64 = 7_000;
 
 #[cfg(test)]
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent knobs a test sets, not a state machine"
+)]
 pub struct ModelPg {
     pub in_recovery: bool,
     /// Whether this node owns a postmaster. False models the node that left
@@ -266,10 +290,15 @@ pub struct ModelPg {
     pub sync_list_empty: bool,
     /// Standbys `PostgreSQL` reports as `sync_state = 'sync'`.
     pub sync_standbys: usize,
+    /// Whether the postmaster this node owned has exited.
+    pub exited: bool,
     // Behind a `Mutex` because the commands that change them take `&self`,
     // like their real counterparts. `pub(crate)` only so `..Default::default()`
     // works at the call sites; construct them through the builders below.
     pub(crate) readonly: std::sync::Mutex<bool>,
+    /// The last `synchronous_standby_names` written; once set, the probe
+    /// reports its emptiness rather than `sync_list_empty`.
+    pub(crate) sync_names: std::sync::Mutex<Option<String>>,
     pub(crate) slots: std::sync::Mutex<std::collections::HashSet<String>>,
     pub(crate) calls: std::sync::Mutex<Vec<String>>,
 }
@@ -289,7 +318,9 @@ impl Default for ModelPg {
             replication_stats: Vec::new(),
             sync_list_empty: true,
             sync_standbys: 0,
+            exited: false,
             readonly: std::sync::Mutex::new(false),
+            sync_names: std::sync::Mutex::new(None),
             slots: std::sync::Mutex::new(std::collections::HashSet::new()),
             calls: std::sync::Mutex::new(Vec::new()),
         }
@@ -359,6 +390,26 @@ impl ModelPg {
 impl PgControl for ModelPg {
     fn has_postmaster(&self) -> bool {
         self.has_postmaster
+    }
+
+    fn postmaster_state(&mut self) -> Result<crate::supervisor::PostmasterState> {
+        use crate::supervisor::PostmasterState;
+        Ok(if self.exited {
+            PostmasterState::Exited { refused: false }
+        } else if self.has_postmaster {
+            PostmasterState::Running
+        } else {
+            PostmasterState::NotRunning
+        })
+    }
+
+    async fn level_client_fence(
+        &self,
+        wanted: &crate::governor::reconciler::WantedClientFence,
+        _cluster_id: &str,
+    ) -> anyhow::Result<()> {
+        self.note(&format!("level_client_fence(fenced={})", wanted.fenced));
+        Ok(())
     }
 
     async fn is_in_recovery(&self) -> Result<bool> {
@@ -444,7 +495,12 @@ impl PgControl for ModelPg {
         Ok(PgWriteState {
             in_recovery: self.in_recovery,
             read_only: self.is_readonly(),
-            sync_list_empty: self.sync_list_empty,
+            sync_list_empty: self
+                .sync_names
+                .lock()
+                .ok()
+                .and_then(|names| names.as_ref().map(String::is_empty))
+                .unwrap_or(self.sync_list_empty),
             sync_standbys: self.sync_standbys,
         })
     }
@@ -461,6 +517,9 @@ impl PgControl for ModelPg {
 
     async fn set_sync_standby_names(&self, names: &str) -> Result<()> {
         self.note(&format!("set_sync_standby_names({names})"));
+        if let Ok(mut current) = self.sync_names.lock() {
+            *current = Some(names.to_string());
+        }
         Ok(())
     }
 

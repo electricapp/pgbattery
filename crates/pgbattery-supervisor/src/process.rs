@@ -548,7 +548,7 @@ pub struct SupervisorConfig {
 /// `docs/STATE_MACHINE.md`). The third case — `Unknown` — exists because
 /// `pg_rewind` needs the same psql connection that the probe failed on;
 /// blindly assuming `Mismatch` when unreachable would spin on a dead
-/// leader. Defer instead, retry on the next `ensure_follows` tick.
+/// leader. Defer instead, retry on the next reconciler pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimelineCheck {
     Match,
@@ -2287,8 +2287,7 @@ host all all ::/0 {auth_method}
     /// later promotes, a stale non-empty value activates with zero connected
     /// replicas, blocking ALL writes — including the ALTER SYSTEM needed
     /// to fix it. Clearing here means every promotion starts with an empty
-    /// (async) sync config; `ReplicationManager` enables sync once replicas
-    /// actually connect.
+    /// (async) sync config until promotion installs the voter set's list.
     fn compute_standby_auto_conf(
         existing: &str,
         leader_addr: SocketAddr,
@@ -3149,7 +3148,7 @@ host all all ::/0 {auth_method}
 
     /// Leader's current WAL position (`pg_current_wal_lsn`), as a parsed
     /// 64-bit value. Fast-fail with the same 1.5s wall-clock budget as
-    /// `get_remote_timeline` — both run on the hot `ensure_follows` path.
+    /// `get_remote_timeline` — both run on every follower's reconciler pass.
     async fn get_remote_lsn(&self, addr: SocketAddr) -> Option<u64> {
         let answer = self
             .query_leader(addr, "SELECT pg_current_wal_lsn()::text;")
@@ -3159,7 +3158,7 @@ host all all ::/0 {auth_method}
 
     /// One unaligned single-value query against a peer's `PostgreSQL`, with the
     /// same 1.5 s wall-clock budget as `get_remote_timeline` — every caller is
-    /// on the hot `ensure_follows` path. `None` on an unreachable peer, a
+    /// on a follower's reconciler pass. `None` on an unreachable peer, a
     /// failed query, or the budget running out.
     async fn query_leader(&self, addr: SocketAddr, sql: &str) -> Option<String> {
         let psql = self.config.pg_bin_dir.join("psql");
@@ -3227,8 +3226,8 @@ host all all ::/0 {auth_method}
     /// - `Mismatch` → must `pg_rewind` to align with the leader's new
     ///   timeline.
     /// - `Unknown` → can't determine, and can't `pg_rewind` either (it
-    ///   needs the same connection). Defer; we'll retry on the next
-    ///   `ensure_follows` tick when the leader may be reachable.
+    ///   needs the same connection). Defer; the next reconciler pass
+    ///   retries when the leader may be reachable.
     ///
     /// **Why this can't fail-safe to `Mismatch`**: when the leader is
     /// unreachable, `pg_rewind` would also fail. Treating Unknown as
@@ -3815,13 +3814,13 @@ host all all ::/0 {auth_method}
     /// - `default_transaction_read_only`, whenever an acknowledgement is
     ///   required. `PostgreSQL` does not begin honouring the sync list the
     ///   instant it is written, so a primary can carry a correct list and still
-    ///   acknowledge a commit nothing else holds. The lease loop lifts the flag
-    ///   once a standby is designated `sync`, or once the replication manager
-    ///   deliberately falls back to async; until then a client gets a clean
-    ///   read-only error rather than a promise that can vanish.
+    ///   acknowledge a commit nothing else holds. The reconciler lifts the
+    ///   flag once a standby is designated `sync`, or once an async fallback
+    ///   is committed; until then a client gets a clean read-only error rather
+    ///   than a promise that can vanish.
     ///
     /// Neither failure aborts the promotion — the cluster still needs a
-    /// primary, and both settings are reconciled by loops that run every tick.
+    /// primary, and the reconciler levels both settings on every pass.
     /// They are counted because they are the difference between a window that
     /// cannot be entered and one that can.
     async fn arm_promotion_write_gate(&self, sync_standby_names: &str) {
@@ -3831,7 +3830,7 @@ host all all ::/0 {auth_method}
                 sync_standby_names,
                 "Failed to set synchronous_standby_names before promotion — \
                  the new primary keeps the inherited list until \
-                 ReplicationManager rewrites it on its next tick"
+                 the reconciler's next pass rewrites it"
             );
             metrics::counter!("pgbattery_promotion_sync_reset_failures").increment(1);
         }
@@ -4321,8 +4320,7 @@ impl Supervisor {
     /// Called when a node is removed from the cluster to prevent unbounded WAL retention.
     ///
     /// Returns the underlying SQL error on failure so the caller (the
-    /// replication manager's per-tick reconciliation) can retry on its next
-    /// pass. Swallowing errors here would silently leak the slot — a pinned
+    /// reconciler's slot sweep) can retry on its next pass. Swallowing errors here would silently leak the slot — a pinned
     /// slot keeps WAL forever, eventually filling disk. The caller treats
     /// transient failures as warnings via `SLOT_DROP_FAILURE_ESCALATION`.
     ///
@@ -4525,9 +4523,9 @@ impl Supervisor {
     ///
     /// Reads the live GUC first; if it already matches `names` (after
     /// canonicalisation), returns without issuing an ALTER SYSTEM. This
-    /// makes the caller side stateless — `ReplicationManager` can call this
-    /// every tick without keeping its own "last-applied" cache that could
-    /// be poisoned by an external `ALTER SYSTEM`.
+    /// makes the caller side stateless — the reconciler calls this every
+    /// pass without keeping its own "last-applied" cache that could be
+    /// poisoned by an external `ALTER SYSTEM`.
     ///
     /// `pg_reload_conf()` returns as soon as the signal is sent to the
     /// postmaster, not after the config is actually re-read. Returning here
@@ -4746,10 +4744,9 @@ pub struct PgWriteState {
     /// `default_transaction_read_only`.
     pub read_only: bool,
     /// Whether `synchronous_standby_names` is empty — i.e. this primary
-    /// requires no standby acknowledgement at all. True for a lone voter and
-    /// for the replication manager's deliberate async fallback, both of which
-    /// are states where a commit acknowledged by the primary alone is the
-    /// agreed durability rather than a surprise.
+    /// requires no standby acknowledgement at all: a lone voter, a committed
+    /// async fallback, or a list lost to a restart, which the write gate
+    /// tells apart through the committed sync mode.
     pub sync_list_empty: bool,
     /// Standbys `PostgreSQL` currently reports as `sync_state = 'sync'`.
     ///
@@ -5992,7 +5989,7 @@ mod tests {
 
     #[test]
     fn test_parse_role_readonly_async_fallback() {
-        // The replication manager's deliberate RPO>0 state: no ack required.
+        // An empty list: no ack required.
         assert_eq!(
             parse_role_readonly("false,off,empty,0").unwrap(),
             PgWriteState {

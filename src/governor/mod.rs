@@ -7,13 +7,14 @@
 //! - Dynamic quorum replication management
 //! - LSN-aware elections (Kukushkin safety)
 
+pub mod fence;
 pub mod lease;
 pub mod network;
 pub mod pg_control;
 pub mod promotion_watchdog;
 pub mod propose;
 pub mod raft;
-pub mod replication_manager;
+pub mod reconciler;
 pub mod state_machine;
 pub mod storage;
 pub mod tls;

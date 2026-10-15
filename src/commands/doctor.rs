@@ -637,7 +637,7 @@ fn check_replication(probes: &[NodeProbe]) -> Vec<CheckResult> {
 
 /// The `replication:sync` verdict from the leader's write-gate evidence:
 /// standbys `PostgreSQL` reports `sync` against what the voter count requires.
-/// The replication manager's plan gauge is intent, not evidence: it reads
+/// The reconciler's plan gauge is intent, not evidence: it reads
 /// "sync" through leader grace while no standby is `sync`.
 fn sync_durability_verdict(confirmed: Option<u64>, required: Option<u64>) -> (CheckStatus, String) {
     match (confirmed, required) {

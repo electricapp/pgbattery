@@ -4,7 +4,7 @@
 The rewind gate tolerates divergence up to `PG_REWIND_DIVERGENCE_THRESHOLD_BYTES`
 (16 MiB) and its justification is that synchronous replication is holding the
 acked writes elsewhere. During the async fallback that assumption is exactly
-false: the replication manager has deliberately emptied
+false: the reconciler has deliberately emptied
 `synchronous_standby_names`, so the leader acknowledges writes it alone holds.
 Depose it there and the survivors elect a leader without them; the old leader
 then rewinds, and the diverged WAL — those acknowledged writes — is discarded.
@@ -45,7 +45,7 @@ LOAD_TABLE: Final[str] = "rewind_loss_load"
 RECOVERY_TIMEOUT_S: Final[float] = 300.0
 
 # `pgbattery_replication_sync` is 1.0 while a sync list is configured and 0.0
-# once the replication manager has fallen back to async. That edge is the
+# once the reconciler has installed the async fallback. That edge is the
 # window this measures, so it is waited for rather than slept past.
 SYNC_METRIC: Final[str] = "pgbattery_replication_sync"
 
@@ -128,7 +128,7 @@ def _pg_answers(node: str) -> bool:
 
 
 def await_async_fallback(leader: str, timeout_s: float) -> bool:
-    """Wait until the replication manager has emptied the sync list."""
+    """Wait until the reconciler has emptied the sync list."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         value = fp.read_metric(leader, SYNC_METRIC)

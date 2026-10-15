@@ -303,10 +303,7 @@ mod tests {
         "pgbattery_sync_mode_commit_failures",
         "pgbattery_sync_quorum",
         "pgbattery_sync_replicas",
-        "pgbattery_sync_standby_updates",
         "pgbattery_sync_standbys",
-        "pgbattery_sync_state_verification_timeouts",
-        "pgbattery_sync_state_verifications",
     ];
 
     /// Histogram families, which the exporter renders as summaries: seven
