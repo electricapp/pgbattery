@@ -636,9 +636,10 @@ enum StandbyAction {
     /// LSN comparison inconclusive). Caller returns Ok(()) and lets the
     /// reconcile loop retry.
     Defer,
-    /// Config differs but timelines match — restart with new conninfo, no
-    /// `pg_rewind` needed.
-    RestartOnly,
+    /// Config differs but timelines are compatible — rewrite the conninfo
+    /// and reload; the walreceiver reconnects to the new leader with no
+    /// restart and no `pg_rewind`.
+    Repoint,
     /// Timeline divergence (either via remote probe or via local-LSN-ahead
     /// detection) — `pg_rewind` required before restart.
     Rewind,
@@ -698,6 +699,9 @@ pub struct Supervisor {
     /// The running postmaster's stderr relay, which ends with the last line
     /// that named a data-directory fault.
     log_relay: Option<tokio::task::JoinHandle<Option<String>>>,
+    /// The `Exited` state of a postmaster reaped since the last start or stop,
+    /// so every poll reads the exit rather than whichever came first.
+    exited: Option<PostmasterState>,
     session: SqlSession,
 }
 
@@ -1329,6 +1333,7 @@ impl Supervisor {
             config,
             child: None,
             log_relay: None,
+            exited: None,
             session,
         }
     }
@@ -1403,14 +1408,15 @@ impl Supervisor {
     /// node hands off, while a postmaster we never started (or deliberately
     /// stopped) is a state the reconcile loop repairs. Collapsing them is why
     /// a restore has to hold the supervisor lock from `stop` to `start` — the
-    /// health tick would otherwise read the gap as a crash and shut the node
-    /// down mid-restore.
+    /// reconciler would otherwise read the gap as a crash and shut the node
+    /// down mid-restore. An exit reads as one to every poll until the next
+    /// `start` or `stop`.
     ///
     /// # Errors
     /// Returns an error if the OS call to check process status fails.
     pub fn postmaster_state(&mut self) -> Result<PostmasterState> {
         let Some(child) = &mut self.child else {
-            return Ok(PostmasterState::NotRunning);
+            return Ok(self.exited.unwrap_or(PostmasterState::NotRunning));
         };
         // try_wait() returns Ok(Some(status)) if exited, Ok(None) if still running
         match child.try_wait() {
@@ -1419,17 +1425,17 @@ impl Supervisor {
                     exit_status = ?status,
                     "PostgreSQL process exited unexpectedly"
                 );
-                // CRITICAL: Clear child reference after reaping zombie
-                // Otherwise the next poll returns Err instead of Exited
+                // Reaped: the zombie is gone, and the exit is recorded instead.
                 self.child = None;
+                let exited = PostmasterState::Exited {
+                    code: status.code(),
+                };
+                self.exited = Some(exited);
                 // Clear the role gauge on the running→exited transition so
                 // monitoring does not show a stale primary/standby role
-                // after a crash. Only on this transition: once `child` is
-                // None, later polls report NotRunning and never re-emit.
+                // after a crash.
                 metrics::gauge!("pgbattery_pg_is_primary").set(0.0);
-                Ok(PostmasterState::Exited {
-                    code: status.code(),
-                })
+                Ok(exited)
             }
             Ok(None) => Ok(PostmasterState::Running),
             Err(e) => Err(Error::Postgres(format!(
@@ -1474,6 +1480,7 @@ impl Supervisor {
     pub async fn start(&mut self) -> Result<()> {
         // Always reconnect SQL client after PostgreSQL restarts.
         self.invalidate_sql_client().await;
+        self.exited = None;
 
         // Clean up any stale postmaster.pid / zombie postgres left behind
         // by a previous pgbattery process that was killed abruptly (SIGKILL,
@@ -1994,6 +2001,7 @@ host all all ::/0 {auth_method}
     /// fails.
     pub async fn stop(&mut self) -> Result<()> {
         self.invalidate_sql_client().await;
+        self.exited = None;
 
         if self.child.is_none() {
             return Ok(());
@@ -2667,12 +2675,12 @@ host all all ::/0 {auth_method}
 
     /// Given whether local replay is ahead of the leader (`None` = probe
     /// failed), decide the action for a config-changed timeline *mismatch*:
-    /// ahead → real divergence, rewind; at-or-behind → clean re-point, restart
-    /// and stream; unknown → defer and retry.
+    /// ahead → real divergence, rewind; at-or-behind → clean re-point and
+    /// stream; unknown → defer and retry.
     const fn standby_action_for_mismatch(local_ahead: Option<bool>) -> StandbyAction {
         match local_ahead {
             Some(true) => StandbyAction::Rewind,
-            Some(false) => StandbyAction::RestartOnly,
+            Some(false) => StandbyAction::Repoint,
             None => StandbyAction::Defer,
         }
     }
@@ -2693,7 +2701,7 @@ host all all ::/0 {auth_method}
             // or just restart with new conninfo.
             return Ok(
                 match self.check_timeline_state(new_leader_addr, lineage).await {
-                    TimelineCheck::Match => StandbyAction::RestartOnly,
+                    TimelineCheck::Match => StandbyAction::Repoint,
                     TimelineCheck::Mismatch => {
                         // A timeline mismatch alone is NOT divergence. A
                         // just-promoted leader is one timeline ahead of a clean
@@ -2705,7 +2713,7 @@ host all all ::/0 {auth_method}
                         // rewind when this node's replayed WAL is actually ahead of
                         // the leader — i.e. it holds WAL on the old timeline the
                         // leader forked away from. If it is at-or-behind, re-point
-                        // and stream (RestartOnly). A misclassification is safe: a
+                        // and stream (Repoint). A misclassification is safe: a
                         // still-diverged node fails to stream and the next tick's
                         // config-unchanged `Mismatch -> Rewind` path catches it, and
                         // the `pg_rewind` divergence gate is the final data-loss
@@ -2875,7 +2883,7 @@ host all all ::/0 {auth_method}
     ///
     /// Truth table:
     ///
-    ///   `config_changed=true`                      → restart with new conninfo
+    ///   `config_changed=true`                      → reload with new conninfo
     ///   `config_changed=false`, streaming OK       → no-op (steady state)
     ///   `config_changed=false`, streaming broken   → probe leader timeline:
     ///       `timeline=Mismatch` → `pg_rewind`
@@ -2891,70 +2899,39 @@ host all all ::/0 {auth_method}
         new_leader_addr: SocketAddr,
         terms: FollowTerms,
     ) -> Result<()> {
-        let needs_rewind = match self
+        match self
             .decide_standby_action(new_leader_addr, terms.lineage)
             .await?
         {
             StandbyAction::NoOp | StandbyAction::Defer => return Ok(()),
-            StandbyAction::RestartOnly => false,
-            StandbyAction::Rewind => true,
             StandbyAction::Reprovision => {
                 return self.reprovision_from(new_leader_addr, terms.lineage).await;
             }
-        };
-
-        // The divergence gate's local-LSN input must be read while PG is
-        // still up — stop() comes next. Captured on both paths because the
-        // re-point can still escalate to a rewind below, and the gate fails
-        // closed without it.
-        let pre_stop_lsn = self.capture_lsn_for_rewind_gate().await;
-
-        self.stop().await?;
-
-        if needs_rewind {
-            tracing::warn!(
-                new_leader = %new_leader_addr,
-                "Timeline mismatch detected while already in recovery - running pg_rewind"
-            );
-            if self
-                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, terms)
-                .await?
-                == RewindOutcome::Reprovisioned
-            {
-                return Ok(());
+            StandbyAction::Repoint => {
+                // `primary_conninfo` and `primary_slot_name` reload from
+                // PostgreSQL 13: the walreceiver reconnects to the new leader
+                // with no restart. One that cannot follow the new timeline
+                // shows on the next pass as a mismatch, which rewinds.
+                tracing::info!(new_leader = %new_leader_addr, "Re-pointing standby to new primary");
+                self.configure_standby(new_leader_addr).await?;
+                self.reload_config().await?;
             }
-        }
-
-        tracing::info!(
-            new_leader = %new_leader_addr,
-            "Switching standby to new primary (requires restart)"
-        );
-
-        self.configure_standby(new_leader_addr).await?;
-        if let Err(e) = self.start().await {
-            // A rewound directory that will not start has nothing left to try
-            // here, and a start that merely did not finish is not a refusal —
-            // both go back to the reconcile loop rather than escalating.
-            if needs_rewind || !matches!(e, Error::PostgresRefusedToOpen(_)) {
-                return Err(e);
-            }
-            // The re-point was chosen because this node looked able to adopt
-            // the leader's timeline by streaming. It could not: `PostgreSQL`
-            // refuses to open at all when the leader's timeline is not a child
-            // of its history, and no later restart changes that, so nothing
-            // retries this node back into the cluster. Take the rewind that
-            // was declined.
-            metrics::counter!("pgbattery_standby_repoint_escalated_to_rewind").increment(1);
-            tracing::warn!(
-                error = %e,
-                new_leader = %new_leader_addr,
-                "Standby did not open after re-pointing - rewinding onto the leader"
-            );
-            if self
-                .rewind_onto_leader(new_leader_addr, pre_stop_lsn, terms)
-                .await?
-                == RewindOutcome::Rewound
-            {
+            StandbyAction::Rewind => {
+                // The divergence gate's local-LSN input must be read while PG
+                // is still up.
+                let pre_stop_lsn = self.capture_lsn_for_rewind_gate().await;
+                self.stop().await?;
+                tracing::warn!(
+                    new_leader = %new_leader_addr,
+                    "Timeline mismatch detected while already in recovery - running pg_rewind"
+                );
+                if self
+                    .rewind_onto_leader(new_leader_addr, pre_stop_lsn, terms)
+                    .await?
+                    == RewindOutcome::Reprovisioned
+                {
+                    return Ok(());
+                }
                 self.configure_standby(new_leader_addr).await?;
                 self.start().await?;
             }
@@ -5084,7 +5061,7 @@ mod tests {
         // pay a full stop/rewind/start every failover.
         assert_eq!(
             Supervisor::standby_action_for_mismatch(Some(false)),
-            StandbyAction::RestartOnly
+            StandbyAction::Repoint
         );
         // Genuinely ahead of the leader → holds divergent WAL → rewind.
         assert_eq!(
@@ -6106,6 +6083,38 @@ mod tests {
                 "{did_not_finish} would rebuild a directory nothing is wrong with"
             );
         }
+    }
+
+    /// M4: reaping an exit erased it, so whoever polled first — a readiness
+    /// probe for a leadership transfer — took the crash, and the reconciler
+    /// then read a postmaster that was never started.
+    #[tokio::test]
+    async fn an_exit_reads_as_an_exit_to_every_poll_until_a_restart() {
+        let mut supervisor = Supervisor::new(SupervisorConfig {
+            pg_bin_dir: PathBuf::from("/nonexistent"),
+            pg_data_dir: PathBuf::from("/nonexistent"),
+            pg_port: 5_432,
+            pg_user: "postgres".to_string(),
+            wal_level: WalLevel::Replica,
+            node_id: 1,
+            pg_auth_mode: PgAuthMode::Trust,
+            wal_archive_dir: None,
+        });
+        // Exited but unreaped, so the supervisor's own poll reaps it.
+        supervisor.child = Some(Command::new("sh").arg("-c").arg("exit 3").spawn().unwrap());
+        sleep(Duration::from_millis(200)).await;
+
+        assert!(!supervisor.is_alive().unwrap());
+        assert_eq!(
+            supervisor.postmaster_state().unwrap(),
+            PostmasterState::Exited { code: Some(3) },
+            "the first poll consumed the crash"
+        );
+        supervisor.stop().await.unwrap();
+        assert_eq!(
+            supervisor.postmaster_state().unwrap(),
+            PostmasterState::NotRunning
+        );
     }
 
     #[test]

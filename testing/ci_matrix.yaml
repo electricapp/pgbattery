@@ -54,6 +54,7 @@
         "leaderless-wedge-recovery",
         "restart-budget-sustained-pg-death",
         "unopenable-standby-rebuilt",
+        "standby-repoints-without-restart",
         "mgmt-api-no-stale-leader-after-pg-death",
         "hung-postmaster-failover",
         "cascade-double-failover-wedge",
@@ -658,6 +659,58 @@
           "type": "leader_equals",
           "value": 1,
           "comment": "The rebuild is a follower's; it must not have cost the cluster its leader."
+        },
+        {
+          "type": "cluster_topology",
+          "nodes": 3,
+          "leaders": 1
+        }
+      ]
+    },
+    {
+      "id": "standby-repoints-without-restart",
+      "contracts": [
+        "V1"
+      ],
+      "description": "Move leadership node1 -> node2 and require node3, a standby throughout, to follow node2 without restarting: primary_conninfo and primary_slot_name reload from PostgreSQL 13. A restart drops node3's readers and replays from its last restartpoint before it can stream, and the new leader's writes stay closed until a standby is sync again.",
+      "actions": [
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 1
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "min_healthy_replicas": 2
+        },
+        {
+          "type": "cmd",
+          "comment": "node3's postmaster start time while it follows node1.",
+          "cmd": "mkdir -p testing/artifacts/standby-repoint && docker compose exec -T node3 psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SELECT pg_postmaster_start_time()' > testing/artifacts/standby-repoint/before && cat testing/artifacts/standby-repoint/before"
+        },
+        {
+          "type": "transfer_leadership",
+          "target_node_id": 2
+        },
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "min_healthy_replicas": 2
+        },
+        {
+          "type": "cmd",
+          "comment": "Once node3 streams from node2, its postmaster must be the one that followed node1.",
+          "cmd": "for i in $(seq 1 60); do S=$(docker compose exec -T node3 psql -h 127.0.0.1 -p 5434 -U postgres -tAc \"SELECT sender_host FROM pg_stat_wal_receiver WHERE status = 'streaming'\" | tr -d '[:space:]'); [ \"$S\" = 172.28.0.12 ] && break; sleep 1; done; echo \"node3 streams from: $S\"; [ \"$S\" = 172.28.0.12 ] || { echo 'FAIL: node3 never streamed from node2'; exit 1; }; AFTER=$(docker compose exec -T node3 psql -h 127.0.0.1 -p 5434 -U postgres -tAc 'SELECT pg_postmaster_start_time()'); echo \"before: $(cat testing/artifacts/standby-repoint/before) after: $AFTER\"; [ \"$AFTER\" = \"$(cat testing/artifacts/standby-repoint/before)\" ] || { echo 'FAIL: node3 restarted to re-point'; exit 1; }"
+        }
+      ],
+      "assertions": [
+        {
+          "type": "leader_equals",
+          "value": 2
         },
         {
           "type": "cluster_topology",

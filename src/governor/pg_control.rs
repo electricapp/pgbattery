@@ -44,6 +44,9 @@ pub trait PgControl: Send + Sync {
     /// The process status could not be read.
     fn postmaster_state(&mut self) -> Result<crate::supervisor::PostmasterState>;
 
+    /// Start `PostgreSQL` on the existing data directory, fenced.
+    fn start(&mut self) -> impl Future<Output = Result<()>> + Send;
+
     /// `pg_is_in_recovery()`. True for a standby.
     fn is_in_recovery(&self) -> impl Future<Output = Result<bool>> + Send;
 
@@ -170,6 +173,10 @@ impl PgControl for crate::supervisor::Supervisor {
 
     fn postmaster_state(&mut self) -> Result<crate::supervisor::PostmasterState> {
         Self::postmaster_state(self)
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        Self::start(self).await
     }
 
     async fn is_in_recovery(&self) -> Result<bool> {
@@ -409,6 +416,15 @@ impl PgControl for ModelPg {
         _cluster_id: &str,
     ) -> anyhow::Result<()> {
         self.note(&format!("level_client_fence(fenced={})", wanted.fenced));
+        Ok(())
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        self.note("start");
+        self.has_postmaster = true;
+        if let Ok(mut readonly) = self.readonly.lock() {
+            *readonly = true;
+        }
         Ok(())
     }
 

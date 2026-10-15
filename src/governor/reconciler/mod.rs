@@ -36,7 +36,7 @@ use super::promotion_watchdog::{
     LeadershipObservation, PromotionWatchdog, WedgeVerdict, YieldCandidate, choose_yield_target,
 };
 use super::raft::{FenceState, Governor, TypeConfig};
-use super::state_machine::{ClusterCommand, ClusterState, CutoverPhase, NodeId};
+use super::state_machine::{ClusterCommand, ClusterState, CutoverPhase, NodeId, PgUpgradeState};
 use crate::supervisor::{FollowTerms, LineageTerm, PostmasterState, Supervisor};
 
 /// Pass cadence with nothing to wake it sooner.
@@ -170,7 +170,9 @@ struct View {
     /// Every committed member, the slot targets.
     members: HashSet<NodeId>,
     follow_terms: FollowTerms,
-    awaits_rejoin: bool,
+    /// The committed Track B record: while frozen its orchestrator owns the
+    /// primary's postmaster, and a standby it awaits stays stopped.
+    pg_upgrade: PgUpgradeState,
     lineage_unrecorded: bool,
     committed_sync: Option<bool>,
     client_fence: WantedClientFence,
@@ -214,7 +216,7 @@ impl View {
             members: state.nodes.keys().copied().collect(),
             lineage_unrecorded: follow_terms.lineage == LineageTerm::Committed(None),
             follow_terms,
-            awaits_rejoin: state.pg_upgrade.leaves_stopped(node_id),
+            pg_upgrade: state.pg_upgrade.clone(),
             committed_sync: state.sync_replication_active,
             client_fence: WantedClientFence::derive(&state, client_fence),
         }
@@ -363,6 +365,14 @@ impl NodeReconciler {
                 None
             }
             Role::Leader => {
+                // A leader whose PostgreSQL is not running brings it up, born
+                // fenced; while an upgrade is frozen its orchestrator owns it.
+                if !pg.has_postmaster()
+                    && !view.pg_upgrade.frozen
+                    && let Err(e) = pg.start().await
+                {
+                    warn!(error = %e, "Leader could not start its PostgreSQL");
+                }
                 let primary = follow::promote_local_postgres(
                     pg,
                     &self.cluster_state,
@@ -396,8 +406,8 @@ impl NodeReconciler {
                         leader, "Leader address equals own PG address - refusing self-demote"
                     ),
                     Some(addr) => {
-                        follow::demote_to_leader(pg, addr, view.awaits_rejoin, view.follow_terms)
-                            .await;
+                        let awaits_rejoin = view.pg_upgrade.leaves_stopped(self.node_id);
+                        follow::demote_to_leader(pg, addr, awaits_rejoin, view.follow_terms).await;
                     }
                 }
                 None
@@ -1005,7 +1015,7 @@ mod tests {
             voters: three.clone(),
             members: three,
             follow_terms: ClusterState::default().follow_terms(),
-            awaits_rejoin: false,
+            pg_upgrade: PgUpgradeState::default(),
             lineage_unrecorded: false,
             committed_sync: Some(true),
             client_fence: WantedClientFence {
@@ -1185,6 +1195,43 @@ mod tests {
         );
         assert!(cadence.report_due(7, start + LSN_HEARTBEAT));
         node.lsn = cadence;
+    }
+
+    /// M2: a leader whose PostgreSQL was left stopped had no way back but the
+    /// watchdog's yield a minute later, and none at all with no caught-up
+    /// peer.
+    #[tokio::test]
+    async fn a_leader_starts_its_stopped_postgres_unless_an_upgrade_owns_it() {
+        let stopped = || ModelPg {
+            has_postmaster: false,
+            in_recovery: true,
+            ..ModelPg::default()
+        };
+        let mut pg = stopped();
+        reconciler(Duration::from_secs(5))
+            .pass(&mut pg, &leading())
+            .await;
+        let calls = pg.calls();
+        assert_eq!(
+            calls.first().map(String::as_str),
+            Some("start"),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"verify_promotion_safe".to_string()),
+            "{calls:?}"
+        );
+
+        let mut pg = stopped();
+        let mut frozen = leading();
+        frozen.pg_upgrade.frozen = true;
+        reconciler(Duration::from_secs(5))
+            .pass(&mut pg, &frozen)
+            .await;
+        assert!(
+            !pg.calls().contains(&"start".to_string()),
+            "started under a frozen upgrade"
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 # `types`: every name must resolve to an enum/struct/trait/type or enum variant
 #          in src/ or crates/, unless listed under [foreign].
 
-enums.StandbyAction = ["NoOp", "Defer", "RestartOnly", "Rewind", "Reprovision"]
+enums.StandbyAction = ["NoOp", "Defer", "Repoint", "Rewind", "Reprovision"]
 enums.ReplicaHealth = ["Healthy", "Lagging", "Unhealthy"]
 enums.ClusterCommand = [
   "AddNode",

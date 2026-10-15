@@ -359,15 +359,19 @@ pub struct FenceObservation {
     pub is_primary: bool,
     pub freeze_installed: bool,
     pub grants: FenceGrants,
+    /// A prepared transaction is open in this database.
+    pub prepared: bool,
 }
 
 impl FenceObservation {
     /// The fence and the DDL freeze both hold on a primary: nothing a fenced
-    /// role can still be granted is left to revoke. Preflight at SEAL proved
-    /// the roles have no other write path.
+    /// role can still be granted is left to revoke, and no prepared
+    /// transaction is open — its owner commits it whenever it likes, fence or
+    /// no fence, and logical decoding ships it at that commit, past the final
+    /// LSN. Preflight at SEAL proved the roles have no other write path.
     #[must_use]
     pub const fn sealable(self) -> bool {
-        self.is_primary && self.freeze_installed && !self.grants.revocable
+        self.is_primary && self.freeze_installed && !self.grants.revocable && !self.prepared
     }
 }
 
@@ -429,14 +433,16 @@ pub async fn observe(
             "SELECT (NOT pg_is_in_recovery())::text \
              || '|' || EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = '{}')::text \
              || '|' || (to_regclass('{FENCE_TABLE}') IS NOT NULL)::text \
-             || '|' || {revocable}::text;",
+             || '|' || {revocable}::text \
+             || '|' || EXISTS(SELECT 1 FROM pg_prepared_xacts \
+                              WHERE database = current_database())::text;",
             super::ddl_freeze::DDL_TRIGGER
         ))
         .await
         .context("observing the client fence")?;
     let fields: Vec<&str> = raw.trim().split('|').collect();
-    let [primary, freeze, table, grants] = fields.as_slice() else {
-        bail!("expected four fence facts, got {raw:?}");
+    let [primary, freeze, table, grants, prepared] = fields.as_slice() else {
+        bail!("expected five fence facts, got {raw:?}");
     };
     let recorded = if parse_pg_bool(table)? {
         let escaped_cluster = cluster_id.replace('\'', "''");
@@ -458,6 +464,7 @@ pub async fn observe(
             revocable: parse_pg_bool(grants)?,
             recorded,
         },
+        prepared: parse_pg_bool(prepared)?,
     })
 }
 
@@ -591,11 +598,26 @@ mod tests {
             is_primary,
             freeze_installed,
             grants: seen(revocable, true),
+            prepared: false,
         };
         assert!(at(true, true, false).sealable());
         assert!(!at(false, true, false).sealable());
         assert!(!at(true, false, false).sealable());
         assert!(!at(true, true, true).sealable());
+    }
+
+    /// H5: a transaction prepared before the fence commits whenever its
+    /// owner says COMMIT PREPARED, fence or no fence, and logical decoding
+    /// ships it at that commit: after the final LSN, and so never drained.
+    #[test]
+    fn an_open_prepared_transaction_is_not_sealable() {
+        let observed = FenceObservation {
+            is_primary: true,
+            freeze_installed: true,
+            grants: seen(false, true),
+            prepared: true,
+        };
+        assert!(!observed.sealable());
     }
 
     /// Seeding restores the dump's ACLs onto a recipient fenced from boot,
