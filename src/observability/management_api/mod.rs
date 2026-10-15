@@ -154,6 +154,8 @@ pub struct ManagementApiState {
     /// entry; handlers must read authority through
     /// `Governor::cutover_authority_projection`, never the raw log state.
     pub awaits_write_authority_from: Option<Arc<str>>,
+    /// `Config::accept_unverified_self_upgrade`.
+    pub accept_unverified_self_upgrade: bool,
 }
 
 /// The two paths needed to read a data directory's control file, plus Track B

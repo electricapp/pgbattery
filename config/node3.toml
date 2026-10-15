@@ -15,6 +15,9 @@ advertise_mgmt_addr = "172.28.0.13:9091"
 election_timeout_ms = 1000
 heartbeat_interval_ms = 250
 
+# Test cluster only: the binary-upgrade proof rolls unsigned local builds.
+accept_unverified_self_upgrade = true
+
 [[peers]]
 id = 1
 raft_addr = "172.28.0.11:5433"

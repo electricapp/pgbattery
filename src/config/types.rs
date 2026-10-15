@@ -200,6 +200,12 @@ pub struct Config {
     /// Local backup configuration
     #[serde(default)]
     pub backup: BackupConfig,
+
+    /// Let a self-upgrade request skip signature verification or name its own
+    /// signer. Off, the node runs only binaries signed by the identity it was
+    /// built or configured with (`PGBATTERY_RELEASE_IDENTITY_REGEX`).
+    #[serde(default)]
+    pub accept_unverified_self_upgrade: bool,
 }
 
 // `BackupConfig` and `BackupType` are defined in `pgbattery_core` and

@@ -61,6 +61,13 @@ const fn self_upgrade_refused_on_leader(is_leader: bool, voters: usize) -> bool 
     is_leader && voters > 1
 }
 
+/// Whether `body` asks this node to trust a binary its own configuration
+/// would not. Skipping verification, or naming the signer, hands whoever
+/// holds the API token code execution on the node.
+const fn unverified_without_consent(body: &SelfUpgradeHttpRequest, accepted: bool) -> bool {
+    !accepted && (body.insecure_no_verify || body.identity.is_some())
+}
+
 /// Replace this node's binary and request a graceful process restart.
 #[allow(
     clippy::too_many_lines,
@@ -70,6 +77,19 @@ pub(super) async fn self_upgrade(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<SelfUpgradeHttpRequest>,
 ) -> impl IntoResponse {
+    if unverified_without_consent(&body, state.accept_unverified_self_upgrade) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(SelfUpgradeResponse {
+                success: false,
+                message: "This node verifies its binaries against its own signer: \
+                          insecure_no_verify and identity need \
+                          accept_unverified_self_upgrade in its config"
+                    .to_string(),
+                backup_path: None,
+            }),
+        );
+    }
     let Ok(_guard) = state.upgrade_lock.try_lock() else {
         return (
             StatusCode::CONFLICT,
@@ -1159,9 +1179,36 @@ pub(super) async fn postgres_upgrade_rollback(
 #[allow(clippy::unwrap_used, reason = "test assertions on known-good values")]
 mod tests {
     use super::{
-        PgUpgradeState, UpgradeRecordStep, apply_refusal, rejoin_refusal,
-        self_upgrade_refused_on_leader,
+        PgUpgradeState, SelfUpgradeHttpRequest, UpgradeRecordStep, apply_refusal, rejoin_refusal,
+        self_upgrade_refused_on_leader, unverified_without_consent,
     };
+
+    /// The API token alone must not choose what a node runs: a request that
+    /// skips verification or names its own signer needs the node's consent.
+    #[test]
+    fn an_unverified_binary_needs_the_nodes_own_consent() {
+        let request = |insecure_no_verify, identity: Option<&str>| SelfUpgradeHttpRequest {
+            version: "9.9.9".to_string(),
+            url: Some("http://attacker.example".to_string()),
+            allow_insecure_http: true,
+            insecure_no_verify,
+            allow_downgrade: false,
+            identity: identity.map(str::to_string),
+        };
+        assert!(unverified_without_consent(&request(true, None), false));
+        assert!(unverified_without_consent(
+            &request(false, Some(".*")),
+            false
+        ));
+        assert!(!unverified_without_consent(
+            &request(true, Some(".*")),
+            true
+        ));
+        assert!(
+            !unverified_without_consent(&request(false, None), false),
+            "a verified binary from any URL is still checked against the pinned signer"
+        );
+    }
 
     /// Restarting the current leader of a multi-voter cluster drops
     /// leadership mid-write-path; a single-voter cluster has nowhere to

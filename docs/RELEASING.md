@@ -36,7 +36,11 @@ inclusion proof. It accepts a binary only if **all** of these hold (see
 
 Issuer + identity are baked into the binary as constants; operators can override
 them with `--identity <regex>` / `PGBATTERY_RELEASE_IDENTITY_REGEX` and
-`PGBATTERY_RELEASE_OIDC_ISSUER` (e.g. for a fork).
+`PGBATTERY_RELEASE_OIDC_ISSUER` (e.g. for a fork). Over the management API, a
+self-upgrade that names its own identity or skips verification is refused
+unless the node's config sets `accept_unverified_self_upgrade = true`: the API
+token alone does not choose what a node runs. A fork rolling a cluster sets the
+environment variables on its nodes instead.
 
 **Rekor transparency-log inclusion is now verified** (previously a known gap).
 When a release publishes no `.bundle` — older releases, or a publisher that

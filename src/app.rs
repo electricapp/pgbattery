@@ -922,6 +922,7 @@ impl App {
                 .awaits_write_authority_from
                 .as_deref()
                 .map(Arc::from),
+            accept_unverified_self_upgrade: self.config.accept_unverified_self_upgrade,
         })
     }
 
