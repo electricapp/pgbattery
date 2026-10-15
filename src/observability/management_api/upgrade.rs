@@ -563,6 +563,17 @@ pub struct UpgradeRecordResponse {
     pub message: Option<String>,
 }
 
+/// The Track B upgrade record as this node has applied it.
+pub(super) async fn get_upgrade_record(
+    State(state): State<Arc<ManagementApiState>>,
+) -> Json<UpgradeRecordResponse> {
+    Json(UpgradeRecordResponse {
+        success: true,
+        record: state.cluster_state.read().pg_upgrade.clone(),
+        message: None,
+    })
+}
+
 /// Commit one step of the Track B upgrade record for the whole cluster.
 ///
 /// Committed to the Raft log, not latched per node: gateways and supervisors

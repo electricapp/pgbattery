@@ -22,6 +22,7 @@ use tracing::info;
 use crate::cluster::ClusterClient;
 use crate::commands::doctor::require_doctor_strict;
 use crate::config::Config;
+use crate::governor::state_machine::PgUpgradeState;
 use crate::observability::management_api::UpgradeRecordStep;
 use serde::{Deserialize, Serialize};
 
@@ -218,6 +219,34 @@ impl TransferMode {
     }
 }
 
+/// What an invocation does to an upgrade already under way, instead of an
+/// apply: at most one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordAction {
+    Abort,
+    Resume,
+    Confirm,
+    Rollback,
+}
+
+impl RecordAction {
+    fn of(params: &PostgresUpgradeParams) -> Result<Option<Self>> {
+        let chosen: Vec<Self> = [
+            (params.abort, Self::Abort),
+            (params.resume, Self::Resume),
+            (params.confirm, Self::Confirm),
+            (params.rollback, Self::Rollback),
+        ]
+        .into_iter()
+        .filter_map(|(set, action)| set.then_some(action))
+        .collect();
+        if chosen.len() > 1 {
+            bail!("Refusing: --confirm, --rollback, --abort and --resume are mutually exclusive");
+        }
+        Ok(chosen.first().copied())
+    }
+}
+
 /// Operator flags for Track B / Track C preflight / apply / confirm / rollback.
 #[derive(Debug, Clone)]
 pub struct PostgresUpgradeParams {
@@ -228,6 +257,8 @@ pub struct PostgresUpgradeParams {
     pub rollback: bool,
     /// Commit the record's abort for an upgrade left frozen.
     pub abort: bool,
+    /// Rejoin the standbys a served upgrade's record still lists.
+    pub resume: bool,
     pub node: Option<String>,
     pub allow_no_backup: bool,
     pub accept_no_rollback: bool,
@@ -271,17 +302,12 @@ pub async fn run_postgres_upgrade(params: PostgresUpgradeParams) -> Result<()> {
         return crate::commands::upgrade::blue_green::run_blue_green_preflight(params).await;
     }
 
-    if u8::from(params.confirm) + u8::from(params.rollback) + u8::from(params.abort) > 1 {
-        bail!("Refusing: --confirm, --rollback and --abort are mutually exclusive");
-    }
-    if params.abort {
-        return run_abort(params).await;
-    }
-    if params.confirm {
-        return run_confirm(params).await;
-    }
-    if params.rollback {
-        return run_rollback(params).await;
+    match RecordAction::of(&params)? {
+        Some(RecordAction::Abort) => return run_abort(params).await,
+        Some(RecordAction::Resume) => return run_resume(params).await,
+        Some(RecordAction::Confirm) => return run_confirm(params).await,
+        Some(RecordAction::Rollback) => return run_rollback(params).await,
+        None => {}
     }
 
     if !params.check_only && !params.experimental {
@@ -699,6 +725,66 @@ async fn run_abort(params: PostgresUpgradeParams) -> Result<()> {
     commit_step(&client, &membership.nodes, UpgradeRecordStep::Abort).await?;
     info!("Upgrade aborted: clients released, stopped standbys restart on their own");
     Ok(())
+}
+
+/// The standbys a `--resume` rejoins: those the committed record still lists.
+/// Before SERVE the record is frozen and the way out is `--abort`, which
+/// releases them on the major they already run.
+fn resume_targets<'a>(
+    record: &PgUpgradeState,
+    nodes: &'a [crate::cluster::client::NodeInfo],
+) -> Result<Vec<&'a crate::cluster::client::NodeInfo>> {
+    if record.frozen {
+        bail!(
+            "The upgrade has not served its primary yet; finish it with --abort, \
+             which releases the stopped standbys on their current major"
+        );
+    }
+    Ok(nodes
+        .iter()
+        .filter(|n| record.awaiting_rejoin.contains(&n.node_id))
+        .collect())
+}
+
+/// `--resume`: finish an upgrade whose orchestrator died after the primary
+/// served. Each standby the record still lists is rejoined to the primary's
+/// major exactly as the apply would have, then the verification gate runs.
+async fn run_resume(params: PostgresUpgradeParams) -> Result<()> {
+    let (client, entry, _) =
+        cluster_client_and_entry(params.node.clone(), params.config_path.as_deref()).await?;
+    let membership = client.get_nodes(&entry).await?;
+    wait_for_serving_primary(&client, &membership.nodes).await?;
+    let leader = client.get_leader_info(&entry).await?;
+    let Some(leader_mgmt) = leader.leader_mgmt_addr else {
+        bail!("No cluster leader to read the upgrade record from");
+    };
+    let record = client.get_upgrade_record(&leader_mgmt).await?;
+    let standbys = resume_targets(&record, &membership.nodes)?;
+    if standbys.is_empty() {
+        info!("No standby awaits rejoin; nothing to resume");
+        return Ok(());
+    }
+    info!(
+        standbys = ?standbys.iter().map(|n| n.node_id).collect::<Vec<_>>(),
+        to_major = params.to_major,
+        "Resuming the upgrade: rejoining the standbys the record lists"
+    );
+    rejoin_standbys(
+        &client,
+        &membership.nodes,
+        &leader_mgmt,
+        &standbys,
+        params.to_major,
+    )
+    .await?;
+    verify_post_upgrade(
+        &client,
+        &membership.nodes,
+        &leader_mgmt,
+        params.to_major,
+        params.config_path.as_deref(),
+    )
+    .await
 }
 
 fn split_host_port(addr: &str) -> Result<(String, u16)> {
@@ -3333,6 +3419,41 @@ backup_dir = \"/var/backups/pgbattery\"
 
         let linked = fake_datadir(dir.path(), "data_linked", 17, false);
         assert!(!old_cluster_recoverable(&linked));
+    }
+
+    /// An orchestrator that died after SERVE left its standbys stopped with
+    /// nothing able to rejoin them. `--resume` rejoins exactly the ones the
+    /// committed record still lists; before SERVE the way out is `--abort`.
+    #[test]
+    fn resume_rejoins_only_the_standbys_the_record_lists() {
+        let node = |id| crate::cluster::client::NodeInfo {
+            node_id: id,
+            mgmt_addr: format!("10.0.0.{id}:9091"),
+            raft_addr: String::new(),
+            pg_addr: String::new(),
+            metrics_addr: String::new(),
+            is_leader: id == 1,
+        };
+        let nodes = [node(1), node(2), node(3)];
+        let served = PgUpgradeState {
+            frozen: false,
+            awaiting_rejoin: vec![3],
+        };
+        let targets = resume_targets(&served, &nodes).unwrap();
+        assert_eq!(
+            targets.iter().map(|n| n.node_id).collect::<Vec<_>>(),
+            vec![3]
+        );
+        let frozen = PgUpgradeState {
+            frozen: true,
+            awaiting_rejoin: vec![2, 3],
+        };
+        assert!(resume_targets(&frozen, &nodes).is_err());
+        assert!(
+            resume_targets(&PgUpgradeState::default(), &nodes)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A standby rejoin wipes PGDATA and basebackups from the primary, so

@@ -404,6 +404,11 @@ pub enum UpgradeSubcommand {
         #[arg(long)]
         abort: bool,
 
+        /// Resume an upgrade whose orchestrator died after the primary
+        /// served: rejoin the standbys the record still lists, then verify
+        #[arg(long)]
+        resume: bool,
+
         /// Track C: logical blue/green major upgrade. --check runs catalog
         /// preflight; --experimental runs the cutover against an already
         /// seeded green cluster (provisioning and seeding are not implemented)

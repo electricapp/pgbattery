@@ -734,6 +734,36 @@ impl ClusterClient {
         ))
     }
 
+    /// The Track B upgrade record as `addr` has applied it
+    /// (`GET .../postgres-upgrade/record`).
+    ///
+    /// # Errors
+    /// Unreachable, unauthorized, or an unparseable answer.
+    pub async fn get_upgrade_record(
+        &self,
+        addr: &str,
+    ) -> Result<crate::governor::state_machine::PgUpgradeState> {
+        let url = format!("http://{addr}/api/v1/admin/postgres-upgrade/record");
+        let resp = self
+            .add_management_token(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to contact {addr}: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = read_error_body(resp).await;
+            anyhow::bail!(management_api_failure(
+                "Upgrade record read",
+                status,
+                &err_body,
+                self.management_api_token.is_some()
+            ));
+        }
+        let answer: crate::observability::management_api::UpgradeRecordResponse =
+            resp.json().await?;
+        Ok(answer.record)
+    }
+
     /// Stop `PostgreSQL` on a node (`POST /api/v1/admin/postgres/stop`).
     ///
     /// # Errors

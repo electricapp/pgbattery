@@ -448,7 +448,7 @@ pub async fn start_management_api(
         )
         .route(
             "/api/v1/admin/postgres-upgrade/record",
-            post(upgrade::commit_upgrade_step),
+            post(upgrade::commit_upgrade_step).get(upgrade::get_upgrade_record),
         )
         .route("/api/v1/admin/postgres/stop", post(upgrade::stop_postgres))
         .route(
