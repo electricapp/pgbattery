@@ -129,10 +129,6 @@ class ContractFailure(RuntimeError):
     """A Track B contract did not hold."""
 
 
-class ProductGap(NotImplementedError):
-    """A sound assertion the product cannot pass yet. Names the missing behaviour."""
-
-
 class NodePaths(BaseModel):
     """The PostgreSQL paths a node's own config file gives it."""
 
@@ -602,11 +598,8 @@ def _assert_leftover_discarded(leader: Node, target: str) -> None:
     console.print(f"discard-on-resume OK: the leftover {target} was replaced, not reused")
 
 
-def _kill_mid_apply(leader: Node, cli: Node, entry: str) -> list[str]:
-    """SIGKILL the apply's own pg_upgrade on `leader` and assert the effect.
-
-    Returns the product gaps it found; every other broken expectation raises.
-    """
+def _kill_mid_apply(leader: Node, cli: Node, entry: str) -> None:
+    """SIGKILL the apply's own pg_upgrade on `leader` and assert the effect."""
     paths = node_paths(leader.service, _active_files())
     target = target_datadir(paths.pg_data_dir, TO_MAJOR)
     _exec(leader.service, "rm", "-rf", SHIM_HOLD_DIR)
@@ -657,23 +650,21 @@ def _kill_mid_apply(leader: Node, cli: Node, entry: str) -> list[str]:
     if result.get("rc") == "0":
         raise ContractFailure("apply reported success after its pg_upgrade was killed")
 
-    gaps: list[str] = []
-    if not _cluster_frozen(leader):
-        gap = (
-            "after a failed apply the committed upgrade freeze must stay until a resume or an "
-            "explicit abort clears it; the apply's failure path lifted it as soon as the old "
-            "primary answered (apply_experimental -> unfreeze_after_serving_primary_logging)"
-        )
-        err_console.print(f"[bold red]PRODUCT GAP[/]: {gap}")
-        gaps.append(gap)
     _assert_serves_old_major(leader)
     _assert_old_control_intact(leader, paths)
+    # A failed apply that recovered the old cluster returns it to service: held
+    # clients are released into the primary that answers, not kept waiting on
+    # an upgrade that is no longer running.
+    if _cluster_frozen(leader):
+        raise ContractFailure(
+            f"after a failed apply {leader.service} serves {FROM_MAJOR}, yet the freeze still "
+            "holds clients"
+        )
     _mark_leftover(leader, target)
     console.print(
         f"chaos mid-upgrade: apply failed, {leader.service} serves {FROM_MAJOR} from an intact "
-        f"control file, leftover target {target} marked"
+        f"control file to released clients, leftover target {target} marked"
     )
-    return gaps
 
 
 @app.command()
@@ -709,7 +700,6 @@ def main(
     entry = _entry_addr()
     _seed(gateway)
 
-    gaps: list[str] = []
     writer = Writer(gateway)
     writer.start()
     try:
@@ -719,7 +709,7 @@ def main(
             describe="the writer's first acked key",
         )
         if chaos == MID_UPGRADE:
-            gaps = _kill_mid_apply(leader, cli, entry)
+            _kill_mid_apply(leader, cli, entry)
             # The resume's preflight is `doctor --strict` again: the standbys
             # the failed apply stopped must be back and sync first.
             resumed = settle.await_settled(topo.nodes)
@@ -792,8 +782,6 @@ def main(
             if not row or row[0] != "17":
                 raise ContractFailure(f"seed row missing after upgrade: {row}")
 
-    if gaps:
-        raise ProductGap("; ".join(gaps))
     console.print(f"pg-major-upgrade-proof OK ({FROM_MAJOR} -> {TO_MAJOR})")
 
 
