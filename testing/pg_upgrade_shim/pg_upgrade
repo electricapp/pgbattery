@@ -1,0 +1,25 @@
+#!/bin/sh
+# Test-only stand-in for pg_upgrade, used by pg-major-upgrade-chaos-mid-upgrade.
+#
+# `--check` runs straight through, so the preflight is never held. An apply
+# writes its pid to `held.pid`, waits for `release`, then execs the real
+# pg_upgrade under that same pid: the harness knows which process is the
+# apply's pg_upgrade instead of guessing with a pattern match.
+set -eu
+
+hold="${PG_UPGRADE_SHIM_HOLD:-/tmp/pg_upgrade_shim/hold}"
+real="$(dirname "$0")/pg_upgrade.real"
+
+for arg in "$@"; do
+  case "$arg" in
+    --check | -c) exec "$real" "$@" ;;
+  esac
+done
+
+mkdir -p "$hold"
+echo "$$" >"$hold/held.pid.tmp"
+mv "$hold/held.pid.tmp" "$hold/held.pid"
+while [ ! -e "$hold/release" ]; do
+  sleep 0.05
+done
+exec "$real" "$@"

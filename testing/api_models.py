@@ -83,6 +83,22 @@ class DebugState(BaseModel):
     there first (`SYNC_FIELD`)."""
 
 
+class PostgresBinDir(BaseModel):
+    """One configured bindir in `GET /api/v1/postgres/bins`, probed live."""
+
+    path: str
+    postgres_executable: bool
+    reported_major: int | None = None
+
+
+class PostgresBins(BaseModel):
+    """`GET /api/v1/postgres/bins`: every configured major's bindir, by major."""
+
+    node_id: int
+    active_bin_dir: str
+    bin_dirs: dict[str, PostgresBinDir]
+
+
 class TxidStatus(BaseModel):
     """`GET /api/v1/cluster/txid-status/{txid}`.
 

@@ -149,9 +149,16 @@ and PG-major upgrade in the same release if avoidable.
       check is a key-set difference naming missing keys, never a row count
 - [x] Backup + verified-restore preflight actually runs (no `--allow-no-backup` in the proof)
 - [x] Post-upgrade `PG_VERSION` proves N+1 on every node (anti-vacuity: refuse if still on N)
-- [x] Chaos mid-`pg_upgrade` itself — `pg-major-upgrade-chaos-mid-upgrade`. Waits
-      for `pg_upgrade` to actually be running before the SIGKILL, so a run that
-      killed nothing fails rather than passing. **Never executed.**
+- [ ] Chaos mid-`pg_upgrade` itself — `pg-major-upgrade-chaos-mid-upgrade`. A
+      shim bindir (`testing/pg_upgrade_shim/`, mounted by
+      `docker-compose.pgupgrade-shim.yml`) holds the apply's own `pg_upgrade`,
+      never a `--check`, so the SIGKILL lands on it on the derived leader before
+      it starts any server. Asserts the apply fails, the old control file reads
+      in production, the leader serves 17, a re-run discards the leftover
+      target and completes, and W1 holds across both applies. **Red on a
+      product gap**: a failed apply lifts the committed freeze as soon as the
+      old primary answers, instead of keeping it until a resume or an abort
+      clears it.
 
 ---
 

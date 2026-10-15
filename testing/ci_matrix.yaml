@@ -2664,7 +2664,7 @@
     {
       "id": "pg-major-upgrade-chaos-mid-upgrade",
       "contracts": ["W1", "V1"],
-      "description": "Track B chaos during pg_upgrade itself: SIGKILL pg_upgrade mid-transfer and require the old cluster to survive. Waits for pg_upgrade to actually be running before killing it, so a run that killed nothing fails rather than passing. Asserts the apply reports failure, the primary still reports major 17, and it accepts a write — the discard-on-resume rule, which treats a target directory no postmaster ever started as wreckage.",
+      "description": "Track B chaos during pg_upgrade itself, on docker-compose.pgupgrade.yml layered with docker-compose.pgupgrade-shim.yml: the PostgreSQL 18 bindir is a shim whose pg_upgrade holds an apply (never a --check) until released, so the SIGKILL lands on the apply's own pg_upgrade on the derived leader, after it has written into the target and before it started any server; a pattern match would also hit the preflight. Asserts the effect: the apply reports failure, the committed freeze still holds (the product must not lift it on failure), the old control file reads in production and the leader serves 17 as primary. Then re-runs the apply and asserts the leftover target is discarded rather than reused (discard-on-resume), and finishes with the plain proof's verification, W1 over a writer that ran across both applies included.",
       "actions": [
         {
           "type": "cmd",

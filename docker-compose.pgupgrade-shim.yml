@@ -1,0 +1,19 @@
+# Layered on docker-compose.pgupgrade.yml by pg-major-upgrade-chaos-mid-upgrade
+# only (COMPOSE_FILE=docker-compose.pgupgrade.yml:docker-compose.pgupgrade-shim.yml).
+# Each node's config names the pg_upgrade shim as its PostgreSQL 18 bindir, and
+# the shim scripts are mounted for testing/pg_major_upgrade_proof.py to install.
+# Compose merges volumes by container path, so the config mount replaces the
+# base file's and the state volume is untouched.
+services:
+  node1:
+    volumes:
+      - ./config/pgupgrade-shim/node1.toml:/app/pgbattery.toml:ro
+      - ./testing/pg_upgrade_shim:/opt/pg_upgrade_shim:ro
+  node2:
+    volumes:
+      - ./config/pgupgrade-shim/node2.toml:/app/pgbattery.toml:ro
+      - ./testing/pg_upgrade_shim:/opt/pg_upgrade_shim:ro
+  node3:
+    volumes:
+      - ./config/pgupgrade-shim/node3.toml:/app/pgbattery.toml:ro
+      - ./testing/pg_upgrade_shim:/opt/pg_upgrade_shim:ro

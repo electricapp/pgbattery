@@ -1,0 +1,32 @@
+# config/pgupgrade/node3.toml for pg-major-upgrade-chaos-mid-upgrade only:
+# pg_bin_dirs["18"] names the pg_upgrade shim (testing/pg_upgrade_shim/).
+# testing/test_pg_upgrade_shim.py holds every other key equal to the original.
+node_id = 3
+listen_addr = "0.0.0.0:5432"
+raft_addr = "0.0.0.0:5433"
+metrics_addr = "0.0.0.0:9090"
+pg_bin_dir = "/usr/lib/postgresql/17/bin"
+pg_bin_dirs = { "17" = "/usr/lib/postgresql/17/bin", "18" = "/tmp/pg_upgrade_shim/bin" }
+pg_data_dir = "/var/lib/postgresql/data"
+pg_internal_port = 5434
+pg_auth_mode = "trust"
+
+# Advertise addresses (what other nodes use to reach this node)
+advertise_raft_addr = "172.31.0.13:5433"
+advertise_mgmt_addr = "172.31.0.13:9091"
+
+election_timeout_ms = 1000
+heartbeat_interval_ms = 250
+
+[[peers]]
+id = 1
+raft_addr = "172.31.0.11:5433"
+pg_addr = "172.31.0.11:5434"
+
+[[peers]]
+id = 2
+raft_addr = "172.31.0.12:5433"
+pg_addr = "172.31.0.12:5434"
+
+[backup]
+wal_archive_dir = "/var/lib/postgresql/wal_archive"
