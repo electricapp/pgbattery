@@ -20,13 +20,18 @@
 "governor/state_machine.rs" = ["vote_lsn_threshold_bytes"]
 
 [timeline_verification]
-"crates/pgbattery-supervisor/src/process.rs" = [
-  "pg_controldata",
-  "pg_rewind",
+"crates/pgbattery-supervisor/src/process/controldata.rs" = [
+  "PG_CONTROLDATA_TIMEOUT_MS",
   "receiver_info",
+  "run_pg_controldata",
   "timeline_id",
   "verify_promotion_safe",
 ]
+"crates/pgbattery-supervisor/src/process/follow.rs" = [
+  "get_wal_receiver_timeline",
+  "received_tli",
+]
+"crates/pgbattery-supervisor/src/process/rewind.rs" = ["run_pg_rewind"]
 
 [cutover_authority]
 "governor/state_machine.rs" = [

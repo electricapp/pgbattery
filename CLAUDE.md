@@ -33,7 +33,7 @@ src/                           — root crate (`pgbattery` binary)
 
 crates/
   pgbattery-core/src/          — clock, constants, error, types
-  pgbattery-supervisor/src/    — PostgreSQL process mgmt (process.rs, backup.rs)
+  pgbattery-supervisor/src/    — PostgreSQL process mgmt (process/, session.rs, backup.rs)
 ```
 
 `crate::supervisor::*` resolves via the shim; real source is under `crates/pgbattery-supervisor/src/`.
@@ -94,7 +94,7 @@ Know which layer covers a change before adding another. For counts: `./testing/c
 
 | Layer                   | Where                                      | What it checks                                                                 |
 | ----------------------- | ------------------------------------------ | ------------------------------------------------------------------------------ |
-| Rust unit tests         | inline `mod tests`                         | Pure decision functions (`process.rs`, gateway handlers, `state_machine.rs`)   |
+| Rust unit tests         | inline `mod tests`                         | Pure decision functions (`process/`, gateway handlers, `state_machine.rs`)     |
 | Property tests          | `proptest!`                                | LSN election/promotion gate, `rewind_divergence_decision`, sync-standby quorum |
 | Storage conformance     | `openraft::testing::Suite` in `storage.rs` | Log/SM stores + crash-recovery / durability-pin                                |
 | TLA+                    | `tla/` (`make check`)                      | `lease_fencing`, `raft_lsn`, `timeline_verification`, `cutover_authority`      |

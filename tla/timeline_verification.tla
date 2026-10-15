@@ -9,7 +9,7 @@
  * (pg_rewind reconciles it), so this spec checks the transition invariants that
  * DO hold, not a divergence-blocking property.
  *
- * Based on: crates/pgbattery-supervisor/src/process.rs verify_promotion_safe()
+ * Based on: crates/pgbattery-supervisor/src/process/controldata.rs verify_promotion_safe()
  *
  * Key Safety Property:
  *   A node cannot promote to primary if its timeline has diverged from
@@ -19,13 +19,13 @@
  *
  * TLA+ Variable → Rust Code:
  *   timelineID[n]         → pg_controldata: "Latest checkpoint's TimeLineID"
- *   walReceiverTimeline   → pg_wal_receiver_status(): timeline
+ *   walReceiverTimeline   → pg_stat_wal_receiver: received_tli
  *   inRecovery[n]         → SELECT pg_is_in_recovery()
  *   isPrimary[n]          → NOT in_recovery
  *
  * Safety Check (observability, NOT a hard block — see note at end of header):
  *   TLA: receiverTimeline > localTimeline → logged, promotion proceeds
- *   Code: crates/pgbattery-supervisor/src/process.rs verify_promotion_safe()
+ *   Code: crates/pgbattery-supervisor/src/process/controldata.rs verify_promotion_safe()
  *         returns Err ONLY on operational failure (pg_controldata timeout /
  *         missing TimeLineID / parse error), which aborts promotion. Timeline
  *         divergence itself does NOT return Err and does NOT block — pg_rewind
@@ -36,23 +36,23 @@
  * 1. TIMELINE QUERY:
  *    Spec: Instant read of timelineID
  *    Reality: Shell out to pg_controldata + parsing
- *    Gap: Could hang on NFS stale handles (no timeout originally)
- *    Fix: Added 10s timeout wrapper in crates/pgbattery-supervisor/src/process.rs
- *    CODE: crates/pgbattery-supervisor/src/process.rs
+ *    Gap: Could hang on a frozen volume or stale NFS handle
+ *    Mitigation: run_pg_controldata is bounded by PG_CONTROLDATA_TIMEOUT_MS
+ *    CODE: crates/pgbattery-supervisor/src/process/controldata.rs
  *
  * 2. WAL RECEIVER QUERY:
  *    Spec: Instant read of walReceiverTimeline
- *    Reality: SQL query SELECT * FROM pg_wal_receiver_status()
+ *    Reality: SELECT received_tli FROM pg_stat_wal_receiver
  *    Gap: Could hang if PostgreSQL deadlocked
- *    Mitigation: PostgreSQL query timeout (statement_timeout)
- *    CODE: crates/pgbattery-supervisor/src/process.rs
+ *    Mitigation: get_wal_receiver_timeline bounds the query at 1.5 s
+ *    CODE: crates/pgbattery-supervisor/src/process/follow.rs
  *
  * 3. PROMOTION ATOMICITY:
  *    Spec: Promotion is single atomic action
- *    Reality: verify → promote → wait_for_promotion (multi-step)
+ *    Reality: verify_promotion_safe → promote (multi-step)
  *    Gap: Could crash between verify and promote
  *    Mitigation: Timeline verified on EVERY ExistingPrimary startup
- *    CODE: crates/pgbattery-supervisor/src/process.rs
+ *    CODE: crates/pgbattery-supervisor/src/process/follow.rs
  *
  * 4. TIMELINE INCREMENT:
  *    Spec: timeline++ on promotion
@@ -75,7 +75,7 @@
  *   while receiving WAL from a higher timeline. This is EXPECTED and SAFE.
  *   Blocking would prevent recovery from ever completing.
  *
- * CODE: crates/pgbattery-supervisor/src/process.rs
+ * CODE: crates/pgbattery-supervisor/src/process/controldata.rs
  *   if receiver_info > timeline_id {
  *       tracing::info!("Timeline difference detected (expected after pg_rewind)");
  *       // Does NOT block - proceeds with promotion

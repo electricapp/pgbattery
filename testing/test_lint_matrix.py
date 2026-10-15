@@ -71,6 +71,15 @@ class ClusterPortTest(unittest.TestCase):
         self.assertEqual(lm.restated_cluster_ports(source, self.PORTS), [])
 
 
+class FinalTypeTest(unittest.TestCase):
+    def test_the_python_as_committed_types_every_final(self) -> None:
+        lm.check_finals_state_their_type()
+
+    def test_a_bare_final_is_caught(self) -> None:
+        source = "A: Final[int] = 1\nB: Final = 2\nC:Final=3\nD: Final[re.Pattern[str]] = x\n"
+        self.assertEqual(lm.bare_finals(source), [2, 3])
+
+
 class ProseExemptionTest(unittest.TestCase):
     def test_the_exemptions_as_committed_still_apply(self) -> None:
         lm.check_prose_exemptions_are_still_needed()
@@ -187,6 +196,18 @@ class StateMachineInventoryTest(unittest.TestCase):
         with mock.patch.object(Path, "read_text", return_value=source):
             index = lm.enum_variant_index([Path("error.rs")])
         self.assertEqual(index["Error"], {"IdleTimeout", "ArrivesAfterTheBraces"})
+
+    def test_a_type_under_any_visibility_is_seen(self) -> None:
+        source = (
+            "pub(super) enum Restricted {\n    Seen,\n}\n"
+            "pub(in crate::process) struct Scoped;\n"
+            "enum Private {\n    Also,\n}\n"
+        )
+        with mock.patch.object(Path, "read_text", return_value=source):
+            declared = lm.declared_types([Path("follow.rs")])
+            index = lm.enum_variant_index([Path("follow.rs")])
+        self.assertLessEqual({"Restricted", "Scoped", "Private"}, declared.keys())
+        self.assertEqual(index["Restricted"], {"Seen"})
 
     def test_a_foreign_name_the_workspace_now_defines_is_caught(self) -> None:
         with (

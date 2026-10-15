@@ -158,7 +158,7 @@ the donor does not hold authority, so it still cannot arm.
 Each spec's header maps its TLA+ variables and actions to the Rust that implements
 them, by file and function (not line number, which rots). The supervisor lives in
 the `crates/pgbattery-supervisor/` workspace crate
-(`crates/pgbattery-supervisor/src/process.rs`), not `src/supervisor/` (a re-export shim).
+(`crates/pgbattery-supervisor/src/process/`), not `src/supervisor/` (a re-export shim).
 
 The mapping is a lint, not a comment. `lint_matrix.py`'s "TLA specs name real
 code" resolves every `.rs` path a spec names against the workspace, and requires

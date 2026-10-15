@@ -1020,7 +1020,7 @@ FILE_REFERENCE = re.compile(
 )
 """A token in case text that reads as a path to a file in this repository."""
 
-CROSS_REF_PRUNE: Final = frozenset(
+CROSS_REF_PRUNE: Final[frozenset[str]] = frozenset(
     {".git", ".venv", "__pycache__", "target", "node_modules", "backups", "states", "store"}
 )
 """Directories that hold build output or run artifacts, not referenceable sources."""
@@ -1316,6 +1316,27 @@ def check_derived_rust_constants_resolve() -> None:
     fp.replication_slot_prefix()
 
 
+BARE_FINAL: Final[re.Pattern[str]] = re.compile(r"\s*\w+\s*:\s*Final\s*=")
+
+
+def bare_finals(text: str) -> list[int]:
+    """Line numbers annotated with a bare `Final`, which states no type."""
+    return [n for n, line in enumerate(text.splitlines(), start=1) if BARE_FINAL.match(line)]
+
+
+def check_finals_state_their_type() -> None:
+    """Every `Final` names its type: `Final[int]`, never a bare `Final`."""
+    sources = [*TESTING_DIR.glob("*.py"), *TESTING_DIR.glob("*/*.py")]
+    sources += (PROJECT_ROOT / "demo").glob("*.py")
+    problems = [
+        f"{path.relative_to(PROJECT_ROOT)}:{n}"
+        for path in sorted(sources)
+        for n in bare_finals(path.read_text(encoding="utf-8"))
+    ]
+    if problems:
+        raise AssertionError("bare Final, write Final[T]: " + ", ".join(problems))
+
+
 def check_harness_derives_cluster_ports() -> None:
     """No harness script may restate a port `topology.py` already publishes."""
     problems = []
@@ -1385,12 +1406,20 @@ def rust_sources() -> list[Path]:
     return files
 
 
+RUST_VISIBILITY: Final[re.Pattern[str]] = re.compile(r"^pub(\([^)]*\))?\s+")
+
+
+def without_visibility(line: str) -> str:
+    """A Rust line stripped and without its leading `pub`, `pub(super)`, ..."""
+    return RUST_VISIBILITY.sub("", line.strip())
+
+
 def declared_types(sources: Iterable[Path]) -> dict[str, Path]:
     keywords = ("enum ", "struct ", "trait ", "type ")
     found: dict[str, Path] = {}
     for path in sources:
         for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip().removeprefix("pub(crate) ").removeprefix("pub ")
+            stripped = without_visibility(line)
             for keyword in keywords:
                 if not stripped.startswith(keyword):
                     continue
@@ -1407,7 +1436,7 @@ def enum_variant_index(sources: Iterable[Path]) -> dict[str, set[str]]:
     for path in sources:
         lines = path.read_text(encoding="utf-8").splitlines()
         for start_i, line in enumerate(lines):
-            stripped = line.strip().removeprefix("pub(crate) ").removeprefix("pub ")
+            stripped = without_visibility(line)
             if not stripped.startswith("enum "):
                 continue
             name = stripped[len("enum ") :].split("<")[0].split("{")[0].strip()
@@ -1804,6 +1833,7 @@ def lint() -> None:
     check("Case cross-references name real files", check_case_cross_references_resolve)
     check("preflight.sh mirrors the CI gates", check_preflight_mirrors_ci)
     check("Harness derives cluster ports", check_harness_derives_cluster_ports)
+    check("Python Finals state their type", check_finals_state_their_type)
     check("Derived Rust constants resolve", check_derived_rust_constants_resolve)
     check("Docs name real files", check_prose_file_references_resolve)
     check("Doc reference exemptions still apply", check_prose_exemptions_are_still_needed)
