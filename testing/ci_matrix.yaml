@@ -2091,7 +2091,7 @@
         },
         {
           "type": "cmd",
-          "comment": "Wait for the held sessions' INSERTs (25s after they opened) to land.",
+          "comment": "Wait for the held sessions' inserts (25s after they opened) to land.",
           "cmd": "for i in $(seq 1 60); do N=$(docker compose exec -T node2 psql -U postgres -h 127.0.0.1 -p 5432 -d postgres -tAc 'SELECT count(*) FROM ci_gateway_migration;' 2>/dev/null | tr -d '[:space:]'); echo \"attempt $i: rows=${N:-unreadable}\"; [ \"${N:-0}\" -ge 1 ] && exit 0; sleep 1; done; echo 'no row from any held session'; docker compose exec -T node2 sh -lc 'for f in /tmp/ci_gw_idle_*.out; do echo \"--- $f\"; cat $f; done' || true; exit 1"
         }
       ],

@@ -4844,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_refence_is_not_reported_as_severing_sessions() {
+    fn a_quiet_fence_reapplication_is_not_reported_as_severing_sessions() {
         // A leaderless node re-fences every 100 ms tick; logging each no-op
         // at INFO buried the fences that did end live sessions.
         assert!(!App::fence_severed_sessions("0\n"));
