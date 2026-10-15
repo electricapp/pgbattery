@@ -670,16 +670,39 @@ fn starts_with_ci(s: &str, prefix: &str) -> bool {
 /// other setting kept. Applied before each postmaster spawns, so a start is
 /// never writable before the lease loop opens it.
 fn with_writes_fenced(existing: &str) -> String {
-    let kept: Vec<&str> = existing
-        .lines()
-        .filter(|line| !starts_with_ci(line.trim(), "default_transaction_read_only"))
-        .collect();
-    let mut fenced = kept.join("\n");
-    if !fenced.is_empty() {
-        fenced.push('\n');
+    with_auto_conf_setting(existing, "default_transaction_read_only", Some("'on'"))
+}
+
+/// `postgresql.auto.conf` with `key` set to `value` (quoted by the caller),
+/// or removed for `None`. In place: an existing line keeps its position and
+/// duplicates go, so writers of different keys never move each other's lines
+/// and each leaves the other's output unchanged.
+fn with_auto_conf_setting(existing: &str, key: &str, value: Option<&str>) -> String {
+    let names_key = |line: &str| {
+        let trimmed = line.trim_start();
+        starts_with_ci(trimmed, key)
+            && trimmed
+                .get(key.len()..)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    let mut lines = Vec::new();
+    let mut placed = false;
+    for line in existing.lines() {
+        if !names_key(line) {
+            lines.push(line.to_string());
+        } else if let (Some(v), false) = (value, placed) {
+            lines.push(format!("{key} = {v}"));
+            placed = true;
+        }
     }
-    fenced.push_str("default_transaction_read_only = 'on'\n");
-    fenced
+    if let (Some(v), false) = (value, placed) {
+        lines.push(format!("{key} = {v}"));
+    }
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 /// Upsert a managed config block between explicit start/end markers.
@@ -1005,9 +1028,51 @@ const fn rewind_recovery(error: &Error) -> RewindRecovery {
 /// which it does when `PostgreSQL` exits.
 async fn relay_postgres_log(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
+    let mut level = tracing::Level::INFO;
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "postgres", "{line}");
+        level = pg_line_level(&line, level);
+        match level {
+            tracing::Level::ERROR => tracing::error!(target: "postgres", "{line}"),
+            tracing::Level::WARN => tracing::warn!(target: "postgres", "{line}"),
+            tracing::Level::INFO => tracing::info!(target: "postgres", "{line}"),
+            _ => tracing::debug!(target: "postgres", "{line}"),
+        }
     }
+}
+
+/// Level to relay one line of `PostgreSQL`'s stderr at, from its own
+/// severity tag: PANIC ends the server (error); FATAL, ERROR and WARNING end
+/// a session or a statement, not pgbattery (warn). A detail line (DETAIL,
+/// HINT, STATEMENT, …) or an untagged continuation belongs to the message
+/// before it and keeps its level. The first tag on the line wins, so SQL
+/// quoted in a STATEMENT cannot raise it.
+fn pg_line_level(line: &str, previous: tracing::Level) -> tracing::Level {
+    use tracing::Level;
+    const TAGS: &[(&str, Option<Level>)] = &[
+        ("PANIC:  ", Some(Level::ERROR)),
+        ("FATAL:  ", Some(Level::WARN)),
+        ("ERROR:  ", Some(Level::WARN)),
+        ("WARNING:  ", Some(Level::WARN)),
+        ("LOG:  ", Some(Level::INFO)),
+        ("INFO:  ", Some(Level::INFO)),
+        ("NOTICE:  ", Some(Level::INFO)),
+        ("DEBUG1:  ", Some(Level::DEBUG)),
+        ("DEBUG2:  ", Some(Level::DEBUG)),
+        ("DEBUG3:  ", Some(Level::DEBUG)),
+        ("DEBUG4:  ", Some(Level::DEBUG)),
+        ("DEBUG5:  ", Some(Level::DEBUG)),
+        ("DETAIL:  ", None),
+        ("HINT:  ", None),
+        ("CONTEXT:  ", None),
+        ("STATEMENT:  ", None),
+        ("QUERY:  ", None),
+        ("LOCATION:  ", None),
+    ];
+    TAGS.iter()
+        .filter_map(|(tag, level)| line.find(tag).map(|at| (at, *level)))
+        .min_by_key(|(at, _)| *at)
+        .and_then(|(_, level)| level)
+        .unwrap_or(previous)
 }
 
 /// Remove everything inside `dir`, leaving the directory itself.
@@ -1665,10 +1730,16 @@ effective_cache_size = '512MB'
         // (the supervisor cannot assume its caller validated).
         let auth_method = match self.config.pg_auth_mode {
             PgAuthMode::Trust => {
-                tracing::warn!(
-                    "pg_auth_mode is 'trust': any client that can reach the PostgreSQL port has \
-                     unauthenticated superuser access — run the cluster on an isolated network"
-                );
+                // A property of the configuration, not of this start: once per
+                // process, or every restart repeats it.
+                static TRUST_WARNED: std::sync::Once = std::sync::Once::new();
+                TRUST_WARNED.call_once(|| {
+                    tracing::warn!(
+                        "pg_auth_mode is 'trust': any client that can reach the PostgreSQL \
+                         port has unauthenticated superuser access — run the cluster on an \
+                         isolated network"
+                    );
+                });
                 "trust"
             }
             // No component provisions credentials (primary_conninfo,
@@ -2163,8 +2234,7 @@ host all all ::/0 {auth_method}
     }
 
     /// Pure: compute the postgresql.auto.conf contents we want for a standby
-    /// of `leader_addr`. Filters out replication settings we manage, then
-    /// appends them.
+    /// of `leader_addr`, setting the replication settings we manage in place.
     ///
     /// `synchronous_standby_names` is also cleared. A standby doesn't use
     /// it, but the value persists across role transitions. If this node
@@ -2178,22 +2248,11 @@ host all all ::/0 {auth_method}
         leader_addr: SocketAddr,
         cfg: &SupervisorConfig,
     ) -> String {
-        let preserved_lines: Vec<&str> = existing
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim();
-                !starts_with_ci(trimmed, "primary_conninfo")
-                    && !starts_with_ci(trimmed, "primary_slot_name")
-                    && !starts_with_ci(trimmed, "synchronous_standby_names")
-            })
-            .collect();
-
-        format!(
-            "{}\nprimary_conninfo = '{}'\nprimary_slot_name = '{}'\n",
-            preserved_lines.join("\n"),
-            Self::primary_conninfo_for(leader_addr, cfg),
-            ReplicationSlot::for_node(cfg.node_id)
-        )
+        let conninfo = format!("'{}'", Self::primary_conninfo_for(leader_addr, cfg));
+        let slot = format!("'{}'", ReplicationSlot::for_node(cfg.node_id));
+        let text = with_auto_conf_setting(existing, "primary_conninfo", Some(&conninfo));
+        let text = with_auto_conf_setting(&text, "primary_slot_name", Some(&slot));
+        with_auto_conf_setting(&text, "synchronous_standby_names", None)
     }
 
     /// CRITICAL SAFETY CHECK: verify `PostgreSQL` is in a consistent state
@@ -5082,6 +5141,83 @@ mod tests {
             "a fenced file is left alone"
         );
         assert!(with_writes_fenced("").contains("default_transaction_read_only = 'on'"));
+    }
+
+    /// `PostgreSQL`'s own severity decides the level: a FATAL relayed at INFO
+    /// is invisible to anyone filtering on warnings. Detail lines carry the
+    /// level of the message they belong to.
+    #[test]
+    fn postgres_lines_keep_their_own_severity() {
+        use tracing::Level;
+        let at = |line: &str| pg_line_level(line, Level::INFO);
+        let prefix = "2026-10-15 15:24:57.093 UTC [1464] ";
+        assert_eq!(
+            at(&format!("{prefix}PANIC:  could not write")),
+            Level::ERROR
+        );
+        assert_eq!(
+            at(&format!("{prefix}FATAL:  terminating walreceiver process")),
+            Level::WARN
+        );
+        assert_eq!(
+            at(&format!("{prefix}ERROR:  permission denied")),
+            Level::WARN
+        );
+        assert_eq!(at(&format!("{prefix}WARNING:  oops")), Level::WARN);
+        assert_eq!(
+            at(&format!("{prefix}LOG:  checkpoint starting")),
+            Level::INFO
+        );
+        assert_eq!(at(&format!("{prefix}DEBUG2:  x")), Level::DEBUG);
+        assert_eq!(
+            pg_line_level(&format!("{prefix}STATEMENT:  INSERT 1"), Level::WARN),
+            Level::WARN,
+            "a statement line belongs to the error before it"
+        );
+        assert_eq!(
+            pg_line_level("\tcontinued message text", Level::ERROR),
+            Level::ERROR
+        );
+        assert_eq!(
+            at(&format!(
+                "{prefix}STATEMENT:  SELECT 'ERROR:  in a literal'"
+            )),
+            Level::INFO,
+            "the first tag on the line wins"
+        );
+    }
+
+    /// Two writers share `postgresql.auto.conf`: the standby config and the
+    /// start fence. Each must leave the other's output alone, or the standby
+    /// check sees a change after every start and restarts the standby on
+    /// every reconcile tick — each restart ending its walreceiver.
+    #[test]
+    fn a_fenced_standby_config_is_left_alone_by_both_writers() {
+        let config = SupervisorConfig {
+            pg_bin_dir: PathBuf::from("/nonexistent"),
+            pg_data_dir: PathBuf::from("/nonexistent"),
+            pg_port: 5_432,
+            pg_user: "postgres".to_string(),
+            wal_level: WalLevel::Replica,
+            node_id: 1,
+            pg_auth_mode: PgAuthMode::Trust,
+            wal_archive_dir: None,
+        };
+        let leader: SocketAddr = "172.28.0.12:5434".parse().unwrap();
+        let primary_before = "# Do not edit this file manually!\n\
+                              default_transaction_read_only = 'off'\n\
+                              synchronous_standby_names = 'FIRST 1 (a)'\n";
+        let standby = Supervisor::compute_standby_auto_conf(primary_before, leader, &config);
+        let started = with_writes_fenced(&standby);
+        assert_eq!(
+            Supervisor::compute_standby_auto_conf(&started, leader, &config),
+            started,
+            "the standby config must be a fixed point after the start fence"
+        );
+        assert_eq!(with_writes_fenced(&started), started);
+        assert!(started.contains("default_transaction_read_only = 'on'"));
+        assert!(started.contains("primary_slot_name = "));
+        assert!(!started.contains("synchronous_standby_names"));
     }
 
     // ── upsert_managed_block ──────────────────────────────────────────────
