@@ -162,8 +162,9 @@ pub struct ConnectionState {
     /// the backend acknowledges each Parse, Close or query (`awaiting`).
     pub replay: SessionReplay,
 
-    /// Backend key data (PID, secret) received from `PostgreSQL`.
-    /// Used for routing cancel requests to the correct backend.
+    /// The `BackendKeyData` the client was given at startup, the only key it
+    /// cancels with. A migration keeps it; the registry maps it to whichever
+    /// backend runs the session now ([`CancelRoute`]).
     pub backend_key: Option<BackendKey>,
 
     /// Forwarded requests whose backend answer is still owed, in send order
@@ -272,6 +273,14 @@ pub struct BackendKey {
     pub secret: Vec<u8>,
 }
 
+/// Where a cancel for a client's key goes: the backend running the session
+/// now, and the key that backend issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRoute {
+    pub addr: SocketAddr,
+    pub key: BackendKey,
+}
+
 /// Registry for tracking all active connections.
 ///
 /// This is used by the failover logic to coordinate migrations
@@ -289,10 +298,10 @@ pub struct ConnectionRegistry {
     /// Shard locks are held only during lookup, not during connection work.
     connections: DashMap<u64, SharedConnectionState>,
 
-    /// Backend key to backend address mapping for cancel request routing.
-    /// When a connection receives `BackendKeyData` from `PostgreSQL`, we store
-    /// the mapping so cancel requests can be routed to the correct backend.
-    backend_keys: DashMap<BackendKey, SocketAddr>,
+    /// Cancel routing: the key each client was given, to the backend running
+    /// its session now. Absent while a session migrates, so a cancel then is
+    /// dropped rather than sent to the backend it left.
+    backend_keys: DashMap<BackendKey, CancelRoute>,
 
     /// Atomic connection ID counter (replaces expensive UUID generation)
     /// Cache-padded: written by accept thread, read by all
@@ -320,23 +329,23 @@ impl ConnectionRegistry {
         }
     }
 
-    /// Register a backend key mapping for cancel request routing.
-    pub fn register_backend_key(&self, key: BackendKey, backend_addr: SocketAddr) {
-        self.backend_keys.insert(key, backend_addr);
+    /// Route cancels for the client's `key` to `route`.
+    pub fn register_backend_key(&self, key: BackendKey, route: CancelRoute) {
+        self.backend_keys.insert(key, route);
     }
 
-    /// Unregister a backend key when connection closes.
+    /// Stop routing cancels for the client's `key`.
     pub fn unregister_backend_key(&self, key: &BackendKey) {
         self.backend_keys.remove(key);
     }
 
-    /// Look up the backend address for a cancel request.
-    pub fn lookup_backend_for_cancel(&self, pid: i32, secret: &[u8]) -> Option<SocketAddr> {
+    /// Where a cancel sent with the client's key goes now.
+    pub fn lookup_backend_for_cancel(&self, pid: i32, secret: &[u8]) -> Option<CancelRoute> {
         let key = BackendKey {
             pid,
             secret: secret.to_vec(),
         };
-        self.backend_keys.get(&key).map(|r| *r)
+        self.backend_keys.get(&key).map(|r| r.clone())
     }
 
     /// Generate a new connection ID (fast, no crypto).

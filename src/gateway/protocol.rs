@@ -326,6 +326,18 @@ pub fn build_failover_error_response(message: &str) -> BytesMut {
 /// (`idle_session_timeout`).
 pub const SQLSTATE_IDLE_SESSION_TIMEOUT: &str = "57P05";
 
+/// A `CancelRequest` for the backend session `pid` with `secret`.
+#[must_use]
+pub fn build_cancel_request(pid: i32, secret: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(12 + secret.len()).unwrap_or(u32::MAX);
+    let mut msg = Vec::with_capacity(12 + secret.len());
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(&CANCEL_REQUEST_CODE);
+    msg.extend_from_slice(&pid.to_be_bytes());
+    msg.extend_from_slice(secret);
+    msg
+}
+
 /// The SQLSTATE (`C` field) of a backend `ErrorResponse`.
 #[must_use]
 pub fn error_sqlstate(msg: &[u8]) -> Option<&str> {

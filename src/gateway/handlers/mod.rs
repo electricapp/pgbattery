@@ -16,7 +16,7 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::gateway::connection::{ConnectionRegistry, ProxyMode, SharedConnectionState};
 use crate::gateway::protocol::{
-    MAX_CANCEL_REQUEST_LEN, MessageType, PacketHeader, TransactionStatus,
+    MAX_CANCEL_REQUEST_LEN, MessageType, PacketHeader, TransactionStatus, build_cancel_request,
     build_fatal_error_response, cancel_request_key, error_sqlstate, extract_transaction_status,
     is_cancel_request, is_gssenc_request, is_ssl_request, refusal_is_transient,
     startup_has_replication_option,
@@ -695,11 +695,12 @@ impl ConnectionHandler {
         Ok(StartupOrCancel::Startup(buf))
     }
 
-    /// Forward a cancel request to the backend.
+    /// Forward a cancel request to the backend running the session now.
     ///
-    /// Cancel requests contain a PID and secret key that identify the target connection.
-    /// We look up which backend issued that PID/secret and send the cancel there,
-    /// rather than blindly sending to the current leader (which may have changed).
+    /// The client cancels with the key it was given at startup; the registry
+    /// maps it to the session's current backend and the key that backend
+    /// issued, so a cancel after a migration reaches the new backend re-keyed,
+    /// never the current leader blindly.
     async fn forward_cancel_request(&self, cancel_msg: &[u8]) -> Result<()> {
         // Extract PID and secret from cancel request
         // Format: length(4) + cancel code(4) + PID(4) + secret (variable length)
@@ -713,7 +714,7 @@ impl ConnectionHandler {
         // to the current leader was the old behaviour but is actively wrong
         // after failover — the new leader's backend has a fresh PID space, so
         // the cancel could hit an *unrelated* running query. Drop the request.
-        let Some(target) = self.registry.lookup_backend_for_cancel(pid, secret) else {
+        let Some(route) = self.registry.lookup_backend_for_cancel(pid, secret) else {
             tracing::warn!(
                 conn_id = self.id,
                 pid,
@@ -722,7 +723,7 @@ impl ConnectionHandler {
             metrics::counter!("pgbattery_cancel_requests_unroutable").increment(1);
             return Ok(());
         };
-
+        let target = route.addr;
         if target == UNKNOWN_SOCKET_ADDR {
             return Err(Error::NoLeader);
         }
@@ -748,7 +749,9 @@ impl ConnectionHandler {
                 addr: target,
                 source: e,
             })?;
-        backend.write_all(cancel_msg).await?;
+        backend
+            .write_all(&build_cancel_request(route.key.pid, &route.key.secret))
+            .await?;
         backend.flush().await?;
 
         tracing::debug!(conn_id = self.id, "Cancel request forwarded");
@@ -1208,23 +1211,18 @@ impl ConnectionHandler {
         }
     }
 
-    /// Drop the current `BackendKeyData` entry from the cancel routing table.
-    ///
-    /// Called during migration before the new backend registers its own
-    /// (pid, secret) pair. Idempotent — a no-op if no key is currently
-    /// registered. Also clears the in-state copy so we don't inadvertently
-    /// unregister the new key on shutdown.
+    /// Withdraw the client's cancel route while the session migrates, so a
+    /// cancel then is dropped rather than sent to the backend it left — or
+    /// to whatever session reuses that pid there. The client keeps its key;
+    /// the new backend's `BackendKeyData` re-points it. Idempotent.
     fn unregister_backend_key(&self) {
-        let old_key = {
-            let mut state = self.state.write();
-            state.backend_key.take()
-        };
-        if let Some(key) = old_key {
+        let key = self.state.read().backend_key.clone();
+        if let Some(key) = key {
             self.registry.unregister_backend_key(&key);
             tracing::debug!(
                 conn_id = self.id,
                 pid = key.pid,
-                "Unregistered backend key before migration"
+                "Cancel route withdrawn for migration"
             );
         }
     }
@@ -1931,7 +1929,7 @@ impl ConnectionHandler {
             MessageType::ParseComplete => batch.acks.push(Ack::ParseComplete),
             MessageType::CloseComplete => batch.acks.push(Ack::CloseComplete),
             MessageType::ErrorResponse => batch.acks.push(Ack::Error),
-            MessageType::BackendKeyData => self.handle_backend_key_data_message(msg),
+            MessageType::BackendKeyData => self.handle_backend_key_data_message(msg, true),
             MessageType::CopyInResponse
             | MessageType::CopyOutResponse
             | MessageType::CopyBothResponse => {
@@ -1959,33 +1957,40 @@ impl ConnectionHandler {
         batch.mode_transition = Some(ProxyMode::Normal);
     }
 
-    fn handle_backend_key_data_message(&self, msg: &[u8]) {
+    /// Route the client's cancels to the backend that sent `msg`. At startup
+    /// the key is forwarded and becomes the client's; after a migration it
+    /// is absorbed, and the client's key is re-pointed at it.
+    fn handle_backend_key_data_message(&self, msg: &[u8], forwarded: bool) {
         // 'K' + len(4) + pid(4) + secret. Protocol 3.0 secrets are exactly
         // 4 bytes; protocol 3.2 (PG 18+) secrets are variable-length — keep
         // whatever the backend sent so cancel matching compares in full.
-        if let Some(pid_slice) = msg.get(5..9)
-            && let Ok(pid_arr) = <[u8; 4]>::try_from(pid_slice)
-            && let Some(secret) = msg.get(9..)
-            && !secret.is_empty()
-        {
-            let pid = i32::from_be_bytes(pid_arr);
-            let backend_key = crate::gateway::connection::BackendKey {
-                pid,
-                secret: secret.to_vec(),
-            };
-            self.state.write().backend_key = Some(backend_key.clone());
-
-            let current_backend_addr = self.state.read().backend_addr;
-            if let Some(backend_addr) = current_backend_addr {
-                self.registry
-                    .register_backend_key(backend_key, backend_addr);
-                tracing::debug!(
-                    conn_id = self.id,
-                    pid = pid,
-                    backend = %backend_addr,
-                    "Registered backend key for cancel routing"
-                );
+        let Some(pid) = msg
+            .get(5..9)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(i32::from_be_bytes)
+        else {
+            return;
+        };
+        let Some(secret) = msg.get(9..).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let issued = crate::gateway::connection::BackendKey {
+            pid,
+            secret: secret.to_vec(),
+        };
+        let (client_key, backend_addr) = {
+            let mut state = self.state.write();
+            if forwarded {
+                state.backend_key = Some(issued.clone());
             }
+            (state.backend_key.clone(), state.backend_addr)
+        };
+        if let (Some(client_key), Some(addr)) = (client_key, backend_addr) {
+            self.registry.register_backend_key(
+                client_key,
+                crate::gateway::connection::CancelRoute { addr, key: issued },
+            );
+            tracing::debug!(conn_id = self.id, pid, backend = %addr, "Cancel route registered");
         }
     }
 
@@ -2350,7 +2355,9 @@ impl ConnectionHandler {
                     }
                     // Absorb silently, but BackendKeyData still updates the
                     // cancel-routing table.
-                    MessageType::BackendKeyData => self.handle_backend_key_data_message(&msg),
+                    MessageType::BackendKeyData => {
+                        self.handle_backend_key_data_message(&msg, false);
+                    }
                     MessageType::ErrorResponse => {
                         refused.get_or_insert_with(|| {
                             error_sqlstate(&msg).unwrap_or("XX000").to_owned()
@@ -3922,6 +3929,62 @@ mod tests {
             waited.as_ref().is_err_and(reconnect_may_recover),
             "{waited:?}"
         );
+    }
+
+    fn key_data(pid: i32, secret: &[u8]) -> BytesMut {
+        let mut body = pid.to_be_bytes().to_vec();
+        body.extend_from_slice(secret);
+        message(b'K', &body)
+    }
+
+    fn cancel_request(pid: i32, secret: &[u8]) -> Vec<u8> {
+        let mut msg = u32::try_from(12 + secret.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        msg.extend_from_slice(&crate::gateway::protocol::CANCEL_REQUEST_CODE);
+        msg.extend_from_slice(&pid.to_be_bytes());
+        msg.extend_from_slice(secret);
+        msg
+    }
+
+    /// M16: a migration withdrew the only key the client was ever given, so
+    /// every cancel after it was dropped. It must reach the new backend,
+    /// re-keyed to the session that backend runs.
+    #[tokio::test]
+    async fn a_cancel_after_migration_reaches_the_new_backend() {
+        use crate::gateway::connection::ConnectionState;
+        use tokio::io::AsyncReadExt as _;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, mut backend_peer) = proxied(state.clone()).await;
+        state.write().backend_addr = Some(SocketAddr::from(([10, 255, 0, 1], 5_434)));
+        backend_answers(&mut handler, &[key_data(7, &[0, 0, 0, 1]), ready(b'I')]).await;
+
+        // Migration: the old backend leaves the routing table, and the new
+        // one issues a key the client never sees.
+        handler.unregister_backend_key();
+        let new_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        state.write().backend_addr = Some(new_backend.local_addr().unwrap());
+        let mut answer = key_data(9, &[0, 0, 0, 2]);
+        answer.extend_from_slice(&ready(b'I'));
+        backend_peer.write_all(&answer).await.unwrap();
+        handler
+            .wait_for_ready(&mut backend, &mut BytesMut::new())
+            .await
+            .unwrap();
+
+        handler
+            .forward_cancel_request(&cancel_request(7, &[0, 0, 0, 1]))
+            .await
+            .unwrap();
+        let (mut cancel, _) = timeout(Duration::from_secs(2), new_backend.accept())
+            .await
+            .unwrap_or_else(|_| panic!("the cancel never reached the new backend"))
+            .unwrap();
+        let mut sent = Vec::new();
+        cancel.read_to_end(&mut sent).await.unwrap();
+        assert_eq!(sent, cancel_request(9, &[0, 0, 0, 2]));
     }
 
     /// With no route and its backend intact, a session stays where it is:
