@@ -40,6 +40,8 @@ enums.DonorRisk = ["Continue", "Abort"]
 enums.PostmasterState = ["Running", "NotRunning", "Exited"]
 # What a node knows of its own WAL when a vote is sent or answered (§1).
 enums.OwnWal = ["At", "Empty", "Unknown"]
+# Modeled transitions recorded for trace validation (§8).
+enums.SpecEvent = ["Raft", "Anchor", "Open", "Writes", "Vote"]
 # Wire-compat labels on NodeInfo — not live Raft leadership (see STATE_MACHINE §5).
 enums.NodeRole = ["Leader", "Follower"]
 enums.TimelineCheck = ["Match", "Mismatch", "Unknown", "Foreign"]
@@ -104,6 +106,7 @@ types = [
   "Ack",
   "ReplayChange",
   "WriteGate",
+  "SpecEvent",
 ]
 
 [foreign]

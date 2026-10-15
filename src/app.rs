@@ -652,6 +652,7 @@ impl App {
         // Held separately from `mgmt_state` so the transition observer below can
         // write to the same buffer the HTTP handlers read.
         let debug_events = Arc::new(crate::observability::debug_events::DebugEventBuffer::new());
+        crate::observability::spec_trace::install(self.config.node_id, (*debug_events).clone());
         let mgmt_state = self.build_management_state(
             &raft,
             &cluster_state,

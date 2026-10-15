@@ -48,6 +48,7 @@ use super::raft::TypeConfig;
 use super::state_machine::{ClusterState, NodeId};
 use super::tls::RaftTlsConfig;
 use crate::error::{Error, Result};
+use crate::observability::spec_trace::{self, SpecEvent, VoterWal};
 
 /// Maximum RPC frame size. 4 MB is generous for Raft messages —
 /// the state machine snapshot is just node IDs/LSNs.
@@ -630,6 +631,14 @@ impl OwnWal {
             Self::Empty | Self::Unknown => None,
         }
     }
+
+    const fn traced(self) -> VoterWal {
+        match self {
+            Self::At(lsn) => VoterWal::At(lsn),
+            Self::Empty => VoterWal::Empty,
+            Self::Unknown => VoterWal::Unknown,
+        }
+    }
 }
 
 /// This node's own WAL, read live when it asks for a vote and when it answers
@@ -710,10 +719,21 @@ async fn process_request(
                 candidate_lsn,
             } = postcard::from_bytes(body)?;
             let candidate_id = req.vote.leader_id().node_id;
+            let term = req.vote.leader_id().get_term();
 
             let own = local_wal.read().await;
             let threshold = cluster_state.read().vote_lsn_threshold_bytes();
             let gate = vote_lsn_gate(candidate_lsn, own, threshold);
+            let traced = |granted| {
+                spec_trace::record(SpecEvent::Vote {
+                    term,
+                    candidate: candidate_id,
+                    granted,
+                    candidate_lsn,
+                    voter_wal: own.traced(),
+                    threshold,
+                });
+            };
 
             if gate.is_ok() {
                 tracing::trace!(%peer_addr, candidate_id, ?candidate_lsn, ?own, "Vote request LSN check passed");
@@ -721,8 +741,10 @@ async fn process_request(
                     .vote(req)
                     .await
                     .map_err(|e| Error::Raft(e.to_string()))?;
+                traced(resp.vote_granted);
                 append_frame_serialize(response_buf, RpcType::VoteResponse, corr_id, &resp)
             } else {
+                traced(false);
                 tracing::warn!(
                     candidate_id,
                     %peer_addr,

@@ -38,6 +38,7 @@ use super::promotion_watchdog::{
 use super::raft::{FenceState, Governor, TypeConfig};
 use super::state_machine::{ClusterCommand, ClusterState, CutoverPhase, NodeId, PgUpgradeState};
 use super::wal_positions::SharedWalPositions;
+use crate::observability::spec_trace::{self, SpecEvent};
 use crate::supervisor::{FollowTerms, LineageTerm, PostmasterState, Supervisor};
 
 /// Pass cadence with nothing to wake it sooner.
@@ -645,9 +646,13 @@ impl NodeReconciler {
         self.open_writes(pg, view, required).await
     }
 
-    /// Open writes on a fenced primary once the lease is valid and the sync
-    /// durability it promises is delivered. Under the supervisor lock by
-    /// construction, so writes never open in the middle of an operation.
+    /// Open writes on a fenced primary once the lease is valid, the failover
+    /// hold-down has run out, and the sync durability it promises is
+    /// delivered. Under the supervisor lock by construction, so writes never
+    /// open in the middle of an operation.
+    ///
+    /// The hold-down gates the open, not only a promotion: a leader re-elected
+    /// over a primary that was never demoted promotes nothing.
     async fn open_writes<P: PgControl>(&self, pg: &P, view: &View, required: usize) -> WriteGate {
         let waiting = if view.has_quorum {
             WriteGate::Opening
@@ -664,19 +669,44 @@ impl NodeReconciler {
         if state.in_recovery {
             return WriteGate::Unknown;
         }
+        // Re-read immediately before opening.
+        let (lease_valid, anchor, held) = {
+            let lease = self.lease.read();
+            let anchor = lease.failover_anchor();
+            let held = follow::promotion_lease_holddown(
+                anchor,
+                lease.now(),
+                crate::governor::DEFAULT_LEASE_DURATION,
+            )
+            .is_some();
+            (lease.is_valid(), anchor, held)
+        };
         // Open only when a reload would not close it again.
         if state.read_only.settled(false) {
+            if !held {
+                self.lease.write().spend_failover_anchor(anchor);
+            }
             return WriteGate::Open;
         }
         let committed_async = view.committed_sync == Some(false);
-        if !writes_may_open(state.sync_list_empty, state.sync_standbys, required, committed_async)
-            // Re-read immediately before opening.
-            || !self.lease.read().is_valid()
+        if !writes_may_open(
+            state.sync_list_empty,
+            state.sync_standbys,
+            required,
+            committed_async,
+        ) || !lease_valid
+            || held
         {
             return waiting;
         }
+        // Traced as the gate admits it: the fence can see writes open before
+        // the call returns.
+        spec_trace::record(SpecEvent::Open);
         match tokio::time::timeout(TICK_SQL_BUDGET, pg.set_readonly(false)).await {
-            Ok(Ok(())) => WriteGate::Open,
+            Ok(Ok(())) => {
+                self.lease.write().spend_failover_anchor(anchor);
+                WriteGate::Open
+            }
             Ok(Err(e)) => {
                 error!(error = %e, "Failed to enable writes");
                 waiting
@@ -1191,6 +1221,42 @@ mod tests {
 
         node.pass(&mut pg, &leading()).await;
         assert!(pg.is_readonly());
+    }
+
+    #[tokio::test]
+    async fn a_reelected_primary_holds_writes_until_its_anchor_is_a_lease_old() {
+        // Re-elected over a PostgreSQL that never left the primary role, so
+        // no promotion ran its hold-down: a node deposed in the meantime may
+        // still hold a lease until one has passed since this term began.
+        let mut pg = ModelPg {
+            sync_standbys: 1,
+            ..ModelPg::default().starting_readonly()
+        };
+        let mut node = reconciler(Duration::from_secs(5));
+        {
+            let mut lease = node.lease.write();
+            let now = lease.now();
+            lease.set_failover_anchor(Some(now));
+        }
+
+        let out = node.pass(&mut pg, &leading()).await;
+        assert!(pg.is_readonly(), "opened inside the hold-down");
+        assert!(out.opening, "a held primary must re-pass soon");
+
+        {
+            let mut lease = node.lease.write();
+            let spent = lease
+                .now()
+                .checked_sub(crate::governor::DEFAULT_LEASE_DURATION);
+            lease.set_failover_anchor(spent);
+        }
+        node.pass(&mut pg, &leading()).await;
+        assert!(!pg.is_readonly(), "a spent hold-down still held writes");
+        assert_eq!(
+            node.lease.read().failover_anchor(),
+            None,
+            "opening writes consumes the anchor"
+        );
     }
 
     #[tokio::test]

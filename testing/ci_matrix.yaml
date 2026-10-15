@@ -64,6 +64,7 @@
         "lsn-leaderless-livelock-recovery",
         "standby-elected-after-leader-dies-mid-load",
         "follower-gateway-deposed-primary",
+        "trace-validation",
         "vote-rejection-progresses",
         "rewind-refused-on-data-loss-risk"
       ]
@@ -4325,6 +4326,25 @@
         {
           "type": "cmd",
           "cmd": "testing/follower_gateway_routing.py",
+          "timeout_sec": 600
+        }
+      ]
+    },
+    {
+      "id": "trace-validation",
+      "contracts": ["L1", "L3"],
+      "description": "A real failover's trace held to tla/lease_fencing.tla and tla/raft_lsn.tla. Every node records the transitions the specs model (term and leader, anchor stamps and spends, write-gate opens, the write state each fence tick leaves, each vote answered with its WAL gate inputs) and the case reads them from /debug/events for the whole run while the leader's Raft port is cut both ways. The checker (testing/trace_check.py) holds the merged trace to: at most one write authority at a time, opens only on a believed leader past the hold-down from its term's first sighting, writability only through the gate, fences that land, one leader per term with a quorum of grants, at most one grant per voter and term, and every grant within the WAL threshold. Fails on any violation, on any rule that decided no instance, and on any drift in trace_check.DRIFTS that, written into a copy of this run's trace, does not trip the rule it targets. Evicted events make an instance unverifiable, never violated.",
+      "actions": [
+        {
+          "type": "wait_cluster",
+          "nodes": 3,
+          "leaders": 1,
+          "timeout_sec": 90,
+          "min_healthy_replicas": 2
+        },
+        {
+          "type": "cmd",
+          "cmd": "testing/trace_validation.py",
           "timeout_sec": 600
         }
       ]

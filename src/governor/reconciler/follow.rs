@@ -104,7 +104,7 @@ pub(super) async fn promote_local_postgres<P: PgControl>(
             let total_secs = now.duration_since(anchor).as_secs_f64();
             metrics::histogram!("pgbattery_failover_total_seconds").record(total_secs);
             info!(total_secs, "Failover total duration recorded");
-            lease.write().set_failover_anchor(None);
+            // The anchor stays for the open, which re-checks it and spends it.
             Some(true)
         }
         Err(e) => {

@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use super::SharedLeaseState;
 use super::lease::LEASE_CHECK_INTERVAL;
 use super::pg_control::PgFence;
+use crate::observability::spec_trace::{self, SpecEvent};
 
 /// Per-SQL-call budget on the hot ticks (the fence, the reconciler's write
 /// gate and LSN read). A hung postmaster must not stall a tick past it; on
@@ -59,6 +60,8 @@ pub(crate) fn spawn<F: PgFence + 'static>(
         // by one catch-up tick, never a burst.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut failures: u32 = 0;
+        // The last write state traced, so only changes are recorded.
+        let mut traced = None;
         tracing::info!("Lease fence started");
         loop {
             tokio::select! {
@@ -69,7 +72,7 @@ pub(crate) fn spawn<F: PgFence + 'static>(
                     }
                 }
                 _ = interval.tick() => {
-                    if tick(&session, &lease, &mut failures, &shutdown_tx).await {
+                    if tick(&session, &lease, &mut failures, &shutdown_tx, &mut traced).await {
                         break;
                     }
                 }
@@ -79,19 +82,28 @@ pub(crate) fn spawn<F: PgFence + 'static>(
 }
 
 /// One fence tick. Returns `true` once the failure threshold has shut the
-/// process down.
+/// process down. Traces the write state the tick leaves when it differs from
+/// `traced`.
 async fn tick<F: PgFence>(
     session: &F,
     lease: &SharedLeaseState,
     failures: &mut u32,
     shutdown_tx: &watch::Sender<bool>,
+    traced: &mut Option<SpecEvent>,
 ) -> bool {
     let (in_recovery, writable) = probe(session).await;
     // Read after the probe, immediately before acting: a snapshot from tick
     // entry can be a budget stale in either direction.
-    let lease_valid = lease.read().is_valid();
-    match action(lease_valid, writable, in_recovery) {
-        FenceAction::Close => close(session, failures, shutdown_tx).await,
+    let (lease_valid, lease_leader) = {
+        let lease = lease.read();
+        (lease.is_valid(), lease.is_leader())
+    };
+    // Fail-closed: a write state the probe could not read is fenced.
+    let (stop, writable_after) = match action(lease_valid, writable.unwrap_or(true), in_recovery) {
+        FenceAction::Close => match close(session, failures, shutdown_tx).await {
+            Closed::Fenced => (false, Some(false)),
+            Closed::Failed { stop } => (stop, writable),
+        },
         FenceAction::TerminateBypassers => {
             // The default only changes new transactions: `BEGIN READ WRITE`
             // and sessions already open bypass it, so eviction repeats every
@@ -100,13 +112,31 @@ async fn tick<F: PgFence>(
             log_termination(
                 tokio::time::timeout(TICK_SQL_BUDGET, session.terminate_client_backends()).await,
             );
-            false
+            (false, writable)
         }
         FenceAction::None => {
             *failures = 0;
-            false
+            (false, writable)
         }
+    };
+    let event = SpecEvent::Writes {
+        writable: writable_after,
+        lease_valid,
+        lease_leader,
+    };
+    if *traced != Some(event) {
+        spec_trace::record(event);
+        *traced = Some(event);
     }
+    stop
+}
+
+/// What a close left.
+enum Closed {
+    /// Read-only, or no server left to take a write.
+    Fenced,
+    /// Still possibly writable; `stop` once the failures shut the process down.
+    Failed { stop: bool },
 }
 
 const fn action(lease_valid: bool, writable: bool, in_recovery: Option<bool>) -> FenceAction {
@@ -122,23 +152,24 @@ const fn action(lease_valid: bool, writable: bool, in_recovery: Option<bool>) ->
     }
 }
 
-/// `(in_recovery, writable)` in one round trip, fail-closed: a failed or
-/// late probe reads as writable, so the fence closes.
+/// `(in_recovery, writable)` in one round trip; `writable` is `None` when a
+/// failed or late probe could not tell, which the tick treats as writable
+/// (fail-closed), so the fence closes.
 ///
 /// Fail-closed stops where nothing is serving: no socket, or a server that
 /// says it is starting up or shutting down takes no writes, and every start
 /// comes up fenced. A timeout is not that: a hung server may still hold
 /// writable sessions.
-async fn probe<F: PgFence>(session: &F) -> (Option<bool>, bool) {
+async fn probe<F: PgFence>(session: &F) -> (Option<bool>, Option<bool>) {
     match tokio::time::timeout(TICK_SQL_BUDGET, session.probe()).await {
         // Writable now, or after anyone's next reload; never on a standby.
-        Ok(Ok(state)) => (Some(state.in_recovery), state.client_writable()),
-        Ok(Err(pgbattery_core::Error::PostgresNotReady(_))) => (None, false),
+        Ok(Ok(state)) => (Some(state.in_recovery), Some(state.client_writable())),
+        Ok(Err(pgbattery_core::Error::PostgresNotReady(_))) => (None, Some(false)),
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "role/readonly probe failed; assuming writable (fail-closed)");
             metrics::counter!("pgbattery_recovery_probe_failures").increment(1);
             metrics::counter!("pgbattery_readonly_probe_failures").increment(1);
-            (None, true)
+            (None, None)
         }
         Err(_) => {
             tracing::warn!(
@@ -147,7 +178,7 @@ async fn probe<F: PgFence>(session: &F) -> (Option<bool>, bool) {
             );
             metrics::counter!("pgbattery_recovery_probe_failures").increment(1);
             metrics::counter!("pgbattery_readonly_probe_failures").increment(1);
-            (None, true)
+            (None, None)
         }
     }
 }
@@ -164,13 +195,13 @@ const fn failure_is_split_brain_risk(error: &pgbattery_core::Error) -> bool {
 }
 
 /// Lease lapsed over a writable primary: set the read-only default and evict
-/// client backends. Returns `true` once failures reach the threshold and the
-/// process is shutting down.
+/// client backends. A failure that reaches the threshold shuts the process
+/// down.
 async fn close<F: PgFence>(
     session: &F,
     failures: &mut u32,
     shutdown_tx: &watch::Sender<bool>,
-) -> bool {
+) -> Closed {
     tracing::error!("EMERGENCY FENCE: Lease expired, forcing read-only");
     metrics::counter!("pgbattery_emergency_fence").increment(1);
 
@@ -181,11 +212,11 @@ async fn close<F: PgFence>(
             tokio::time::timeout(TICK_SQL_BUDGET, session.terminate_client_backends()).await,
         );
         *failures = 0;
-        return false;
+        return Closed::Fenced;
     }
     // Gone between probe and close: it serves nothing and comes back fenced.
     if matches!(result, Ok(Err(pgbattery_core::Error::PostgresNotReady(_)))) {
-        return false;
+        return Closed::Fenced;
     }
 
     *failures = failures.saturating_add(1);
@@ -211,14 +242,14 @@ async fn close<F: PgFence>(
         ),
         Ok(Ok(())) => unreachable!("matches! covers Ok(Ok)"),
     }
-    if *failures >= FENCE_FAILURE_SHUTDOWN_THRESHOLD {
+    let stop = *failures >= FENCE_FAILURE_SHUTDOWN_THRESHOLD;
+    if stop {
         tracing::error!(
             "Fence failures exceeded threshold — shutting down to prevent split-brain writes"
         );
         let _ = shutdown_tx.send(true);
-        return true;
     }
-    false
+    Closed::Failed { stop }
 }
 
 /// Whether a termination ended any client session. The fence re-runs every
@@ -293,7 +324,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut failures = 0;
 
-        let stopped = tick(&pg, &lease, &mut failures, &shutdown_tx).await;
+        let stopped = tick(&pg, &lease, &mut failures, &shutdown_tx, &mut None).await;
 
         assert!(!stopped, "one fence attempt must not stop the loop");
         let (readonly, calls) = {
@@ -312,6 +343,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tick_traces_the_write_state_it_leaves() {
+        // The trace checker reads writability after the tick acts: a closed
+        // fence is a writable edge down, not a writable primary.
+        let (pg, lease) = expired_lease_over(ModelPg::default());
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mut traced = None;
+
+        tick(&pg, &lease, &mut 0, &shutdown_tx, &mut traced).await;
+
+        assert_eq!(
+            traced,
+            Some(SpecEvent::Writes {
+                writable: Some(false),
+                lease_valid: false,
+                lease_leader: false,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn a_fence_that_cannot_land_escalates_to_shutdown() {
         // The RW-4 tail: a node that lost write authority and cannot give it
         // up stops being a process.
@@ -326,7 +377,7 @@ mod tests {
         let mut stopped = false;
         while ticks < FENCE_FAILURE_SHUTDOWN_THRESHOLD * 2 {
             ticks += 1;
-            if tick(&pg, &lease, &mut failures, &shutdown_tx).await {
+            if tick(&pg, &lease, &mut failures, &shutdown_tx, &mut None).await {
                 stopped = true;
                 break;
             }
@@ -361,12 +412,12 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut failures = 0;
         for _ in 0..FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1 {
-            tick(&pg, &lease, &mut failures, &shutdown_tx).await;
+            tick(&pg, &lease, &mut failures, &shutdown_tx, &mut None).await;
         }
         assert_eq!(failures, FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1);
 
         pg.lock().await.fails = None;
-        let stopped = tick(&pg, &lease, &mut failures, &shutdown_tx).await;
+        let stopped = tick(&pg, &lease, &mut failures, &shutdown_tx, &mut None).await;
 
         assert!(!stopped);
         assert_eq!(failures, 0, "consecutive-failure count did not reset");
@@ -384,7 +435,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut failures = 0;
 
-        let stopped = tick(&pg, &lease, &mut failures, &shutdown_tx).await;
+        let stopped = tick(&pg, &lease, &mut failures, &shutdown_tx, &mut None).await;
 
         assert!(!stopped);
         assert!(!*shutdown_rx.borrow(), "fenced a standby into shutdown");
@@ -406,7 +457,7 @@ mod tests {
         ));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
-        tick(&pg, &lease, &mut 0, &shutdown_tx).await;
+        tick(&pg, &lease, &mut 0, &shutdown_tx, &mut None).await;
 
         assert!(pg.lock().await.is_readonly(), "the fence opened writes");
     }
@@ -419,7 +470,11 @@ mod tests {
             has_postmaster: false,
             ..ModelPg::default()
         }));
-        assert_eq!(probe(&pg).await, (None, false), "no socket serves a write");
+        assert_eq!(
+            probe(&pg).await,
+            (None, Some(false)),
+            "no socket serves a write"
+        );
     }
 
     #[test]

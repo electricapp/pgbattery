@@ -83,6 +83,25 @@ class DebugState(BaseModel):
     there first (`SYNC_FIELD`)."""
 
 
+class DebugEvent(BaseModel):
+    """One entry of `GET /debug/events`. `data` is parsed by whoever reads
+    its `event_type` (`trace_check` for `spec`)."""
+
+    seq: int
+    timestamp_ms: int
+    event_type: str
+    node_id: int
+    data: dict[str, object]
+
+
+class DebugEvents(BaseModel):
+    """`GET /debug/events`: `current_seq` is the newest sequence number this
+    process has recorded, whether or not it is in `events`."""
+
+    current_seq: int
+    events: list[DebugEvent]
+
+
 class PostgresBinDir(BaseModel):
     """One configured bindir in `GET /api/v1/postgres/bins`, probed live."""
 

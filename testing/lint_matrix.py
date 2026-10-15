@@ -55,6 +55,7 @@ from rich.table import Table
 
 import fault_primitives as fp
 import topology
+import trace_check
 
 TESTING_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTING_DIR.parent
@@ -1797,6 +1798,48 @@ def check_lease_fencing_model_matches_the_shipped_timings() -> None:
         )
 
 
+TLA_DEFINITION: Final[re.Pattern[str]] = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*==", re.MULTILINE
+)
+
+
+def tla_definitions(text: str) -> set[str]:
+    """The operators a spec defines at the start of a line, with or without
+    arguments."""
+    return set(TLA_DEFINITION.findall(text))
+
+
+def trace_rule_problems(
+    rules: Iterable[trace_check.Rule], definitions: Mapping[str, set[str]]
+) -> list[str]:
+    """Trace rules that cite nothing, or cite a spec definition that does not
+    exist."""
+    problems = []
+    for rule in rules:
+        if not rule.refs:
+            problems.append(f"{rule.name} cites no spec definition")
+        for ref in rule.refs:
+            spec, _, name = ref.partition(".")
+            if spec not in definitions:
+                problems.append(f"{rule.name}: no tla/{spec}.tla")
+            elif name not in definitions[spec]:
+                problems.append(f"{rule.name}: {spec} defines no {name}")
+    return problems
+
+
+def check_trace_rules_name_spec_definitions() -> None:
+    """Every trace-validation rule must cite actions or invariants the specs
+    define.
+
+    `trace_check` is how a real run is held to the specs; a rule whose cited
+    action was renamed or deleted would keep passing against a model that no
+    longer says what it claims to refine.
+    """
+    definitions = {p.stem: tla_definitions(p.read_text(encoding="utf-8")) for p in tla_specs()}
+    if problems := trace_rule_problems(trace_check.RULES, definitions):
+        raise AssertionError("trace rules cite missing spec definitions — " + " | ".join(problems))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1852,6 +1895,7 @@ def lint() -> None:
         "TLA models state the shipped timings",
         check_lease_fencing_model_matches_the_shipped_timings,
     )
+    check("Trace rules cite real spec definitions", check_trace_rules_name_spec_definitions)
 
     table = Table(title="Test Harness Lint", show_lines=False)
     table.add_column("Check")

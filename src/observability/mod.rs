@@ -32,8 +32,10 @@
 //! - [`logging`]: Tracing subscriber setup
 //! - [`metrics`]: Prometheus metrics registration
 //! - [`management_api`]: Axum-based REST API
+//! - [`spec_trace`]: modeled transitions recorded for trace validation
 
 pub mod debug_events;
 pub mod logging;
 pub mod management_api;
 pub mod metrics;
+pub mod spec_trace;

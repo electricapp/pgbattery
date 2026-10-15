@@ -353,10 +353,13 @@ RenewLease(n) ==
     /\ UNCHANGED <<nodeTerm, believesLeader, campaigning, campaignAge, bootstrapped,
                    quorumAckAge, holdDownRemaining, anchored, pgWritable>>
 
-(* Supervisor enables PG writes — gated by BOTH a valid lease AND the hold-down.
- * Promotion consumes the anchor, matching `promote_local_postgres`: from here on
- * this node is a primary and the gate that governs it is the lease, not the
- * hold-down. *)
+(* The reconciler opens PG writes — gated by BOTH a valid lease AND the
+ * hold-down, and the open spends the anchor: from here on the gate that governs
+ * this primary is the lease, not the hold-down. A promotion holds on the same
+ * anchor first; a leader re-elected over a primary it never demoted reaches
+ * this gate with no promotion at all.
+ * CODE: governor/reconciler/mod.rs open_writes(); governor/lease.rs
+ * spend_failover_anchor(). *)
 EnablePgWrites(n) ==
     /\ believesLeader[n]
     /\ LeaseIsValid(n)

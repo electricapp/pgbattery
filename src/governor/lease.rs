@@ -17,6 +17,8 @@ use pgbattery_core::{Clock, SystemClock};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::observability::spec_trace::{self, SpecEvent};
+
 /// Default lease duration - conservative value
 /// Leader must renew within this window or lose write authority
 pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(2);
@@ -237,7 +239,12 @@ impl LeaseState {
     }
 
     /// Stamp the hold-down anchor at `at`, or clear it.
-    pub const fn set_failover_anchor(&mut self, at: Option<Instant>) {
+    pub fn set_failover_anchor(&mut self, at: Option<Instant>) {
+        if self.failover_anchor != at {
+            spec_trace::record(SpecEvent::Anchor {
+                stamped: at.is_some(),
+            });
+        }
         self.failover_anchor = at;
     }
 
@@ -245,8 +252,20 @@ impl LeaseState {
     /// stamped: an unknown anchor holds for a lease rather than reading as
     /// long expired.
     pub fn promotion_anchor(&mut self) -> Instant {
+        if let Some(anchor) = self.failover_anchor {
+            return anchor;
+        }
         let now = self.clock.now();
-        *self.failover_anchor.get_or_insert(now)
+        self.set_failover_anchor(Some(now));
+        now
+    }
+
+    /// Spend `seen` once writes are open past its hold-down. An anchor
+    /// re-stamped since belongs to a later term and stays.
+    pub fn spend_failover_anchor(&mut self, seen: Option<Instant>) {
+        if self.failover_anchor == seen {
+            self.set_failover_anchor(None);
+        }
     }
 }
 

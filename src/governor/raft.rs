@@ -35,6 +35,7 @@ use super::storage::{
 };
 use crate::config::PeerConfig;
 use crate::error::{Error, Result};
+use crate::observability::spec_trace::{self, SpecEvent};
 
 // Use openraft's declare_raft_types! macro for proper type configuration
 openraft::declare_raft_types!(
@@ -390,6 +391,12 @@ impl Governor {
 
     fn process_metrics_update(&self, metrics: &MetricsView, runtime: &mut GovernorRunState) {
         let leader_id = metrics.current_leader;
+        if (metrics.current_term, leader_id) != (runtime.prev_term, runtime.prev_leader_id) {
+            spec_trace::record(SpecEvent::Raft {
+                term: metrics.current_term,
+                leader: leader_id,
+            });
+        }
         let leader_addr =
             leader_id.and_then(|id| self.state.read().nodes.get(&id).map(|n| n.pg_addr));
         // openraft emits a `RaftMetrics` update on every heartbeat and on

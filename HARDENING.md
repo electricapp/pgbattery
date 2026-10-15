@@ -184,7 +184,7 @@ itself stops existing.
 | RW-5  | Direct writers on the internal PostgreSQL port bypassing the gateway's lease check entirely                                                                            | L1       | `dual_writability_prober.py` writes every internal port at 50 ms resolution. The `trust` perimeter itself is an accepted risk                                                                                                                                                                          |
 | RW-6  | Follower gateway routing writes to a deposed primary during the Raft detection interval, stopped only by the old leader's own lease                                    | W1       | `follower_gateway_routing.py` (`follower-gateway-deposed-primary`) cuts the leader's Raft port both ways with its PostgreSQL reachable, writes through every follower gateway, and asserts from each row's accepting server and commit time that no deposed-side write follows the new primary's first |
 | RW-7  | A node restored from an old backup, Raft directory intact, standing for election after a long leaderless window                                                        | L3       | Every voter compares the candidate's WAL with its own, both read at vote time (`network::vote_lsn_gate`); nothing ages. Unit and property tests in `network.rs`                                                                                                                                        |
-| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1       | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`                                                                                                                                                                                                     |
+| RW-8  | Failover-anchor lifecycle under coalesced watch transitions: a missed clear or missed re-stamp makes the hold-down read an ancient anchor                              | L1       | `failover_anchor.py` drives the live lifecycle and asserts on the anchor's age from `/debug/state`; `trace-validation` checks every write-gate open against its anchor and against the instant its node first saw the term                                                                             |
 | RW-9  | `demote()` holding the supervisor mutex across stop, rewind and recovery, stalling the lease tick, health watchdog and LSN reporting behind it                         | L1       | The lease fence runs on its own PostgreSQL session; `governor::fence::spawn` is handed that session and the lease, never the supervisor mutex                                                                                                                                                          |
 | RW-10 | Join and rejoin edges: a clone source deposed mid-copy, orphan slots pinning WAL, a learner dying mid-join, a wiped bootstrap node impersonating the cluster           | R1, V2   | `join_edges.py`, five cases, run in CI                                                                                                                                                                                                                                                                 |
 | RW-11 | `SetSyncMode` replicated state disagreeing with the live GUC across a leader change, so the election gate uses the loose async threshold while sync is actually active | W1, L3   | `sync_mode_agreement.py` measures how long the replicated flag runs looser than the leader's live GUC, against a budget derived from the reconcile that closes it                                                                                                                                      |
@@ -210,15 +210,21 @@ every test fixes the one it asserts (Class C).
 
 ## Tier 5 — Connect the specs to the binary
 
-The four TLA+ specs are non-vacuous, and the static half of their mapping onto
-the binary is enforced: `lint_matrix.py` resolves the code each spec names, and
-holds `lease_fencing`'s ticks to the milliseconds the binary ships.
+The four TLA+ specs are non-vacuous, and both halves of their mapping onto the
+binary are enforced. Statically, `lint_matrix.py` resolves the code each spec
+names and holds `lease_fencing`'s ticks to the milliseconds the binary ships.
+Dynamically, the binary records the transitions `lease_fencing` and `raft_lsn`
+model (`SpecEvent`: term and leader, anchor stamp and spend, write-gate open,
+the write state each fence tick leaves, each vote with its WAL gate inputs),
+and `trace-validation` holds a real failover's trace to them with
+`trace_check.py`. Each rule cites the spec definitions it refines, which lint
+resolves, and each drift in `trace_check.DRIFTS`, written into the real trace,
+must trip its rule.
 
-What no check reaches is the shape of a run. A trace of real transitions —
-lease renew and expire, anchor stamp and clear, promote and demote, fence
-escalation — is not checked against the specs, so a sequence the spec's `Next`
-does not permit would go unnoticed. That is trace validation, and it is what
-turns "we have specs" into "the specs describe this binary".
+What the traces do not reach: `timeline_verification` and `cutover_authority`
+record no transitions, and one run sees one scenario (a Raft-only partition of
+the leader). Write state is observed at the fence's 100 ms tick, so a writable
+interval shorter than a tick can pass unrecorded.
 
 ## Tier 6 — Real Jepsen, or autonomous exploration
 
@@ -296,11 +302,13 @@ The roadmap is done when:
    it outright needs a deterministic runtime.
 4. Every risk window is either covered by a test, closed by design, or listed in
    Accepted risks with a rationale. **Met.**
-5. The specs are checked against traces from the running binary. **Not met.** The
-   static half of the mapping is enforced; the shape of a run is not.
+5. The specs are checked against traces from the running binary. **Met.**
+   `trace-validation` checks a failover's trace against `lease_fencing` and
+   `raft_lsn`, and fails unless every rule decided an instance and every
+   injected drift was caught. An event the ring evicted makes an instance
+   unverifiable, never violated.
 
-So the distance to zero is criteria 3 and 5: a deterministic runtime, and a
-trace-checking harness.
+So the distance to zero is criterion 3: a deterministic runtime.
 
 ## Execution plan
 
@@ -324,17 +332,6 @@ Rules that apply to every task, so they are not repeated per line:
 
 Effort: **S** hours · **M** one to two days · **L** about a week · **XL**
 multi-week.
-
-- [ ] **Validate real traces against the specs.** A harness run's transitions,
-      checked against `lease_fencing` and `raft_lsn`, with an injected drift
-      caught. Note the observer's limit before building on it: the transition
-      stream rides `watch` channels, which are lossy by design, so a transition
-      superseded before the observer wakes is not recorded — a gap must be
-      distinguishable from an illegal step, or the checker manufactures
-      violations.
-      **Done when** a run's trace is checked against both specs and an injected
-      drift is caught.
-      _Closes_ exit criterion 5 · _Effort_ L
 
 - [ ] **Run the governor and `app.rs` orchestration under `madsim`** with a
       seeded network and clock: delay, reorder, drop, partition, clock advance.

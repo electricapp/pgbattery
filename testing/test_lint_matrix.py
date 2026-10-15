@@ -14,6 +14,7 @@ from unittest import mock
 
 import fault_primitives as fp
 import lint_matrix as lm
+import trace_check as tc
 
 
 class ProseFileReferenceTest(unittest.TestCase):
@@ -300,6 +301,28 @@ class LeaseFencingTimingTest(unittest.TestCase):
     def test_a_commented_ratio_is_not_read_as_an_assignment(self) -> None:
         text = "\\* HoldDown = 99 is what the comment says\nHoldDown = 4\n"
         self.assertEqual(lm.tla_config_constants(text), {"HoldDown": 4})
+
+
+class TraceRuleTest(unittest.TestCase):
+    def test_the_rules_as_committed_cite_real_definitions(self) -> None:
+        lm.check_trace_rules_name_spec_definitions()
+
+    def test_definitions_with_and_without_arguments_are_read(self) -> None:
+        text = "Fence(n) ==\n    TRUE\nOneLeaderPerTerm ==\n  TRUE\n\\* Ghost == comment\n"
+        self.assertEqual(lm.tla_definitions(text), {"Fence", "OneLeaderPerTerm"})
+
+    def test_a_rule_citing_a_renamed_action_is_caught(self) -> None:
+        rule = tc.Rule("open-gated", ("lease_fencing.EnableWrites",), "renamed")
+        problems = lm.trace_rule_problems([rule], {"lease_fencing": {"EnablePgWrites"}})
+        self.assertEqual(problems, ["open-gated: lease_fencing defines no EnableWrites"])
+
+    def test_a_rule_citing_an_unknown_spec_or_nothing_is_caught(self) -> None:
+        rules = [
+            tc.Rule("a", ("ghost.Next",), "no such spec"),
+            tc.Rule("b", (), "cites nothing"),
+        ]
+        problems = lm.trace_rule_problems(rules, {"lease_fencing": {"Next"}})
+        self.assertEqual(problems, ["a: no tla/ghost.tla", "b cites no spec definition"])
 
 
 if __name__ == "__main__":
