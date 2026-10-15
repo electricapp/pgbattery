@@ -1573,8 +1573,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
         // Parse the incoming snapshot BEFORE touching any state so a malformed
         // snapshot cannot corrupt in-memory or on-disk data.
-        let state: ClusterState =
-            postcard::from_bytes(&data).map_err(|e| storage_read_err(&Error::Serialization(e)))?;
+        let state = ClusterState::decode_snapshot(&data)
+            .map_err(|e| storage_read_err(&Error::Serialization(e)))?;
         let state = state_at_snapshot_position(state, meta.last_log_id.map(|l| l.index))
             .map_err(|e| storage_read_err(&e))?;
 
@@ -3378,6 +3378,36 @@ mod tests {
             sm.storage.load_last_applied().unwrap().last_applied_index,
             Some(99)
         );
+    }
+
+    /// Mid-roll, a leader still on the schema-0 binary sends its snapshot to
+    /// an upgraded follower; refusing it would crash-loop the follower until
+    /// the leader is upgraded too.
+    #[tokio::test]
+    async fn an_install_accepts_a_schema_zero_snapshot_from_an_older_leader() {
+        use crate::governor::state_machine::ClusterStateV0;
+
+        let (_dir, mut sm, meta) = store_at_seven_and_meta_at_99();
+        let mut nodes = std::collections::HashMap::new();
+        for id in 1..=5 {
+            nodes.insert(id, test_node_info(id));
+        }
+        let old_leader = ClusterStateV0 {
+            nodes,
+            voter_ids: (1..=5).collect(),
+            learner_ids: std::collections::HashSet::new(),
+            node_lsns: std::collections::HashMap::new(),
+            max_cluster_lsn: 0,
+            sync_replication_active: Some(true),
+        };
+        sm.install_snapshot(
+            &meta,
+            Box::new(Cursor::new(postcard::to_allocvec(&old_leader).unwrap())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sm.state.read().nodes.len(), 5);
+        assert!(sm.state.read().reflects(99));
     }
 
     /// Snapshot data behind its metadata would silently drop the entries in

@@ -167,6 +167,25 @@ impl From<ClusterStateV0> for ClusterState {
     }
 }
 
+impl ClusterState {
+    /// Decode snapshot bytes in the current layout or the schema-0 one.
+    ///
+    /// The current layout extends schema 0 with trailing fields, so schema-0
+    /// bytes fail as current and are read as v0; current bytes never reach the
+    /// fallback. Snapshots arrive in either: on disk from an older binary, or
+    /// over the wire from a leader still running one.
+    ///
+    /// # Errors
+    /// The current layout's decode error when neither layout fits.
+    pub(crate) fn decode_snapshot(data: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes::<Self>(data).or_else(|current| {
+            postcard::from_bytes::<ClusterStateV0>(data)
+                .map(Self::from)
+                .map_err(|_| current)
+        })
+    }
+}
+
 /// The `(epoch, cluster_id)` write authority from `tla/cutover_authority.tla`.
 ///
 /// Not a leadership projection: Raft leadership stays `RaftMetrics::current_leader`.

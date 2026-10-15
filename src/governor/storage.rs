@@ -349,7 +349,7 @@ impl RedbLogStorage {
     /// untouched. Log entries need no rewrite: `ClusterCommand` only appended
     /// enum variants, and postcard discriminants are stable.
     fn migrate_snapshot_v0_to_v1(write_txn: &redb::WriteTransaction) -> Result<()> {
-        use super::state_machine::{ClusterState, ClusterStateV0};
+        use super::state_machine::ClusterState;
 
         let mut table = write_txn
             .open_table(SNAPSHOT_TABLE)
@@ -367,13 +367,13 @@ impl RedbLogStorage {
             return Ok(());
         }
 
-        let v0: ClusterStateV0 = postcard::from_bytes(&data).map_err(|e| {
+        let state = ClusterState::decode_snapshot(&data).map_err(|e| {
             Error::Storage(format!(
                 "schema 0→1 migration: snapshot decodes as neither the current \
                  nor the v0 ClusterState layout (corrupt store?): {e}"
             ))
         })?;
-        let migrated = postcard::to_allocvec(&ClusterState::from(v0))?;
+        let migrated = postcard::to_allocvec(&state)?;
         let digest = Sha256::digest(&migrated);
         table
             .insert("data", migrated.as_slice())
