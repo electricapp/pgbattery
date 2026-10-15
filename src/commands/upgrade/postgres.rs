@@ -2292,13 +2292,9 @@ async fn run_apply_after_stop(ctx: ApplyAfterStop<'_>) -> Result<PreflightReport
         .map_err(|e| anyhow::anyhow!("start after pg_upgrade: {e}"))?;
 
     // Probe before the gateway is unfrozen: held clients must be released
-    // into a primary that answers, not one still in startup. The primary is
-    // born fenced, so the probe opts its own transaction out of the default.
+    // into a primary that answers, not one still in startup.
     supervisor
-        .execute_sql(
-            "BEGIN READ WRITE; CREATE TEMP TABLE pgbattery_upgrade_probe(i int); \
-             DROP TABLE pgbattery_upgrade_probe; COMMIT;",
-        )
+        .execute_sql(PRIMARY_WRITE_PROBE_SQL)
         .await
         .context("upgraded primary did not accept a write")?;
 
@@ -2550,18 +2546,20 @@ pub async fn rollback_local(
 /// those standbys are re-basebackup'd from this old-major primary, which the
 /// caller must drive after a rollback the way it does after a forward apply.
 /// The write goes to a temp table so the drill leaves nothing behind.
+/// A write the started primary accepts. It is born fenced, so the probe opts
+/// its own transaction out of the read-only default, and commits locally:
+/// the standbys are stopped, and a synchronous commit would wait for them.
+const PRIMARY_WRITE_PROBE_SQL: &str = "BEGIN READ WRITE; \
+     SET LOCAL synchronous_commit = local; \
+     CREATE TEMP TABLE pgbattery_write_probe(i int); \
+     INSERT INTO pgbattery_write_probe VALUES (1); \
+     DROP TABLE pgbattery_write_probe; \
+     COMMIT;";
+
 async fn probe_rollback_write(supervisor: &crate::supervisor::Supervisor) -> Result<()> {
     let mut last_err: Option<String> = None;
     for _ in 0..20 {
-        match supervisor
-            .execute_sql(
-                "SET synchronous_commit = local; \
-                 CREATE TEMP TABLE pgbattery_rollback_probe(i int); \
-                 INSERT INTO pgbattery_rollback_probe VALUES (1); \
-                 DROP TABLE pgbattery_rollback_probe;",
-            )
-            .await
-        {
+        match supervisor.execute_sql(PRIMARY_WRITE_PROBE_SQL).await {
             Ok(_) => return Ok(()),
             Err(e) => last_err = Some(e.to_string()),
         }
@@ -2956,6 +2954,20 @@ pub async fn run_standby_rebasebackup(
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "test assertions")]
 mod tests {
     use super::*;
+
+    /// Every start comes up fenced, so a write probe that leans on the
+    /// session default reports a healthy rolled-back primary as dead. The
+    /// probe's own transaction opts out, and commits without the stopped
+    /// standbys.
+    #[test]
+    fn the_write_probe_opts_out_of_the_fenced_default() {
+        assert!(
+            PRIMARY_WRITE_PROBE_SQL.starts_with("BEGIN READ WRITE;"),
+            "{PRIMARY_WRITE_PROBE_SQL}"
+        );
+        assert!(PRIMARY_WRITE_PROBE_SQL.contains("SET LOCAL synchronous_commit = local;"));
+        assert!(PRIMARY_WRITE_PROBE_SQL.ends_with("COMMIT;"));
+    }
 
     fn fake_datadir(parent: &Path, name: &str, major: u32, control: bool) -> PathBuf {
         let dir = parent.join(name);
