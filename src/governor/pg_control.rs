@@ -103,6 +103,54 @@ pub trait PgControl: Send + Sync {
     ) -> impl Future<Output = Result<std::collections::HashSet<String>>> + Send;
 }
 
+/// The write path the lease loop fences, on a session of its own.
+///
+/// Separate from [`PgControl`] because the fence must never wait on the
+/// supervisor lock, and it only closes: opening writes belongs to the lock
+/// holder, so nothing opens them in the middle of an operation.
+pub trait PgFence: Send + Sync {
+    /// Role, read-only default and sync delivery in one round trip.
+    /// `PostgresNotReady` means nothing is serving writes on the port.
+    fn probe(&self) -> impl Future<Output = Result<PgWriteState>> + Send;
+
+    /// Force the read-only default on a primary and verify it took effect.
+    fn close(&self) -> impl Future<Output = Result<()>> + Send;
+
+    /// Sever every client backend; pgbattery's own sessions are spared.
+    fn terminate_client_backends(&self) -> impl Future<Output = Result<String>> + Send;
+}
+
+impl PgFence for crate::supervisor::FenceSession {
+    async fn probe(&self) -> Result<PgWriteState> {
+        Self::probe(self).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        Self::close(self).await
+    }
+
+    async fn terminate_client_backends(&self) -> Result<String> {
+        Self::terminate_client_backends(self).await
+    }
+}
+
+/// In tests the fence talks to the same modelled server as the supervisor,
+/// one call at a time, as an independent session would.
+#[cfg(test)]
+impl<P: PgControl> PgFence for std::sync::Arc<tokio::sync::Mutex<P>> {
+    async fn probe(&self) -> Result<PgWriteState> {
+        self.lock().await.probe_role_and_readonly().await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.lock().await.set_readonly(true).await
+    }
+
+    async fn terminate_client_backends(&self) -> Result<String> {
+        self.lock().await.terminate_client_backends().await
+    }
+}
+
 impl PgControl for crate::supervisor::Supervisor {
     fn has_postmaster(&self) -> bool {
         Self::has_postmaster(self)
@@ -141,10 +189,7 @@ impl PgControl for crate::supervisor::Supervisor {
     }
 
     async fn terminate_client_backends(&self) -> Result<String> {
-        const TERMINATE_SQL: &str = "SELECT count(pg_terminate_backend(pid)) \
-             FROM pg_stat_activity \
-             WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();";
-        self.execute_sql(TERMINATE_SQL).await
+        Self::terminate_client_backends(self).await
     }
 
     async fn get_replication_stats(&self) -> Result<Vec<crate::supervisor::ReplicationStat>> {
@@ -374,6 +419,11 @@ impl PgControl for ModelPg {
 
     async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
         self.note("probe_role_and_readonly");
+        if !self.has_postmaster {
+            return Err(pgbattery_core::Error::PostgresNotReady(
+                "model: nothing listening on the port".to_string(),
+            ));
+        }
         Ok(PgWriteState {
             in_recovery: self.in_recovery,
             read_only: self.is_readonly(),

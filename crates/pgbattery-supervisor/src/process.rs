@@ -28,7 +28,15 @@ const END_MARKER_PREFIX: &str = "__PGBATTERY_SQL_END_";
 /// a fence failure worth the split-brain marker. A session that ends with
 /// nothing from the server went away, and an absent server serves nothing.
 fn server_answered(stderr_tail: &str) -> bool {
-    stderr_tail.contains("ERROR:") || stderr_tail.contains("FATAL:")
+    (stderr_tail.contains("ERROR:") || stderr_tail.contains("FATAL:"))
+        && !server_declined_connections(stderr_tail)
+}
+
+/// Whether the server's own `FATAL` says it is not accepting connections:
+/// starting up, shutting down, in recovery. Such a server takes no writes, so
+/// it is absent for fencing purposes, not a fence that failed.
+fn server_declined_connections(stderr_tail: &str) -> bool {
+    stderr_tail.contains("FATAL:") && stderr_tail.contains("the database system is")
 }
 
 /// How long a read-only change waits for `pg_reload_conf()`'s SIGHUP to reach
@@ -309,6 +317,99 @@ impl LocalSqlClient {
     }
 }
 
+/// Where pgbattery's local psql sessions connect. Shared by the supervisor's
+/// session and the fence's, so a Track B retarget moves both.
+#[derive(Debug)]
+struct SessionTarget {
+    pg_bin_dir: std::sync::RwLock<PathBuf>,
+    pg_port: u16,
+    pg_user: String,
+    /// Carried by every pgbattery session, so the fence's client termination
+    /// spares them. Random per process: a client cannot claim it.
+    application_name: String,
+}
+
+impl SessionTarget {
+    fn new(config: &SupervisorConfig) -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let nonce = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        Self {
+            pg_bin_dir: std::sync::RwLock::new(config.pg_bin_dir.clone()),
+            pg_port: config.pg_port,
+            pg_user: config.pg_user.clone(),
+            application_name: format!("pgbattery-{nonce:016x}"),
+        }
+    }
+
+    fn psql(&self) -> PathBuf {
+        self.pg_bin_dir
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .join("psql")
+    }
+}
+
+/// One persistent psql session to the local server, reconnected on failure.
+struct SqlSession {
+    target: std::sync::Arc<SessionTarget>,
+    client: tokio::sync::Mutex<Option<LocalSqlClient>>,
+}
+
+impl Drop for SqlSession {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.client.try_lock()
+            && let Some(mut existing) = guard.take()
+        {
+            existing.child.start_kill().ok();
+        }
+    }
+}
+
+/// The local server's write path, read and closed on a session of its own.
+///
+/// The lease loop fences through this, never through the supervisor's lock:
+/// a demote, a rewind or a Track B apply can hold that lock for minutes, and
+/// the fence must not wait behind any of them. It only closes; opening writes
+/// is the lock holder's, so nothing opens them in the middle of an operation.
+pub struct FenceSession {
+    session: SqlSession,
+}
+
+impl std::fmt::Debug for FenceSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FenceSession").finish_non_exhaustive()
+    }
+}
+
+impl FenceSession {
+    /// Role, read-only default and sync delivery in one round trip.
+    ///
+    /// # Errors
+    /// `PostgresNotReady` when nothing is serving on the port; any other
+    /// error when a server answered but the probe failed.
+    pub async fn probe(&self) -> Result<PgWriteState> {
+        self.session.probe_role_and_readonly().await
+    }
+
+    /// Force the read-only default on a primary and verify it took effect.
+    ///
+    /// # Errors
+    /// The recovery probe, the `ALTER SYSTEM`, or the verification failed.
+    pub async fn close(&self) -> Result<()> {
+        self.session.set_readonly(true).await
+    }
+
+    /// Sever every client session; pgbattery's own are spared.
+    ///
+    /// # Errors
+    /// The termination query failed.
+    pub async fn terminate_client_backends(&self) -> Result<String> {
+        self.session.terminate_client_backends().await
+    }
+}
+
 /// Whether two `synchronous_standby_names` values are semantically equal.
 ///
 /// Postgres normalises whitespace, quoting, and casing in `SHOW` output
@@ -548,7 +649,7 @@ pub struct TimelineInfo {
 pub struct Supervisor {
     config: SupervisorConfig,
     child: Option<Child>,
-    sql_client: tokio::sync::Mutex<Option<LocalSqlClient>>,
+    session: SqlSession,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -1084,10 +1185,11 @@ impl Supervisor {
     /// Create a new Supervisor.
     #[must_use]
     pub fn new(config: SupervisorConfig) -> Self {
+        let session = SqlSession::new(std::sync::Arc::new(SessionTarget::new(&config)));
         Self {
             config,
             child: None,
-            sql_client: tokio::sync::Mutex::new(None),
+            session,
         }
     }
 
@@ -1096,6 +1198,12 @@ impl Supervisor {
     ///
     /// Must be called while the postmaster is stopped.
     pub fn retarget_paths(&mut self, bin_dir: PathBuf, data_dir: PathBuf) {
+        self.session
+            .target
+            .pg_bin_dir
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&bin_dir);
         self.config.pg_bin_dir = bin_dir;
         self.config.pg_data_dir = data_dir;
     }
@@ -3521,26 +3629,7 @@ host all all ::/0 {auth_method}
     /// reload command fails, or the post-reload verification read disagrees
     /// with the requested value.
     pub async fn set_readonly(&self, readonly: bool) -> Result<()> {
-        // Standbys are inherently read-only, no need to set the flag
-        let in_recovery = match self.is_in_recovery().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to probe recovery state before set_readonly; refusing state change"
-                );
-                return Err(e);
-            }
-        };
-        if in_recovery {
-            tracing::debug!(
-                readonly = readonly,
-                "Skipping set_readonly on standby (inherently read-only)"
-            );
-            return Ok(());
-        }
-
-        self.write_readonly_guc(readonly).await
+        self.session.set_readonly(readonly).await
     }
 
     /// Arm the write gate a promotion will emerge under, while still a standby.
@@ -3605,6 +3694,49 @@ host all all ::/0 {auth_method}
     /// writable every time. Arming the flag first is the only way the primary
     /// exists fenced rather than becoming fenced.
     async fn write_readonly_guc(&self, readonly: bool) -> Result<()> {
+        self.session.write_readonly_guc(readonly).await
+    }
+
+    /// Query current read-only status from `PostgreSQL`.
+    ///
+    /// # Errors
+    /// Returns an error if the `pg_settings` query fails.
+    pub async fn query_readonly_status(&self) -> Result<bool> {
+        self.session.query_readonly_status().await
+    }
+}
+
+impl SqlSession {
+    /// Skip a standby, which is read-only by recovery, then write the flag.
+    async fn set_readonly(&self, readonly: bool) -> Result<()> {
+        let in_recovery = match self.is_in_recovery().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to probe recovery state before set_readonly; refusing state change"
+                );
+                return Err(e);
+            }
+        };
+        if in_recovery {
+            tracing::debug!(
+                readonly = readonly,
+                "Skipping set_readonly on standby (inherently read-only)"
+            );
+            return Ok(());
+        }
+
+        self.write_readonly_guc(readonly).await
+    }
+
+    async fn is_in_recovery(&self) -> Result<bool> {
+        let result = self.execute_sql("SELECT pg_is_in_recovery();").await?;
+        Ok(result.trim() == "t")
+    }
+
+    /// See [`Supervisor::write_readonly_guc`].
+    async fn write_readonly_guc(&self, readonly: bool) -> Result<()> {
         // Live-GUC idempotency: if the cluster setting already matches the
         // intent, skip the ALTER SYSTEM + reload + verify round-trip. The
         // 2s reconcile loop and the 100ms lease loop both call this every
@@ -3618,8 +3750,6 @@ host all all ::/0 {auth_method}
             return Ok(());
         }
 
-        let psql = self.config.pg_bin_dir.join("psql");
-
         let value = if readonly { "on" } else { "off" };
         let alter_sql = format!("ALTER SYSTEM SET default_transaction_read_only = '{value}';");
 
@@ -3627,17 +3757,20 @@ host all all ::/0 {auth_method}
         // ALTER SYSTEM cannot run inside a transaction block.
         //
         // Bounded + `kill_on_drop(true)`, mirroring `set_sync_standby_names`:
-        // a wedged postmaster must not pin the supervisor mutex, and a
-        // caller-side timeout that drops this future must also reap the
-        // psql — an orphaned unfence applying after a later emergency fence
-        // would make a fenced deposed primary writable.
-        let cmd = Command::new(&psql)
+        // a wedged postmaster must not pin the caller, and a caller-side
+        // timeout that drops this future must also reap the psql — an
+        // orphaned unfence applying after a later emergency fence would make
+        // a fenced deposed primary writable.
+        let cmd = Command::new(self.target.psql())
             .arg("-h")
             .arg("127.0.0.1")
             .arg("-p")
-            .arg(self.config.pg_port.to_string())
+            .arg(self.target.pg_port.to_string())
             .arg("-U")
-            .arg(&self.config.pg_user)
+            .arg(&self.target.pg_user)
+            .arg("-d")
+            .arg("postgres")
+            .env("PGAPPNAME", &self.target.application_name)
             .arg("-c")
             .arg(&alter_sql)
             .arg("-c")
@@ -3707,7 +3840,7 @@ host all all ::/0 {auth_method}
     ///
     /// # Errors
     /// Returns an error if the `pg_settings` query fails.
-    pub async fn query_readonly_status(&self) -> Result<bool> {
+    async fn query_readonly_status(&self) -> Result<bool> {
         let result = self
             .execute_sql(
                 "SELECT setting FROM pg_settings WHERE name = 'default_transaction_read_only';",
@@ -3717,6 +3850,38 @@ host all all ::/0 {auth_method}
         Ok(is_readonly)
     }
 
+    /// See [`Supervisor::probe_role_and_readonly`].
+    async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
+        let result = self
+            .execute_sql(
+                "SELECT pg_is_in_recovery()::text || ',' \
+                 || (SELECT setting FROM pg_settings \
+                     WHERE name = 'default_transaction_read_only') || ',' \
+                 || CASE WHEN current_setting('synchronous_standby_names') = '' \
+                         THEN 'empty' ELSE 'set' END || ',' \
+                 || (SELECT count(*) FROM pg_stat_replication \
+                     WHERE sync_state = 'sync')::text;",
+            )
+            .await?;
+        parse_role_readonly(&result)
+    }
+
+    /// `default_transaction_read_only` only changes the default: sessions
+    /// already open, or `BEGIN READ WRITE`, still write. Severing every
+    /// client backend closes both; pgbattery's own sessions, named by the
+    /// per-process `application_name`, are spared.
+    async fn terminate_client_backends(&self) -> Result<String> {
+        self.execute_sql(&format!(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() \
+             AND application_name <> '{}';",
+            self.target.application_name
+        ))
+        .await
+    }
+}
+
+impl Supervisor {
     /// The server's `server_version_num` (e.g. `170004`). Output shape is
     /// stable across every version this project can meet.
     ///
@@ -3736,14 +3901,47 @@ host all all ::/0 {auth_method}
     /// Returns an error if the connection cannot be established, the query
     /// times out, or `PostgreSQL` returns an error.
     pub async fn execute_sql(&self, sql: &str) -> Result<String> {
+        self.session.execute_sql(sql).await
+    }
+
+    /// An independent session to the local server for the lease loop's fence.
+    #[must_use]
+    pub fn fence_session(&self) -> FenceSession {
+        FenceSession {
+            session: SqlSession::new(std::sync::Arc::clone(&self.session.target)),
+        }
+    }
+
+    async fn invalidate_sql_client(&self) {
+        self.session.invalidate().await;
+    }
+
+    /// Sever every client session; pgbattery's own are spared.
+    ///
+    /// # Errors
+    /// The termination query failed.
+    pub async fn terminate_client_backends(&self) -> Result<String> {
+        self.session.terminate_client_backends().await
+    }
+}
+
+impl SqlSession {
+    fn new(target: std::sync::Arc<SessionTarget>) -> Self {
+        Self {
+            target,
+            client: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn execute_sql(&self, sql: &str) -> Result<String> {
         const SQL_TIMEOUT: Duration = Duration::from_secs(30);
 
         // Retry once after invalidating a stale connection (e.g. PostgreSQL restart).
         for attempt in 0..2 {
-            self.get_or_connect_sql_client().await?;
+            self.get_or_connect().await?;
 
             let query_future = async {
-                self.sql_client
+                self.client
                     .lock()
                     .await
                     .as_mut()
@@ -3756,7 +3954,7 @@ host all all ::/0 {auth_method}
 
             let Ok(query_result) = tokio::time::timeout(SQL_TIMEOUT, query_future).await else {
                 tracing::error!(sql = %sql, "SQL query timed out after 30s");
-                self.invalidate_sql_client().await;
+                self.invalidate().await;
                 return Err(Error::Postgres(format!(
                     "SQL query timed out after {}s",
                     SQL_TIMEOUT.as_secs()
@@ -3766,7 +3964,7 @@ host all all ::/0 {auth_method}
             match query_result {
                 Ok(output) => return Ok(output),
                 Err(e) => {
-                    self.invalidate_sql_client().await;
+                    self.invalidate().await;
                     if attempt == 1 {
                         return Err(e);
                     }
@@ -3778,23 +3976,23 @@ host all all ::/0 {auth_method}
         Err(Error::Postgres("SQL execution failed".to_string()))
     }
 
-    async fn get_or_connect_sql_client(&self) -> Result<()> {
-        let mut guard = self.sql_client.lock().await;
+    async fn get_or_connect(&self) -> Result<()> {
+        let mut guard = self.client.lock().await;
         if guard.is_none() {
-            *guard = Some(self.connect_sql_client()?);
+            *guard = Some(self.connect()?);
             tracing::debug!("Established local persistent psql session");
         }
         drop(guard);
         Ok(())
     }
 
-    fn connect_sql_client(&self) -> Result<LocalSqlClient> {
-        let psql = self.config.pg_bin_dir.join("psql");
-        let mut child = Command::new(&psql)
+    fn connect(&self) -> Result<LocalSqlClient> {
+        let mut child = Command::new(self.target.psql())
             .arg("-p")
-            .arg(self.config.pg_port.to_string())
+            .arg(self.target.pg_port.to_string())
             .arg("-U")
-            .arg(&self.config.pg_user)
+            .arg(&self.target.pg_user)
+            .env("PGAPPNAME", &self.target.application_name)
             .arg("-X")
             .arg("-A")
             .arg("-t")
@@ -3859,9 +4057,9 @@ host all all ::/0 {auth_method}
         })
     }
 
-    async fn invalidate_sql_client(&self) {
+    async fn invalidate(&self) {
         let existing = {
-            let mut guard = self.sql_client.lock().await;
+            let mut guard = self.client.lock().await;
             guard.take()
         };
 
@@ -3869,7 +4067,9 @@ host all all ::/0 {auth_method}
             client.shutdown().await;
         }
     }
+}
 
+impl Supervisor {
     /// Create a replication slot for a replica.
     ///
     /// Idempotent: the existence check + CREATE pair runs through two
@@ -4043,8 +4243,7 @@ host all all ::/0 {auth_method}
     /// # Errors
     /// Returns an error if the `pg_is_in_recovery()` query fails.
     pub async fn is_in_recovery(&self) -> Result<bool> {
-        let result = self.execute_sql("SELECT pg_is_in_recovery();").await?;
-        Ok(result.trim() == "t")
+        self.session.is_in_recovery().await
     }
 
     /// Build the exact `primary_conninfo` value this node uses to follow
@@ -4361,18 +4560,7 @@ host all all ::/0 {auth_method}
     /// # Errors
     /// Returns an error if the query fails or returns an unexpected shape.
     pub async fn probe_role_and_readonly(&self) -> Result<PgWriteState> {
-        let result = self
-            .execute_sql(
-                "SELECT pg_is_in_recovery()::text || ',' \
-                 || (SELECT setting FROM pg_settings \
-                     WHERE name = 'default_transaction_read_only') || ',' \
-                 || CASE WHEN current_setting('synchronous_standby_names') = '' \
-                         THEN 'empty' ELSE 'set' END || ',' \
-                 || (SELECT count(*) FROM pg_stat_replication \
-                     WHERE sync_state = 'sync')::text;",
-            )
-            .await?;
-        parse_role_readonly(&result)
+        self.session.probe_role_and_readonly().await
     }
 }
 
@@ -4585,12 +4773,6 @@ impl Drop for Supervisor {
         if let Some(mut child) = self.child.take() {
             // Send SIGTERM
             child.start_kill().ok();
-        }
-
-        if let Ok(mut guard) = self.sql_client.try_lock()
-            && let Some(mut existing) = guard.take()
-        {
-            existing.child.start_kill().ok();
         }
     }
 }
@@ -4825,6 +5007,58 @@ mod tests {
             PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
             16 * 1024 * 1024,
             "threshold is one 16 MiB WAL segment — matches the documented async RPO"
+        );
+    }
+
+    // ── fence session ─────────────────────────────────────────────────────
+
+    /// A server that says it is starting up or shutting down takes no writes;
+    /// its refusal is not a fence that failed on a writable server.
+    #[test]
+    fn a_server_declining_connections_did_not_answer() {
+        for state in ["starting up", "shutting down", "in recovery mode"] {
+            let stderr = format!(
+                "psql: error: connection to server on socket \"/tmp/.s.PGSQL.5434\" failed: \
+                 FATAL:  the database system is {state}"
+            );
+            assert!(!server_answered(&stderr), "{state}");
+        }
+        assert!(server_answered("ERROR:  relation \"x\" does not exist"));
+        assert!(server_answered(
+            "FATAL:  terminating connection due to administrator command"
+        ));
+        assert!(!server_answered(
+            "psql: error: connection to server on socket \"/tmp/.s.PGSQL.5434\" failed: \
+             No such file or directory"
+        ));
+    }
+
+    /// The fence severs clients, never pgbattery's own sessions: the
+    /// supervisor's may be mid-operation when the lease lapses.
+    #[test]
+    fn termination_spares_pgbattery_sessions() {
+        let config = SupervisorConfig {
+            pg_bin_dir: PathBuf::from("/nonexistent"),
+            pg_data_dir: PathBuf::from("/nonexistent"),
+            pg_port: 5_432,
+            pg_user: "postgres".to_string(),
+            wal_level: WalLevel::Replica,
+            node_id: 1,
+            pg_auth_mode: PgAuthMode::Trust,
+            wal_archive_dir: None,
+        };
+        let supervisor = Supervisor::new(config.clone());
+        let fence = supervisor.fence_session();
+        assert!(
+            std::sync::Arc::ptr_eq(&supervisor.session.target, &fence.session.target),
+            "the fence names its session as the supervisor names its own"
+        );
+        let name = &supervisor.session.target.application_name;
+        assert!(name.starts_with("pgbattery-"));
+        assert_ne!(
+            name,
+            &SessionTarget::new(&config).application_name,
+            "a client cannot know the name in advance"
         );
     }
 
@@ -5212,9 +5446,6 @@ mod tests {
     #[test]
     fn a_session_that_died_carrying_a_server_error_counts_as_answered() {
         assert!(server_answered(CORRUPT_CATALOG_STDERR));
-        assert!(server_answered(
-            "FATAL:  the database system is in recovery mode"
-        ));
     }
 
     #[test]

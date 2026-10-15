@@ -683,8 +683,6 @@ impl App {
             fence_tx,
             Arc::clone(&fence_reconciler.fence_apply_lock),
         );
-        // Also clone the token into an owned String copy for the CLI-style
-        // HTTP client used by the auto-promotion path, below.
         let management_addr = self.config.get_mgmt_addr();
 
         Ok(DataNodeTaskHandles {
@@ -1922,7 +1920,10 @@ impl App {
             // so an in-flight write can't outlive the fence and land in WAL
             // that pg_rewind then destroys — the same escalation the emergency
             // lease fence uses.
-            Self::terminate_client_backends(&*pg).await;
+            Self::log_termination(
+                tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.terminate_client_backends())
+                    .await,
+            );
         }
         if let Err(e) = pg.demote(leader_addr, rewind_budget).await {
             metrics::counter!("pgbattery_demote_apply_failures").increment(1);
@@ -2141,9 +2142,12 @@ impl App {
         use crate::governor::lease::LEASE_CHECK_INTERVAL;
 
         tokio::spawn(async move {
+            // Its own session, taken once at startup: the fence never waits
+            // on the supervisor lock after this.
+            let fence = postgres.lock().await.fence_session();
             let mut interval = tokio::time::interval(LEASE_CHECK_INTERVAL);
-            // Fence loop: never burst a backlog of missed 100 ms ticks at the
-            // supervisor lock the instant a long hold releases — coalesce to one.
+            // A tick slower than the interval (a probe at its budget) is
+            // followed by one catch-up tick, never a burst.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut fence_failures: u32 = 0;
 
@@ -2159,6 +2163,7 @@ impl App {
                     }
                     _ = interval.tick() => {
                         if Self::lease_enforcement_tick(
+                            &fence,
                             &postgres,
                             &lease,
                             &cluster_state,
@@ -2195,82 +2200,41 @@ impl App {
     /// One tick of lease enforcement. Returns `true` to break the outer loop
     /// (fence-failure threshold exceeded → shut the process down).
     ///
-    /// Holds the supervisor `MutexGuard` across the probe and fence calls
-    /// within the tick: the role/readonly probe and `set_readonly` must
-    /// reflect a consistent PG state at decision time. Narrowing the lock
-    /// scope would permit a concurrent task to flip role between probe and
-    /// fence.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the supervisor guard is intentionally held across the tick's await points"
-    )]
-    async fn lease_enforcement_tick<P: crate::governor::pg_control::PgControl>(
+    /// The fence probes and closes on its own session and never waits on the
+    /// supervisor lock: a demote, a rewind or a Track B apply holds that lock
+    /// for minutes, and a lease can lapse in the middle of any of them.
+    /// Opening writes is the lock holder's, taken only when the lock is free,
+    /// so writes never open in the middle of an operation.
+    async fn lease_enforcement_tick<F, P>(
+        fence: &F,
         postgres: &Arc<tokio::sync::Mutex<P>>,
         lease: &crate::governor::SharedLeaseState,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         node_id: NodeId,
         fence_failures: &mut u32,
         shutdown_tx: &watch::Sender<bool>,
-    ) -> bool {
-        // Bounded, so a lifecycle operation cannot stop this loop ticking.
-        // `demote` holds the supervisor lock across stop, rewind, and recovery
-        // — measured at 8.3 s for one leadership transfer, which cost ~60 of
-        // the 250 ticks that period owed. Waiting longer than one interval buys
-        // nothing: the work this tick would do is re-derived from scratch by
-        // the next one, and skipping never fences less than blocking did.
-        //
-        // The skip is safe because every path that holds the lock this long
-        // fences first — `demote` sets read-only before stopping, `promote`
-        // arms it before `pg_ctl promote` — so a tick that cannot look is
-        // looking at a node that is already not writable.
-        // clock-lint: allow — histogram sample. The gate is tokio's timer on
-        // LEASE_CHECK_INTERVAL, not this instant.
-        let lock_wait_start = Instant::now();
-        let Ok(pg) = tokio::time::timeout(
-            crate::governor::lease::LEASE_CHECK_INTERVAL,
-            postgres.lock(),
-        )
-        .await
-        else {
-            metrics::counter!("pgbattery_lease_tick_lock_timeouts").increment(1);
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "a lock wait in seconds always fits in f64"
-            )]
-            // clock-lint: allow — histogram sample, not a gate.
-            metrics::histogram!("pgbattery_lease_tick_lock_wait_seconds")
-                .record(lock_wait_start.elapsed().as_secs_f64());
-            return false;
-        };
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "a lock wait in seconds always fits in f64"
-        )]
-        // clock-lint: allow — histogram sample, not a gate.
-        metrics::histogram!("pgbattery_lease_tick_lock_wait_seconds")
-            .record(lock_wait_start.elapsed().as_secs_f64());
-        let (in_recovery, pg_writable, sync_observation) = Self::probe_pg_state(&*pg).await;
+    ) -> bool
+    where
+        F: crate::governor::pg_control::PgFence,
+        P: crate::governor::pg_control::PgControl,
+    {
+        let (in_recovery, pg_writable, sync_observation) = Self::probe_pg_state(fence).await;
 
         // What this cluster's voter set requires, from the same derivation the
         // replication manager and promotion use.
-        let required_sync = {
-            let state = cluster_state.read();
-            let peers =
-                crate::governor::replication_manager::peer_voter_count(&state.voter_ids, node_id);
-            crate::governor::replication_manager::required_sync_standbys(peers)
-        };
+        let peers = crate::governor::replication_manager::peer_voter_count(
+            &cluster_state.read().voter_ids,
+            node_id,
+        );
+        let required_sync = crate::governor::replication_manager::required_sync_standbys(peers);
         let sync_in_force = Self::sync_durability_in_force(sync_observation, required_sync);
         Self::publish_sync_durability(sync_observation, required_sync);
 
-        // Read the lease AFTER the lock wait and the probes, immediately
-        // before choosing a path. Acquiring the supervisor lock can block
-        // behind promote()/demote() for seconds, and the probes can take up
-        // to LEASE_TICK_SQL_BUDGET; a snapshot taken at tick entry can be
-        // stale in both directions by now. Fencing on a stale "invalid"
-        // would emergency-fence a freshly-promoted legitimate primary;
-        // unfencing on a stale "valid" would make an expired-lease node a
-        // writable non-leader for one tick — exactly what fencing exists to
-        // prevent.
+        // Read the lease AFTER the probes, immediately before choosing a
+        // path: the probes can take up to LEASE_TICK_SQL_BUDGET, and a
+        // snapshot taken at tick entry can be stale in both directions by
+        // then. Fencing on a stale "invalid" would emergency-fence a
+        // freshly-promoted legitimate primary.
         let lease_valid = lease.read().is_valid();
 
         match Self::lease_enforcement_action(lease_valid, pg_writable, in_recovery, sync_in_force) {
@@ -2278,7 +2242,7 @@ impl App {
                 // GUC not yet read-only (or the probe failed → fail-closed): set
                 // it and evict client backends. `handle_emergency_fence`
                 // manages `fence_failures` and terminates on success.
-                Self::handle_emergency_fence(&*pg, fence_failures, shutdown_tx).await
+                Self::handle_emergency_fence(fence, fence_failures, shutdown_tx).await
             }
             LeaseAction::TerminateBypassers => {
                 // Invalid lease, GUC already read-only, PG still a confirmed
@@ -2289,13 +2253,19 @@ impl App {
                 // role, so a bypasser that survived the fencing tick (e.g. the
                 // termination timed out) is evicted on the next one.
                 *fence_failures = 0;
-                Self::terminate_client_backends(&*pg).await;
+                Self::log_termination(
+                    tokio::time::timeout(
+                        Self::LEASE_TICK_SQL_BUDGET,
+                        fence.terminate_client_backends(),
+                    )
+                    .await,
+                );
                 false
             }
             LeaseAction::RecoverWrites => {
                 // Lease valid + PG read-only on a confirmed primary → recover.
                 *fence_failures = 0;
-                Self::try_recover_writes(&*pg).await;
+                Self::try_recover_writes(postgres, lease).await;
                 false
             }
             LeaseAction::None => {
@@ -2419,26 +2389,22 @@ impl App {
         }
     }
 
-    /// Truth-source probe: ask PG every tick. Failures are fail-closed: we
-    /// assume "writable" so the policy then fences, and report no replication
-    /// observation so writes are not recovered on a state we could not read.
-    /// One SQL round trip — this runs every 100 ms under the supervisor lock,
-    /// and the fields must come from one consistent snapshot.
-    /// Budgeted: a hung postmaster must not pin the lock past one tick.
+    /// Truth-source probe: ask PG every tick, one round trip so the fields
+    /// describe one instant. Failures are fail-closed: we assume "writable"
+    /// so the policy then fences, and report no replication observation so
+    /// writes are not recovered on a state we could not read. Budgeted: a hung
+    /// postmaster must not stall the tick.
     ///
-    /// Fail-closed stops at a node that owns no postmaster. There is no socket
-    /// to serve a write through, so "assume writable" is not caution, it is a
-    /// false premise — and the fence it triggers can only fail, five times,
-    /// until the node shuts itself down over a split-brain that has no server
-    /// to happen on.
-    async fn probe_pg_state<P: crate::governor::pg_control::PgControl>(
-        pg: &P,
+    /// Fail-closed stops where nothing is serving: no socket, or a server that
+    /// says it is starting up or shutting down. Such a server takes no writes,
+    /// and every start comes up fenced, so "assume writable" there would be a
+    /// false premise whose fence can only fail until the node shuts itself
+    /// down over a split-brain with no server to happen on. A timeout is not
+    /// that: a hung server may still hold writable sessions.
+    async fn probe_pg_state<F: crate::governor::pg_control::PgFence>(
+        fence: &F,
     ) -> (Option<bool>, bool, Option<(bool, usize)>) {
-        if !pg.has_postmaster() {
-            return (None, false, None);
-        }
-        match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.probe_role_and_readonly()).await
-        {
+        match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, fence.probe()).await {
             Ok(Ok(state)) => {
                 // A standby is never client-writable regardless of the GUC.
                 (
@@ -2447,6 +2413,7 @@ impl App {
                     Some((state.sync_list_empty, state.sync_standbys)),
                 )
             }
+            Ok(Err(pgbattery_core::Error::PostgresNotReady(_))) => (None, false, None),
             Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
@@ -2490,20 +2457,33 @@ impl App {
     /// CRITICAL PATH: lease expired but PG is writable. Issue ALTER SYSTEM,
     /// budgeted. Returns `true` if the caller should break the loop (fence
     /// failures exceeded threshold).
-    async fn handle_emergency_fence<P: crate::governor::pg_control::PgControl>(
-        pg: &P,
+    async fn handle_emergency_fence<F: crate::governor::pg_control::PgFence>(
+        fence: &F,
         fence_failures: &mut u32,
         shutdown_tx: &watch::Sender<bool>,
     ) -> bool {
         tracing::error!("EMERGENCY FENCE: Lease expired, forcing read-only");
         metrics::counter!("pgbattery_emergency_fence").increment(1);
 
-        let fence_result =
-            tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.set_readonly(true)).await;
+        let fence_result = tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, fence.close()).await;
         if matches!(fence_result, Ok(Ok(()))) {
             tracing::info!("PostgreSQL fenced (read-only)");
-            Self::terminate_client_backends(pg).await;
+            Self::log_termination(
+                tokio::time::timeout(
+                    Self::LEASE_TICK_SQL_BUDGET,
+                    fence.terminate_client_backends(),
+                )
+                .await,
+            );
             *fence_failures = 0;
+            return false;
+        }
+        // Gone between probe and close: it serves nothing, and comes back
+        // fenced, so there is no failure to count.
+        if matches!(
+            fence_result,
+            Ok(Err(pgbattery_core::Error::PostgresNotReady(_)))
+        ) {
             return false;
         }
 
@@ -2555,10 +2535,10 @@ impl App {
     ///
     /// Best-effort: the GUC fence is already in place, and if PG is somehow
     /// still writable the next 100 ms tick re-runs the fence path.
-    async fn terminate_client_backends<P: crate::governor::pg_control::PgControl>(pg: &P) {
-        match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.terminate_client_backends())
-            .await
-        {
+    fn log_termination(
+        outcome: std::result::Result<pgbattery_core::Result<String>, tokio::time::error::Elapsed>,
+    ) {
+        match outcome {
             Ok(Ok(count)) => {
                 tracing::info!(
                     terminated = count.trim(),
@@ -2579,7 +2559,20 @@ impl App {
         }
     }
 
-    async fn try_recover_writes<P: crate::governor::pg_control::PgControl>(pg: &P) {
+    /// Open writes, if no operation owns `PostgreSQL` right now: one holding
+    /// the supervisor lock (a demote, a Track B apply) decides when writes may
+    /// resume, and the next tick retries. The lease is re-read after taking
+    /// the lock, immediately before opening.
+    async fn try_recover_writes<P: crate::governor::pg_control::PgControl>(
+        postgres: &Arc<tokio::sync::Mutex<P>>,
+        lease: &crate::governor::SharedLeaseState,
+    ) {
+        let Ok(pg) = postgres.try_lock() else {
+            return;
+        };
+        if !lease.read().is_valid() {
+            return;
+        }
         match tokio::time::timeout(Self::LEASE_TICK_SQL_BUDGET, pg.set_readonly(false)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!(error = %e, "Failed to enable writes"),
@@ -3972,20 +3965,14 @@ mod tests {
             // With none, "assume writable" fences nothing five times over and
             // then shuts the node down for a split-brain it cannot be in —
             // which is how a standby left down for repair never got repaired.
-            let model = ModelPg {
+            let pg = Arc::new(tokio::sync::Mutex::new(ModelPg {
                 has_postmaster: false,
-                fails: Some(ModelOp::IsInRecovery),
                 ..ModelPg::default()
-            };
-            let (in_recovery, writable, sync) = App::probe_pg_state(&model).await;
+            }));
+            let (in_recovery, writable, sync) = App::probe_pg_state(&pg).await;
             assert_eq!(in_recovery, None);
             assert!(!writable, "no socket serves a write");
             assert_eq!(sync, None);
-            assert!(
-                model.calls().is_empty(),
-                "probed a server that is not running: {:?}",
-                model.calls()
-            );
         }
 
         #[tokio::test]
@@ -4215,6 +4202,37 @@ mod tests {
             )
         }
 
+        /// RW-9: the fence never waits on the supervisor lock. A lease lapsing
+        /// in the middle of a minutes-long demote or Track B apply is fenced
+        /// on the next tick, not after the operation lets go.
+        #[tokio::test]
+        async fn the_fence_closes_while_an_operation_holds_the_supervisor() {
+            let (server, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
+            let supervisor = Arc::new(tokio::sync::Mutex::new(ModelPg::default()));
+            let _operation = supervisor.lock().await;
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            let mut fence_failures = 0;
+
+            let ticked = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                App::lease_enforcement_tick(
+                    &server,
+                    &supervisor,
+                    &lease,
+                    &three_voters(),
+                    1,
+                    &mut fence_failures,
+                    &shutdown_tx,
+                ),
+            )
+            .await;
+            assert_eq!(ticked, Ok(false), "the fence waited on the supervisor lock");
+            assert!(
+                server.lock().await.is_readonly(),
+                "the lapsed lease was not fenced"
+            );
+        }
+
         #[tokio::test]
         async fn an_expired_lease_fences_a_writable_primary() {
             let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
@@ -4222,6 +4240,7 @@ mod tests {
             let mut fence_failures = 0;
 
             let should_stop = App::lease_enforcement_tick(
+                &pg,
                 &pg,
                 &lease,
                 &three_voters(),
@@ -4265,6 +4284,7 @@ mod tests {
             while ticks < App::FENCE_FAILURE_SHUTDOWN_THRESHOLD * 2 {
                 ticks += 1;
                 if App::lease_enforcement_tick(
+                    &pg,
                     &pg,
                     &lease,
                     &three_voters(),
@@ -4313,6 +4333,7 @@ mod tests {
             for _ in 0..App::FENCE_FAILURE_SHUTDOWN_THRESHOLD - 1 {
                 App::lease_enforcement_tick(
                     &pg,
+                    &pg,
                     &lease,
                     &three_voters(),
                     1,
@@ -4325,6 +4346,7 @@ mod tests {
 
             pg.lock().await.fails = None;
             let should_stop = App::lease_enforcement_tick(
+                &pg,
                 &pg,
                 &lease,
                 &three_voters(),
@@ -4361,83 +4383,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_held_supervisor_lock_does_not_stall_the_tick() {
-            // RW-9. `demote` holds the supervisor lock across stop, rewind, and
-            // recovery — measured at 8.3 s for one leadership transfer, which
-            // cost ~60 of the 250 ticks that period owed. The tick must keep
-            // its period regardless of who holds the lock.
-            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
-            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-            let mut fence_failures = 0;
-
-            let held = pg.clone().lock_owned().await;
-            let started = std::time::Instant::now();
-            let should_stop = App::lease_enforcement_tick(
-                &pg,
-                &lease,
-                &three_voters(),
-                1,
-                &mut fence_failures,
-                &shutdown_tx,
-            )
-            .await;
-            let elapsed = started.elapsed();
-            drop(held);
-
-            assert!(!should_stop, "a skipped tick must not stop the loop");
-            assert!(
-                elapsed < crate::governor::lease::LEASE_CHECK_INTERVAL * 3,
-                "tick blocked for {elapsed:?} on a held lock; it must give up within its period"
-            );
-            assert_eq!(
-                fence_failures, 0,
-                "a skipped tick was counted as a failed fence; a demote long enough to \
-                 skip FENCE_FAILURE_SHUTDOWN_THRESHOLD ticks would then shut the node down"
-            );
-        }
-
-        /// The other half of the skip: once the lock frees, the next tick
-        /// fences. Without this, "gives up within its period" is equally
-        /// satisfied by a loop that gave up permanently.
-        #[tokio::test]
-        async fn the_tick_after_the_lock_frees_fences_normally() {
-            let (pg, lease) = expired_lease_over_a_writable_primary(ModelPg::default());
-            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-            let mut fence_failures = 0;
-
-            let held = pg.clone().lock_owned().await;
-            App::lease_enforcement_tick(
-                &pg,
-                &lease,
-                &three_voters(),
-                1,
-                &mut fence_failures,
-                &shutdown_tx,
-            )
-            .await;
-            drop(held);
-
-            App::lease_enforcement_tick(
-                &pg,
-                &lease,
-                &three_voters(),
-                1,
-                &mut fence_failures,
-                &shutdown_tx,
-            )
-            .await;
-
-            let (readonly, calls) = {
-                let guard = pg.lock().await;
-                (guard.is_readonly(), guard.calls())
-            };
-            assert!(
-                readonly,
-                "the tick after the lock freed left PostgreSQL writable: {calls:?}"
-            );
-        }
-
-        #[tokio::test]
         async fn a_promoted_primary_stays_fenced_until_a_standby_is_sync() {
             // RW-2 end to end through the tick, not just the decision table:
             // the node holds the lease and is primary, but the sync list it
@@ -4451,6 +4396,7 @@ mod tests {
             let mut fence_failures = 0;
 
             App::lease_enforcement_tick(
+                &pg,
                 &pg,
                 &lease,
                 &three_voters(),
@@ -4481,6 +4427,7 @@ mod tests {
 
             App::lease_enforcement_tick(
                 &pg,
+                &pg,
                 &lease,
                 &three_voters(),
                 1,
@@ -4509,8 +4456,16 @@ mod tests {
                 },
             ));
 
-            App::lease_enforcement_tick(&pg, &lease, &lone, 1, &mut fence_failures, &shutdown_tx)
-                .await;
+            App::lease_enforcement_tick(
+                &pg,
+                &pg,
+                &lease,
+                &lone,
+                1,
+                &mut fence_failures,
+                &shutdown_tx,
+            )
+            .await;
 
             assert!(
                 !pg.lock().await.is_readonly(),
@@ -4532,6 +4487,7 @@ mod tests {
             let mut fence_failures = 0;
 
             let should_stop = App::lease_enforcement_tick(
+                &pg,
                 &pg,
                 &lease,
                 &three_voters(),
