@@ -232,7 +232,8 @@ pub async fn run_blue_green_cutover(params: BlueGreenParams) -> Result<()> {
         .cutover_step(&blue_mgmt, "drain-observed", &serde_json::json!({}))
         .await?;
 
-    advance_recipient_sequences(&client, &green_client, &blue_mgmt, &green_mgmt).await?;
+    let donor_sequences =
+        advance_recipient_sequences(&client, &green_client, &blue_mgmt, &green_mgmt).await?;
 
     info!(recipient_pg = %green_pg, "Cutover: transferring");
     client
@@ -242,7 +243,6 @@ pub async fn run_blue_green_cutover(params: BlueGreenParams) -> Result<()> {
             &serde_json::json!({
                 "target_cluster_id": green_cluster_id,
                 "target_pg_addr": green_pg,
-                "reverse_slot_ready": true,
             }),
         )
         .await?;
@@ -262,6 +262,7 @@ pub async fn run_blue_green_cutover(params: BlueGreenParams) -> Result<()> {
                 "epoch": transferred.epoch,
                 "from_cluster_id": sealed.cluster_id,
                 "donor_mgmt_addrs": donor_addrs,
+                "donor_sequences": donor_sequences,
             }),
         )
         .await?;
@@ -371,22 +372,25 @@ impl CutoverPlan {
 /// `last_value` per sequence is final; the recipient must move past it before
 /// any client can call `nextval` there. A sequence missing on the recipient
 /// is an error from the endpoint, never a silent skip.
+/// Advance the recipient's sequences past the sealed donor's (U3); returns
+/// the donor's values, which `receive-authority` checks again before the
+/// recipient's fence lifts.
 async fn advance_recipient_sequences(
     client: &crate::cluster::ClusterClient,
     green_client: &crate::cluster::ClusterClient,
     blue_mgmt: &str,
     green_mgmt: &str,
-) -> Result<()> {
+) -> Result<Vec<crate::observability::management_api::SequenceValue>> {
     let sequences = client.get_sequence_values(blue_mgmt).await?;
     if sequences.is_empty() {
         info!("U3: donor reports no user sequences; nothing to advance");
-        return Ok(());
+        return Ok(sequences);
     }
     let advanced = green_client
         .advance_sequences(
             green_mgmt,
             &crate::observability::management_api::AdvanceSequencesRequest {
-                sequences,
+                sequences: sequences.clone(),
                 margin: SEQUENCE_ADVANCE_MARGIN,
             },
         )
@@ -396,7 +400,7 @@ async fn advance_recipient_sequences(
         margin = SEQUENCE_ADVANCE_MARGIN,
         "U3: recipient sequences advanced past the donor"
     );
-    Ok(())
+    Ok(sequences)
 }
 
 /// Whether the drain is complete, or why it is not yet.

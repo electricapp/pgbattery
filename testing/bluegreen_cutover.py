@@ -600,23 +600,14 @@ def _cutover(
 
     blue_max = _advance_sequences(green_leader, blue_leader)
 
-    # Reverse slot before green's fence lifts (U5): a slot created after the
-    # first accepted write leaves a gap the reverse stream can never carry.
+    # The publication's scope is the operator's choice; the product creates
+    # the reverse slot itself before green's fence lifts (U5).
     _psql(
         green_leader,
         """
         DO $$ BEGIN
           CREATE PUBLICATION bg_reverse FOR TABLE bg_kv;
         EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-        """,
-    )
-    _psql(
-        green_leader,
-        """
-        SELECT pg_create_logical_replication_slot('bg_reverse_slot', 'pgoutput')
-        WHERE NOT EXISTS (
-          SELECT 1 FROM pg_replication_slots WHERE slot_name = 'bg_reverse_slot'
-        );
         """,
     )
 
@@ -626,12 +617,19 @@ def _cutover(
         {
             "target_cluster_id": GREEN_CLUSTER,
             "target_pg_addr": _pg_addr(green_leader),
-            "reverse_slot_ready": True,
         },
     ).raise_for_status()
 
     epoch = int(_cutover_status(blue_leader)["epoch"])
-    _receive_authority(green_leader, epoch, BLUE_CLUSTER, blue)
+    _receive_authority(
+        green_leader, epoch, BLUE_CLUSTER, blue, blue_leader, "bg_reverse", "bg_reverse_slot"
+    )
+    slot = _psql(
+        green_leader,
+        "SELECT slot_type FROM pg_replication_slots WHERE slot_name = 'bg_reverse_slot';",
+    ).strip()
+    if slot != "logical":
+        raise ContractFailure(f"U5: green took authority without its reverse slot ({slot!r})")
     _assert_minority_cannot_hand_over(green_leader, epoch, blue)
     _assert_authority_is_green_only(blue, green_leader, epoch)
     _assert_no_sequence_collision(green_leader, blue_max)
@@ -642,12 +640,22 @@ def _mgmt_addrs(nodes: list[Node]) -> list[str]:
     return [f"{n.ip}:{topology.MGMT_CONTAINER_PORT}" for n in nodes]
 
 
-def _receive_authority(recipient: Node, epoch: int, donor_cluster: str, donors: list[Node]) -> None:
+def _receive_authority(
+    recipient: Node,
+    epoch: int,
+    donor_cluster: str,
+    donors: list[Node],
+    donor_leader: Node,
+    reverse_publication: str,
+    reverse_slot: str,
+) -> None:
     """The recipient confirms the handoff against a majority of donor nodes.
 
     Not `accept_unverified_provenance`: that is the break-glass for an
     unreachable donor, and using it here would leave the verification path
-    untested in the only case that runs it.
+    untested in the only case that runs it. The donor's final sequence values
+    travel with the request so the recipient can refuse (U3) before its fence
+    lifts; it ensures its own reverse slot (U5) in the same step.
     """
     r = _post(
         recipient,
@@ -656,9 +664,13 @@ def _receive_authority(recipient: Node, epoch: int, donor_cluster: str, donors: 
             "epoch": epoch,
             "from_cluster_id": donor_cluster,
             "donor_mgmt_addrs": _mgmt_addrs(donors),
+            "donor_sequences": _sequence_values(donor_leader),
+            "reverse_publication": reverse_publication,
+            "reverse_slot": reverse_slot,
         },
     )
-    r.raise_for_status()
+    if not r.is_success:
+        raise ContractFailure(f"receive-authority refused: {r.status_code} {r.text}")
 
 
 def _assert_minority_cannot_hand_over(recipient: Node, epoch: int, donors: list[Node]) -> None:
@@ -1047,17 +1059,20 @@ def _rollback_drill(
 
     _await_slot_confirms(green_leader, final_lsn, timeout=120.0, slot="bg_reverse_slot")
     _post(green_leader, "drain-observed").raise_for_status()
+    # Green issued sequence values blue never saw; blue must clear them
+    # before it takes writes again (U3 in the reverse direction).
+    _advance_sequences(blue_leader, green_leader)
     _post(
         green_leader,
         "transfer",
         {
             "target_cluster_id": BLUE_CLUSTER,
             "target_pg_addr": _pg_addr(blue_leader),
-            "reverse_slot_ready": True,
         },
     ).raise_for_status()
     epoch = int(_cutover_status(green_leader)["epoch"])
-    _receive_authority(blue_leader, epoch, GREEN_CLUSTER, green)
+    # Blue's reverse is the original forward stream green still consumes.
+    _receive_authority(blue_leader, epoch, GREEN_CLUSTER, green, green_leader, "bg_pub", "bg_sub")
 
     present = set(
         _psql(

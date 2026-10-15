@@ -268,7 +268,7 @@ write.
 **Violation**: fence lifted before the reverse slot exists, plus a write in the gap.
 
 **Inversions**: `test_a_write_missing_from_the_reverse_stream_is_caught`;
-`test_a_transfer_without_a_reverse_slot_is_refused`.
+`test_the_reverse_handoff_names_its_slot_and_clears_sequences_first`.
 
 ---
 

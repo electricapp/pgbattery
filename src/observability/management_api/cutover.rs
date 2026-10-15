@@ -77,8 +77,6 @@ pub struct CutoverTransferRequest {
     pub target_cluster_id: String,
     /// Recipient primary internal PG host:port for donor gateway relay.
     pub target_pg_addr: String,
-    /// Reverse publication slot must exist before TRANSFER (U5).
-    pub reverse_slot_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +102,51 @@ pub struct CutoverReceiveAuthorityRequest {
     /// `donor_mgmt_addrs`, and records the epoch on trust alone.
     #[serde(default)]
     pub accept_unverified_provenance: bool,
+    /// The reverse publication and logical slot this recipient ensures
+    /// before its fence lifts (U5).
+    #[serde(default = "default_reverse_name")]
+    pub reverse_publication: String,
+    #[serde(default = "default_reverse_name")]
+    pub reverse_slot: String,
+    /// The sealed donor's final sequence values. Every sequence here must
+    /// already be past its value before the fence lifts (U3).
+    #[serde(default)]
+    pub donor_sequences: Vec<SequenceValue>,
+}
+
+fn default_reverse_name() -> String {
+    "pgbattery_reverse".to_string()
+}
+
+/// Whether the donor's own slots prove the drain: every logical slot has
+/// confirmed through the sealed LSN.
+const fn drain_proven(confirmed: Option<u64>, sealed: Option<u64>) -> bool {
+    matches!((confirmed, sealed), (Some(c), Some(s)) if c >= s)
+}
+
+/// The recipient's sequences not yet past the donor's final values (U3),
+/// named. A sequence the donor list does not cover is a gap too: an empty
+/// list must not read as "nothing to advance".
+fn sequence_gaps(local: &[SequenceValue], donor: &[SequenceValue]) -> Vec<String> {
+    local
+        .iter()
+        .filter_map(|mine| {
+            let theirs = donor
+                .iter()
+                .find(|d| d.schema == mine.schema && d.name == mine.name);
+            match theirs {
+                None => Some(format!(
+                    "{}.{} has no donor value to clear",
+                    mine.schema, mine.name
+                )),
+                Some(d) if mine.last_value <= d.last_value => Some(format!(
+                    "{}.{} is at {}, the donor issued {}",
+                    mine.schema, mine.name, mine.last_value, d.last_value
+                )),
+                Some(_) => None,
+            }
+        })
+        .collect()
 }
 
 /// What one donor node said about the handoff.
@@ -520,10 +563,37 @@ async fn sealed_position_once_fenced(
     }
 }
 
+/// Drain observed: the U2 claim, proven here from this donor's own slots
+/// rather than taken from the caller.
 pub(super) async fn cutover_drain_observed(
     State(state): State<Arc<ManagementApiState>>,
 ) -> impl IntoResponse {
-    info!("Cutover drain observed");
+    let sealed = state.cluster_state.read().cutover.sealed_final_lsn;
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        return refuse(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "No supervisor on this node to read the drain from its slots",
+        );
+    };
+    let guard = pg.lock().await;
+    let raw = guard.execute_sql(DONOR_RETENTION_SQL).await;
+    drop(guard);
+    let confirmed = raw
+        .ok()
+        .and_then(|r| parse_donor_retention_line(&r))
+        .and_then(|r| r.min_confirmed_flush_lsn);
+    if !drain_proven(confirmed, sealed) {
+        return refuse(
+            &state,
+            StatusCode::CONFLICT,
+            format!(
+                "Refusing DRAIN_OBSERVED: this donor's logical slots have confirmed \
+                 through {confirmed:?}, the seal is at {sealed:?} (U2)"
+            ),
+        );
+    }
+    info!(?confirmed, ?sealed, "Cutover drain observed");
     apply_cutover(&state, ClusterCommand::CutoverDrainObserved).await
 }
 
@@ -531,14 +601,6 @@ pub(super) async fn cutover_transfer(
     State(state): State<Arc<ManagementApiState>>,
     Json(body): Json<CutoverTransferRequest>,
 ) -> impl IntoResponse {
-    if !body.reverse_slot_ready {
-        return refuse(
-            &state,
-            StatusCode::BAD_REQUEST,
-            "Refusing TRANSFER: reverse_slot_ready must be true (U5 — the slot \
-             must predate the recipient's first accepted write)",
-        );
-    }
     let target = body.target_cluster_id.trim().to_string();
     if let Some(rejection) = validate_target(&state, &target, "transfer") {
         return rejection;
@@ -1226,6 +1288,42 @@ async fn await_donor_quorum(
     }
 }
 
+/// What must hold on this recipient before its fence lifts, checked here so
+/// no caller can skip it: the reverse slot exists (U5), and every local
+/// sequence is past what the donor issued (U3).
+async fn ready_to_accept_writes(
+    state: &ManagementApiState,
+    body: &CutoverReceiveAuthorityRequest,
+) -> anyhow::Result<()> {
+    let Some(pg) = state.postgres_manager.as_ref() else {
+        anyhow::bail!("no PostgreSQL supervisor on this node");
+    };
+    let guard = pg.lock().await;
+    crate::commands::upgrade::seed_green::ensure_reverse_replication(
+        &guard,
+        &body.reverse_publication,
+        &body.reverse_slot,
+    )
+    .await?;
+    let raw = guard.execute_sql(DONOR_SEQUENCE_VALUES_SQL).await?;
+    drop(guard);
+    let mut local = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some(seq) = parse_sequence_value_line(line) else {
+            anyhow::bail!("unparseable local sequence row {line:?}");
+        };
+        local.push(seq);
+    }
+    let gaps = sequence_gaps(&local, &body.donor_sequences);
+    if !gaps.is_empty() {
+        anyhow::bail!(
+            "U3: sequences not advanced past the donor: {}",
+            gaps.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// Recipient side: take write authority the donor committed to relinquish.
 ///
 /// The two Raft groups share no log, so the recipient confirms the donor's
@@ -1279,6 +1377,14 @@ pub(super) async fn cutover_receive_authority(
             ),
             Err(refusal) => return *refusal,
         }
+    }
+
+    if let Err(why) = ready_to_accept_writes(&state, &body).await {
+        return refuse(
+            &state,
+            StatusCode::CONFLICT,
+            format!("Refusing to take authority: {why:#}"),
+        );
     }
 
     apply_cutover(
@@ -1358,6 +1464,44 @@ mod tests {
             DonorClaim::Contradicts,
         ];
         assert!(!donor_quorum_confirms(&mixed, 3));
+    }
+
+    /// Drain observed is the U2 claim, so the donor proves it from its own
+    /// slots instead of taking the caller's word: every logical slot
+    /// confirmed through the sealed LSN. Nothing sealed, or a slot that has
+    /// confirmed nothing, proves nothing.
+    #[test]
+    fn the_drain_is_proven_only_by_slots_confirmed_through_the_seal() {
+        assert!(drain_proven(Some(100), Some(100)));
+        assert!(drain_proven(Some(150), Some(100)));
+        assert!(!drain_proven(Some(99), Some(100)));
+        assert!(!drain_proven(None, Some(100)));
+        assert!(!drain_proven(Some(100), None));
+    }
+
+    fn seq(name: &str, last_value: i64) -> SequenceValue {
+        SequenceValue {
+            schema: "public".into(),
+            name: name.into(),
+            last_value,
+        }
+    }
+
+    /// U3 at the moment the recipient's fence lifts: each of its sequences
+    /// must already be past what the donor issued, and a sequence the donor
+    /// list does not cover is a gap — an empty list is not "nothing to do".
+    #[test]
+    fn every_recipient_sequence_must_be_past_the_donor() {
+        let donor = [seq("a", 41), seq("b", 7)];
+        assert_eq!(
+            sequence_gaps(&[seq("a", 10_041), seq("b", 10_007)], &donor),
+            Vec::<String>::new()
+        );
+        let gaps = sequence_gaps(&[seq("a", 41), seq("b", 10_007)], &donor);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps.iter().all(|g| g.contains("public.a")), "{gaps:?}");
+        let uncovered = sequence_gaps(&[seq("c", 5)], &[]);
+        assert_eq!(uncovered.len(), 1, "{uncovered:?}");
     }
 
     /// The donor stays sealed while the recipient drains, so a subscriber that

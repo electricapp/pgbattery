@@ -493,6 +493,7 @@ class ReverseDrainTest(unittest.TestCase):
                 bg, "_cutover_status", return_value={"sealed_final_lsn": 9, "epoch": 2}
             ),
             mock.patch.object(bg, "_await_slot_confirms", return_value=9),
+            mock.patch.object(bg, "_advance_sequences", return_value=0),
             mock.patch.object(bg, "_receive_authority"),
             mock.patch.object(bg, "_psql", side_effect=fake_psql),
             self.assertRaises(bg.ContractFailure) as caught,
@@ -506,14 +507,24 @@ class ReverseDrainTest(unittest.TestCase):
         self.assertIn("U5 violated", str(caught.exception))
         self.assertIn("rb-2", str(caught.exception))
 
-    def test_a_transfer_without_a_reverse_slot_is_refused(self) -> None:
-        """The slot must predate the recipient's first accepted write."""
-        sent: list[Any] = []
+    def test_the_reverse_handoff_names_its_slot_and_clears_sequences_first(self) -> None:
+        """U5 and U3 ride receive-authority: blue names its reverse slot, and
+        its sequences are advanced past green's before it takes writes."""
+        order: list[str] = []
 
         def fake_post(_node: Any, path: str, body: Any = None) -> Any:
-            if path == "transfer":
-                sent.append(body)
+            order.append(path)
             return mock.Mock(status_code=200, raise_for_status=lambda: None)
+
+        def fake_advance(*_args: Any) -> int:
+            order.append("advance-sequences")
+            return 0
+
+        def fake_receive(*args: Any) -> None:
+            order.append("receive-authority")
+            received.append(args)
+
+        received: list[tuple[Any, ...]] = []
 
         # Post-rollback: blue holds authority again, green does not.
         def fake_status(node: Node) -> dict[str, Any]:
@@ -527,7 +538,8 @@ class ReverseDrainTest(unittest.TestCase):
             mock.patch.object(bg, "_post", side_effect=fake_post),
             mock.patch.object(bg, "_cutover_status", side_effect=fake_status),
             mock.patch.object(bg, "_await_slot_confirms", return_value=9),
-            mock.patch.object(bg, "_receive_authority"),
+            mock.patch.object(bg, "_advance_sequences", side_effect=fake_advance),
+            mock.patch.object(bg, "_receive_authority", side_effect=fake_receive),
             mock.patch.object(bg, "_psql", return_value="rb-0"),
             mock.patch.object(bg, "_write_burst", return_value={"rb-0"}),
         ):
@@ -537,11 +549,9 @@ class ReverseDrainTest(unittest.TestCase):
                 [_node("blue1")],
                 [_node("green1", "10.0.0.4")],
             )
-        self.assertTrue(sent, "the drill must actually run a transfer")
-        self.assertTrue(
-            all(b["reverse_slot_ready"] for b in sent),
-            "the harness must never ask for a transfer without the reverse slot",
-        )
+        self.assertIn("receive-authority", order, "the drill must hand authority back")
+        self.assertLess(order.index("advance-sequences"), order.index("receive-authority"))
+        self.assertEqual(received[0][-2:], ("bg_pub", "bg_sub"))
 
 
 if __name__ == "__main__":

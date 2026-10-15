@@ -446,6 +446,70 @@ pub(crate) async fn subscription_sync_states(
         .context("reading subscription sync states")
 }
 
+/// Create the logical slot unless one by that name exists. The name is a
+/// validated simple identifier, so it embeds as a literal unescaped.
+fn reverse_slot_sql(slot: &str) -> String {
+    format!(
+        "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput') \
+         WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot}');"
+    )
+}
+
+/// Ensure this recipient holds the reverse publication and its logical slot.
+///
+/// U5: the slot must predate the recipient's first accepted write, or the
+/// reverse stream has a gap a rollback silently loses. Called by
+/// `receive-authority` before the fence lifts, so no caller can skip it.
+/// Idempotent; refuses when the name belongs to a non-logical slot.
+///
+/// # Errors
+/// An invalid name, SQL failure, or the slot missing after the create.
+pub(crate) async fn ensure_reverse_replication(
+    supervisor: &crate::supervisor::Supervisor,
+    publication: &str,
+    slot: &str,
+) -> Result<()> {
+    let publication = quote_ident(publication)?;
+    let slot = quote_ident(slot)?;
+    let exists = supervisor
+        .execute_sql(&format!(
+            "SELECT count(*)::text FROM pg_publication WHERE pubname = '{publication}';"
+        ))
+        .await
+        .context("checking for the reverse publication")?;
+    if exists.trim() == "0" {
+        let schemas: Vec<String> = supervisor
+            .execute_sql(DONOR_USER_SCHEMAS_SQL)
+            .await
+            .context("listing user schemas for the reverse publication")?
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        supervisor
+            .execute_sql(&create_publication_sql(&publication, &schemas)?)
+            .await
+            .context("creating the reverse publication")?;
+        info!(%publication, "Reverse publication created");
+    }
+    supervisor
+        .execute_sql(&reverse_slot_sql(&slot))
+        .await
+        .context("creating the reverse slot")?;
+    let logical = supervisor
+        .execute_sql(&format!(
+            "SELECT count(*)::text FROM pg_replication_slots \
+             WHERE slot_name = '{slot}' AND slot_type = 'logical';"
+        ))
+        .await
+        .context("verifying the reverse slot")?;
+    if logical.trim() != "1" {
+        bail!("{slot} is not a logical replication slot on this node");
+    }
+    Ok(())
+}
+
 fn quote_ident(name: &str) -> Result<String> {
     if name.is_empty()
         || !name
