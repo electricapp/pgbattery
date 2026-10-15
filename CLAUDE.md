@@ -159,4 +159,3 @@ Full incident list and exit criteria live in `HARDENING.md`. Short version:
 - `docs/RUNBOOK.md`, `docs/DEPLOYMENT.md`, `docs/RELEASING.md` — operations
 - `tla/README.md` — what each spec proves / does not
 - `HARDENING.md` — verification gaps and fault-effect discipline
-- `UPGRADE.md` — upgrade design (proposal)

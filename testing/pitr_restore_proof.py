@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""PITR restore-and-start proof (UPGRADE_CHECKLIST step 3).
+"""PITR restore-and-start proof.
 
 Stand up is assumed (compose already running). This script:
 
@@ -15,7 +15,7 @@ Inversion: if the restore path is skipped or the archive is empty, the
 post-backup marker is missing and this exits non-zero. ``pg_verifybackup``
 alone is not enough.
 
-RPO note (also in UPGRADE_CHECKLIST): without WAL archiving, abort/restore
+RPO note: without WAL archiving, abort/restore
 rewinds to the last full basebackup (hours of loss under light write load).
 With archiving + this proof, abort RPO is bounded by ``archive_timeout``
 (60s) plus apply lag.

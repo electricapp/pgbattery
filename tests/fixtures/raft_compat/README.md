@@ -1,6 +1,7 @@
 # Raft frame + store compatibility fixtures
 
-CI gate for `UPGRADE_CHECKLIST.md` step 1 / `UPGRADE.md` Track A compat.
+CI gate for the Raft frame and store compatibility a rolling `upgrade --cluster`
+relies on: a node on release N must talk to and open the state of release N-1.
 
 ## Layout
 

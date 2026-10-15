@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --project testing python
-"""Track C blue/green cutover e2e (UPGRADE_CHECKLIST step 9).
+"""Track C blue/green cutover e2e.
 
 ``COMPOSE_FILE=docker-compose.bluegreen.yml`` — ports from topology.py only.
 

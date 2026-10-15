@@ -2,8 +2,7 @@
 //!
 //! Pure decision helpers live here so preflight/postflight can be unit-tested
 //! without a live cluster. The orchestration loop (doctor, remote upgrade,
-//! lag wait, transfer-leadership) builds on these — see `UPGRADE_CHECKLIST.md`
-//! step 2.
+//! lag wait, transfer-leadership) builds on these.
 
 use anyhow::{Result, bail};
 use semver::Version;

@@ -138,3 +138,12 @@ key:
    `release.yml`) and ship a client release.
 2. The issuer (`https://token.actions.githubusercontent.com`) is fixed by GitHub
    Actions and should not need to change.
+
+## After the first tagged release
+
+The rolling-upgrade proof (`cluster-binary-upgrade-proof`) rolls two package
+versions built from the same source, so their Raft frame and redb store are
+identical by construction. `governor::compat_fixtures` pins both against
+committed goldens until a real prior release exists. Once one does, add its
+frame and store under `tests/fixtures/raft_compat/supported/` (see that
+directory's README) and roll a cluster from that release to HEAD.

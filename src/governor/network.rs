@@ -11,8 +11,8 @@
 //! body`, where `len` counts everything after itself. A response echoes its
 //! request's `corr_id`. [`RAFT_RPC_FRAME_VERSION`] is the version this binary
 //! emits; peers may send `N-1..=N` once `N > 0` (today `N = 0`, so only `0`).
-//! A version outside that window is a typed protocol error — see `UPGRADE.md`
-//! Track A / `UPGRADE_CHECKLIST.md` step 1.
+//! A version outside that window is a typed protocol error, so a rolling
+//! upgrade never runs a peer it cannot parse (`governor::compat_fixtures`).
 //!
 //! openraft cancels an RPC by dropping its future, and a drop can land at
 //! any await point — after half a frame was written, or with half a response
@@ -58,7 +58,7 @@ const MAX_RPC_FRAME_LEN: usize = 4 * 1024 * 1024;
 /// Raft RPC frame version this binary emits.
 ///
 /// Accept window is `saturating_sub(1)..=RAFT_RPC_FRAME_VERSION`. Bump only
-/// with a rolling-upgrade plan (`UPGRADE_CHECKLIST.md` step 1).
+/// with a rolling-upgrade plan and regenerated `tests/fixtures/raft_compat/`.
 pub const RAFT_RPC_FRAME_VERSION: u8 = 0;
 
 /// Bytes after `len`: version (1) + type (1) + correlation ID (8).
@@ -1344,8 +1344,7 @@ mod tests {
     fn a_frame_bump_needs_version_negotiation_first() {
         assert_eq!(
             RAFT_RPC_FRAME_VERSION, 0,
-            "bumping the frame version requires per-connection negotiation \
-             (UPGRADE.md, compatibility contract 1)"
+            "bumping the frame version requires per-connection negotiation"
         );
     }
 

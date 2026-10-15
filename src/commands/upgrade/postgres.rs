@@ -33,7 +33,7 @@ const SUBPROCESS_BUDGET: Duration = Duration::from_mins(10);
 /// Durable rollback anchor written next to PGDATA after a successful primary apply.
 /// Where a data directory sits in a `pg_upgrade`, probed from disk.
 ///
-/// `UPGRADE.md` refuses a marker file here: the flow must decide from which
+/// No marker file here: the flow must decide from which
 /// data directories exist and what state they are in, never from a note it
 /// wrote about its own intent. Every field below is read from the filesystem
 /// at the moment it is needed.
@@ -313,7 +313,7 @@ pub async fn run_postgres_upgrade(params: PostgresUpgradeParams) -> Result<()> {
     if !params.check_only && !params.experimental {
         bail!(
             "Refusing PostgreSQL major upgrade apply: full flow is behind \
-             --experimental (UPGRADE_CHECKLIST step 5). Run with --check for \
+             --experimental. Run with --check for \
              preflight only, or --confirm / --rollback after an apply."
         );
     }
@@ -1415,10 +1415,7 @@ fn parse_kv_colon(output: &str) -> BTreeMap<String, String> {
 ///
 /// # Errors
 /// Any checklist gate failure.
-#[allow(
-    clippy::too_many_lines,
-    reason = "preflight is one auditable sequence matching UPGRADE_CHECKLIST step 4"
-)]
+#[allow(clippy::too_many_lines, reason = "preflight is one auditable sequence")]
 pub async fn run_local_preflight(
     supervisor: &crate::supervisor::Supervisor,
     active_bin_dir: &Path,

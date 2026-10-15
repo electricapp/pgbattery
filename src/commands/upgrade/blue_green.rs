@@ -665,7 +665,7 @@ fn print_report(report: &BlueGreenPreflightReport) {
 /// Local primary catalog probes (management API / supervisor).
 ///
 /// # Errors
-/// Hard aborts listed in `UPGRADE.md` Track C prerequisites.
+/// Hard aborts: the catalog features logical replication cannot carry.
 pub async fn run_local_blue_green_preflight(
     supervisor: &crate::supervisor::Supervisor,
     _active_bin_dir: &std::path::Path,

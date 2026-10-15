@@ -27,7 +27,7 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 ///
 /// Missing key = schema 0 (every existing store adopts without a stamp).
 /// Older → forward migrate before Raft join; newer → refuse (no downgrade).
-/// See `UPGRADE_CHECKLIST.md` step 1.
+/// Pinned by `governor::compat_fixtures`.
 ///
 /// Schema 1: snapshots serialize the current `ClusterState` (with `cutover`
 /// and `pg_upgrade`); schema 0 snapshots carry the shorter v0 layout and

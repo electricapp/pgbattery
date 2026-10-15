@@ -1,4 +1,4 @@
-//! Raft wire/store compatibility fixtures (`UPGRADE_CHECKLIST` step 1).
+//! Raft wire/store compatibility fixtures.
 //!
 //! Committed golden bytes under `tests/fixtures/raft_compat/` are the CI gate
 //! that patch/minor releases do not change frame format or store schema:
@@ -360,7 +360,7 @@ fn regenerate_raft_compat_fixtures() {
     }
 
     let manifest = format!(
-        "# Raft frame + redb store compatibility pin (UPGRADE_CHECKLIST step 1).\n\
+        "# Raft frame + redb store compatibility pin.\n\
          # Patch/minor releases must not change these values. Bumping either\n\
          # requires updating supported/ fixtures and keeping accept window N-1..=N.\n\
          frame_version={RAFT_RPC_FRAME_VERSION}\n\
@@ -600,7 +600,7 @@ fn unsupported_newer_store_fixture_is_refused() {
 #[test]
 fn frame_accept_window_is_exactly_n_minus_one_through_n() {
     // Major bumps may advance the spoken version by one; the accept window is
-    // always adjacent releases only (UPGRADE_CHECKLIST / UPGRADE.md).
+    // always adjacent releases only.
     let n = RAFT_RPC_FRAME_VERSION;
     let min = n.saturating_sub(1);
     for v in 0..=255u8 {

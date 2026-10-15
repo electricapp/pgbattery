@@ -2694,7 +2694,7 @@
       "contracts": [
         "V2"
       ],
-      "description": "WAL-archive PITR restore-and-start proof (UPGRADE_CHECKLIST step 3). Writes a pre-backup marker, forces WAL archive, takes a full basebackup, writes a post-backup marker, restores into a scratch datadir with restore_command against the live archive, starts a throwaway postmaster, asserts both markers, and accepts a write. Fails if restore never runs or the archive does not apply. RPO without archive is last-full-backup only; with archive_timeout=60s it is bounded to about a minute plus apply lag.",
+      "description": "WAL-archive PITR restore-and-start proof. Writes a pre-backup marker, forces WAL archive, takes a full basebackup, writes a post-backup marker, restores into a scratch datadir with restore_command against the live archive, starts a throwaway postmaster, asserts both markers, and accepts a write. Fails if restore never runs or the archive does not apply. RPO without archive is last-full-backup only; with archive_timeout=60s it is bounded to about a minute plus apply lag.",
       "actions": [
         {
           "type": "cmd",
@@ -2706,7 +2706,7 @@
     {
       "id": "pg-upgrade-hold-writes",
       "contracts": ["W1", "V1"],
-      "description": "Track B gateway hold under continuous writes: freeze → hold window → unfreeze; writers on the non-leader gateways resume with every acked key asserted present by set difference (UPGRADE_CHECKLIST steps 5–6).",
+      "description": "Track B gateway hold under continuous writes: freeze → hold window → unfreeze; writers on the non-leader gateways resume with every acked key asserted present by set difference.",
       "actions": [
         {
           "type": "cmd",
