@@ -2556,6 +2556,13 @@ impl App {
         false
     }
 
+    /// Whether a fence's termination ended any client session. The fence
+    /// re-runs every 100 ms tick while a node has no lease, so a quiet
+    /// re-application is debug, and an unreadable count stays loud.
+    fn fence_severed_sessions(count: &str) -> bool {
+        count.trim() != "0"
+    }
+
     /// Sever client sessions so the read-only fence actually fences.
     ///
     /// `default_transaction_read_only = on` is only a session *default*:
@@ -2574,11 +2581,14 @@ impl App {
         outcome: std::result::Result<pgbattery_core::Result<String>, tokio::time::error::Elapsed>,
     ) {
         match outcome {
-            Ok(Ok(count)) => {
-                tracing::info!(
+            Ok(Ok(count)) if Self::fence_severed_sessions(&count) => {
+                tracing::warn!(
                     terminated = count.trim(),
                     "Terminated client backends after emergency fence"
                 );
+            }
+            Ok(Ok(_)) => {
+                tracing::debug!("Emergency fence re-applied; no client backends to terminate");
             }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "Failed to terminate client backends after fence");
@@ -4831,6 +4841,15 @@ mod tests {
         assert!(!wanted.fenced);
         assert_eq!(wanted.roles, Vec::<String>::new());
         assert!(wanted.needs_reconcile());
+    }
+
+    #[test]
+    fn a_quiet_refence_is_not_reported_as_severing_sessions() {
+        // A leaderless node re-fences every 100 ms tick; logging each no-op
+        // at INFO buried the fences that did end live sessions.
+        assert!(!App::fence_severed_sessions("0\n"));
+        assert!(App::fence_severed_sessions("3"));
+        assert!(App::fence_severed_sessions("garbled"));
     }
 
     #[test]
