@@ -21,6 +21,9 @@ use crate::gateway::protocol::TransactionStatus;
 /// without bound, across every connection.
 pub const MAX_TRACKED_PREPARED_STATEMENTS: usize = 1024;
 
+/// Cap on the bytes of the prepared-statement replay set, per connection.
+pub const MAX_TRACKED_PREPARED_BYTES: usize = 4 * 1024 * 1024;
+
 /// A change a simple query makes to the replayed session state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayChange {
@@ -131,9 +134,15 @@ pub fn acknowledge(state: &mut ConnectionState, ack: Ack) {
 }
 
 fn commit_capture(state: &mut ConnectionState, name: String, bytes: Bytes) {
-    if !state.replay.prepared.contains_key(&name)
-        && state.replay.prepared.len() >= MAX_TRACKED_PREPARED_STATEMENTS
-    {
+    let prepared = &state.replay.prepared;
+    let kept: usize = prepared
+        .iter()
+        .filter(|(held, _)| **held != name)
+        .map(|(_, held)| held.len())
+        .sum();
+    let over_count =
+        !prepared.contains_key(&name) && prepared.len() >= MAX_TRACKED_PREPARED_STATEMENTS;
+    if over_count || kept + bytes.len() > MAX_TRACKED_PREPARED_BYTES {
         mark_unknowable(state, "prepared-statement replay set at its cap");
         return;
     }
@@ -402,6 +411,24 @@ mod tests {
         state.awaiting.push_back(capture("one_more", "SELECT 1"));
         acknowledge(&mut state, Ack::ParseComplete);
         assert!(!state.replay.prepared.contains_key("one_more"));
+        assert!(state.not_migratable);
+    }
+
+    /// M16: the count cap alone let 1,024 captures of up to 16 MiB each pin
+    /// 16 GiB per connection.
+    #[test]
+    fn captures_past_the_byte_budget_fail_closed() {
+        let mut state = ConnectionState::new(0);
+        let big = Bytes::from(vec![0u8; MAX_TRACKED_PREPARED_BYTES / 2 + 1]);
+        state
+            .replay
+            .prepared
+            .insert("first".to_string(), big.clone());
+        state
+            .awaiting
+            .push_back(Awaited::Parse(Some(("second".to_string(), big))));
+        acknowledge(&mut state, Ack::ParseComplete);
+        assert!(!state.replay.prepared.contains_key("second"));
         assert!(state.not_migratable);
     }
 

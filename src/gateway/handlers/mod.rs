@@ -115,6 +115,11 @@ const fn ending_sqlstate(error: &Error) -> &'static str {
     }
 }
 
+/// Largest client message accepted before the backend's first
+/// `ReadyForQuery`: authentication only, and `PostgreSQL` caps an auth token
+/// at 65,535 bytes (`PG_MAX_AUTH_TOKEN_LENGTH`), plus room for framing.
+const MAX_PRE_AUTH_MESSAGE: usize = 65_535 + 1_024;
+
 /// Maximum startup-packet length accepted.
 ///
 /// Matches libpq's `PQ_MAX_STARTUP_PACKET_LENGTH`. The startup packet carries
@@ -1422,8 +1427,17 @@ impl ConnectionHandler {
         buf: &mut BytesMut,
         backend: &mut TcpStream,
     ) -> Result<()> {
-        // Check proxy mode once upfront
-        let proxy_mode = self.state.read().proxy_mode;
+        // Check proxy mode once upfront, and how large a message may be: until
+        // the backend has answered, the client is still authenticating.
+        let (proxy_mode, max_message) = {
+            let state = self.state.read();
+            let max = if state.queries_processed > 0 {
+                MAX_GATEWAY_BUFFER_SIZE
+            } else {
+                MAX_PRE_AUTH_MESSAGE
+            };
+            (state.proxy_mode, max)
+        };
 
         // In passthrough mode, just forward everything
         if proxy_mode == ProxyMode::SslPassthrough {
@@ -1460,20 +1474,7 @@ impl ConnectionHandler {
                 break;
             };
 
-            // Validate packet length to prevent overflow/DoS attacks
-            if !header.is_length_valid(MAX_GATEWAY_BUFFER_SIZE) {
-                tracing::error!(
-                    conn_id = self.id,
-                    claimed_length = header.length,
-                    max_size = MAX_GATEWAY_BUFFER_SIZE,
-                    "Invalid packet length from client"
-                );
-                metrics::counter!("pgbattery_invalid_packet_length").increment(1);
-                return Err(Error::Protocol(format!(
-                    "Invalid packet length: {} exceeds maximum",
-                    header.length
-                )));
-            }
+            self.validate_client_header(header, max_message)?;
 
             let total_len = header.total_length();
             if buf.len() < total_len {
@@ -1959,6 +1960,25 @@ impl ConnectionHandler {
         buf.clear();
         self.state.write().bytes_received += len as u64;
         Ok(())
+    }
+
+    /// Refuse a client message claiming more than `max_size` before buffering
+    /// it: the claim alone would make the gateway hold that much.
+    fn validate_client_header(&self, header: PacketHeader, max_size: usize) -> Result<()> {
+        if header.is_length_valid(max_size) {
+            return Ok(());
+        }
+        tracing::error!(
+            conn_id = self.id,
+            claimed_length = header.length,
+            max_size,
+            "Invalid packet length from client"
+        );
+        metrics::counter!("pgbattery_invalid_packet_length").increment(1);
+        Err(Error::Protocol(format!(
+            "Invalid packet length: {} exceeds maximum",
+            header.length
+        )))
     }
 
     fn validate_backend_header(&self, header: PacketHeader) -> Result<()> {
@@ -3869,6 +3889,38 @@ mod tests {
             buf.extend_from_slice(part);
         }
         handler.process_backend_data(&mut buf).await.unwrap();
+    }
+
+    /// M16: before authentication a client could claim a 16 MiB message and
+    /// have the gateway buffer it. `PostgreSQL` caps an auth token at 64 KiB,
+    /// so nothing larger is a client the backend would answer.
+    #[tokio::test]
+    async fn an_oversized_message_before_authentication_is_refused() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state.clone()).await;
+        let mut claimed = BytesMut::new();
+        claimed.put_u8(b'p');
+        claimed.put_u32(1_048_576);
+        let refused = handler
+            .process_client_data(&mut claimed, &mut backend)
+            .await;
+        assert!(matches!(refused, Err(Error::Protocol(_))), "{refused:?}");
+
+        // Once the backend has answered, ordinary large messages are fine.
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, mut backend, _client, _backend_peer) = proxied(state.clone()).await;
+        backend_answers(&mut handler, &[ready(b'I')]).await;
+        let mut claimed = BytesMut::new();
+        claimed.put_u8(b'Q');
+        claimed.put_u32(1_048_576);
+        assert!(
+            handler
+                .process_client_data(&mut claimed, &mut backend)
+                .await
+                .is_ok()
+        );
     }
 
     /// M16: replay state was recorded when the client sent a Parse, so a
