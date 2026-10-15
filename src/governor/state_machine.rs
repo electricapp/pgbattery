@@ -100,6 +100,12 @@ pub struct ClusterState {
     /// follows, rewinds onto and clones only a leader that serves it.
     #[serde(default)]
     pub lineage: Option<u64>,
+
+    /// The newest Raft term whose leader opened its primary for writes
+    /// (`PrimaryOpened`). Gateways route to the leader only in that term: a
+    /// leader still waiting out the old lease runs a standby.
+    #[serde(default)]
+    pub primary_term: Option<u64>,
 }
 
 /// [`ClusterState`] as store schema 0 serialized it — before `cutover` and
@@ -130,6 +136,7 @@ impl From<ClusterStateV0> for ClusterState {
             feature_level: 0,
             voter_intent: Vec::new(),
             lineage: None,
+            primary_term: None,
         }
     }
 }
@@ -537,6 +544,10 @@ pub enum ClusterCommand {
         cluster_id: String,
         awaits_authority_from: Option<String>,
     },
+
+    /// The leader of `term` has a primary out of recovery with writes open.
+    /// Only that leader can commit it, so the term names the node.
+    PrimaryOpened { term: u64 },
 }
 
 /// Highest cluster feature level this binary decodes.
@@ -567,6 +578,7 @@ impl ClusterCommand {
             | Self::IntendVoter { .. }
             | Self::SetLineage { .. }
             | Self::NameCluster { .. }
+            | Self::PrimaryOpened { .. }
             | Self::CutoverDrainObserved
             | Self::CutoverTransfer { .. }
             | Self::CutoverAbortUnseal { .. }
@@ -654,6 +666,12 @@ impl ClusterState {
                 if let Err(at) = self.voter_intent.binary_search(&node_id) {
                     self.voter_intent.insert(at, node_id);
                 }
+            }
+            ClusterCommand::PrimaryOpened { term } => {
+                if self.primary_term.is_some_and(|recorded| recorded > term) {
+                    return CommandOutcome::OutOfOrder;
+                }
+                self.primary_term = Some(term);
             }
             ClusterCommand::SetLineage { system_identifier } => match self.lineage {
                 Some(current) if current != system_identifier => {
@@ -833,6 +851,18 @@ impl ClusterState {
                 pgbattery_core::constants::PG_REWIND_DIVERGENCE_THRESHOLD_BYTES,
             ),
         }
+    }
+
+    /// Whether clients may be routed to the leader of `current_term`: its
+    /// primary is recorded open in that term. Below the feature level that
+    /// records it, the leader is routed to as soon as it is elected.
+    #[must_use]
+    pub const fn routes_to_leader(&self, current_term: u64) -> bool {
+        let records_opening = ClusterCommand::PrimaryOpened { term: 0 }.required_feature_level();
+        if self.feature_level < records_opening {
+            return true;
+        }
+        matches!(self.primary_term, Some(term) if term == current_term)
     }
 
     /// What the committed record lets a standby do to follow a leader.
@@ -1366,6 +1396,32 @@ mod tests {
         name(&mut green, GREEN, Some(BLUE));
         assert!(!green.cutover.needs_naming(GREEN, Some(BLUE)));
         assert!(!green.cutover.holds_client_write_authority(GREEN));
+    }
+
+    /// M16: the gateway routed to a new leader the moment it was elected, and
+    /// for the old lease's span its primary was a standby: every write failed
+    /// with 25006. Only a leader that opened its primary in the current term
+    /// is routed to.
+    #[test]
+    fn only_a_leader_that_opened_its_primary_this_term_is_routed_to() {
+        let mut state = at_current_level();
+        assert!(!state.routes_to_leader(4), "elected, not yet opened");
+        assert_eq!(
+            state.apply(ClusterCommand::PrimaryOpened { term: 4 }),
+            CommandOutcome::Applied
+        );
+        assert!(state.routes_to_leader(4));
+        assert!(!state.routes_to_leader(5), "a new term starts unopened");
+        assert_eq!(
+            state.apply(ClusterCommand::PrimaryOpened { term: 3 }),
+            CommandOutcome::OutOfOrder,
+            "a deposed leader's late entry"
+        );
+        assert_eq!(state.primary_term, Some(4));
+        assert!(
+            ClusterState::default().routes_to_leader(9),
+            "below the feature level the leader is routed to on election"
+        );
     }
 
     /// The boot fence lands only before any cutover entry: once authority has

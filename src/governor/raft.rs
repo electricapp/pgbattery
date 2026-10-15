@@ -103,6 +103,10 @@ pub struct FenceState {
     /// Recipient PG address to relay to after TRANSFER. `None` while another
     /// cluster holds authority means hold, never guess.
     pub authority_pg_addr: Option<SocketAddr>,
+    /// The current term's leader has opened its primary
+    /// (`ClusterState::routes_to_leader`); until then the gateway holds
+    /// rather than route clients to a standby.
+    pub primary_open: bool,
 }
 
 impl FenceState {
@@ -114,6 +118,7 @@ impl FenceState {
             upgrade_frozen: false,
             client_write_authority: true,
             authority_pg_addr: None,
+            primary_open: true,
         }
     }
 
@@ -472,7 +477,7 @@ impl Governor {
         // the gateway fires more frequently than the per-loop fence check, so
         // expiring the lease first minimises the window for stale writes.
         self.update_lease_state(is_leader, has_quorum, quorum_ack_age);
-        self.update_fencing_state(leader_id, has_quorum, runtime);
+        self.update_fencing_state(leader_id, has_quorum, metrics.current_term, runtime);
         self.log_leadership_changes(leader_id, is_leader, runtime);
         self.emit_raft_metrics(metrics, leader_id, has_quorum);
         self.sync_voter_ids(metrics);
@@ -603,6 +608,7 @@ impl Governor {
         &self,
         leader_id: Option<NodeId>,
         has_quorum: bool,
+        current_term: u64,
         runtime: &mut GovernorRunState,
     ) {
         let should_fence = !has_quorum;
@@ -647,14 +653,19 @@ impl Governor {
         // Derived outside the watch closure: taking `state.read()` inside
         // `send_if_modified` would hold the watch lock across another lock,
         // on every metrics update.
-        let (client_write_authority, authority_pg_addr, upgrade_frozen) = {
+        let (client_write_authority, authority_pg_addr, upgrade_frozen, primary_open) = {
             let state = self.state.read();
             let (authority, relay) = Self::cutover_authority_projection(
                 &state.cutover,
                 &self.cluster_id,
                 self.awaits_authority_from.as_deref(),
             );
-            (authority, relay, state.pg_upgrade.frozen)
+            (
+                authority,
+                relay,
+                state.pg_upgrade.frozen,
+                state.routes_to_leader(current_term),
+            )
         };
         self.fence_tx.send_if_modified(|current| {
             let new_fence = FenceState {
@@ -663,6 +674,7 @@ impl Governor {
                 upgrade_frozen,
                 client_write_authority,
                 authority_pg_addr,
+                primary_open,
             };
             if *current == new_fence {
                 false
@@ -850,6 +862,7 @@ impl Governor {
                 upgrade_frozen: current.upgrade_frozen,
                 client_write_authority: current.client_write_authority,
                 authority_pg_addr: current.authority_pg_addr,
+                primary_open: current.primary_open,
             };
             if *current == next {
                 false
@@ -2567,9 +2580,7 @@ mod tests {
         let f = FenceState {
             fenced: true,
             has_quorum: false,
-            upgrade_frozen: false,
-            client_write_authority: true,
-            authority_pg_addr: None,
+            ..FenceState::unfenced()
         };
         assert!(f.fenced);
         assert!(!f.has_quorum);
@@ -2673,9 +2684,7 @@ mod tests {
             FenceState {
                 fenced: true,
                 has_quorum: false,
-                upgrade_frozen: false,
-                client_write_authority: true,
-                authority_pg_addr: None,
+                ..FenceState::unfenced()
             }
         );
     }

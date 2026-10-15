@@ -2211,9 +2211,7 @@ mod tests {
                 .send(FenceState {
                     fenced: true,
                     has_quorum: false,
-                    upgrade_frozen: false,
-                    client_write_authority: true,
-                    authority_pg_addr: None,
+                    ..FenceState::unfenced()
                 })
                 .unwrap();
             observe_until_event(&events, handle, &shutdown_tx).await;
@@ -2257,10 +2255,7 @@ mod tests {
             fence_tx
                 .send(FenceState {
                     fenced: true,
-                    has_quorum: true,
-                    upgrade_frozen: false,
-                    client_write_authority: true,
-                    authority_pg_addr: None,
+                    ..FenceState::unfenced()
                 })
                 .unwrap();
             observe_until_event(&events, handle, &shutdown_tx).await;

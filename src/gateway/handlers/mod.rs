@@ -46,25 +46,27 @@ const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 /// Once another cluster holds committed write authority this gateway relays
 /// to it, so connection strings survive a cutover. Falling back to the local
 /// leader there would route clients into the cluster that gave authority
-/// away, so no relay while authority is elsewhere means no route: hold.
+/// away, so no relay while authority is elsewhere means no route: hold. The
+/// local leader is a route only once its primary is open in this term: until
+/// then it runs a standby, and every write sent there fails with 25006.
 const fn route(fence: &FenceState, leader: Option<SocketAddr>) -> Option<SocketAddr> {
     if let Some(addr) = fence.authority_pg_addr {
         return Some(addr);
     }
-    if fence.local_client_writes_fenced() {
+    if fence.local_client_writes_fenced() || !fence.primary_open {
         return None;
     }
     leader
 }
 
-/// Whether a follower's open backend no longer matches its session's route.
-fn follower_backend_stale(
-    is_leader: bool,
+/// Whether a session's open backend no longer matches its route, on any
+/// node: forwarding there could reach a deposed primary.
+fn backend_stale(
     fence: &FenceState,
     leader: Option<SocketAddr>,
     backend: Option<SocketAddr>,
 ) -> bool {
-    !is_leader && route(fence, leader) != backend
+    route(fence, leader) != backend
 }
 
 /// Whether the session must (re)connect to `target`. A lost backend always
@@ -205,7 +207,7 @@ struct BatchFenceSnapshot {
     is_leader: bool,
     lease_valid_until: Instant,
     now: Instant,
-    follower_backend_stale: bool,
+    backend_stale: bool,
 }
 
 #[derive(Default)]
@@ -607,7 +609,7 @@ impl ConnectionHandler {
 
     /// Connect to the route and proxy until the session ends.
     async fn serve(&mut self, startup: &Bytes) -> Result<()> {
-        let leader = self.get_leader()?;
+        let leader = self.await_route().await?;
         let mut backend = self.connect_to_backend(leader).await?;
         // Bounded so a backend that accepts but never drains can't pin us.
         write_all_within_deadline(&mut backend, startup, self.id).await?;
@@ -760,6 +762,72 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// The session's route, waiting for one up to `FENCE_WAIT_TIMEOUT_SECS`:
+    /// an election, or a new leader opening its primary, ends within it.
+    async fn await_route(&mut self) -> Result<SocketAddr> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(FENCE_WAIT_TIMEOUT_SECS);
+        loop {
+            if let Ok(addr) = self.get_leader() {
+                return Ok(addr);
+            }
+            tokio::select! {
+                res = self.leader_rx.changed() => {
+                    if res.is_err() {
+                        return Err(Error::ChannelClosed);
+                    }
+                }
+                res = self.fence_rx.changed() => {
+                    if res.is_err() {
+                        return Err(Error::ChannelClosed);
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => return Err(Error::NoLeader),
+            }
+        }
+    }
+
+    /// Bring a settled session — idle, nothing owed — to its route before
+    /// reading more of the client, holding it while there is none. A session
+    /// with work in flight stays where it is: its answers keep flowing, and
+    /// its next message re-checks the route before it is forwarded.
+    async fn follow_route(
+        &mut self,
+        backend: &mut TcpStream,
+        backend_buf: &mut BytesMut,
+    ) -> Result<()> {
+        let (current, settled) = {
+            let state = self.state.read();
+            (
+                state.backend_addr,
+                state.tx_status == TransactionStatus::Idle && !state.response_pending(),
+            )
+        };
+        let route = self.get_leader().ok();
+        if route == current {
+            return Ok(());
+        }
+        if route.is_none() {
+            if !settled {
+                return Ok(());
+            }
+            if let Err(e) = self.await_route().await {
+                self.send_failover_error_response(
+                    "pgbattery: no primary accepted sessions in time; reconnect",
+                )
+                .await;
+                return Err(e);
+            }
+        }
+        // A failure that may recover came after the old backend was shut
+        // down, so the session has lost it.
+        match self.handle_leader_change(backend, backend_buf, false).await {
+            Err(e) if reconnect_may_recover(&e) => {
+                self.reroute_lost_backend(backend, backend_buf).await
+            }
+            other => other,
+        }
+    }
+
     /// Where this connection's queries go.
     fn get_leader(&self) -> Result<SocketAddr> {
         let fence = *self.fence_rx.borrow();
@@ -797,6 +865,7 @@ impl ConnectionHandler {
         loop {
             self.wait_for_upgrade_hold_if_needed().await?;
             self.wait_for_fence_if_needed().await?;
+            self.follow_route(backend, &mut backend_buf).await?;
             let idle = idle_remaining(
                 last_activity.elapsed(),
                 idle_timeout,
@@ -816,17 +885,11 @@ impl ConnectionHandler {
                     return Err(self.sever_idle().await);
                 }
 
+                // Route changes are acted on at the top of the loop
+                // (`follow_route`); these arms only wake it.
                 result = self.leader_rx.changed() => {
                     if result.is_err() {
                         return Err(Error::ChannelClosed);
-                    }
-                    // A failure that may recover came after the old backend
-                    // was shut down, so the session has lost it.
-                    if let Err(e) = self.handle_leader_change(backend, &mut backend_buf, false).await {
-                        if !reconnect_may_recover(&e) {
-                            return Err(e);
-                        }
-                        self.reroute_lost_backend(backend, &mut backend_buf).await?;
                     }
                 }
 
@@ -1339,19 +1402,18 @@ impl ConnectionHandler {
             let lease = self.lease.read();
             (lease.is_leader(), lease.valid_until())
         };
-        // Follower staleness: the unbiased `select!` may service a client
-        // write before the loop observes `leader_rx.changed()`; if the route
-        // moved, `backend` is stale and the leader lease gate does not run.
-        // See docs/STATE_MACHINE.md section 6.
+        // Staleness: the unbiased `select!` may service a client write before
+        // the loop brings the session to its route; if the route moved, or
+        // there is none yet, `backend` may be a deposed primary. See
+        // docs/STATE_MACHINE.md section 6.
         let fence = *self.fence_rx.borrow();
         let leader = *self.leader_rx.borrow();
-        let follower_backend_stale =
-            follower_backend_stale(is_leader, &fence, leader, self.state.read().backend_addr);
+        let backend_stale = backend_stale(&fence, leader, self.state.read().backend_addr);
         BatchFenceSnapshot {
             is_leader,
             lease_valid_until,
             now: Instant::now(),
-            follower_backend_stale,
+            backend_stale,
         }
     }
 
@@ -1427,10 +1489,13 @@ impl ConnectionHandler {
             // fencing. Every message type except Terminate ('X') is
             // potentially write-causing ('D' and 'C' are ambiguous between
             // frontend and backend meanings — better to over-fence than
-            // under-fence). Followers proxy to the leader and should not
-            // check their own (invalid) lease; they sever instead of
-            // forwarding a write to a deposed primary.
+            // under-fence). Every node severs a session whose backend is not
+            // its route rather than forward a write to a deposed primary; the
+            // leader also checks its own lease, which followers do not hold.
             if header.msg_type != MessageType::Terminate {
+                if fence.backend_stale {
+                    self.sever_stale_backend().await?;
+                }
                 if fence.is_leader {
                     if fence.now >= fence.lease_valid_until {
                         tracing::error!(
@@ -1446,8 +1511,6 @@ impl ConnectionHandler {
                         return Err(Error::Fenced);
                     }
                     lease_deadline = Some(fence.lease_valid_until);
-                } else if fence.follower_backend_stale {
-                    self.sever_stale_backend().await?;
                 }
             }
 
@@ -2938,11 +3001,9 @@ mod tests {
     #[test]
     fn a_hold_lifted_by_transfer_severs_instead_of_resuming_on_the_donor() {
         let transferred = FenceState {
-            fenced: false,
-            has_quorum: true,
-            upgrade_frozen: false,
             client_write_authority: false,
             authority_pg_addr: Some("10.0.0.9:5432".parse().unwrap()),
+            ..FenceState::unfenced()
         };
         assert!(!ConnectionHandler::hold_exit_resumes(&transferred));
 
@@ -2978,6 +3039,27 @@ mod tests {
         assert_eq!(route(&FenceState::unfenced(), None), None);
     }
 
+    /// M16: a leader elected but still waiting out the old lease runs a
+    /// standby, and routing to it failed every write with 25006. No route
+    /// until its primary is open; a relay never waits on the local leader.
+    #[test]
+    fn no_route_to_a_leader_whose_primary_is_not_open() {
+        let leader: SocketAddr = "10.0.0.1:5434".parse().unwrap();
+        let opening = FenceState {
+            primary_open: false,
+            ..FenceState::unfenced()
+        };
+        assert_eq!(route(&opening, Some(leader)), None);
+        let relay = FenceState {
+            primary_open: false,
+            ..relaying_to("10.0.0.9:5434")
+        };
+        assert_eq!(
+            route(&relay, Some(leader)),
+            Some("10.0.0.9:5434".parse().unwrap())
+        );
+    }
+
     /// A follower relaying to the recipient has the recipient as its
     /// backend, never its own leader. Comparing against the leader marked
     /// every relayed batch stale and severed every session on a follower
@@ -2987,31 +3069,18 @@ mod tests {
         let leader: SocketAddr = "10.0.0.1:5434".parse().unwrap();
         let green: SocketAddr = "10.0.0.9:5434".parse().unwrap();
         let relay = relaying_to("10.0.0.9:5434");
-        assert!(!follower_backend_stale(
-            false,
-            &relay,
-            Some(leader),
-            Some(green)
-        ));
-        assert!(follower_backend_stale(
-            false,
-            &relay,
-            Some(leader),
-            Some(leader)
-        ));
+        assert!(!backend_stale(&relay, Some(leader), Some(green)));
+        assert!(backend_stale(&relay, Some(leader), Some(leader)));
         let local = FenceState::unfenced();
-        assert!(follower_backend_stale(
-            false,
-            &local,
-            Some(leader),
-            Some(green)
-        ));
-        assert!(!follower_backend_stale(
-            true,
-            &local,
-            Some(leader),
-            Some(green)
-        ));
+        assert!(backend_stale(&local, Some(leader), Some(green)));
+        assert!(!backend_stale(&local, Some(leader), Some(leader)));
+        // On the leader node too: elected with its primary not yet open, a
+        // session still on the deposed primary must not be forwarded there.
+        let opening = FenceState {
+            primary_open: false,
+            ..FenceState::unfenced()
+        };
+        assert!(backend_stale(&opening, Some(leader), Some(green)));
     }
 
     /// A backend that went away must be reconnected even when the route did
@@ -3065,10 +3134,7 @@ mod tests {
     async fn test_fence_wait_resumes_when_lifted() {
         let (fence_tx, mut fence_rx) = watch::channel(FenceState {
             fenced: true,
-            has_quorum: true,
-            upgrade_frozen: false,
-            client_write_authority: true,
-            authority_pg_addr: None,
+            ..FenceState::unfenced()
         });
 
         // Lift the fence after 50ms
@@ -3096,9 +3162,7 @@ mod tests {
         let (_fence_tx, mut fence_rx) = watch::channel(FenceState {
             fenced: true,
             has_quorum: false,
-            upgrade_frozen: false,
-            client_write_authority: true,
-            authority_pg_addr: None,
+            ..FenceState::unfenced()
         });
 
         // Short timeout - fence never lifts
@@ -3513,14 +3577,23 @@ mod tests {
     async fn test_handler_with_peer(
         state: SharedConnectionState,
     ) -> (ConnectionHandler, TcpStream) {
+        let (_leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);
+        let (_fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
+        test_handler_with_watches(state, leader_rx, fence_rx).await
+    }
+
+    /// As [`test_handler_with_peer`], on watches the test drives.
+    async fn test_handler_with_watches(
+        state: SharedConnectionState,
+        leader_rx: watch::Receiver<Option<SocketAddr>>,
+        fence_rx: watch::Receiver<FenceState>,
+    ) -> (ConnectionHandler, TcpStream) {
         use crate::config::SslModeConfig;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
         let client = client.unwrap();
         let (peer, _) = accepted.unwrap();
-        let (_leader_tx, leader_rx) = watch::channel(None::<SocketAddr>);
-        let (_fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
         let config = GatewayConfig {
             listen_addr: UNKNOWN_SOCKET_ADDR,
             ssl_mode: SslModeConfig::Disable,
@@ -3985,6 +4058,30 @@ mod tests {
         let mut sent = Vec::new();
         cancel.read_to_end(&mut sent).await.unwrap();
         assert_eq!(sent, cancel_request(9, &[0, 0, 0, 2]));
+    }
+
+    /// A session with no route waits for one rather than ending: the new
+    /// leader opens its primary within the hold.
+    #[tokio::test]
+    async fn a_session_with_no_route_waits_for_one() {
+        use crate::gateway::connection::ConnectionState;
+
+        let leader: SocketAddr = "10.0.0.1:5434".parse().unwrap();
+        let (_leader_tx, leader_rx) = watch::channel(Some(leader));
+        let (fence_tx, fence_rx) = watch::channel(FenceState {
+            primary_open: false,
+            ..FenceState::unfenced()
+        });
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, _client) = test_handler_with_watches(state, leader_rx, fence_rx).await;
+        let opens = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fence_tx.send(FenceState::unfenced()).unwrap();
+            fence_tx
+        });
+        let routed = timeout(Duration::from_secs(2), handler.await_route()).await;
+        assert_eq!(routed.unwrap().unwrap(), leader);
+        drop(opens.await);
     }
 
     /// With no route and its backend intact, a session stays where it is:

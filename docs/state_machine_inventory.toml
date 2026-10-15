@@ -28,6 +28,7 @@ enums.ClusterCommand = [
   "IntendVoter",
   "SetLineage",
   "NameCluster",
+  "PrimaryOpened",
   "SetFeatureLevel",
 ]
 enums.CutoverPhase = ["Idle", "Armed", "Sealing", "Sealed", "Draining", "Transferred", "Aborted"]
@@ -54,6 +55,7 @@ enums.SessionChange = [
   "UnlistenAll",
 ]
 enums.StatementClass = ["Modeled", "Unmodeled"]
+enums.WriteGate = ["Open", "Opening", "Unknown"]
 enums.Awaited = ["Parse", "Close", "Ready"]
 enums.Ack = ["ParseComplete", "CloseComplete", "Error", "Ready"]
 enums.ReplayChange = [
@@ -101,6 +103,7 @@ types = [
   "Awaited",
   "Ack",
   "ReplayChange",
+  "WriteGate",
 ]
 
 [foreign]

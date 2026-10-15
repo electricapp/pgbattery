@@ -213,6 +213,11 @@ struct View {
     pg_upgrade: PgUpgradeState,
     lineage_unrecorded: bool,
     naming: Naming,
+    /// This node's current Raft term.
+    term: u64,
+    /// The log records the leader of `term` with its primary open, so
+    /// gateways route to it (`ClusterState::routes_to_leader`).
+    primary_opened: bool,
     committed_sync: Option<bool>,
     client_fence: WantedClientFence,
 }
@@ -224,7 +229,7 @@ impl View {
         cluster_state: &RwLock<ClusterState>,
         client_fence: &ClientFenceConfig,
     ) -> Self {
-        let (leader, has_quorum, raft_voters) = {
+        let (leader, has_quorum, raft_voters, term) = {
             let metrics = raft.metrics();
             let m = metrics.borrow();
             let voters: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();
@@ -234,7 +239,7 @@ impl View {
                 voters.len(),
                 m.millis_since_quorum_ack,
             );
-            (m.current_leader, has_quorum, voters)
+            (m.current_leader, has_quorum, voters, m.current_term)
         };
         let state = cluster_state.read();
         let role = match leader {
@@ -249,6 +254,8 @@ impl View {
         let follow_terms = state.follow_terms();
         Self {
             naming: Naming::read(&state, client_fence),
+            term,
+            primary_opened: state.routes_to_leader(term),
             role,
             has_quorum,
             raft_voters,
@@ -267,6 +274,17 @@ impl View {
     }
 }
 
+/// Where a leading primary's write gate stands after a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteGate {
+    /// Out of recovery with writes open, now and after any reload.
+    Open,
+    /// Waiting on the lease or on sync durability; pass again soon.
+    Opening,
+    /// Not known this pass: a probe failed, or quorum is gone.
+    Unknown,
+}
+
 /// Network work a pass asks for, run after the lock is released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Effect {
@@ -276,6 +294,8 @@ enum Effect {
     CommitLineage(u64),
     /// Commit this node's configured name and boot fence as the cluster's.
     NameCluster,
+    /// Commit that this leader's primary is open in `term`.
+    PrimaryOpened(u64),
     /// Report this node's WAL position to its leader's book.
     ReportLsn { lsn: u64, to: SocketAddr },
     /// Hand leadership to `target` through this node's own transfer endpoint.
@@ -472,7 +492,13 @@ impl NodeReconciler {
 
         let required = required_sync_standbys(peer_voter_names(&view.voters, self.node_id).len());
         if view.is_leader() && primary == Some(true) {
-            out.opening = self.lead(pg, view, now, &mut out).await;
+            let gate = self.lead(pg, view, now, &mut out).await;
+            out.opening = gate == WriteGate::Opening;
+            // Gateways route to this leader only once the log says its
+            // primary is open in this term.
+            if gate == WriteGate::Open && !view.primary_opened {
+                out.propose(view, Effect::PrimaryOpened(view.term));
+            }
         } else {
             self.replicas.reset();
             publish_sync_durability(None, required);
@@ -547,7 +573,7 @@ impl NodeReconciler {
         view: &View,
         now: Instant,
         out: &mut Outcome,
-    ) -> bool {
+    ) -> WriteGate {
         let targets: Vec<NodeId> = view
             .members
             .iter()
@@ -563,7 +589,7 @@ impl NodeReconciler {
             Ok(Err(e)) => {
                 warn!(error = %e, "Could not read pg_stat_replication; sync list unchanged");
                 publish_sync_durability(None, required);
-                return false;
+                return WriteGate::Unknown;
             }
             Err(_) => {
                 warn!(
@@ -571,7 +597,7 @@ impl NodeReconciler {
                     "pg_stat_replication exceeded its budget"
                 );
                 publish_sync_durability(None, required);
-                return false;
+                return WriteGate::Unknown;
             }
         };
         let healthy = self.replicas.observe(
@@ -622,38 +648,45 @@ impl NodeReconciler {
     /// Open writes on a fenced primary once the lease is valid and the sync
     /// durability it promises is delivered. Under the supervisor lock by
     /// construction, so writes never open in the middle of an operation.
-    /// Returns whether the primary is still waiting to open.
-    async fn open_writes<P: PgControl>(&self, pg: &P, view: &View, required: usize) -> bool {
+    async fn open_writes<P: PgControl>(&self, pg: &P, view: &View, required: usize) -> WriteGate {
+        let waiting = if view.has_quorum {
+            WriteGate::Opening
+        } else {
+            WriteGate::Unknown
+        };
         let Ok(Ok(state)) =
             tokio::time::timeout(TICK_SQL_BUDGET, pg.probe_role_and_readonly()).await
         else {
             publish_sync_durability(None, required);
-            return false;
+            return WriteGate::Unknown;
         };
         publish_sync_durability(Some(state.sync_standbys), required);
+        if state.in_recovery {
+            return WriteGate::Unknown;
+        }
         // Open only when a reload would not close it again.
-        if state.in_recovery || state.read_only.settled(false) {
-            return false;
+        if state.read_only.settled(false) {
+            return WriteGate::Open;
         }
         let committed_async = view.committed_sync == Some(false);
         if !writes_may_open(state.sync_list_empty, state.sync_standbys, required, committed_async)
             // Re-read immediately before opening.
             || !self.lease.read().is_valid()
         {
-            return view.has_quorum;
+            return waiting;
         }
         match tokio::time::timeout(TICK_SQL_BUDGET, pg.set_readonly(false)).await {
-            Ok(Ok(())) => false,
+            Ok(Ok(())) => WriteGate::Open,
             Ok(Err(e)) => {
                 error!(error = %e, "Failed to enable writes");
-                view.has_quorum
+                waiting
             }
             Err(_) => {
                 error!(
                     budget_ms = budget_ms(),
                     "Re-enable writes exceeded tick budget"
                 );
-                view.has_quorum
+                waiting
             }
         }
     }
@@ -807,69 +840,72 @@ impl Driver {
         }
     }
 
-    async fn execute(&mut self, effect: Effect) {
-        let cluster_state = Arc::clone(&self.reconciler.cluster_state);
-        let commit = |command| {
-            tokio::time::timeout(
-                EFFECT_DEADLINE,
-                super::propose::propose(&self.raft, &cluster_state, command),
-            )
-        };
-        match effect {
-            Effect::CommitSyncMode(active) => {
-                match commit(ClusterCommand::SetSyncMode { active }).await {
-                    Ok(Ok(_)) => info!(
-                        sync_active = active,
-                        "Committed sync-mode transition to cluster state"
-                    ),
-                    Ok(Err(e)) => {
-                        warn!(error = %e, sync_active = active, "Failed to commit sync-mode transition to Raft");
-                        metrics::counter!("pgbattery_sync_mode_commit_failures").increment(1);
-                    }
-                    Err(_) => {
-                        warn!(sync_active = active, "Sync-mode commit missed its deadline");
-                        metrics::counter!("pgbattery_sync_mode_commit_failures").increment(1);
-                    }
-                }
-            }
+    /// The command a commit effect proposes.
+    fn command_for(&self, effect: &Effect) -> Option<ClusterCommand> {
+        match *effect {
+            Effect::CommitSyncMode(active) => Some(ClusterCommand::SetSyncMode { active }),
             Effect::CommitLineage(system_identifier) => {
-                match commit(ClusterCommand::SetLineage { system_identifier }).await {
-                    Ok(Ok(resp)) if resp.outcome.applied() => {
-                        info!(lineage = system_identifier, "Committed the cluster lineage");
-                    }
-                    Ok(Ok(_)) => warn!(
-                        lineage = system_identifier,
-                        "The cluster already records a different lineage than this primary serves"
-                    ),
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "Could not commit the cluster lineage; retrying");
-                    }
-                    Err(_) => warn!("Committing the cluster lineage missed its deadline; retrying"),
-                }
+                Some(ClusterCommand::SetLineage { system_identifier })
             }
+            Effect::PrimaryOpened(term) => Some(ClusterCommand::PrimaryOpened { term }),
             Effect::NameCluster => {
                 let fence = &self.reconciler.client_fence;
-                let command = ClusterCommand::NameCluster {
+                Some(ClusterCommand::NameCluster {
                     cluster_id: fence.cluster_id.to_string(),
                     awaits_authority_from: fence
                         .awaits_write_authority_from
                         .as_deref()
                         .map(str::to_string),
-                };
-                match commit(command).await {
-                    Ok(Ok(resp)) if resp.outcome.applied() => {
-                        info!(cluster_id = %fence.cluster_id, "Committed the cluster's name");
-                    }
-                    Ok(Ok(_)) => warn!(
-                        cluster_id = %fence.cluster_id,
-                        "The cluster already committed a different name"
-                    ),
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "Could not commit the cluster's name; retrying");
-                    }
-                    Err(_) => warn!("Committing the cluster's name missed its deadline; retrying"),
-                }
+                })
             }
+            Effect::ReportLsn { .. } | Effect::Yield { .. } => None,
+        }
+    }
+
+    /// Commit one effect's command; a failure is retried by the next pass
+    /// that still finds the log without it.
+    async fn commit(&self, command: ClusterCommand, counts_failures: bool) {
+        let cluster_state = Arc::clone(&self.reconciler.cluster_state);
+        let proposed = format!("{command:?}");
+        let committed = tokio::time::timeout(
+            EFFECT_DEADLINE,
+            super::propose::propose(&self.raft, &cluster_state, command),
+        )
+        .await;
+        let failed = match committed {
+            Ok(Ok(resp)) if resp.outcome.applied() => {
+                info!(command = %proposed, "Committed to cluster state");
+                false
+            }
+            Ok(Ok(_)) => {
+                warn!(command = %proposed, "Committed, but the log already records otherwise");
+                false
+            }
+            Ok(Err(e)) => {
+                warn!(command = %proposed, error = %e, "Could not commit; retrying");
+                true
+            }
+            Err(_) => {
+                warn!(command = %proposed, "Commit missed its deadline; retrying");
+                true
+            }
+        };
+        if failed && counts_failures {
+            metrics::counter!("pgbattery_sync_mode_commit_failures").increment(1);
+        }
+    }
+
+    async fn execute(&mut self, effect: Effect) {
+        if let Some(command) = self.command_for(&effect) {
+            let counts_failures = matches!(effect, Effect::CommitSyncMode(_));
+            self.commit(command, counts_failures).await;
+            return;
+        }
+        match effect {
+            Effect::CommitSyncMode(_)
+            | Effect::CommitLineage(_)
+            | Effect::PrimaryOpened(_)
+            | Effect::NameCluster => {}
             Effect::ReportLsn { lsn, to } => {
                 if self.report_lsn_to_leader(to, lsn).await {
                     let now = self.reconciler.lease.read().now();
@@ -1057,6 +1093,8 @@ mod tests {
             pg_upgrade: PgUpgradeState::default(),
             lineage_unrecorded: false,
             naming: Naming::Settled,
+            term: 3,
+            primary_opened: true,
             committed_sync: Some(true),
             client_fence: WantedClientFence {
                 fenced: false,
@@ -1232,6 +1270,40 @@ mod tests {
             ..config
         };
         assert_eq!(Naming::read(&state, &misnamed), Naming::Misnamed);
+    }
+
+    /// M16: gateways route to a leader only once the log says its primary is
+    /// open in this term, so the leader records that when its writes open,
+    /// and not while it still waits on durability.
+    #[tokio::test]
+    async fn a_leader_records_its_primary_open_once_writes_are() {
+        let mut node = reconciler(Duration::from_secs(5));
+        let mut view = leading();
+        view.primary_opened = false;
+
+        let mut waiting = ModelPg {
+            sync_list_empty: false,
+            ..ModelPg::default().starting_readonly()
+        };
+        let out = node.pass(&mut waiting, &view).await;
+        assert!(out.opening);
+        assert!(
+            !out.effects.contains(&Effect::PrimaryOpened(3)),
+            "{:?}",
+            out.effects
+        );
+
+        let mut open = ModelPg::default();
+        let out = node.pass(&mut open, &view).await;
+        assert!(
+            out.effects.contains(&Effect::PrimaryOpened(3)),
+            "{:?}",
+            out.effects
+        );
+
+        view.primary_opened = true;
+        let out = node.pass(&mut open, &view).await;
+        assert!(!out.effects.contains(&Effect::PrimaryOpened(3)));
     }
 
     #[tokio::test]

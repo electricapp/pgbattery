@@ -92,6 +92,7 @@ fn sample_state_current() -> ClusterState {
         applied_index: Some(42),
         feature_level: 1,
         voter_intent: vec![2],
+        primary_term: Some(3),
         ..ClusterState::from(sample_state_v0())
     }
 }
@@ -151,6 +152,7 @@ fn sample_log_entries() -> Vec<LogEntry> {
             cluster_id: "green".to_string(),
             awaits_authority_from: Some("blue".to_string()),
         }),
+        LogEntryPayload::Normal(ClusterCommand::PrimaryOpened { term: 3 }),
     ];
     commands
         .into_iter()
