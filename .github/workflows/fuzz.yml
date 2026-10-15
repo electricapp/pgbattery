@@ -75,7 +75,7 @@ jobs:
       # nearest toolchain file to the cwd), so the `cargo fuzz` step below runs on
       # nightly while the rest of the project stays on 1.99.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: nightly
 
@@ -125,7 +125,7 @@ jobs:
 
       - name: Upload crashing inputs (if any)
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
           path: |
