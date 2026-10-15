@@ -1,14 +1,6 @@
 //! Gateway connection handler logic.
-//!
-//! Commit verification ("no-lost-commit" probe) works for both simple query
-//! protocol (`Q`) and extended query protocol (`Parse`/`Bind`/`Execute`).
-//! For extended protocol, the gateway tracks Parse→Bind→Execute chains to
-//! detect COMMIT, captures `pg_current_xact_id_if_assigned()` before the Execute
-//! is forwarded, and probes the new leader with `pg_xact_status()` on backend
-//! disconnect.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,9 +14,7 @@ use crate::config::{
     MAX_GATEWAY_BUFFER_SIZE, UNKNOWN_SOCKET_ADDR,
 };
 use crate::error::{Error, Result};
-use crate::gateway::connection::{
-    CommitProbeState, ConnectionRegistry, ProxyMode, SharedConnectionState,
-};
+use crate::gateway::connection::{ConnectionRegistry, ProxyMode, SharedConnectionState};
 use crate::gateway::protocol::{
     MAX_CANCEL_REQUEST_LEN, MessageType, PacketHeader, TransactionStatus,
     build_failover_error_response, cancel_request_key, extract_transaction_status,
@@ -45,35 +35,12 @@ use crate::governor::raft::FenceState;
 /// gone or hostile, so the connection is severed.
 const PROXY_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Prebuilt `SELECT pg_current_xact_id_if_assigned()` Query message ('Q' +
-/// length + SQL + NUL), pipelined ahead of every probed COMMIT.
-///
-/// `_if_assigned` reads the transaction's xid without assigning one: a
-/// read-only transaction answers NULL and stays read-only, instead of being
-/// turned into one that writes a commit record, fsyncs, and waits for a sync
-/// standby. With no xid there is nothing whose outcome a probe could recover.
-/// The 64-bit epoch-qualified value is what `get_txid_status` probes via
-/// `pg_xact_status(xid8)`. Pinned against
-/// [`ConnectionHandler::build_query_message`] by test.
-const TXID_PROBE_MESSAGE: [u8; 45] =
-    *b"Q\x00\x00\x00\x2cSELECT pg_current_xact_id_if_assigned()\x00";
-
 /// Maximum startup-packet length accepted.
 ///
 /// Matches libpq's `PQ_MAX_STARTUP_PACKET_LENGTH`. The startup packet carries
 /// every connection parameter; the server itself rejects anything larger, so
 /// this is the same ceiling rather than an arbitrary gateway limit.
 pub const MAX_STARTUP_PACKET_LEN: usize = 10_000;
-
-/// Shared HTTP client for the commit-recovery probes (leader discovery +
-/// txid-status). Building a `reqwest::Client` sets up a connection pool and TLS
-/// config; one reused client avoids constructing it per probe during a failover
-/// storm. Both endpoints are unauthenticated plaintext GETs, so no per-call
-/// configuration is needed.
-fn commit_probe_http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
-}
 
 /// Release the allocation of a proxy buffer that grew to handle a large
 /// transfer once it is fully drained. `read_buf` grows a `BytesMut` toward
@@ -125,10 +92,6 @@ pub struct ConnectionHandler {
     pub registry: Arc<ConnectionRegistry>,
     /// `Bytes` so the failover replay paths clone a refcount, not the packet.
     pub startup_params: Option<Bytes>,
-    /// Transaction status verification state - tracks in-flight COMMITs
-    pub commit_probe: CommitProbeState,
-    /// Tracks extended protocol Parse→Bind→Execute COMMIT chains for probe support.
-    extended_commit_tracker: ExtendedCommitTracker,
     /// True once this connection uses extended query protocol.
     pub extended_protocol_seen: bool,
     /// Leader lease - checked before forwarding writes
@@ -171,66 +134,12 @@ struct BackendDataBatch {
     mode_transition: Option<ProxyMode>,
 }
 
-/// Returns true for the common single-statement COMMIT/END forms, skipping
-/// the C parser (`pg_query::parse`) entirely.
-///
-/// Handles: `COMMIT [WORK|TRANSACTION][;]` and `END [WORK|TRANSACTION][;]`
-/// with arbitrary leading/trailing whitespace. Anything more unusual (e.g.
-/// `COMMIT AND CHAIN`, multi-statement batches) returns false and falls
-/// through to the full AST parse.
-fn is_trivial_commit(query: &str) -> bool {
-    // Strip trailing semicolons and whitespace, then match common forms.
-    let q = query.trim_ascii().trim_end_matches(';').trim_ascii_end();
-    q.eq_ignore_ascii_case("commit")
-        || q.eq_ignore_ascii_case("commit work")
-        || q.eq_ignore_ascii_case("commit transaction")
-        || q.eq_ignore_ascii_case("end")
-        || q.eq_ignore_ascii_case("end work")
-        || q.eq_ignore_ascii_case("end transaction")
-}
-
-/// Whether it is safe to splice a `SELECT pg_current_xact_id_if_assigned()` probe into the
-/// backend stream ahead of this simple-query COMMIT.
-///
-/// The probe is a simple query pipelined immediately ahead of the COMMIT; its
-/// response frames arrive as a prefix of the backend stream and are diverted
-/// (never forwarded) by the backend scan until the probe's `ReadyForQuery`.
-/// That prefix assumption is only correct when the COMMIT is a standalone
-/// trivial statement (`lone_commit`), no earlier client message from the same
-/// batch is still buffered (`pending_empty`), *and* no response from a prior
-/// batch is still in flight (`no_response_pending`). Otherwise the diversion
-/// would consume the prior statement's (or the extended protocol's) responses
-/// — swallowing messages the client is owed, and worse, parsing that
-/// statement's rows as the txid — desyncing the session. The
-/// `no_response_pending` guard covers the cross-batch case that
-/// `pending_empty` cannot see: a client that pipelines a bare COMMIT in a
-/// fresh batch while the previous batch's `ReadyForQuery` has not yet
-/// arrived. Such a connection is still `InTransaction` and therefore
-/// non-migratable, so suppressing the probe here only means a mid-COMMIT
-/// failover severs (08006) cleanly instead of acking a bogus synthetic
-/// COMMIT. The captured txid is only ever consumed for a standalone simple
-/// COMMIT anyway (see `probe_txid` in `handle_backend_disconnect`), so gating
-/// here loses nothing.
-const fn simple_commit_probe_is_safe(
-    lone_commit: bool,
-    pending_empty: bool,
-    no_response_pending: bool,
-) -> bool {
-    lone_commit && pending_empty && no_response_pending
-}
-
 /// Keyword hits from the single-pass `query_keyword_flags` scan — one walk
 /// over the query bytes answers every full-text prefilter the per-message
 /// path needs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "one independent flag per keyword group the single scan answers"
-)]
 pub struct QueryKeywordFlags {
-    /// `commit` or `end` token present (word-boundary, case-insensitive).
-    pub commit: bool,
-    /// `listen` or `unlisten` token present.
+    /// `listen` or `unlisten` token present (word-boundary, case-insensitive).
     pub subscription: bool,
     /// A session-state function call is present: `set_config` or the
     /// session-scoped advisory-lock family (`pg_advisory_lock`,
@@ -439,122 +348,17 @@ fn leading_statement_keyword_matches(query: &str, keywords: &[&str]) -> bool {
         .any(|k| ConnectionHandler::contains_token_ci(query, k))
 }
 
-/// Tracks extended query protocol `Parse`→`Bind`→`Execute` chains to detect COMMIT.
-///
-/// Most ORMs and drivers use extended protocol exclusively. Without this tracker,
-/// we could not capture the xid before a COMMIT Execute and the probe
-/// would always fail. The tracker handles both unnamed ("") and named statements.
-///
-/// `Vec<String>` with linear search is used instead of `HashSet` because in
-/// practice a connection has 0–2 named statements at any time — linear search
-/// over a cache-hot vec beats hashing at that cardinality.
-#[derive(Debug, Default)]
-struct ExtendedCommitTracker {
-    /// Statement names (including "") whose query text is COMMIT or END.
-    commit_statements: Vec<String>,
-    /// Portal names (including "") bound to a COMMIT statement.
-    commit_portals: Vec<String>,
+/// Query text of a Parse message: 'P', length, then the NUL-terminated
+/// statement name and query.
+fn parse_message_query(msg: &[u8]) -> Option<&str> {
+    let (_stmt_name, rest) = read_cstring(msg.get(5..)?)?;
+    read_cstring(rest).map(|(query, _)| query)
 }
 
-impl ExtendedCommitTracker {
-    /// Extract the statement name and query text from a Parse message.
-    fn parse_names(msg: &BytesMut) -> Option<(&str, &str)> {
-        let body = msg.get(5..)?;
-        let (stmt_name, rest) = Self::read_cstring(body)?;
-        let (query, _) = Self::read_cstring(rest)?;
-        Some((stmt_name, query))
-    }
-
-    /// Record whether `stmt_name` is bound to a COMMIT statement. The
-    /// unnamed statement ("") is silently replaced on each Parse, so a
-    /// non-COMMIT outcome removes any previous entry. Borrowed name:
-    /// the common non-COMMIT path only ever compares, so the allocation
-    /// happens solely on the rare insert.
-    fn record_parse(&mut self, stmt_name: &str, is_commit: bool) {
-        if is_commit {
-            if !Self::vec_contains(&self.commit_statements, stmt_name) {
-                self.commit_statements.push(stmt_name.to_owned());
-            }
-        } else {
-            Self::vec_remove(&mut self.commit_statements, stmt_name);
-        }
-    }
-
-    /// Full AST check for COMMIT in exotic forms (AND CHAIN,
-    /// multi-statement…). Runs the C parser — callers must offload this to
-    /// a blocking thread.
-    fn ast_is_commit(query: &str) -> bool {
-        let Ok(parsed) = pg_query::parse(query) else {
-            return false;
-        };
-        parsed.protobuf.stmts.iter().any(|raw_stmt| {
-            raw_stmt
-                .stmt
-                .as_ref()
-                .and_then(|s| s.node.as_ref())
-                .is_some_and(|node| {
-                    matches!(
-                        node,
-                        pg_query::protobuf::node::Node::TransactionStmt(tx)
-                            if matches!(
-                                pg_query::protobuf::TransactionStmtKind::try_from(tx.kind),
-                                Ok(pg_query::protobuf::TransactionStmtKind::TransStmtCommit)
-                            )
-                    )
-                })
-        })
-    }
-
-    /// Process a Bind message. Updates portal→statement tracking.
-    fn on_bind(&mut self, msg: &BytesMut) {
-        let Some(body) = msg.get(5..) else { return };
-        let Some((portal_name, rest)) = Self::read_cstring(body) else {
-            return;
-        };
-        let Some((stmt_name, _)) = Self::read_cstring(rest) else {
-            return;
-        };
-        if Self::vec_contains(&self.commit_statements, stmt_name) {
-            Self::vec_insert(&mut self.commit_portals, portal_name.to_owned());
-        } else {
-            Self::vec_remove(&mut self.commit_portals, portal_name);
-        }
-    }
-
-    /// Returns true if this Execute message targets a COMMIT portal.
-    fn is_commit_execute(&self, msg: &BytesMut) -> bool {
-        let Some(body) = msg.get(5..) else {
-            return false;
-        };
-        let Some((portal_name, _)) = Self::read_cstring(body) else {
-            return false;
-        };
-        Self::vec_contains(&self.commit_portals, portal_name)
-    }
-
-    fn read_cstring(data: &[u8]) -> Option<(&str, &[u8])> {
-        let null_pos = data.iter().position(|&b| b == 0)?;
-        let s = std::str::from_utf8(data.get(..null_pos)?).ok()?;
-        Some((s, data.get(null_pos + 1..)?))
-    }
-
-    /// Insert `s` if not already present. Deduplicates without hashing.
-    fn vec_insert(v: &mut Vec<String>, s: String) {
-        if !v.iter().any(|x| x == &s) {
-            v.push(s);
-        }
-    }
-
-    /// Remove the first occurrence of `s`. Uses `swap_remove` for O(1) removal.
-    fn vec_remove(v: &mut Vec<String>, s: &str) {
-        if let Some(pos) = v.iter().position(|x| x == s) {
-            v.swap_remove(pos);
-        }
-    }
-
-    fn vec_contains(v: &[String], s: &str) -> bool {
-        v.iter().any(|x| x == s)
-    }
+fn read_cstring(data: &[u8]) -> Option<(&str, &[u8])> {
+    let null_pos = data.iter().position(|&b| b == 0)?;
+    let s = std::str::from_utf8(data.get(..null_pos)?).ok()?;
+    Some((s, data.get(null_pos + 1..)?))
 }
 
 /// A statement that mutates session state the gateway tracks for failover:
@@ -605,7 +409,6 @@ enum StatementClass {
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 struct QueryAnalysis {
-    contains_commit: bool,
     /// Session-state mutations in statement order. Order matters:
     /// `SET x=1; DISCARD ALL` and `DISCARD ALL; SET x=1` leave different
     /// session state behind.
@@ -617,7 +420,7 @@ impl ConnectionHandler {
         clippy::too_many_arguments,
         reason = "wires together the per-connection collaborators at construction"
     )]
-    pub fn new(
+    pub const fn new(
         id: u64,
         client: MaybeTlsStream,
         state: SharedConnectionState,
@@ -637,8 +440,6 @@ impl ConnectionHandler {
             config,
             registry,
             startup_params: None,
-            commit_probe: CommitProbeState::default(),
-            extended_commit_tracker: ExtendedCommitTracker::default(),
             extended_protocol_seen: false,
             lease,
             preread,
@@ -1286,23 +1087,12 @@ impl ConnectionHandler {
             )
         };
 
-        // Only the standalone simple-query COMMIT can be answered with the
-        // synthetic single-frame response; for anything else the client is
-        // owed a different sequence, so it falls through to severance
-        // (08006) rather than desync the session.
-        let probe_txid = (self.commit_probe.pending_commit && self.commit_probe.lone_commit)
-            .then_some(self.commit_probe.txid)
-            .flatten();
-
-        if probe_txid.is_some() || migratable {
+        if migratable {
             // A backend FIN is only a HINT that failover is underway —
             // authoritative signals (`leader_rx`, `fence_rx`) take another
             // election-timeout to settle. Wait for cluster state to actually
-            // advance first: the commit probe must interrogate the NEW
-            // leader (probing before the signal lands finds the deposed one
-            // and reports a spurious "outcome unknown"), and migration must
-            // not short-circuit on a stale `leader_rx` and spin against
-            // repeated `read_buf == 0`.
+            // advance first: migration must not short-circuit on a stale
+            // `leader_rx` and spin against repeated `read_buf == 0`.
             tracing::info!(
                 conn_id = self.id,
                 stale_backend = ?stale_backend,
@@ -1325,42 +1115,6 @@ impl ConnectionHandler {
                 .await;
                 return Err(Error::BackendDisconnected);
             }
-        }
-
-        if let Some(txid) = probe_txid {
-            tracing::warn!(
-                conn_id = self.id,
-                txid = txid,
-                "Backend disconnected during pending COMMIT, probing new leader"
-            );
-            metrics::counter!("pgbattery_commit_probes_initiated").increment(1);
-            match self.probe_txid_status(txid).await {
-                Ok(true) => {
-                    self.send_synthetic_commit_response().await?;
-                    self.commit_probe = CommitProbeState::default();
-                    self.reconnect_after_commit_probe(backend, backend_buf)
-                        .await?;
-                    return Ok(());
-                }
-                Ok(false) => {
-                    tracing::info!(
-                        conn_id = self.id,
-                        txid = txid,
-                        "Transaction NOT committed, returning error to client"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        conn_id = self.id,
-                        txid = txid,
-                        error = %e,
-                        "Failed to probe transaction status"
-                    );
-                }
-            }
-        }
-
-        if migratable {
             metrics::counter!("pgbattery_migrations_on_disconnect").increment(1);
             return self.handle_leader_change(backend, backend_buf).await;
         }
@@ -1368,7 +1122,9 @@ impl ConnectionHandler {
         // Non-migratable: tell the client why instead of silently dropping
         // the TCP socket, so the driver can apply its transport-retry logic
         // on SQLSTATE 08006 rather than surfacing the failure as a
-        // non-retryable "server crashed" error.
+        // non-retryable "server crashed" error. A request in flight, COMMIT
+        // included, has an outcome only the client can resolve: an xid does
+        // not identify one transaction across primary periods.
         let reason = if response_pending {
             "pgbattery: backend disconnected with a client request in flight; outcome unknown"
         } else if tx_status == TransactionStatus::InTransaction {
@@ -1380,31 +1136,6 @@ impl ConnectionHandler {
         };
         self.send_failover_error_response(reason).await;
         Err(Error::BackendDisconnected)
-    }
-
-    async fn reconnect_after_commit_probe(
-        &mut self,
-        backend: &mut TcpStream,
-        backend_buf: &mut BytesMut,
-    ) -> Result<()> {
-        let new_leader = self.get_leader()?;
-        // Clear the old backend key so a cancel for the old PID can't be
-        // misrouted to the new backend (see `handle_leader_change`).
-        self.unregister_backend_key();
-        *backend = self.connect_to_backend(new_leader).await?;
-        // Any partial frame left over from the dead backend would misalign
-        // parsing of the new backend's stream.
-        backend_buf.clear();
-        if let Some(startup) = self.startup_params.clone() {
-            write_all_within_deadline(backend, &startup, self.id).await?;
-            self.wait_for_ready(backend, backend_buf).await?;
-        }
-        // Order mirrors `handle_leader_change`: LISTEN, then prepared
-        // statements. Connections with session GUCs are non-migratable and
-        // never reach this path.
-        self.restore_listen_subscriptions(backend, backend_buf)
-            .await?;
-        self.restore_prepared_statements(backend, backend_buf).await
     }
 
     /// Drop the current `BackendKeyData` entry from the cancel routing table.
@@ -1632,8 +1363,7 @@ impl ConnectionHandler {
                 }
             }
 
-            self.handle_query_message(header.msg_type, &msg, backend, &pending)
-                .await?;
+            self.handle_query_message(header.msg_type, &msg).await?;
 
             // Check for termination
             if header.msg_type == MessageType::Terminate {
@@ -1730,19 +1460,9 @@ impl ConnectionHandler {
         Err(Error::Fenced)
     }
 
-    /// Inspect a client message for state the gateway must track, injecting
-    /// the txid probe when a COMMIT is detected.
-    ///
-    /// `pending` holds messages approved for forwarding but not yet written;
-    /// it is read (never mutated) here — the txid probe is only injected when
-    /// `pending` is empty, so it can never reorder buffered client messages.
-    async fn handle_query_message(
-        &mut self,
-        msg_type: MessageType,
-        msg: &BytesMut,
-        backend: &mut TcpStream,
-        pending: &BytesMut,
-    ) -> Result<()> {
+    /// Inspect a client message for session state the gateway must track.
+    /// Every message is forwarded verbatim; nothing is injected.
+    async fn handle_query_message(&self, msg_type: MessageType, msg: &BytesMut) -> Result<()> {
         match msg_type {
             MessageType::Query => {
                 if msg.len() <= 5 {
@@ -1750,15 +1470,6 @@ impl ConnectionHandler {
                 }
                 let query_bytes = msg.get(5..msg.len().saturating_sub(1)).unwrap_or_default();
                 let query_text = String::from_utf8_lossy(query_bytes);
-                // `response_pending` reflects prior batches only — the current
-                // message is not folded into state until `commit_client_batch`
-                // runs after this call — so it is exactly the "is a prior
-                // statement's response still outstanding" signal the probe
-                // gate needs.
-                let (tx_status, response_pending) = {
-                    let state = self.state.read();
-                    (state.tx_status, state.response_pending())
-                };
                 // One pass over the query bytes answers every full-text
                 // prefilter; the leading-keyword session check is O(first
                 // token) and stays separate.
@@ -1779,26 +1490,6 @@ impl ConnectionHandler {
                     );
                 }
 
-                // Trivial-COMMIT fast path: a standalone simple-query
-                // COMMIT/END is the only probe-eligible shape (the synthetic
-                // commit response is wire-correct for nothing else — see
-                // `CommitProbeState::lone_commit`), and it cannot carry
-                // subscription or session-state changes, so the probe decision
-                // needs no parse. Non-trivial commit shapes (multi-statement
-                // batches, COMMIT AND CHAIN) never probe and need no analysis
-                // of their own: their session-state commands, if any, are
-                // caught by the prefilters below (the multi-statement `;`
-                // fallback included).
-                if tx_status == TransactionStatus::InTransaction
-                    && flags.commit
-                    && is_trivial_commit(&query_text)
-                {
-                    if simple_commit_probe_is_safe(true, pending.is_empty(), !response_pending) {
-                        self.capture_txid_for_commit(backend, true).await;
-                    }
-                    return Ok(());
-                }
-
                 if !needs_subscription_analysis && !needs_session_state_analysis {
                     return Ok(());
                 }
@@ -1817,29 +1508,8 @@ impl ConnectionHandler {
                 self.observe_parse_message(msg).await?;
                 self.capture_parse_for_replay(msg);
             }
-            MessageType::Bind => {
-                self.extended_commit_tracker.on_bind(msg);
-            }
-            // NOTE on the misleading variant name: the `MessageType` enum is
-            // named from the server-to-client perspective, but the wire byte
-            // `E` means **Execute** in the client-to-server direction. This
-            // arm therefore fires on Execute, not on ErrorResponse (clients
-            // never send ErrorResponse upstream).
-            MessageType::ErrorResponse
-                if self.extended_commit_tracker.is_commit_execute(msg)
-                    && self.state.read().tx_status == TransactionStatus::InTransaction =>
-            {
-                // Extended-protocol COMMIT: deliberately do NOT inject a txid
-                // probe. The probe is a simple query; splicing it into a
-                // Parse/Bind/Execute/Sync sequence swallows the client's
-                // ParseComplete/BindComplete and clobbers the unnamed portal,
-                // desyncing the stream. The single-frame synthetic response
-                // likewise cannot match the sequence the client expects. An
-                // in-transaction connection is already non-migratable, so a
-                // mid-COMMIT failover severs (08006) rather than migrating —
-                // the correct outcome. See docs/STATE_MACHINE.md section 6.
-            }
-            // Same pattern: wire byte `C` is Close in the client-to-server
+            // The `MessageType` enum is named from the server-to-client
+            // perspective: wire byte `C` is Close in the client-to-server
             // direction, whereas the variant is named after the server-side
             // CommandComplete. Clients send Close to deallocate a prepared
             // statement or portal.
@@ -1851,13 +1521,10 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    /// Observe a Parse message for COMMIT detection *and* session-state
-    /// migratability.
+    /// Observe a Parse message for session-state migratability.
     ///
-    /// Three tiers, mirroring the simple-query path: a word-boundary token
-    /// prefilter (so `end_date`/`vendor` columns don't pay for the parser),
-    /// a zero-alloc match for the common ORM `COMMIT` forms, and a full AST
-    /// parse on a blocking thread for exotic forms — `pg_query::parse` is
+    /// Mirrors the simple-query path: cheap prefilters, then a full AST parse
+    /// on a blocking thread only when one fires — `pg_query::parse` is
     /// synchronous C code and must not stall the Tokio worker.
     ///
     /// Session state must be detected here, not only on the simple-query
@@ -1880,27 +1547,10 @@ impl ConnectionHandler {
     /// temp-schema token to arm the fallback — is treated as migratable
     /// without having been examined. Migration is only as safe as that list is
     /// complete. See `docs/STATE_MACHINE.md` section 6.
-    async fn observe_parse_message(&mut self, msg: &BytesMut) -> Result<()> {
-        let Some((stmt_name, query)) = ExtendedCommitTracker::parse_names(msg) else {
+    async fn observe_parse_message(&self, msg: &BytesMut) -> Result<()> {
+        let Some(query) = parse_message_query(msg) else {
             return Ok(());
         };
-        // A Parse message carries exactly one statement (PostgreSQL rejects
-        // multi-statement Parse bodies), and every COMMIT variant is
-        // statement-leading — so an O(first-token) leading-keyword check is
-        // the commit prefilter here. A mere `end` identifier in the body
-        // (`WHERE end > $1`) never reaches the C parser.
-        let is_commit = if !leading_statement_keyword_matches(query, &["commit", "end"]) {
-            false
-        } else if is_trivial_commit(query) {
-            true
-        } else {
-            let query_owned = query.to_owned();
-            tokio::task::spawn_blocking(move || ExtendedCommitTracker::ast_is_commit(&query_owned))
-                .await
-                .map_err(|e| Error::Protocol(format!("parse analysis task failed: {e}")))?
-        };
-        self.extended_commit_tracker
-            .record_parse(stmt_name, is_commit);
 
         // One pass answers the full-text prefilters. Function-call state
         // (set_config / advisory locks) is not a leading keyword, so the
@@ -1914,10 +1564,12 @@ impl ConnectionHandler {
             || flags.temp_object
         {
             let query_owned = query.to_owned();
-            let analysis = tokio::task::spawn_blocking(move || Self::analyze_query(&query_owned))
-                .await
-                .map_err(|e| Error::Protocol(format!("parse session analysis task failed: {e}")))?;
-            if !analysis.session_changes.is_empty() {
+            let finds_state = tokio::task::spawn_blocking(move || {
+                Self::analyzer_finds_session_state(&query_owned)
+            })
+            .await
+            .map_err(|e| Error::Protocol(format!("parse session analysis task failed: {e}")))?;
+            if finds_state {
                 self.mark_session_non_migratable(
                     "session-state statement prepared via extended protocol",
                 );
@@ -1976,93 +1628,6 @@ impl ConnectionHandler {
         }
     }
 
-    /// Write the `SELECT pg_current_xact_id_if_assigned()` probe to the backend, pipelined
-    /// immediately ahead of the client's COMMIT (which the caller forwards
-    /// right after this returns). The probe's response frames arrive as a
-    /// prefix of the backend stream and are diverted — never forwarded — by
-    /// `process_backend_data` while `awaiting_probe_response` is set; the
-    /// txid is captured there from the probe's `DataRow`. Pipelining keeps the
-    /// probe off the COMMIT's latency: no backend round trip happens here.
-    async fn capture_txid_for_commit(&mut self, backend: &mut TcpStream, lone_commit: bool) {
-        // The probe injects its own write to the backend; gate it on a still-
-        // valid lease so the gateway never issues backend I/O after write
-        // authority has lapsed (the per-message pre-check ran earlier, but the
-        // probe is best-effort anyway — the COMMIT proceeds without it).
-        let (is_leader, valid_until) = {
-            let lease = self.lease.read();
-            (lease.is_leader(), lease.valid_until())
-        };
-        if is_leader && Instant::now() >= valid_until {
-            tracing::debug!(
-                conn_id = self.id,
-                "Skipping txid capture: leader lease expired"
-            );
-            return;
-        }
-        // A relayed backend is another cluster's PostgreSQL. Its xid names
-        // nothing this cluster's leader can answer for, and asking would
-        // report an unrelated local transaction's outcome as the client's.
-        if !self.fence_rx.borrow().client_write_authority {
-            return;
-        }
-        tracing::debug!(conn_id = self.id, "Detected COMMIT, capturing txid");
-        match write_all_within_deadline(backend, &TXID_PROBE_MESSAGE, self.id).await {
-            Ok(()) => {
-                self.commit_probe.txid = None;
-                self.commit_probe.pending_commit = true;
-                self.commit_probe.lone_commit = lone_commit;
-                self.commit_probe.awaiting_probe_response = true;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    conn_id = self.id,
-                    error = %e,
-                    "Failed to write txid probe, proceeding without verification"
-                );
-            }
-        }
-    }
-
-    /// Consume one diverted probe-response frame (see
-    /// `capture_txid_for_commit`). Returns any frame that must still reach
-    /// the client: an async `NotificationResponse` can interleave with the
-    /// probe's response and belongs to the client, not the probe.
-    fn observe_probe_response_message(
-        &mut self,
-        msg_type: MessageType,
-        msg: &[u8],
-    ) -> Option<Vec<u8>> {
-        match msg_type {
-            MessageType::DataRow => {
-                if self.commit_probe.txid.is_none()
-                    && let Some(field_data) = Self::extract_first_field(msg)
-                    && let Ok(val) = String::from_utf8_lossy(field_data).parse::<u64>()
-                {
-                    self.commit_probe.txid = Some(val);
-                }
-                None
-            }
-            MessageType::ReadyForQuery => {
-                self.commit_probe.awaiting_probe_response = false;
-                if self.commit_probe.txid.is_none() {
-                    // Usually NULL: the transaction never assigned an xid, so
-                    // there is no outcome to recover. A failed probe reads the
-                    // same, and either way the COMMIT is simply not probed.
-                    tracing::debug!(
-                        conn_id = self.id,
-                        "txid probe yielded no xid; COMMIT proceeds unprobed"
-                    );
-                }
-                None
-            }
-            MessageType::NotificationResponse => Some(msg.to_vec()),
-            // RowDescription, CommandComplete, ErrorResponse (probe failed;
-            // txid stays None and the trailing RFQ clears the flag) — all
-            // belong to the probe and are dropped.
-            _ => None,
-        }
-    }
-
     /// Word-boundary, case-insensitive token search over raw bytes.
     ///
     /// Replaces the split-based implementation. `windows` iterates over the
@@ -2093,12 +1658,6 @@ impl ConnectionHandler {
     #[cfg(test)]
     fn might_contain_subscription_command(query: &str) -> bool {
         Self::query_keyword_flags(query).subscription
-    }
-
-    /// Single-flag view of the fused scan (see above).
-    #[inline]
-    fn might_contain_commit_command(query: &str) -> bool {
-        Self::query_keyword_flags(query).commit
     }
 
     /// Prefilter for statements that mutate tracked session state: session
@@ -2155,7 +1714,7 @@ impl ConnectionHandler {
     }
 
     /// Single-pass scan for every keyword the per-query hot path needs:
-    /// COMMIT/END, LISTEN/UNLISTEN, the session-state function calls
+    /// LISTEN/UNLISTEN, the session-state function calls
     /// (`set_config`, the `pg_advisory_lock` / `pg_try_advisory_lock`
     /// families), and the temp-schema tokens (`temp`, `temporary`, `pg_temp`).
     ///
@@ -2179,10 +1738,8 @@ impl ConnectionHandler {
         const TEMPORARY: &[u8] = b"temporary"; // 9
         const UNLISTEN: &[u8] = b"unlisten"; // 8
         const PG_TEMP: &[u8] = b"pg_temp"; // 7
-        const COMMIT: &[u8] = b"commit"; // 6
         const LISTEN: &[u8] = b"listen"; // 6
         const TEMP: &[u8] = b"temp"; // 4
-        const END: &[u8] = b"end"; // 3
 
         let qb = query.as_bytes();
         let len = qb.len();
@@ -2231,18 +1788,12 @@ impl ConnectionHandler {
             } else if matches_at(i, PG_TEMP) {
                 flags.temp_object = true;
                 i += PG_TEMP.len();
-            } else if matches_at(i, COMMIT) {
-                flags.commit = true;
-                i += COMMIT.len();
             } else if matches_at(i, LISTEN) {
                 flags.subscription = true;
                 i += LISTEN.len();
             } else if matches_at(i, TEMP) {
                 flags.temp_object = true;
                 i += TEMP.len();
-            } else if matches_at(i, END) {
-                flags.commit = true;
-                i += END.len();
             } else {
                 i += 1;
             }
@@ -2259,49 +1810,21 @@ impl ConnectionHandler {
         // complete messages is scanned in place and written to the client as
         // one contiguous span — one write syscall (one TLS record) per batch
         // instead of one per message, which dominates on DataRow floods.
-        //
-        // Exception: while a txid probe's response is inbound
-        // (`awaiting_probe_response`), its frames form a PREFIX of the stream
-        // (the probe is only injected when nothing else is outstanding, and
-        // the flag can only clear — never set — during this scan, since the
-        // probe write happens on the client arm of the same task). Those head
-        // frames are consumed without forwarding; `forward_from` marks where
-        // the client-owned region begins.
         let mut batch = BackendDataBatch::default();
         let mut consumed = 0usize;
-        let mut forward_from = 0usize;
-        // Async NOTIFY frames that interleaved with the probe's response —
-        // they belong to the client (NOTIFY has no ordering guarantee against
-        // query responses, so re-emitting them ahead of the span is sound).
-        let mut diverted_notifies: Vec<u8> = Vec::new();
         while let Some(header) = buf.get(consumed..).and_then(PacketHeader::parse) {
             self.validate_backend_header(header)?;
             let total_len = header.total_length();
             let Some(msg) = buf.get(consumed..consumed + total_len) else {
                 break; // Wait for more data
             };
-            if self.commit_probe.awaiting_probe_response {
-                if let Some(notify) = self.observe_probe_response_message(header.msg_type, msg) {
-                    diverted_notifies.extend_from_slice(&notify);
-                }
-                consumed += total_len;
-                forward_from = consumed;
-                continue;
-            }
             self.observe_backend_message(header.msg_type, msg, &mut batch);
             consumed += total_len;
         }
 
-        if !diverted_notifies.is_empty() {
-            write_all_within_deadline(&mut self.client, &diverted_notifies, self.id).await?;
-        }
         if consumed > 0 {
             let span = buf.split_to(consumed);
-            if let Some(forwardable) = span.get(forward_from..)
-                && !forwardable.is_empty()
-            {
-                write_all_within_deadline(&mut self.client, forwardable, self.id).await?;
-            }
+            write_all_within_deadline(&mut self.client, &span, self.id).await?;
         }
         self.apply_backend_data_batch(&batch);
         Ok(())
@@ -2336,13 +1859,13 @@ impl ConnectionHandler {
     /// Update tracked state from one backend message. Forwarding happens
     /// separately — the caller writes the whole scanned span in one batch.
     fn observe_backend_message(
-        &mut self,
+        &self,
         msg_type: MessageType,
         msg: &[u8],
         batch: &mut BackendDataBatch,
     ) {
         match msg_type {
-            MessageType::ReadyForQuery => self.handle_ready_for_query_message(msg, batch),
+            MessageType::ReadyForQuery => Self::handle_ready_for_query_message(msg, batch),
             MessageType::BackendKeyData => self.handle_backend_key_data_message(msg),
             MessageType::CopyInResponse
             | MessageType::CopyOutResponse
@@ -2356,24 +1879,8 @@ impl ConnectionHandler {
         batch.bytes_received += msg.len() as u64;
     }
 
-    fn handle_ready_for_query_message(&mut self, msg: &[u8], batch: &mut BackendDataBatch) {
-        // Clear commit-probe state on every ReadyForQuery, including malformed
-        // truncated ones. Leaving `pending_commit = true` past an RFQ would
-        // poison the next failover decision (we'd probe txid_status for a
-        // transaction whose response was actually already received).
-        let was_pending = self.commit_probe.pending_commit;
-        let prev_txid = self.commit_probe.txid;
-        self.commit_probe.pending_commit = false;
-        self.commit_probe.txid = None;
-
+    fn handle_ready_for_query_message(msg: &[u8], batch: &mut BackendDataBatch) {
         if msg.len() <= 5 {
-            if was_pending {
-                tracing::debug!(
-                    conn_id = self.id,
-                    txid = ?prev_txid,
-                    "Cleared commit_probe on truncated ReadyForQuery"
-                );
-            }
             return;
         }
 
@@ -2382,14 +1889,6 @@ impl ConnectionHandler {
         // ReadyForQuery only arrives outside COPY, so it marks the session
         // back in Normal mode as of this point in the stream.
         batch.mode_transition = Some(ProxyMode::Normal);
-
-        if was_pending {
-            tracing::debug!(
-                conn_id = self.id,
-                txid = ?prev_txid,
-                "COMMIT response received, clearing pending state"
-            );
-        }
     }
 
     fn handle_backend_key_data_message(&self, msg: &[u8]) {
@@ -2598,11 +2097,8 @@ impl ConnectionHandler {
                 *backend = self.connect_to_backend(new_leader).await?;
                 // Drop anything the old backend left behind — a stale
                 // partial frame would misalign parsing of the new backend's
-                // stream. Probe state likewise belongs to the old backend:
-                // the new one never received a probe query, so a lingering
-                // `awaiting_probe_response` would divert its first frames.
+                // stream.
                 backend_buf.clear();
-                self.commit_probe = CommitProbeState::default();
 
                 // Re-send startup message
                 if let Some(startup) = self.startup_params.clone() {
@@ -2999,8 +2495,8 @@ impl ConnectionHandler {
         }
 
         // The whole text failed to parse. Salvage per-statement analysis for
-        // what the scanner can still separate (`contains_commit` for the
-        // probe path; tracked changes for observability), but fail closed
+        // what the scanner can still separate (tracked changes stay
+        // tracked), but fail closed
         // regardless: the session-state prefilter fired and the parser could
         // not fully understand the text — either a syntax error the server
         // will reject (severing is harmless) or grammar newer than the
@@ -3047,10 +2543,6 @@ impl ConnectionHandler {
             let Some(stmt_node) = raw_stmt.stmt.as_ref().and_then(|stmt| stmt.node.as_ref()) else {
                 continue;
             };
-
-            if Self::is_commit_statement(stmt_node) {
-                analysis.contains_commit = true;
-            }
 
             match Self::classify_statement(stmt_node) {
                 StatementClass::Modeled(Some(change)) => analysis.session_changes.push(change),
@@ -3112,16 +2604,6 @@ impl ConnectionHandler {
             return "unknown".to_owned();
         }
         name.to_owned()
-    }
-
-    fn is_commit_statement(stmt: &pg_query::protobuf::node::Node) -> bool {
-        match stmt {
-            pg_query::protobuf::node::Node::TransactionStmt(tx_stmt) => matches!(
-                pg_query::protobuf::TransactionStmtKind::try_from(tx_stmt.kind),
-                Ok(pg_query::protobuf::TransactionStmtKind::TransStmtCommit)
-            ),
-            _ => false,
-        }
     }
 
     /// Classify one parsed statement's effect on session state.
@@ -3324,42 +2806,12 @@ impl ConnectionHandler {
         }
     }
 
-    /// Check if a query text is a COMMIT or END command.
-    ///
-    /// Three-tier detection: byte-scan → trivial-string-match → full C parse.
-    /// The C parser is only reached for exotic multi-statement forms.
+    /// Whether the analyzer finds session state in `query`: a change the
+    /// gateway tracks, or one that makes the session non-migratable. Runs the
+    /// C parser, so async callers offload it to a blocking thread.
     #[must_use]
-    pub fn is_commit_query(query: &str) -> bool {
-        if !Self::might_contain_commit_command(query) {
-            return false;
-        }
-        if is_trivial_commit(query) {
-            return true;
-        }
-        Self::analyze_query(query).contains_commit
-    }
-
-    /// Extract the first field's data from a `DataRow` message.
-    ///
-    /// `DataRow` format: 'D' + len(4) + `field_count`(2) + [`field_len`(4) + data]*
-    /// Returns `None` if the message is malformed or has no fields.
-    fn extract_first_field(msg: &[u8]) -> Option<&[u8]> {
-        // Need at least: type(1) + len(4) + field_count(2) = 7 bytes
-        let field_count_bytes = msg.get(5..7)?;
-        let field_count = u16::from_be_bytes(<[u8; 2]>::try_from(field_count_bytes).ok()?);
-        if field_count < 1 {
-            return None;
-        }
-        // First field length at offset 7..11
-        let field_len_bytes = msg.get(7..11)?;
-        let field_len = i32::from_be_bytes(<[u8; 4]>::try_from(field_len_bytes).ok()?);
-        if field_len <= 0 {
-            return None;
-        }
-        let field_start = 11;
-        // Safety: field_len is positive (checked above), so the cast is safe
-        let field_end = field_start + usize::try_from(field_len).ok()?;
-        msg.get(field_start..field_end)
+    pub fn analyzer_finds_session_state(query: &str) -> bool {
+        !Self::analyze_query(query).session_changes.is_empty()
     }
 
     /// Build a `PostgreSQL` Query message from SQL text.
@@ -3373,177 +2825,6 @@ impl ConnectionHandler {
         msg.put_slice(sql.as_bytes());
         msg.put_u8(0); // null terminator
         msg
-    }
-
-    /// Query the current leader to check if a transaction was committed.
-    /// Returns true if committed, false if aborted or in-progress.
-    ///
-    /// The probe runs through management API so it does not depend on client
-    /// authentication method (trust/scram/md5).
-    async fn probe_txid_status(&self, txid: u64) -> Result<bool> {
-        tracing::info!(
-            conn_id = self.id,
-            txid = txid,
-            "Probing new leader for transaction status"
-        );
-        let status = self.query_txid_status_via_management_api(txid).await?;
-        Ok(Self::interpret_probe_status(
-            self.id,
-            txid,
-            status.as_deref(),
-        ))
-    }
-
-    async fn query_txid_status_via_management_api(&self, txid: u64) -> Result<Option<String>> {
-        #[derive(Debug, Deserialize)]
-        struct TxidStatusApiResponse {
-            status: Option<String>,
-        }
-
-        let leader_mgmt_addr = self.discover_leader_mgmt_addr().await?;
-        let client = commit_probe_http_client();
-        let url = format!("http://{leader_mgmt_addr}/api/v1/cluster/txid-status/{txid}");
-        let response =
-            client.get(&url).send().await.map_err(|e| {
-                Error::Protocol(format!("Failed to query txid status endpoint: {e}"))
-            })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
-            return Err(Error::Protocol(format!(
-                "txid status endpoint failed ({status}): {body}"
-            )));
-        }
-
-        let payload = response
-            .json::<TxidStatusApiResponse>()
-            .await
-            .map_err(|e| Error::Protocol(format!("Invalid txid status response: {e}")))?;
-        Ok(payload.status)
-    }
-
-    async fn discover_leader_mgmt_addr(&self) -> Result<String> {
-        #[derive(Debug, Deserialize)]
-        struct LeaderApiResponse {
-            leader_mgmt_addr: Option<String>,
-        }
-
-        let local_mgmt_addr = self.config.mgmt_addr;
-        let client = commit_probe_http_client();
-        let url = format!("http://{local_mgmt_addr}/api/v1/cluster/leader");
-        let response = client.get(&url).send().await.map_err(|e| {
-            Error::Protocol(format!("Failed to query leader discovery endpoint: {e}"))
-        })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read response body>".to_string());
-            return Err(Error::Protocol(format!(
-                "Leader discovery endpoint failed ({status}): {body}"
-            )));
-        }
-
-        let payload = response
-            .json::<LeaderApiResponse>()
-            .await
-            .map_err(|e| Error::Protocol(format!("Invalid leader discovery response: {e}")))?;
-        payload
-            .leader_mgmt_addr
-            .ok_or_else(|| Error::Protocol("No leader management address available".to_string()))
-    }
-
-    fn interpret_probe_status(conn_id: u64, txid: u64, status_result: Option<&str>) -> bool {
-        match status_result {
-            Some("committed") => {
-                tracing::info!(
-                    conn_id = conn_id,
-                    txid = txid,
-                    "Transaction confirmed COMMITTED on new leader"
-                );
-                metrics::counter!("pgbattery_commit_probes_committed").increment(1);
-                true
-            }
-            Some("aborted") => {
-                tracing::info!(
-                    conn_id = conn_id,
-                    txid = txid,
-                    "Transaction confirmed ABORTED on new leader"
-                );
-                metrics::counter!("pgbattery_commit_probes_aborted").increment(1);
-                false
-            }
-            Some("in progress") => {
-                tracing::warn!(
-                    conn_id = conn_id,
-                    txid = txid,
-                    "Transaction still in progress on new leader"
-                );
-                metrics::counter!("pgbattery_commit_probes_in_progress").increment(1);
-                false
-            }
-            Some(other) => {
-                tracing::warn!(
-                    conn_id = conn_id,
-                    txid = txid,
-                    status = other,
-                    "Unknown txid_status result"
-                );
-                false
-            }
-            None => {
-                tracing::warn!(conn_id = conn_id, txid = txid, "txid_status returned NULL");
-                false
-            }
-        }
-    }
-
-    /// Send a synthetic COMMIT success response to the client.
-    /// This is used when we verify that a commit succeeded via `txid_status`
-    /// after the original primary crashed.
-    async fn send_synthetic_commit_response(&mut self) -> Result<()> {
-        use bytes::BufMut;
-        // CommandComplete ('C' + len(4) + "COMMIT\0") followed by
-        // ReadyForQuery ('Z' + len(4) + 'I') in one buffer, one write.
-        let tag = b"COMMIT\0";
-        let tag_msg_len = u32::try_from(4 + tag.len()).unwrap_or(u32::MAX);
-        let mut msg = BytesMut::with_capacity(5 + tag.len() + 6);
-        msg.put_u8(b'C');
-        msg.put_u32(tag_msg_len);
-        msg.put_slice(tag);
-        msg.put_u8(b'Z');
-        msg.put_u32(5);
-        msg.put_u8(b'I');
-
-        write_all_within_deadline(&mut self.client, &msg, self.id).await?;
-
-        // The synthetic 'Z' 'I' told the client its transaction is over and it
-        // is Idle. Bring the gateway's own view in sync: otherwise `tx_status`
-        // stays `InTransaction` (set before the crash) and the NEXT failover
-        // spuriously severs this healthy, now-idle session (08006) because
-        // `handle_leader_change` reads `tx_status`, while the registry's
-        // in-transaction gauge stays skewed until the connection closes. The
-        // synthesized ReadyForQuery also answers everything the old backend
-        // still owed — that backend is gone and can never respond — so the
-        // in-flight accounting resets to drained.
-        self.registry
-            .update_tx_status_on(&self.state, TransactionStatus::Idle);
-        {
-            let mut state = self.state.write();
-            state.responses_outstanding = 0;
-            state.extended_unsynced = false;
-        }
-
-        tracing::info!(
-            conn_id = self.id,
-            "Sent synthetic COMMIT response after verification"
-        );
-
-        Ok(())
     }
 }
 
@@ -3644,90 +2925,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_commit_query() {
-        // Basic COMMIT variants
-        assert!(ConnectionHandler::is_commit_query("COMMIT"));
-        assert!(ConnectionHandler::is_commit_query("commit"));
-        assert!(ConnectionHandler::is_commit_query("Commit"));
-        assert!(ConnectionHandler::is_commit_query("COMMIT;"));
-        assert!(ConnectionHandler::is_commit_query("  COMMIT  "));
-        assert!(ConnectionHandler::is_commit_query("  commit;  "));
-
-        // END variants (SQL synonym for COMMIT)
-        assert!(ConnectionHandler::is_commit_query("END"));
-        assert!(ConnectionHandler::is_commit_query("end"));
-        assert!(ConnectionHandler::is_commit_query("END;"));
-
-        // Extended forms
-        assert!(ConnectionHandler::is_commit_query("COMMIT TRANSACTION"));
-        assert!(ConnectionHandler::is_commit_query("COMMIT WORK"));
-        assert!(ConnectionHandler::is_commit_query("END TRANSACTION"));
-        assert!(ConnectionHandler::is_commit_query("END WORK"));
-
-        // Non-COMMIT queries
-        assert!(!ConnectionHandler::is_commit_query("SELECT 1"));
-        assert!(!ConnectionHandler::is_commit_query("ROLLBACK"));
-        assert!(!ConnectionHandler::is_commit_query("BEGIN"));
-        assert!(!ConnectionHandler::is_commit_query(
-            "INSERT INTO foo VALUES (1)"
-        ));
-        assert!(!ConnectionHandler::is_commit_query(
-            "SELECT COMMIT FROM table"
-        ));
-
-        // Multi-statement queries
-        assert!(ConnectionHandler::is_commit_query(
-            "INSERT INTO foo VALUES (1); COMMIT"
-        ));
-        assert!(ConnectionHandler::is_commit_query(
-            "INSERT INTO foo VALUES (1); COMMIT;"
-        ));
-        assert!(ConnectionHandler::is_commit_query(
-            "SELECT 1; END; SELECT 2"
-        ));
-        assert!(ConnectionHandler::is_commit_query(
-            "BEGIN; INSERT INTO foo VALUES (1); COMMIT;"
-        ));
-    }
-
-    /// `pg_current_xact_id()` assigns an xid, turning every read-only
-    /// transaction the probe touches into one that writes a commit record,
-    /// fsyncs and waits for a sync standby. The probe must only read one.
-    #[test]
-    fn txid_probe_message_matches_builder() {
-        assert_eq!(
-            &TXID_PROBE_MESSAGE[..],
-            &ConnectionHandler::build_query_message("SELECT pg_current_xact_id_if_assigned()")[..]
-        );
-    }
-
-    /// A relayed session's backend is the recipient cluster's PostgreSQL;
-    /// its xid means nothing to this cluster's leader, whose answer could
-    /// fabricate a COMMIT acknowledgement for an unrelated transaction.
-    #[tokio::test]
-    async fn a_relayed_commit_is_not_probed() {
-        use crate::gateway::connection::ConnectionState;
-
-        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-        let (mut handler, _client) = test_handler_with_peer(state).await;
-        let (_fence_tx, relaying) = watch::channel(FenceState {
-            client_write_authority: false,
-            authority_pg_addr: Some("172.28.1.11:5434".parse().unwrap()),
-            ..FenceState::unfenced()
-        });
-        handler.fence_rx = relaying;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (backend, _accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
-        let mut backend = backend.unwrap();
-
-        handler.capture_txid_for_commit(&mut backend, true).await;
-
-        assert!(!handler.commit_probe.pending_commit);
-        assert!(!handler.commit_probe.awaiting_probe_response);
-    }
-
-    #[test]
     fn test_build_query_message() {
         let msg = ConnectionHandler::build_query_message("SELECT 1");
 
@@ -3746,41 +2943,6 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_probe_state_default() {
-        let state = CommitProbeState::default();
-        assert!(state.txid.is_none());
-        assert!(!state.pending_commit);
-    }
-
-    #[test]
-    fn test_simple_commit_probe_only_safe_for_standalone_commit() {
-        // Safe: a lone trivial COMMIT, nothing buffered ahead of it, and no
-        // prior response in flight — the injected probe drains exactly its own
-        // response.
-        assert!(simple_commit_probe_is_safe(true, true, true));
-
-        // Unsafe: an earlier statement is still buffered in this batch (e.g.
-        // `Q(INSERT); Q(COMMIT)` pipelined). Diverting the probe's response
-        // would consume the INSERT's response and leak the probe's response
-        // to the client.
-        assert!(!simple_commit_probe_is_safe(true, false, true));
-
-        // Unsafe: a prior batch's statement is still awaiting its ReadyForQuery
-        // (the client pipelined a bare COMMIT in a fresh batch while an earlier
-        // `INSERT … RETURNING` is still outstanding). `pending` is empty here,
-        // so only the `no_response_pending` term catches it — draining the
-        // probe would otherwise swallow the INSERT's rows and parse them as the
-        // txid.
-        assert!(!simple_commit_probe_is_safe(true, true, false));
-
-        // Unsafe: not a standalone COMMIT (e.g. `COMMIT AND CHAIN` or a
-        // multi-statement batch), so the synthetic single-frame response would
-        // not match what the client is owed.
-        assert!(!simple_commit_probe_is_safe(false, true, true));
-        assert!(!simple_commit_probe_is_safe(false, false, false));
-    }
-
-    #[test]
     fn test_analyze_query_subscription_changes() {
         let analysis = ConnectionHandler::analyze_query(
             r#"LISTEN events; UNLISTEN jobs; UNLISTEN *; LISTEN "MyChannel";"#,
@@ -3794,7 +2956,6 @@ mod tests {
                 SessionChange::Listen("MyChannel".to_string()),
             ]
         );
-        assert!(!analysis.contains_commit);
     }
 
     fn sets_session_var(query: &str) -> bool {
@@ -3986,41 +3147,6 @@ mod tests {
         }
     }
 
-    /// This decides whether a client is told its transaction committed after the
-    /// primary died mid-`COMMIT`. Only `PostgreSQL`'s literal `"committed"` may
-    /// answer yes: anything else — aborted, still running, an unrecognised
-    /// string, or NULL because the txid aged past `txid_status`'s visibility
-    /// horizon — must answer no, because a wrong yes manufactures a phantom
-    /// commit the client will never retry.
-    #[test]
-    fn interpret_probe_status_only_trusts_committed() {
-        const TXID: u64 = 4242;
-        assert!(ConnectionHandler::interpret_probe_status(
-            1,
-            TXID,
-            Some("committed")
-        ));
-        for status in [
-            Some("aborted"),
-            Some("in progress"),
-            // Case and whitespace variants are not PostgreSQL's spelling; if one
-            // ever shows up it is a bug, and guessing "committed" is the unsafe
-            // guess.
-            Some("COMMITTED"),
-            Some(" committed"),
-            Some("committed "),
-            Some("commit"),
-            Some(""),
-            Some("unknown"),
-            None,
-        ] {
-            assert!(
-                !ConnectionHandler::interpret_probe_status(1, TXID, status),
-                "{status:?} must not be reported as committed"
-            );
-        }
-    }
-
     /// The metric label depends on how `Debug` is derived for the node enum. If
     /// that changes, these fail rather than the label silently becoming junk.
     #[test]
@@ -4203,7 +3329,6 @@ mod tests {
         let (_fence_tx, fence_rx) = watch::channel(FenceState::unfenced());
         let config = GatewayConfig {
             listen_addr: UNKNOWN_SOCKET_ADDR,
-            mgmt_addr: UNKNOWN_SOCKET_ADDR,
             ssl_mode: SslModeConfig::Disable,
             ssl_cert_path: None,
             ssl_key_path: None,
@@ -4267,7 +3392,7 @@ mod tests {
             "SET search_path = myschema",
         ] {
             let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-            let mut handler = test_handler(state.clone()).await;
+            let handler = test_handler(state.clone()).await;
             handler
                 .observe_parse_message(&parse_message("", query))
                 .await
@@ -4286,7 +3411,7 @@ mod tests {
             "UPDATE readings SET temp = 21.5 WHERE id = 1",
         ] {
             let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-            let mut handler = test_handler(state.clone()).await;
+            let handler = test_handler(state.clone()).await;
             handler
                 .observe_parse_message(&parse_message("s1", query))
                 .await
@@ -4305,16 +3430,6 @@ mod tests {
     async fn simple_query_marks_unmigratable_session_state() {
         use crate::gateway::connection::ConnectionState;
 
-        // A connected socket standing in for the backend. Nothing is written to
-        // it: the txid probe only fires for an in-transaction trivial COMMIT,
-        // and these sessions are Idle.
-        async fn backend_socket() -> TcpStream {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let (backend, _accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
-            backend.unwrap()
-        }
-
         for query in [
             "CREATE TEMP VIEW v AS SELECT 1",
             "CREATE TEMP SEQUENCE s",
@@ -4323,14 +3438,11 @@ mod tests {
             "EXPLAIN ANALYZE CREATE TEMP TABLE t AS SELECT 1",
         ] {
             let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-            let mut handler = test_handler(state.clone()).await;
-            let mut backend = backend_socket().await;
+            let handler = test_handler(state.clone()).await;
             handler
                 .handle_query_message(
                     MessageType::Query,
                     &ConnectionHandler::build_query_message(query),
-                    &mut backend,
-                    &BytesMut::new(),
                 )
                 .await
                 .unwrap();
@@ -4348,14 +3460,11 @@ mod tests {
             "DISCARD TEMP",
         ] {
             let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-            let mut handler = test_handler(state.clone()).await;
-            let mut backend = backend_socket().await;
+            let handler = test_handler(state.clone()).await;
             handler
                 .handle_query_message(
                     MessageType::Query,
                     &ConnectionHandler::build_query_message(query),
-                    &mut backend,
-                    &BytesMut::new(),
                 )
                 .await
                 .unwrap();
@@ -4376,7 +3485,7 @@ mod tests {
         // notification state on failover.
         for query in ["LISTEN jobs", "UNLISTEN jobs", "UNLISTEN *"] {
             let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-            let mut handler = test_handler(state.clone()).await;
+            let handler = test_handler(state.clone()).await;
             handler
                 .observe_parse_message(&parse_message("", query))
                 .await
@@ -4402,7 +3511,7 @@ mod tests {
             .replay
             .prepared
             .insert("ps1".to_string(), Bytes::from_static(b"parse-bytes"));
-        let mut handler = test_handler(state.clone()).await;
+        let handler = test_handler(state.clone()).await;
         handler
             .observe_parse_message(&parse_message("", "DEALLOCATE ps1"))
             .await
@@ -4416,7 +3525,7 @@ mod tests {
         // A column merely named `listen` passes the token prefilter but parses
         // to no session change — precision must be preserved (no ratchet).
         let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-        let mut handler = test_handler(state.clone()).await;
+        let handler = test_handler(state.clone()).await;
         handler
             .observe_parse_message(&parse_message("", "SELECT listen FROM radio"))
             .await
@@ -4464,7 +3573,7 @@ mod tests {
         // followed by a CopyInResponse: the connection is IN copy mode at the
         // end of the chunk, whatever order the flags were folded in.
         let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-        let mut handler = test_handler(state.clone()).await;
+        let handler = test_handler(state.clone()).await;
         let rfq: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
         let copy_in: &[u8] = &[b'G', 0, 0, 0, 4];
 
@@ -4480,117 +3589,12 @@ mod tests {
 
         // The inverse order (COPY completed within the chunk) ends Normal.
         let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(1)));
-        let mut handler = test_handler(state.clone()).await;
+        let handler = test_handler(state.clone()).await;
         let mut batch = BackendDataBatch::default();
         handler.observe_backend_message(MessageType::CopyInResponse, copy_in, &mut batch);
         handler.observe_backend_message(MessageType::ReadyForQuery, rfq, &mut batch);
         handler.apply_backend_data_batch(&batch);
         assert_eq!(state.read().proxy_mode, ProxyMode::Normal);
-    }
-
-    /// Encode one backend message: `msg_type` + length + body.
-    fn backend_frame(msg_type: u8, body: &[u8]) -> Vec<u8> {
-        let mut f = Vec::with_capacity(5 + body.len());
-        f.push(msg_type);
-        f.extend_from_slice(&(4 + u32::try_from(body.len()).unwrap()).to_be_bytes());
-        f.extend_from_slice(body);
-        f
-    }
-
-    /// Encode a single-column single-row `DataRow` carrying `value` as text.
-    fn data_row(value: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&1_i16.to_be_bytes());
-        body.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
-        body.extend_from_slice(value.as_bytes());
-        backend_frame(b'D', &body)
-    }
-
-    #[tokio::test]
-    async fn probe_response_is_diverted_and_commit_response_forwarded() {
-        use crate::gateway::connection::ConnectionState;
-        use tokio::io::AsyncReadExt;
-
-        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-        state.write().responses_outstanding = 1; // the COMMIT itself
-        let (mut handler, mut peer) = test_handler_with_peer(state.clone()).await;
-        handler.commit_probe.awaiting_probe_response = true;
-        handler.commit_probe.pending_commit = true;
-        handler.commit_probe.lone_commit = true;
-
-        // First backend chunk: the probe's own response (RowDescription,
-        // DataRow(42), CommandComplete, ReadyForQuery). Every frame must be
-        // diverted — txid captured, nothing forwarded, and the probe's RFQ
-        // must not count against the outstanding client responses.
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&backend_frame(b'T', &0_i16.to_be_bytes()));
-        buf.extend_from_slice(&data_row("42"));
-        buf.extend_from_slice(&backend_frame(b'C', b"SELECT 1\0"));
-        buf.extend_from_slice(&backend_frame(b'Z', b"I"));
-        handler.process_backend_data(&mut buf).await.unwrap();
-
-        assert_eq!(handler.commit_probe.txid, Some(42));
-        assert!(!handler.commit_probe.awaiting_probe_response);
-        assert!(handler.commit_probe.pending_commit);
-        assert_eq!(state.read().responses_outstanding, 1);
-
-        // Second chunk: the COMMIT's response. It is forwarded verbatim —
-        // and it is the FIRST thing the client receives (had any probe frame
-        // leaked, read_exact would see it here and mismatch). Its RFQ clears
-        // the probe state (response delivered, synthetic response must never
-        // fire) and settles the outstanding count.
-        let commit_cc = backend_frame(b'C', b"COMMIT\0");
-        let commit_rfq = backend_frame(b'Z', b"I");
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&commit_cc);
-        buf.extend_from_slice(&commit_rfq);
-        handler.process_backend_data(&mut buf).await.unwrap();
-
-        let mut expected = commit_cc.clone();
-        expected.extend_from_slice(&commit_rfq);
-        let mut received = vec![0_u8; expected.len()];
-        timeout(Duration::from_secs(2), peer.read_exact(&mut received))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            received, expected,
-            "client must see exactly the COMMIT frames"
-        );
-        assert!(!handler.commit_probe.pending_commit);
-        assert_eq!(handler.commit_probe.txid, None);
-        assert_eq!(state.read().responses_outstanding, 0);
-        assert!(state.read().is_migratable());
-    }
-
-    #[tokio::test]
-    async fn probe_diversion_reforwards_interleaved_notifications() {
-        use crate::gateway::connection::ConnectionState;
-        use tokio::io::AsyncReadExt;
-
-        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
-        let (mut handler, mut peer) = test_handler_with_peer(state.clone()).await;
-        handler.commit_probe.awaiting_probe_response = true;
-
-        // An async NOTIFY delivered between the probe's frames belongs to the
-        // client and must survive the diversion.
-        let notify = backend_frame(b'A', b"\x00\x00\x30\x39jobs\0payload\0");
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&data_row("7"));
-        buf.extend_from_slice(&notify);
-        buf.extend_from_slice(&backend_frame(b'Z', b"I"));
-        handler.process_backend_data(&mut buf).await.unwrap();
-
-        assert_eq!(handler.commit_probe.txid, Some(7));
-        let mut received = vec![0_u8; notify.len()];
-        timeout(Duration::from_secs(2), peer.read_exact(&mut received))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            received, notify,
-            "NOTIFY must be re-forwarded, not swallowed"
-        );
     }
 
     #[test]
@@ -4815,17 +3819,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_commit_query_handles_literals_and_comments() {
-        assert!(!ConnectionHandler::is_commit_query("SELECT ';' AS semi"));
-        assert!(!ConnectionHandler::is_commit_query(
-            "/* COMMIT; */ SELECT 1"
-        ));
-        assert!(ConnectionHandler::is_commit_query(
-            "SELECT ';' AS semi; COMMIT;"
-        ));
-    }
-
-    #[test]
     fn test_contains_token_ci_word_boundaries() {
         assert!(ConnectionHandler::contains_token_ci("COMMIT;", "commit"));
         assert!(ConnectionHandler::contains_token_ci("END", "end"));
@@ -4839,12 +3832,6 @@ mod tests {
 
     #[test]
     fn test_query_prefilter_helpers() {
-        assert!(ConnectionHandler::might_contain_commit_command("COMMIT"));
-        assert!(ConnectionHandler::might_contain_commit_command("END;"));
-        assert!(!ConnectionHandler::might_contain_commit_command(
-            "SELECT send_mail()"
-        ));
-
         assert!(ConnectionHandler::might_contain_subscription_command(
             "LISTEN events"
         ));
@@ -4953,6 +3940,68 @@ mod tests {
         state.proxy_mode = ProxyMode::Normal;
         state.tx_status = TransactionStatus::Failed;
         assert!(!state.is_migratable());
+    }
+
+    /// The client's COMMIT reaches the backend with nothing spliced into its
+    /// transaction, and a backend lost with it in flight is answered as
+    /// PostgreSQL answers: one 08006 frame, outcome unknown. An xid does not
+    /// name one transaction across primary periods, so the gateway never
+    /// claims an outcome it cannot know.
+    #[tokio::test]
+    async fn a_commit_lost_in_flight_is_answered_with_08006_alone() {
+        use crate::gateway::connection::ConnectionState;
+        use tokio::io::AsyncReadExt;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        state.write().tx_status = TransactionStatus::InTransaction;
+        let (mut handler, mut client) = test_handler_with_peer(state.clone()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (backend, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut backend = backend.unwrap();
+        let (mut server, _) = accepted.unwrap();
+
+        let commit = ConnectionHandler::build_query_message("COMMIT");
+        let mut client_buf = commit.clone();
+        handler
+            .process_client_data(&mut client_buf, &mut backend)
+            .await
+            .unwrap();
+        backend.shutdown().await.unwrap();
+        let mut forwarded = Vec::new();
+        timeout(Duration::from_secs(2), server.read_to_end(&mut forwarded))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded, commit, "the backend must see the COMMIT alone");
+
+        // The backend dies before answering.
+        drop(server);
+        let result = handler
+            .handle_backend_disconnect(&mut backend, &mut BytesMut::new())
+            .await;
+        assert!(
+            matches!(result, Err(Error::BackendDisconnected)),
+            "{result:?}"
+        );
+        drop(handler);
+
+        let mut answered = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut answered))
+            .await
+            .unwrap()
+            .unwrap();
+        let header = PacketHeader::parse(&answered).unwrap();
+        assert_eq!(header.msg_type, MessageType::ErrorResponse);
+        assert_eq!(
+            header.total_length(),
+            answered.len(),
+            "one frame and no other"
+        );
+        assert!(
+            answered.windows(7).any(|w| w == b"C08006\0"),
+            "the frame carries SQLSTATE 08006"
+        );
     }
 }
 

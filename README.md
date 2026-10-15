@@ -19,7 +19,7 @@
 
 **Patroni + etcd + HAProxy = 847 config lines. pgbattery = 1 binary (~14 MB).**
 
-MongoDB-style failover for PostgreSQL. Idle connections migrate to the new leader in <100 ms with no client reconnect. A COMMIT caught mid-failover is resolved as committed-or-error; other in-flight statements get a retryable error.
+MongoDB-style failover for PostgreSQL. Idle connections migrate to the new leader in <100 ms with no client reconnect. A request caught mid-failover, COMMIT included, gets SQLSTATE 08006 with its outcome unknown, exactly as PostgreSQL reports a lost connection.
 
 ![pgbattery failover demo: SIGKILL the leader, the session keeps writing on the new leader without reconnecting](docs/assets/failover-demo.gif)
 
@@ -88,9 +88,9 @@ cargo run --release -- doctor --discover localhost:9081   # pre-deploy health ga
 
 ## What pgbattery Does
 
-pgbattery is a single binary for PostgreSQL HA: leader election, fencing, commit verification, backups, metrics, and TLS, without etcd or a separate load balancer.
+pgbattery is a single binary for PostgreSQL HA: leader election, fencing, backups, metrics, and TLS, without etcd or a separate load balancer.
 
-Idle connections migrate transparently to the new leader (<100 ms blip in the local 3-node cluster) with no client reconnect. A COMMIT caught mid-failover is resolved as committed-or-error by probing the new leader; other in-flight statements get a retryable error (SQLSTATE 08006). It also includes a CLI, REST API, Prometheus metrics, `pg_basebackup`/`pg_dump` automation, and a built-in upgrade workflow. Safety work includes a TLA+ election spec, chaos tooling, LSN-aware promotions, and lease-based fencing for stale primaries.
+Idle connections migrate transparently to the new leader (<100 ms blip in the local 3-node cluster) with no client reconnect. A request caught mid-failover, COMMIT included, gets SQLSTATE 08006 with its outcome unknown, and the client resolves it as it would any in-doubt transaction. It also includes a CLI, REST API, Prometheus metrics, `pg_basebackup`/`pg_dump` automation, and a built-in upgrade workflow. Safety work includes a TLA+ election spec, chaos tooling, LSN-aware promotions, and lease-based fencing for stale primaries.
 
 ## Architecture
 
@@ -102,7 +102,7 @@ Gateway (5432) → Governor (Raft) → Supervisor → PostgreSQL
 - Governor: OpenRaft-based consensus with LSN-aware elections.
 - Supervisor: manages PostgreSQL (initdb, promote/demote, backup/restore).
 
-Commit probing: Gateway captures `txid_current()` before COMMIT, and if the backend dies, asks the new leader `SELECT txid_status(...)`. Clients get a definitive answer instead of “maybe committed.”
+In-flight requests: a backend lost mid-request, COMMIT included, is answered with SQLSTATE 08006. The gateway does not guess the outcome, because a transaction ID names one transaction only within a single primary's lifetime.
 
 See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the deep dive.
 
@@ -113,7 +113,6 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the deep dive.
 | **Client errors on failover** | None (migration)           | Reconnect required  | Reconnect required | Reconnect required   |
 | **Failover time**             | <100 ms idle / ~5 s writes | 15-30s              | 20-40s             | 60-120s (DNS)        |
 | **Connection migration**      | Yes                        | No                  | No                 | No                   |
-| **In-flight COMMIT recovery** | Yes (probe+verify)         | No                  | No                 | No                   |
 | **Dependencies**              | None                       | etcd/Consul/ZK      | Kubernetes         | AWS infrastructure   |
 | **Deployment**                | Single binary              | Multiple components | K8s operator       | Managed service      |
 | **LSN-aware elections**       | Yes                        | Partial             | No                 | N/A (managed)        |
@@ -219,7 +218,7 @@ brew install uv                                       # or: pipx install uv
 
 ### What Works
 
-- Leader failure: idle connections see a <100 ms blip and keep their connection; a COMMIT in flight is resolved as committed-or-error, other in-flight statements get a retryable error
+- Leader failure: idle connections see a <100 ms blip and keep their connection; a request in flight, COMMIT included, gets SQLSTATE 08006 with its outcome unknown
 - Network partition: layered fencing (Raft CheckQuorum, lease expiry, gateway routing, PG read-only + backend termination) keeps writes on one node
 - Connection migration: idle transactions survive failover; sessions carrying backend-local state are severed with SQLSTATE 08006 rather than silently migrated
 - Data integrity: synchronous replication, LSN-aware elections, and timeline verification

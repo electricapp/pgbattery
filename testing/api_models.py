@@ -99,18 +99,6 @@ class PostgresBins(BaseModel):
     bin_dirs: dict[str, PostgresBinDir]
 
 
-class TxidStatus(BaseModel):
-    """`GET /api/v1/cluster/txid-status/{txid}`.
-
-    `status` is `None` for a transaction the server will not answer for — a
-    txid from the future, or one too old to be in the commit log. That is an
-    honest unknown and callers must not read it as either outcome.
-    """
-
-    txid: int
-    status: str | None = None
-
-
 def parse(model: type[ModelT], body: str) -> ModelT:
     """Parse `body` into `model`, or raise `ApiParseError`.
 

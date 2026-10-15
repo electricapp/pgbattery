@@ -858,9 +858,37 @@ pub struct PostgresStatusResponse {
     pub active_bin_dir: String,
     pub active_data_dir: String,
     pub rollback_available: bool,
+    /// `pg_is_in_recovery()` on this node's `PostgreSQL`: `Some(false)` is a
+    /// serving primary. `None` when it did not answer within the budget.
+    #[serde(default)]
+    pub in_recovery: Option<bool>,
 }
 
-/// Probe active `PG_VERSION` / paths on this node.
+/// `pg_is_in_recovery()`, read across the process boundary. One budget covers
+/// the supervisor lock and the query, so a postmaster held by a demote or an
+/// apply answers `None` instead of pinning the caller. Anything but `t`/`f`
+/// is `None`, never a guess.
+async fn probe_in_recovery(state: &ManagementApiState) -> Option<bool> {
+    const IN_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let pg = state.postgres_manager.as_ref()?;
+    let raw = tokio::time::timeout(IN_RECOVERY_BUDGET, async {
+        pg.lock()
+            .await
+            .execute_sql("SELECT pg_is_in_recovery();")
+            .await
+    })
+    .await
+    .ok()?
+    .ok()?;
+    match raw.trim() {
+        "t" => Some(true),
+        "f" => Some(false),
+        _ => None,
+    }
+}
+
+/// Probe active `PG_VERSION` / paths on this node, and whether its
+/// `PostgreSQL` answers as a primary.
 ///
 /// The probe walks the data parent on disk, so it runs on the blocking pool
 /// rather than a runtime worker.
@@ -878,9 +906,11 @@ pub(super) async fn get_postgres_status(
                 active_bin_dir: String::new(),
                 active_data_dir: String::new(),
                 rollback_available: false,
+                in_recovery: None,
             }),
         );
     };
+    let in_recovery = probe_in_recovery(&state).await;
     let probe = tokio::task::spawn_blocking(move || {
         let major = crate::commands::upgrade::postgres::data_dir_major(&paths.data_dir).ok();
         let rollback_available = major.is_some_and(|m| {
@@ -899,6 +929,7 @@ pub(super) async fn get_postgres_status(
             .to_string(),
             active_data_dir: paths.data_dir.display().to_string(),
             rollback_available,
+            in_recovery,
         }
     })
     .await;
@@ -914,6 +945,7 @@ pub(super) async fn get_postgres_status(
                     active_bin_dir: String::new(),
                     active_data_dir: String::new(),
                     rollback_available: false,
+                    in_recovery,
                 }),
             )
         }

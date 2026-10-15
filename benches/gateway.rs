@@ -140,54 +140,8 @@ fn bench_backend_stream(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Query analysis pre-filter — called on every simple-protocol Query message
-// to decide whether to invoke the C parser at all.
-//
-// In practice: `might_contain_commit_command` + `might_contain_subscription_command`
-// are both evaluated on every Q message. The combined cost must stay tiny
-// relative to the network round-trip.
-// ---------------------------------------------------------------------------
-
-fn bench_query_prefilter(c: &mut Criterion) {
-    let mut g = c.benchmark_group("query_prefilter");
-
-    // The hot path: most queries are plain DML with no keywords.
-    // Both heuristics must short-circuit immediately.
-    g.bench_function("select/both_miss", |b| {
-        let q = "SELECT id, name, email FROM users WHERE id = $1";
-        b.iter(|| {
-            black_box(ConnectionHandler::contains_token_ci(q, "commit"))
-                | black_box(ConnectionHandler::contains_token_ci(q, "end"))
-                | black_box(ConnectionHandler::contains_token_ci(q, "listen"))
-                | black_box(ConnectionHandler::contains_token_ci(q, "unlisten"))
-        });
-    });
-
-    g.bench_function("insert/both_miss", |b| {
-        let q = "INSERT INTO events (user_id, action, ts) VALUES ($1, $2, NOW())";
-        b.iter(|| {
-            black_box(ConnectionHandler::contains_token_ci(q, "commit"))
-                | black_box(ConnectionHandler::contains_token_ci(q, "end"))
-                | black_box(ConnectionHandler::contains_token_ci(q, "listen"))
-                | black_box(ConnectionHandler::contains_token_ci(q, "unlisten"))
-        });
-    });
-
-    // COMMIT — commit check fires, subscription check misses.
-    g.bench_function("commit/commit_fires", |b| {
-        b.iter(|| {
-            black_box(ConnectionHandler::contains_token_ci("COMMIT", "commit"))
-                | black_box(ConnectionHandler::contains_token_ci("COMMIT", "end"))
-                | black_box(ConnectionHandler::contains_token_ci("COMMIT", "listen"))
-                | black_box(ConnectionHandler::contains_token_ci("COMMIT", "unlisten"))
-        });
-    });
-
-    g.finish();
-}
-
-// ---------------------------------------------------------------------------
-// contains_token_ci — word-boundary keyword heuristic, called 4× per query
+// contains_token_ci — word-boundary keyword scan behind the session-state
+// prefilter's multi-statement fallback
 // ---------------------------------------------------------------------------
 
 fn bench_contains_token_ci(c: &mut Criterion) {
@@ -251,9 +205,9 @@ fn bench_contains_token_ci(c: &mut Criterion) {
 
 // ---------------------------------------------------------------------------
 // query_keyword_flags — the single full-text scan the per-message hot path
-// runs: one pass sets the commit (commit/end), subscription
-// (listen/unlisten), and session-function-state (set_config /
-// pg_advisory_lock*) flags that would otherwise each cost their own
+// runs: one pass sets the subscription (listen/unlisten),
+// session-function-state (set_config / pg_advisory_lock*), and temp-object
+// (temp/temporary/pg_temp) flags that would otherwise each cost their own
 // contains_token_ci walk.
 // ---------------------------------------------------------------------------
 
@@ -270,7 +224,7 @@ fn bench_query_keyword_flags(c: &mut Criterion) {
         b.iter(|| ConnectionHandler::query_keyword_flags(black_box(q)));
     });
 
-    g.bench_function("commit/commit_fires", |b| {
+    g.bench_function("commit/all_miss", |b| {
         b.iter(|| ConnectionHandler::query_keyword_flags(black_box("COMMIT")));
     });
 
@@ -285,55 +239,11 @@ fn bench_query_keyword_flags(c: &mut Criterion) {
     g.finish();
 }
 
-// ---------------------------------------------------------------------------
-// is_commit_query — full detection pipeline (heuristic + optional C parse)
-// ---------------------------------------------------------------------------
-
-fn bench_is_commit_query(c: &mut Criterion) {
-    let mut g = c.benchmark_group("is_commit_query");
-
-    g.bench_function("select/heuristic_short_circuit", |b| {
-        b.iter(|| {
-            black_box(ConnectionHandler::is_commit_query(black_box(
-                "SELECT id FROM users WHERE id = $1",
-            )));
-        });
-    });
-
-    g.bench_function("end_column/parse_eliminates", |b| {
-        b.iter(|| {
-            black_box(ConnectionHandler::is_commit_query(black_box(
-                "SELECT end_time FROM events WHERE id = $1",
-            )));
-        });
-    });
-
-    g.bench_function("commit/true_positive", |b| {
-        b.iter(|| ConnectionHandler::is_commit_query(black_box("COMMIT")));
-    });
-
-    g.bench_function("end_transaction/true_positive", |b| {
-        b.iter(|| ConnectionHandler::is_commit_query(black_box("END TRANSACTION")));
-    });
-
-    g.bench_function("multi_stmt_commit/true_positive", |b| {
-        b.iter(|| {
-            black_box(ConnectionHandler::is_commit_query(black_box(
-                "INSERT INTO audit (msg) VALUES ($1); COMMIT;",
-            )));
-        });
-    });
-
-    g.finish();
-}
-
 criterion_group!(
     benches,
     bench_protocol_parsing,
     bench_backend_stream,
-    bench_query_prefilter,
     bench_contains_token_ci,
     bench_query_keyword_flags,
-    bench_is_commit_query,
 );
 criterion_main!(benches);

@@ -50,8 +50,8 @@ DESCRIPTION:
    gateway that always routes clients to the current leader.
 
    On failover, idle client connections migrate to the new leader with no
-   reconnect; a COMMIT in flight is resolved as committed-or-error, and other
-   in-flight statements return a retryable error.
+   reconnect; a request in flight, COMMIT included, returns SQLSTATE 08006
+   with its outcome unknown, as PostgreSQL reports a lost connection.
 
    Run 'pgbattery <command> --help' for details on any command.
 

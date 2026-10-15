@@ -8,7 +8,7 @@
 
 # for humans.
 
-> **Validation.** `make check` (below) runs all five specs through TLC and fails
+> **Validation.** `make check` (below) runs all four specs through TLC and fails
 > on any violation, then runs the counterexample models and fails if any of them
 > _passes_. The model checker (`tla2tools.jar`) is pinned by version + SHA-256 in
 > the `Makefile`, so every run — local or CI — uses an identical, verified
@@ -62,7 +62,6 @@ coverage the next time somebody added a spec.
 | ----------------------- | -------------------------------------------------------- | ------------------------------- |
 | `lease_fencing`         | hold-down anchored at the campaign it wins               | `AtMostOneWriteAuthority`       |
 | `raft_lsn`              | one vote per term                                        | `ElectionSafety`                |
-| `commit_probing`        | LSN election gate (leader holds every replicated txn)    | `AckedSuccessIsDurable`         |
 | `timeline_verification` | pg_rewind's divergence gate                              | `TimelineMonotonic`             |
 | `cutover_authority`     | green refuses to self-elect while blue unreachable       | `FailClosedWhenBlueUnreachable` |
 | `cutover_authority`     | arming requires holding authority (`inv-green-self-arm`) | `AtMostOneWriteAuthority`       |
@@ -72,13 +71,12 @@ so the mechanism is disabled only where a counterexample is the expected result.
 
 ## What each spec checks
 
-| Spec                        | Verified property                                                         |
-| --------------------------- | ------------------------------------------------------------------------- |
-| `lease_fencing.tla`         | At most one node holds **write authority** across leadership transfer     |
-| `raft_lsn.tla`              | Election safety + the LSN gate never deadlocks elections                  |
-| `commit_probing.tla`        | In-doubt COMMIT probing is correct; acknowledged commits survive failover |
-| `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions    |
-| `cutover_authority.tla`     | Track C: ≤1 `(epoch, cluster)` writable; green never self-elects (U1/U4)  |
+| Spec                        | Verified property                                                        |
+| --------------------------- | ------------------------------------------------------------------------ |
+| `lease_fencing.tla`         | At most one node holds **write authority** across leadership transfer    |
+| `raft_lsn.tla`              | Election safety + the LSN gate never deadlocks elections                 |
+| `timeline_verification.tla` | PostgreSQL timelines stay bounded and never decrease across promotions   |
+| `cutover_authority.tla`     | Track C: ≤1 `(epoch, cluster)` writable; green never self-elects (U1/U4) |
 
 `cutover_authority.tla` models one direction: blue is the donor and only blue
 arms honestly. The `GreenSelfArm` defect action models green arming with the
@@ -141,15 +139,6 @@ the donor does not hold authority, so it still cannot arm.
   under-informed voter, so a node can lead while behind on LSN. The LSN gate is
   **advisory**; Raft log-matching (abstracted here) is the real safety net, exactly
   as the implementation comments state.
-
-**`commit_probing.tla`** — passes (47,932 distinct states)
-
-- `ProbeCommittedImpliesVisible` / `ProbeAbortedImpliesNotWritten` — no false commit
-  or false abort.
-- `AckedSuccessIsDurable` — any success the client saw (normal or synthetic) is
-  still visible on the current leader after failover (RPO=0).
-  `commit_probing.inv-election-ignores-lsn.cfg` drops the requirement that a new
-  leader hold every replicated transaction, and TLC produces the lost ack.
 
 **`timeline_verification.tla`** — passes (3,208 distinct states)
 

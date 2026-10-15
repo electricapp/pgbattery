@@ -67,7 +67,7 @@ pub use discovery::{
     ClusterIdentityResponse, JoinInfoResponse, LeaderResponse, NodeDiscoveryInfo, NodesResponse,
     PeerInfo, VersionResponse,
 };
-pub use lsn::{LagResponse, ReportLsnRequest, ReportLsnResponse, TxidStatusResponse};
+pub use lsn::{LagResponse, ReportLsnRequest, ReportLsnResponse};
 pub use upgrade::{
     BlueGreenPreflightHttpResponse, BlueGreenPreflightReport, BlueGreenPreflightRequest,
     PostgresBinDirInfo, PostgresBinsResponse, PostgresStatusResponse, PostgresUpgradeApplyRequest,
@@ -494,11 +494,6 @@ pub async fn start_management_api(
         .route("/api/v1/cluster/join-info", get(discovery::get_join_info))
         // Replication lag (for health-based promotion)
         .route("/api/v1/cluster/node/{node_id}/lag", get(lsn::get_node_lag))
-        // Transaction status probe (for no-lost-commit verification)
-        .route(
-            "/api/v1/cluster/txid-status/{txid}",
-            get(lsn::get_txid_status),
-        )
         // Membership operations
         .route("/api/v1/cluster/members", get(cluster::list_members))
         .merge(protected_routes)

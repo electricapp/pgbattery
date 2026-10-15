@@ -97,7 +97,7 @@ Know which layer covers a change before adding another. For counts: `./testing/c
 | Rust unit tests         | inline `mod tests`                         | Pure decision functions (`process.rs`, gateway handlers, `state_machine.rs`)   |
 | Property tests          | `proptest!`                                | LSN election/promotion gate, `rewind_divergence_decision`, sync-standby quorum |
 | Storage conformance     | `openraft::testing::Suite` in `storage.rs` | Log/SM stores + crash-recovery / durability-pin                                |
-| TLA+                    | `tla/` (`make check`)                      | `lease_fencing`, `raft_lsn`, `commit_probing`, `timeline_verification`         |
+| TLA+                    | `tla/` (`make check`)                      | `lease_fencing`, `raft_lsn`, `timeline_verification`, `cutover_authority`      |
 | Fuzzing                 | `fuzz/`                                    | PG wire, query analysis, Raft RPC, snapshot decode, LSN parse                  |
 | Docker HA matrix        | `testing/ci_runner.py` + `ci_matrix.yaml`  | Real 3-node faults; cases cite contract IDs                                    |
 | Transactional anomaly   | `linearizability_register.py` + Elle       | Strict serializability + in-tree WGL                                           |

@@ -862,7 +862,6 @@ impl Config {
     pub fn gateway_config(&self) -> GatewayConfig {
         GatewayConfig {
             listen_addr: self.listen_addr,
-            mgmt_addr: self.get_mgmt_addr(),
             ssl_mode: self.ssl_mode,
             ssl_cert_path: self.ssl_cert_path.clone(),
             ssl_key_path: self.ssl_key_path.clone(),

@@ -694,12 +694,23 @@ async fn wait_standby_streaming(
     }
 }
 
-/// Confirm some primary answers SQL before releasing held clients.
+/// Whether a node's `/api/v1/postgres/status` shows the Raft leader serving
+/// as primary: the reply comes from that node, and its `pg_is_in_recovery()`
+/// answered false. An unanswered probe is not a primary.
+fn confirms_serving_primary(
+    status: &crate::observability::management_api::PostgresStatusResponse,
+    leader_id: u64,
+) -> bool {
+    status.node_id == leader_id && status.in_recovery == Some(false)
+}
+
+/// Confirm the Raft leader's `PostgreSQL` serves as primary before releasing
+/// held clients.
 ///
-/// `GET /api/v1/cluster/txid-status/{txid}` runs a real query on the
-/// leader's `PostgreSQL` under a 2 s budget, so a 200 is proof of a serving
-/// primary. Leader metadata alone only proves an election happened; after a
-/// failed apply the elected node's postmaster can be stopped.
+/// Leader metadata alone only proves an election happened; after a failed
+/// apply the elected node's postmaster can be stopped. The leader's status
+/// endpoint reads `pg_is_in_recovery()` under a budget, so its answer is a
+/// probe of the running server.
 async fn wait_for_serving_primary(
     client: &ClusterClient,
     nodes: &[crate::cluster::client::NodeInfo],
@@ -710,12 +721,12 @@ async fn wait_for_serving_primary(
             let Ok(leader) = client.get_leader_info(&n.mgmt_addr).await else {
                 continue;
             };
-            let Some(leader_mgmt) = leader.leader_mgmt_addr else {
+            let (Some(leader_id), Some(leader_mgmt)) = (leader.leader_id, leader.leader_mgmt_addr)
+            else {
                 continue;
             };
-            let url = format!("http://{leader_mgmt}/api/v1/cluster/txid-status/1");
-            if let Ok(resp) = client.http_client().get(&url).send().await
-                && resp.status().is_success()
+            if let Ok(status) = client.get_postgres_status(&leader_mgmt).await
+                && confirms_serving_primary(&status, leader_id)
             {
                 info!(leader = %leader_mgmt, "Primary confirmed serving");
                 return Ok(());
@@ -3451,5 +3462,25 @@ Bytes per WAL segment:                16777216\n";
         assert!(err.contains("(3 "), "the count is named: {err}");
 
         assert!(refuse_collation_mismatches(0).is_ok());
+    }
+
+    /// Held clients are released only into a primary the leader's own
+    /// `PostgreSQL` vouches for. A standby, a server that did not answer, and
+    /// a reply from some other node all keep the cluster frozen.
+    #[test]
+    fn only_the_leader_answering_as_primary_releases_clients() {
+        let status =
+            |node_id, in_recovery| crate::observability::management_api::PostgresStatusResponse {
+                node_id,
+                active_major: Some(17),
+                active_bin_dir: String::new(),
+                active_data_dir: String::new(),
+                rollback_available: false,
+                in_recovery,
+            };
+        assert!(confirms_serving_primary(&status(1, Some(false)), 1));
+        assert!(!confirms_serving_primary(&status(1, Some(true)), 1));
+        assert!(!confirms_serving_primary(&status(1, None), 1));
+        assert!(!confirms_serving_primary(&status(2, Some(false)), 1));
     }
 }

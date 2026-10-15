@@ -110,39 +110,6 @@ pub struct SessionReplay {
     pub prepared: HashMap<String, Bytes>,
 }
 
-/// State for tracking in-flight COMMIT for transaction status verification.
-///
-/// If a primary crashes after writing a COMMIT to WAL but before sending
-/// acknowledgment to the proxy, we can query the new leader with
-/// `SELECT txid_status($txid)` to verify if the transaction committed.
-/// This prevents false negatives where the client sees an error but the
-/// transaction actually succeeded.
-#[derive(Debug, Default, Clone)]
-pub struct CommitProbeState {
-    /// Transaction ID from `pg_current_xact_id_if_assigned()` (xid8,
-    /// epoch-qualified, textually unsigned digits) - captured before COMMIT;
-    /// `None` when the transaction never assigned one
-    pub txid: Option<u64>,
-    /// Whether we're waiting for a COMMIT response from backend
-    pub pending_commit: bool,
-    /// True while the probe's own response frames (`RowDescription`, `DataRow`,
-    /// `CommandComplete`, `ReadyForQuery`) are still inbound from the backend.
-    /// The probe is written immediately ahead of the client's COMMIT in one
-    /// pipelined flow — no extra round trip on the COMMIT's latency — so its
-    /// response arrives as a prefix of the backend stream. While this flag is
-    /// set, the backend scan diverts those head frames (capturing the txid
-    /// from the `DataRow`) instead of forwarding them; the probe's
-    /// `ReadyForQuery` clears it, and everything after belongs to the client.
-    pub awaiting_probe_response: bool,
-    /// True only when the in-flight COMMIT was a standalone simple-query
-    /// `COMMIT` (nothing else in the batch). The synthetic commit response
-    /// emits exactly one `CommandComplete`+`ReadyForQuery`, which is only
-    /// wire-correct for that case. For a multi-statement batch or the extended
-    /// protocol the client is owed a different message sequence, so we sever
-    /// (08006) instead of risking a desynced session.
-    pub lone_commit: bool,
-}
-
 /// Per-connection state tracking.
 ///
 /// PERF: Fields are ordered for cache efficiency.

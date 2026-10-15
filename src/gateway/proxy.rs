@@ -38,9 +38,6 @@ pub struct GatewayConfig {
     /// Address to listen for client connections
     pub listen_addr: SocketAddr,
 
-    /// Local management API address for leader discovery/probing.
-    pub mgmt_addr: SocketAddr,
-
     /// SSL/TLS mode
     pub ssl_mode: SslModeConfig,
 
@@ -406,7 +403,6 @@ mod tests {
     fn test_gateway_config() {
         let config = GatewayConfig {
             listen_addr: "127.0.0.1:5432".parse().unwrap(),
-            mgmt_addr: "127.0.0.1:9091".parse().unwrap(),
             ssl_mode: SslModeConfig::Disable,
             ssl_cert_path: None,
             ssl_key_path: None,
@@ -423,7 +419,6 @@ mod tests {
     fn test_gateway_new_rejects_passthrough_mode() {
         let config = GatewayConfig {
             listen_addr: "127.0.0.1:5432".parse().unwrap(),
-            mgmt_addr: "127.0.0.1:9091".parse().unwrap(),
             ssl_mode: SslModeConfig::Passthrough,
             ssl_cert_path: None,
             ssl_key_path: None,

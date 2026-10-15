@@ -49,7 +49,7 @@ jobs:
         run: make -C tla check
 
   # The models a PR cannot afford: a fourth term for lease_fencing, four nodes
-  # for raft_lsn and timeline_verification, a third connection for commit_probing.
+  # for raft_lsn and timeline_verification.
   # Each `<spec>.large.cfg` records what it widens and the measurement behind
   # the choice; `check-large` refuses to run if any spec lacks one.
   tlc-large:

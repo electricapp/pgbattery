@@ -201,12 +201,12 @@ fuzz_target!(|data: &[u8]| {
             ConnectionHandler::query_keyword_flags(sql),
             "query_keyword_flags is not deterministic"
         );
-        if flags.commit {
-            let first = ConnectionHandler::is_commit_query(sql);
+        if flags.subscription || flags.temp_object {
+            let first = ConnectionHandler::analyzer_finds_session_state(sql);
             assert_eq!(
                 first,
-                ConnectionHandler::is_commit_query(sql),
-                "is_commit_query is not deterministic"
+                ConnectionHandler::analyzer_finds_session_state(sql),
+                "analyzer_finds_session_state is not deterministic"
             );
         }
     }

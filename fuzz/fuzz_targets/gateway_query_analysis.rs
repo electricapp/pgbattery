@@ -3,31 +3,27 @@
 //! place untrusted input reaches `libpg_query` (a C library).
 //!
 //! Reachable public entry points: `ConnectionHandler::contains_token_ci`,
-//! `query_keyword_flags`, `is_commit_query`, `build_query_message`.
-//! `is_commit_query` is the route into the C parser: when the commit prefilter
-//! fires it calls the private `analyze_query`, which runs `pg_query::parse`
+//! `query_keyword_flags`, `analyzer_finds_session_state`,
+//! `build_query_message`. `analyzer_finds_session_state` is the route into the
+//! C parser: it calls the private `analyze_query`, which runs `pg_query::parse`
 //! (and, on a parse error, `pg_query::split_with_scanner` plus a per-statement
 //! reparse) and walks the resulting AST — including the session-state
-//! classification arms. So this target does exercise the AST walk, but only
-//! for queries that also carry a `commit`/`end` token. See the coverage note
-//! at the bottom.
+//! classification arms — for every input.
 //!
 //! Invariants checked:
 //!   - `contains_token_ci` matches an independent word-boundary reference
 //!     implementation, for needles and haystacks both taken from the fuzz
 //!     input. This is the load-bearing prefilter: a false negative means a
-//!     session-state or COMMIT statement is never looked at again.
+//!     session-state statement is never looked at again.
 //!   - `query_keyword_flags` is deterministic and invariant under ASCII case
 //!     folding (it is documented case-insensitive, and ASCII folding changes
 //!     neither byte length nor word-character-ness, so this is exact).
 //!   - `query_keyword_flags` is monotone under append: appending text after a
 //!     newline can only add flags, never clear one. A keyword must not become
 //!     invisible because more SQL follows it.
-//!   - `is_commit_query` is deterministic — called twice on the same text it
-//!     must agree, which is a real check on `libpg_query` holding no state
-//!     across calls.
-//!   - `is_commit_query(q)` implies `query_keyword_flags(q).commit`, the
-//!     documented three-tier structure (byte scan gates the C parse).
+//!   - `analyzer_finds_session_state` is deterministic — called twice on the
+//!     same text it must agree, which is a real check on `libpg_query` holding
+//!     no state across calls.
 //!   - `build_query_message` emits a frame `PacketHeader::parse` agrees with:
 //!     total length equals buffer length, payload is the SQL bytes plus a
 //!     terminating NUL.
@@ -45,18 +41,17 @@
 //!     something a fuzz target can approximate. `analyze_query`,
 //!     `QueryAnalysis`, and `SessionChange` therefore stay private on purpose:
 //!     widening them would buy only a strictly weaker property (determinism
-//!     and no-panic, both already covered here through the public prefilters)
-//!     in exchange for permanent public API surface.
+//!     and no-panic, both already covered here through
+//!     `analyzer_finds_session_state`) in exchange for permanent public API
+//!     surface.
 //!   - Any relationship between `query_keyword_flags` and `contains_token_ci`
 //!     over the *specific* prefilter tokens. The doc comment states the two
-//!     use identical word-boundary semantics, so `flags.commit ==
-//!     contains_token_ci(q, "commit") | contains_token_ci(q, "end")` ought to
-//!     hold — but the token list is private, and exposing it to assert a
-//!     snapshot of itself is not worth the API surface either. The invariants
-//!     below are all token-agnostic for that reason: they hold no matter which
-//!     keywords the fused scan grows.
-//!   - Whether a given query *should* be treated as a COMMIT. There is no
-//!     oracle for that short of PostgreSQL itself.
+//!     use identical word-boundary semantics, so `flags.subscription ==
+//!     contains_token_ci(q, "listen") | contains_token_ci(q, "unlisten")`
+//!     ought to hold — but the token list is private, and exposing it to
+//!     assert a snapshot of itself is not worth the API surface either. The
+//!     invariants below are all token-agnostic for that reason: they hold no
+//!     matter which keywords the fused scan grows.
 //!
 //! Run with: cargo fuzz run gateway_query_analysis
 #![no_main]
@@ -67,8 +62,6 @@ use pgbattery::gateway::protocol::PacketHeader;
 /// The prefilter tokens the gateway actually scans for. Used only as *inputs*
 /// to the `contains_token_ci` differential, never to predict a flag value.
 const PREFILTER_TOKENS: &[&str] = &[
-    "commit",
-    "end",
     "listen",
     "unlisten",
     "set_config",
@@ -155,10 +148,6 @@ fuzz_target!(|data: &[u8]| {
     for (name, part) in [("head", head), ("tail", tail)] {
         let part_flags = ConnectionHandler::query_keyword_flags(part);
         assert!(
-            !part_flags.commit || joined_flags.commit,
-            "commit flag lost from {name} after append"
-        );
-        assert!(
             !part_flags.subscription || joined_flags.subscription,
             "subscription flag lost from {name} after append"
         );
@@ -166,18 +155,17 @@ fuzz_target!(|data: &[u8]| {
             !part_flags.function_state || joined_flags.function_state,
             "function_state flag lost from {name} after append"
         );
+        assert!(
+            !part_flags.temp_object || joined_flags.temp_object,
+            "temp_object flag lost from {name} after append"
+        );
     }
 
-    // Full detection pipeline. This is where libpg_query gets the bytes.
-    let is_commit = ConnectionHandler::is_commit_query(sql);
+    // The analyzer. This is where libpg_query gets the bytes.
     assert_eq!(
-        is_commit,
-        ConnectionHandler::is_commit_query(sql),
-        "is_commit_query is not deterministic"
-    );
-    assert!(
-        !is_commit || flags.commit,
-        "is_commit_query bypassed its own commit prefilter"
+        ConnectionHandler::analyzer_finds_session_state(sql),
+        ConnectionHandler::analyzer_finds_session_state(sql),
+        "analyzer_finds_session_state is not deterministic"
     );
 
     // Query message builder must agree with the header parser. Skipped for SQL
