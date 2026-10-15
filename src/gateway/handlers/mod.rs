@@ -3,8 +3,9 @@
 //! Commit verification ("no-lost-commit" probe) works for both simple query
 //! protocol (`Q`) and extended query protocol (`Parse`/`Bind`/`Execute`).
 //! For extended protocol, the gateway tracks Parse→Bind→Execute chains to
-//! detect COMMIT, captures `pg_current_xact_id()` before the Execute is forwarded,
-//! and probes the new leader with `txid_status()` on backend disconnect.
+//! detect COMMIT, captures `pg_current_xact_id_if_assigned()` before the Execute
+//! is forwarded, and probes the new leader with `pg_xact_status()` on backend
+//! disconnect.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::Deserialize;
@@ -44,15 +45,18 @@ use crate::governor::raft::FenceState;
 /// gone or hostile, so the connection is severed.
 const PROXY_WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Prebuilt `SELECT pg_current_xact_id()` Query message ('Q' + length + SQL
-/// + NUL), pipelined ahead of every probed COMMIT.
+/// Prebuilt `SELECT pg_current_xact_id_if_assigned()` Query message ('Q' +
+/// length + SQL + NUL), pipelined ahead of every probed COMMIT.
 ///
-/// `pg_current_xact_id` (`PostgreSQL` 13+, matching the supported floor)
-/// rather than the soft-deprecated `txid_current` wrapper; both yield the
-/// same 64-bit epoch-qualified value, which `get_txid_status` already
-/// probes via `pg_xact_status(xid8)`. Pinned against
+/// `_if_assigned` reads the transaction's xid without assigning one: a
+/// read-only transaction answers NULL and stays read-only, instead of being
+/// turned into one that writes a commit record, fsyncs, and waits for a sync
+/// standby. With no xid there is nothing whose outcome a probe could recover.
+/// The 64-bit epoch-qualified value is what `get_txid_status` probes via
+/// `pg_xact_status(xid8)`. Pinned against
 /// [`ConnectionHandler::build_query_message`] by test.
-const TXID_PROBE_MESSAGE: [u8; 33] = *b"Q\x00\x00\x00\x20SELECT pg_current_xact_id()\x00";
+const TXID_PROBE_MESSAGE: [u8; 45] =
+    *b"Q\x00\x00\x00\x2cSELECT pg_current_xact_id_if_assigned()\x00";
 
 /// Maximum startup-packet length accepted.
 ///
@@ -185,7 +189,7 @@ fn is_trivial_commit(query: &str) -> bool {
         || q.eq_ignore_ascii_case("end transaction")
 }
 
-/// Whether it is safe to splice a `SELECT pg_current_xact_id()` probe into the
+/// Whether it is safe to splice a `SELECT pg_current_xact_id_if_assigned()` probe into the
 /// backend stream ahead of this simple-query COMMIT.
 ///
 /// The probe is a simple query pipelined immediately ahead of the COMMIT; its
@@ -438,7 +442,7 @@ fn leading_statement_keyword_matches(query: &str, keywords: &[&str]) -> bool {
 /// Tracks extended query protocol `Parse`→`Bind`→`Execute` chains to detect COMMIT.
 ///
 /// Most ORMs and drivers use extended protocol exclusively. Without this tracker,
-/// we could not capture `pg_current_xact_id()` before a COMMIT Execute and the probe
+/// we could not capture the xid before a COMMIT Execute and the probe
 /// would always fail. The tracker handles both unnamed ("") and named statements.
 ///
 /// `Vec<String>` with linear search is used instead of `HashSet` because in
@@ -1972,7 +1976,7 @@ impl ConnectionHandler {
         }
     }
 
-    /// Write the `SELECT pg_current_xact_id()` probe to the backend, pipelined
+    /// Write the `SELECT pg_current_xact_id_if_assigned()` probe to the backend, pipelined
     /// immediately ahead of the client's COMMIT (which the caller forwards
     /// right after this returns). The probe's response frames arrive as a
     /// prefix of the backend stream and are diverted — never forwarded — by
@@ -1993,6 +1997,12 @@ impl ConnectionHandler {
                 conn_id = self.id,
                 "Skipping txid capture: leader lease expired"
             );
+            return;
+        }
+        // A relayed backend is another cluster's PostgreSQL. Its xid names
+        // nothing this cluster's leader can answer for, and asking would
+        // report an unrelated local transaction's outcome as the client's.
+        if !self.fence_rx.borrow().client_write_authority {
             return;
         }
         tracing::debug!(conn_id = self.id, "Detected COMMIT, capturing txid");
@@ -2035,9 +2045,12 @@ impl ConnectionHandler {
             MessageType::ReadyForQuery => {
                 self.commit_probe.awaiting_probe_response = false;
                 if self.commit_probe.txid.is_none() {
-                    tracing::warn!(
+                    // Usually NULL: the transaction never assigned an xid, so
+                    // there is no outcome to recover. A failed probe reads the
+                    // same, and either way the COMMIT is simply not probed.
+                    tracing::debug!(
                         conn_id = self.id,
-                        "txid probe yielded no value; COMMIT proceeds without verification"
+                        "txid probe yielded no xid; COMMIT proceeds unprobed"
                     );
                 }
                 None
@@ -3677,12 +3690,41 @@ mod tests {
         ));
     }
 
+    /// `pg_current_xact_id()` assigns an xid, turning every read-only
+    /// transaction the probe touches into one that writes a commit record,
+    /// fsyncs and waits for a sync standby. The probe must only read one.
     #[test]
     fn txid_probe_message_matches_builder() {
         assert_eq!(
             &TXID_PROBE_MESSAGE[..],
-            &ConnectionHandler::build_query_message("SELECT pg_current_xact_id()")[..]
+            &ConnectionHandler::build_query_message("SELECT pg_current_xact_id_if_assigned()")[..]
         );
+    }
+
+    /// A relayed session's backend is the recipient cluster's PostgreSQL;
+    /// its xid means nothing to this cluster's leader, whose answer could
+    /// fabricate a COMMIT acknowledgement for an unrelated transaction.
+    #[tokio::test]
+    async fn a_relayed_commit_is_not_probed() {
+        use crate::gateway::connection::ConnectionState;
+
+        let state = Arc::new(parking_lot::RwLock::new(ConnectionState::new(0)));
+        let (mut handler, _client) = test_handler_with_peer(state).await;
+        let (_fence_tx, relaying) = watch::channel(FenceState {
+            client_write_authority: false,
+            authority_pg_addr: Some("172.28.1.11:5434".parse().unwrap()),
+            ..FenceState::unfenced()
+        });
+        handler.fence_rx = relaying;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (backend, _accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut backend = backend.unwrap();
+
+        handler.capture_txid_for_commit(&mut backend, true).await;
+
+        assert!(!handler.commit_probe.pending_commit);
+        assert!(!handler.commit_probe.awaiting_probe_response);
     }
 
     #[test]

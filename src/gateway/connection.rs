@@ -119,8 +119,9 @@ pub struct SessionReplay {
 /// transaction actually succeeded.
 #[derive(Debug, Default, Clone)]
 pub struct CommitProbeState {
-    /// Transaction ID from `pg_current_xact_id()` (xid8, epoch-qualified,
-    /// textually unsigned digits) - captured before COMMIT
+    /// Transaction ID from `pg_current_xact_id_if_assigned()` (xid8,
+    /// epoch-qualified, textually unsigned digits) - captured before COMMIT;
+    /// `None` when the transaction never assigned one
     pub txid: Option<u64>,
     /// Whether we're waiting for a COMMIT response from backend
     pub pending_commit: bool,
