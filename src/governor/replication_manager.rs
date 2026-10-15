@@ -437,18 +437,7 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
                 }
 
                 _ = check_interval.tick() => {
-                    // `RaftMetrics::current_leader` — canonical SoT per
-                    // docs/STATE_MACHINE.md. Reconfiguring sync replication
-                    // from anything else would be a second leadership belief.
-                    let is_leader = {
-                        let metrics = self.raft.metrics();
-                        let m = metrics.borrow();
-                        let v = m.current_leader == Some(self.node_id);
-                        drop(m);
-                        v
-                    };
-
-                    if !is_leader {
+                    if !self.is_leader() {
                         // Followers don't apply sync replication. Drop our
                         // local memory of "last committed sync mode" so
                         // if we later become leader we'll re-commit on
@@ -476,6 +465,13 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
     }
 
     /// Check replica health and update `synchronous_standby_names` if needed.
+    /// `RaftMetrics::current_leader`, the canonical source per
+    /// `docs/STATE_MACHINE.md`: reconfiguring sync replication from anything
+    /// else would be a second leadership belief.
+    fn is_leader(&self) -> bool {
+        self.raft.metrics().borrow().current_leader == Some(self.node_id)
+    }
+
     async fn check_and_update_sync_standbys(&mut self) -> Result<()> {
         self.ensure_replication_slots_if_due().await;
         let (healthy_voter_count, repl_stats) = self.refresh_replica_health_and_metrics().await?;
@@ -778,12 +774,15 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         // No cache: `Supervisor::set_sync_standby_names` is itself idempotent
         // (reads the live GUC and short-circuits if it already matches), so
         // calling it every tick costs at most one extra `SHOW` and rules out
-        // a class of cache-poisoning bugs.
-        self.postgres
-            .lock()
-            .await
-            .set_sync_standby_names(new_sync_names)
-            .await?;
+        // a class of cache-poisoning bugs. Leadership is re-read under the
+        // lock: the tick's first read can predate a wait on it, and a deposed
+        // leader must not rewrite the list its successor now owns.
+        let pg = self.postgres.lock().await;
+        if !self.is_leader() {
+            return Ok(());
+        }
+        pg.set_sync_standby_names(new_sync_names).await?;
+        drop(pg);
 
         let now_active = !new_sync_names.is_empty();
 
@@ -905,7 +904,10 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
         // the next ensure tick retries.
         const SLOT_SQL_BUDGET: Duration = Duration::from_secs(2);
 
-        // Collect node IDs (excluding self) so we can drop the cluster lock
+        // Membership is read after the supervisor lock: a join creates its
+        // slot under that lock, and a list read before waiting on it would
+        // drop the slot the join just made.
+        let pg = self.postgres.lock().await;
         let target_ids: Vec<NodeId> = {
             let cluster = self.cluster_state.read();
             cluster
@@ -915,8 +917,6 @@ impl<P: crate::governor::pg_control::PgControl> ReplicationManager<P> {
                 .filter(|id| *id != self.node_id)
                 .collect()
         };
-
-        let pg = self.postgres.lock().await;
         let existing_slots =
             match tokio::time::timeout(SLOT_SQL_BUDGET, pg.list_physical_replication_slots()).await
             {

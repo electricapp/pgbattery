@@ -793,6 +793,34 @@ impl App {
         }
     }
 
+    /// `(fenced, phase, roles)` the client-write fence should have, from the
+    /// committed log plus boot-fence config. Never the metrics-tick fence
+    /// projection, which lags apply. A recipient fenced before any cutover
+    /// entry has only its configured roles; a donor sealing gets them from
+    /// the log.
+    fn wanted_client_fence(
+        state: &crate::governor::state_machine::ClusterState,
+        cluster_id: &str,
+        awaits_write_authority_from: Option<&str>,
+        configured_roles: &[String],
+    ) -> (
+        bool,
+        crate::governor::state_machine::CutoverPhase,
+        Vec<String>,
+    ) {
+        let (holds, _) = Governor::cutover_authority_projection(
+            &state.cutover,
+            cluster_id,
+            awaits_write_authority_from,
+        );
+        let roles = if state.cutover.fenced_app_roles.is_empty() {
+            configured_roles.to_vec()
+        } else {
+            state.cutover.fenced_app_roles.clone()
+        };
+        (!holds, state.cutover.phase, roles)
+    }
+
     fn spawn_client_fence_reconciler(input: ClientFenceReconcilerInputs) -> JoinHandle<()> {
         use crate::commands::upgrade::client_fence;
 
@@ -808,28 +836,15 @@ impl App {
         } = input;
         tokio::spawn(async move {
             loop {
-                // Wanted state comes from the committed log (plus boot-fence
-                // config), read fresh each pass — not from the metrics-tick
-                // fence projection, which lags apply and once let a wake
-                // during a SEAL lift the fence the handler had just applied.
-                // The watch below is only the wake-up, never the truth.
-                let (want_fenced, phase) = {
-                    let state = cluster_state.read();
-                    let (holds, _) = Governor::cutover_authority_projection(
-                        &state.cutover,
+                let wanted = || {
+                    Self::wanted_client_fence(
+                        &cluster_state.read(),
                         &cluster_id,
                         awaits_write_authority_from.as_deref(),
-                    );
-                    (!holds, state.cutover.phase)
+                        &configured_roles,
+                    )
                 };
-                // A recipient fenced before any cutover entry has only its
-                // configured roles; a donor sealing gets them from the log.
-                let committed = cluster_state.read().cutover.fenced_app_roles.clone();
-                let roles = if committed.is_empty() {
-                    configured_roles.clone()
-                } else {
-                    committed
-                };
+                let (_, _, roles) = wanted();
                 // A standby refuses every REVOKE and every CREATE EVENT
                 // TRIGGER, so retrying there would spin for the life of the
                 // process. The primary carries the fence; replication carries
@@ -849,6 +864,12 @@ impl App {
                         // with a seal's fence→LSN-read→commit window.
                         let _fence_guard = fence_apply_lock.lock().await;
                         let guard = postgres.lock().await;
+                        // Wanted state is re-derived under both locks, from the
+                        // committed log: a SEAL or abort that held them may
+                        // have moved the phase while this pass waited, and a
+                        // decision from before the wait would lift the fence
+                        // the SEAL just applied.
+                        let (want_fenced, phase, roles) = wanted();
                         // Unfreeze before touching the fence and freeze after:
                         // applying the fence creates the snapshot table, which is
                         // DDL the freeze would refuse.
@@ -1447,6 +1468,15 @@ impl App {
     /// just-deposed leader can observe `current_leader != self` while the
     /// watch still holds its own address — and demote against itself.
     /// `leader_rx` remains the wakeup signal only.
+    ///
+    /// Leadership and committed state are read after the supervisor lock is
+    /// taken: a demote or Track B apply can hold it for minutes, and a
+    /// decision on what was true before that wait would act on a cluster
+    /// that has moved on.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the supervisor guard is held across the decision so it is made after the wait"
+    )]
     async fn ensure_follows<P: crate::governor::pg_control::PgControl>(
         node_id: NodeId,
         self_pg_addr: SocketAddr,
@@ -1457,6 +1487,7 @@ impl App {
     ) -> crate::governor::promotion_watchdog::LeadershipObservation {
         use crate::governor::promotion_watchdog::LeadershipObservation;
 
+        let mut pg = postgres.lock().await;
         let leader_id = {
             let metrics = raft.metrics();
             let m = metrics.borrow();
@@ -1470,7 +1501,7 @@ impl App {
         };
         if leader_id == node_id {
             let pg_primary =
-                Self::promote_local_postgres(postgres, cluster_state, lease, node_id).await;
+                Self::promote_local_postgres(&mut *pg, cluster_state, lease, node_id).await;
             return LeadershipObservation {
                 is_raft_leader: true,
                 pg_primary,
@@ -1509,7 +1540,7 @@ impl App {
         }
 
         Self::demote_to_leader(
-            postgres,
+            &mut *pg,
             addr,
             "follow leader",
             upgrade_frozen,
@@ -1735,12 +1766,11 @@ impl App {
     /// if that could not be probed. The promotion watchdog reads it; see
     /// [`crate::governor::promotion_watchdog`].
     async fn promote_local_postgres<P: crate::governor::pg_control::PgControl>(
-        postgres: &Arc<tokio::sync::Mutex<P>>,
+        pg: &mut P,
         cluster_state: &Arc<parking_lot::RwLock<crate::governor::state_machine::ClusterState>>,
         lease: &crate::governor::SharedLeaseState,
         node_id: NodeId,
     ) -> Option<bool> {
-        let mut pg = postgres.lock().await;
         // One probe, reported to the caller whatever it said — see
         // `observe_pg_primary` for why `None` is load-bearing.
         let observed = Self::observe_pg_primary(&*pg).await;
@@ -1848,7 +1878,7 @@ impl App {
     /// (`should_fence_before_demote`), so the steady-state reconcile tick on a
     /// healthy follower is probes plus an idempotent no-op demote.
     async fn demote_to_leader<P: crate::governor::pg_control::PgControl>(
-        postgres: &Arc<tokio::sync::Mutex<P>>,
+        pg: &mut P,
         leader_addr: SocketAddr,
         context: &str,
         upgrade_frozen: bool,
@@ -1859,36 +1889,18 @@ impl App {
         // 2 s) and on every `leader_rx` event. Propagation would just cause
         // the caller to swallow the same error.
         //
-        // `demote` can run a full stop → pg_rewind → start while holding the
-        // supervisor lock, which the lease-enforcement loop also needs. This is
-        // safe: (1) the fence below stops PG from accepting writes *before* the
-        // long demote — `set_readonly(true)` flips the read-only default and
-        // `terminate_client_backends` severs existing sessions, so neither an
-        // already-open transaction nor a `BEGIN READ WRITE` can commit WAL that
-        // the following `pg_rewind` would silently discard; (2) every blocking
-        // sub-operation inside `demote` (stop, pg_rewind, wait_for_ready) is
-        // itself timeout-bounded, so the lock is released eventually, never held
-        // indefinitely.
+        // The fence below stops PG from accepting writes *before* the demote's
+        // stop → pg_rewind → start: `set_readonly(true)` flips the read-only
+        // default and `terminate_client_backends` severs existing sessions, so
+        // neither an open transaction nor a `BEGIN READ WRITE` can commit WAL
+        // the rewind would silently discard. Every blocking step inside
+        // `demote` is timeout-bounded, though bounded is not brief (~20 min
+        // worst case); the lease fence runs on its own session meanwhile.
         //
-        // "Bounded" here is NOT "brief". The dominant worst-case terms are
-        // `pg_rewind` (PG_REWIND_BUDGET, up to ~5 min) and the post-restart
-        // crash-recovery wait (RECOVERY_TIMEOUT_SECS, up to ~10 min); the
-        // demote's remaining steps — stop, role probes, the pre-stop LSN
-        // capture, and the post-start inactive-slot sweep (one enumerate plus
-        // one drop per slot, each under the 30 s SQL timeout) — add a few
-        // more minutes of individually-timeout-bounded work, ~20 min all
-        // told. While that runs, the 100 ms lease-enforcement tick blocks on
-        // the same lock (the per-tick SQL budget wraps the probe, not the
-        // lock acquisition). That is correctness-benign — this node was
-        // fenced read-only above before the long operation began, so a
-        // stalled lease tick cannot miss an unfenced-writes window on it —
-        // but it does stall this node's lease/health probing for the
-        // duration.
         // Logged once per freeze so the 2 s tick does not flood the log.
         static FREEZE_SKIP_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
 
-        let mut pg = postgres.lock().await;
         // A stopped standby stays stopped while the committed upgrade freeze
         // is on: the orchestrator stopped it and rejoins it itself, and an
         // auto-start here races that rejoin.
@@ -3983,7 +3995,7 @@ mod tests {
                 in_recovery: false,
                 ..ModelPg::default()
             });
-            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert_eq!(calls, vec!["is_in_recovery"], "did more than probe");
         }
@@ -3994,7 +4006,7 @@ mod tests {
                 in_recovery: true,
                 ..ModelPg::default()
             });
-            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
                 calls.contains(&"verify_promotion_safe".to_string()),
@@ -4026,7 +4038,7 @@ mod tests {
                 ..ModelPg::default()
             });
             cluster.write().voter_ids = [1, 2, 3].into_iter().collect();
-            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
                 calls
@@ -4045,7 +4057,7 @@ mod tests {
                 ..ModelPg::default()
             });
             cluster.write().voter_ids = std::collections::HashSet::from([1]);
-            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
                 calls.contains(&"promote()".to_string()),
@@ -4063,7 +4075,7 @@ mod tests {
                 fails: Some(ModelOp::VerifyPromotionSafe),
                 ..ModelPg::default()
             });
-            App::promote_local_postgres(&pg, &cluster, &lease, 1).await;
+            App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await;
             let calls = pg.lock().await.calls();
             assert!(
                 !calls.iter().any(|c| c.starts_with("promote(")),
@@ -4077,7 +4089,7 @@ mod tests {
         async fn a_primary_reports_itself_as_serving() {
             let (pg, cluster, lease) = fixtures(ModelPg::default());
             assert_eq!(
-                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await,
                 Some(true)
             );
         }
@@ -4089,7 +4101,7 @@ mod tests {
                 ..ModelPg::default()
             });
             assert_eq!(
-                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await,
                 Some(true)
             );
         }
@@ -4102,7 +4114,7 @@ mod tests {
                 ..ModelPg::default()
             });
             assert_eq!(
-                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await,
                 Some(false)
             );
         }
@@ -4120,7 +4132,7 @@ mod tests {
                 ..ModelPg::default()
             });
             assert_eq!(
-                App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1).await,
                 None
             );
         }
@@ -4139,7 +4151,8 @@ mod tests {
             let mut watchdog = PromotionWatchdog::default();
             let observation = LeadershipObservation {
                 is_raft_leader: true,
-                pg_primary: App::promote_local_postgres(&pg, &cluster, &lease, 1).await,
+                pg_primary: App::promote_local_postgres(&mut *pg.lock().await, &cluster, &lease, 1)
+                    .await,
             };
             let start = std::time::Instant::now();
             let bound = std::time::Duration::from_millis(
@@ -4908,6 +4921,39 @@ mod tests {
             false,
             App::LSN_UNCHANGED_REPORT_TICKS + 1
         ));
+    }
+
+    /// A recipient fenced at boot uses its configured roles until its own log
+    /// names any; a sealing donor fences the roles its SEAL committed.
+    #[test]
+    fn the_wanted_client_fence_comes_from_the_log_then_config() {
+        use crate::governor::state_machine::{
+            ClusterCommand, ClusterState, CutoverPhase, FEATURE_LEVEL,
+        };
+        let configured = vec!["app".to_string()];
+        let recipient = ClusterState::new();
+        assert_eq!(
+            App::wanted_client_fence(&recipient, "green", Some("blue"), &configured),
+            (true, CutoverPhase::Idle, configured.clone())
+        );
+
+        let mut donor = ClusterState {
+            feature_level: FEATURE_LEVEL,
+            ..ClusterState::new()
+        };
+        assert!(!App::wanted_client_fence(&donor, "blue", None, &configured).0);
+        donor.apply(ClusterCommand::CutoverArmed {
+            target_cluster_id: "green".into(),
+            local_cluster_id: "blue".into(),
+        });
+        donor.apply(ClusterCommand::CutoverSeal {
+            final_lsn: 1,
+            app_roles: vec!["writer".into()],
+        });
+        assert_eq!(
+            App::wanted_client_fence(&donor, "blue", None, &configured),
+            (true, CutoverPhase::Sealed, vec!["writer".to_string()])
+        );
     }
 
     #[test]

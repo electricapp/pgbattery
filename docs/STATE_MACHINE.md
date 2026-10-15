@@ -151,6 +151,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 - **Driven by**: `(RaftMetrics::current_leader, pg_is_in_recovery())`.
 - **Trigger**: `leader_rx.changed()` + 2 s reconcile → `App::ensure_follows` (`src/app.rs`).
 - **Snapshot coherence**: promote/demote and follow-target from one `RaftMetrics::current_leader` read + `nodes` map. `leader_rx` is wakeup only — never the address (mixing snapshots demoted a just-deposed leader toward its own stale addr). `demote(addr)` refuses `addr == self`.
+- **Decide after acquiring**: every pass that acts on PostgreSQL under the supervisor lock reads leadership and committed state after taking it — `ensure_follows`, the replication manager's sync-list write and slot sweep, the client-fence reconciler. Any of them can wait minutes behind a demote or Track B apply, and a decision from before the wait acts on a cluster that has moved on.
 - **No role cache.** `promote()` / `demote(addr)` unconditional; both idempotent.
 - **Observation**: `LeadershipObservation` — Raft-leader bool + PG primary as `Some(true)` / `Some(false)` / `None` (probe failed; distinct from `Some(false)`). `promote_local_postgres` fails closed on `None`.
 
