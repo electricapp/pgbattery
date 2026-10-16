@@ -78,7 +78,7 @@ Internal port 9091 (host 9081/9082/9083).
 
 ## The local loop
 
-`scripts/preflight.sh` runs local CI stand-ins (fmt, clippy, fuzz clippy, machete, typos, prettier, harness lint/self-tests, `cargo test`, `cargo doc`) in ~1 minute. `.githooks/pre-push` runs it (`git config core.hooksPath .githooks` once; `SKIP_PREFLIGHT=1 git push` to bypass). Each gate names its CI job; `lint_matrix.py` fails if CI adds a lint without a preflight mirror.
+`scripts/preflight.sh` runs local CI stand-ins (fmt, clippy, fuzz clippy, machete, typos, prettier, `cargo audit`, `cargo deny`, harness lint/self-tests, `cargo test`, `cargo doc`) in ~1 minute. `.githooks/pre-push` runs it (`git config core.hooksPath .githooks` once; `SKIP_PREFLIGHT=1 git push` to bypass). Each gate names its CI job; `lint_matrix.py` fails if CI adds a lint without a preflight mirror.
 
 Images use the `ci` cargo profile (release opts without whole-program LTO). `release.yml` still ships `release`.
 

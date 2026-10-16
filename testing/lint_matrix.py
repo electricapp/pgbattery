@@ -1073,8 +1073,6 @@ MIRRORS = re.compile(r"^[ \t]*#\s*mirrors:\s*(\S+\.yml):(\S+)[ \t]*$", re.MULTIL
 
 PREFLIGHT_CANNOT_RUN: Final[dict[str, str]] = {
     "ci.yml:msrv": "needs a second toolchain installed; compilation is covered by clippy",
-    "ci.yml:deny": "cargo-deny fetches advisory and license databases over the network",
-    "ci.yml:security": "same, and it is a supply-chain gate rather than a code gate",
     "ci.yml:bench": "compiles the benchmark harness only; nothing a code edit breaks silently",
     "ci.yml:build": "release artifact build; the ci profile already compiles everything",
     "ci.yml:docker": "builds the image, which every harness run does anyway",

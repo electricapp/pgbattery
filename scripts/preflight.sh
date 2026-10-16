@@ -70,6 +70,13 @@ gate "cargo machete" cargo machete
 gate "typos" typos
 # mirrors: prettier.yml:prettier
 gate "prettier (markdown)" npx --yes prettier@3.8.4 --check "**/*.md"
+# Both fetch the advisory database, which is the point: a new advisory or a
+# stale ignore fails here rather than on the push. `--deny warnings` is
+# supply-chain.yml's stricter form, so it covers ci.yml's too.
+# mirrors: ci.yml:security
+gate "cargo audit" cargo audit --deny warnings
+# mirrors: ci.yml:deny
+gate "cargo deny" cargo deny check
 
 # mirrors: ha-ci.yml:lint-test-harness
 gate "ruff format" uv run --project testing ruff format --check testing/
