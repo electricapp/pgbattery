@@ -509,12 +509,19 @@ def _check_open_term(
 
 def _check_writable_edges(trace: Trace, report: Report) -> None:
     for node in trace.nodes.values():
-        closed_at = 0  # the seq of the last step known not writable
+        # The seq at which writable last turned not writable. A closed reading
+        # without a writable one before it is the primary not yet open, which
+        # an open admitted just before may still be applying.
+        closed_at = 0
+        was_writable = False
         prev: WriteStep | None = None
         for step in node.writes:
             edge = step.writable is True and (prev is None or prev.writable is not True)
-            if step.writable is False:
+            if step.writable is True:
+                was_writable = True
+            elif step.writable is False and was_writable:
                 closed_at = step.seq
+                was_writable = False
             if edge:
                 _check_edge(node, step, prev, closed_at, report)
             prev = step

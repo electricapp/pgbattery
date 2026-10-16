@@ -213,6 +213,20 @@ class WriteStateTest(unittest.TestCase):
         run.writes(1, 100, writable=True, lease_valid=True, lease_leader=True)
         self.assertNotEqual(checked(run).violated(tc.WRITABLE_VIA_OPEN), [])
 
+    def test_an_open_seen_closed_while_it_applies_is_one_open(self) -> None:
+        # The gate traces its open before applying it, so a fence tick can
+        # still read the primary closed in between. Only a writable primary
+        # closing again needs a second open.
+        run = Run()
+        run.raft(1, 0, term=1, leader=1)
+        run.open(1, 10)
+        run.writes(1, 20, writable=False, lease_valid=True, lease_leader=True)
+        run.writes(1, 120, writable=True, lease_valid=True, lease_leader=True)
+        self.assertEqual(checked(run).violated(tc.WRITABLE_VIA_OPEN), [])
+        run.writes(1, 2_000, writable=False, lease_valid=False, lease_leader=True)
+        run.writes(1, 3_000, writable=True, lease_valid=True, lease_leader=True)
+        self.assertNotEqual(checked(run).violated(tc.WRITABLE_VIA_OPEN), [])
+
     def test_writable_when_the_trace_starts_is_unverifiable(self) -> None:
         run = Run()
         run.raft(1, 0, term=1, leader=1)
