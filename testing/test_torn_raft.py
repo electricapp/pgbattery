@@ -55,6 +55,7 @@ def cluster_runner(
     silent: str | None = None,
     node_log: str = "",
     restarts: int = 0,
+    torn_before_election: bool = False,
 ) -> ClusterRunner:
     """A shell that answers as a healthy cluster.
 
@@ -64,10 +65,10 @@ def cluster_runner(
     write and the log read — and stays true when that path is refactored.
     """
     leader_json = f'{{"leader_id":{leader.removeprefix("node")}}}' if leader else "{}"
-    raft_log = "[lazyfs]: using a custom config\n"
+    torn_line = ""
     if torn_record is not None:
         persisted, offset = torn_record
-        raft_log += (
+        torn_line = (
             f"[lazyfs.faults]: Write to path {tr.RAFT_DB}: "
             f"will persist {persisted} bytes from offset {offset}\n"
         )
@@ -80,21 +81,25 @@ def cluster_runner(
                 "docker inspect",
                 hf.ok(f"{container} 2026-01-01T00:00:00Z {restarts}" if container else ""),
             ),
-            (fp.LAZYFS_RAFT.log, hf.ok(raft_log)),
             ("docker compose logs", hf.ok(node_log)),
         ],
         checkpoints=checkpoints,
         silent=silent,
+        torn_line=torn_line,
+        torn_before_election=torn_before_election,
     )
 
 
 class ClusterRunner(hf.ScriptedRunner):
-    """A scripted cluster whose LazyFS log grows when a checkpoint is asked for.
+    """A scripted cluster whose LazyFS logs grow with what is asked of it.
 
     `flush_lazyfs_cache` waits for the count of applied checkpoints to *rise*,
     not merely to be non-zero, because a log that already carried one would
     otherwise let a flush that never happened read as done. A static log would
     make that wait un-satisfiable, so the double has to model the growth.
+
+    The torn write is causal for the same reason: an idle store is written only
+    when an election is held, so the tear appears once one has been asked for.
     """
 
     def __init__(
@@ -103,13 +108,28 @@ class ClusterRunner(hf.ScriptedRunner):
         *,
         checkpoints: bool = True,
         silent: str | None = None,
+        torn_line: str = "",
+        torn_before_election: bool = False,
     ) -> None:
         super().__init__(rules)
         self.checkpoints = checkpoints
         self.silent_port = f":{topology.MGMT_PORTS[silent]}/" if silent else None
         self.applied = 0
+        self.torn_line = torn_line
+        self.elections = 1 if torn_before_election else 0
 
     def __call__(self, cmd: str, timeout_s: float) -> fp.CommandResult:
+        if "transfer-leadership" in cmd:
+            self.calls.append(cmd)
+            self.elections += 1
+            return hf.ok()
+        if "--force-recreate" in cmd:
+            # A fresh container starts a fresh LazyFS log.
+            self.elections = 0
+        if fp.LAZYFS_RAFT.log in cmd:
+            self.calls.append(cmd)
+            torn = self.torn_line if self.elections else ""
+            return hf.ok(f"[lazyfs]: using a custom config\n{torn}")
         if self.checkpoints and fp.lazyfs_checkpoint_cmd() in cmd:
             self.applied += 1
         if self.silent_port is not None and self.silent_port in cmd:
@@ -539,6 +559,31 @@ class MakeLeaderTest(SeamTest):
         self.assertIn("would have damaged a follower", str(caught.exception))
 
 
+class DriveElectionsTest(SeamTest):
+    """An idle store is written only by what the cluster proposes, so the
+    armed tear is reached by elections the victim takes part in."""
+
+    def test_a_follower_victim_is_never_handed_leadership(self) -> None:
+        for current in ("node1", "node3", None):
+            self.assertNotEqual(tr.next_election_target("node2", "follower", current), "node2")
+        self.assertEqual(tr.next_election_target("node2", "follower", "node1"), "node3")
+        self.assertEqual(tr.next_election_target("node2", "follower", "node3"), "node1")
+
+    def test_a_leader_victim_hands_leadership_away_and_takes_it_back(self) -> None:
+        self.assertEqual(tr.next_election_target("node1", "leader", "node1"), "node2")
+        self.assertEqual(tr.next_election_target("node1", "leader", "node2"), "node1")
+
+    def test_elections_stop_once_the_tear_lands(self) -> None:
+        runner = self.install(cluster_runner(torn_record=(160, 0)))
+        elections = tr.drive_elections("node2", "follower", 60.0)
+        self.assertEqual(elections, 1, "kept electing after the tear landed")
+        self.assertEqual(len(runner.matching("transfer-leadership/3")), 1)
+
+    def test_a_tear_that_never_lands_is_bounded(self) -> None:
+        self.install(cluster_runner(torn_record=None))
+        self.assertGreater(tr.drive_elections("node2", "follower", 60.0), 1)
+
+
 class MgmtTokenTest(SeamTest):
     """CI passes the token in the environment; compose reads it from `.env`."""
 
@@ -582,6 +627,16 @@ class PageTearDisarmTest(SeamTest):
             runner.matching("--force-recreate"),
             "a run that failed to tear must still leave the victim disarmed",
         )
+
+    def test_a_tear_that_landed_before_the_rejoin_is_refused(self) -> None:
+        # It hit a node the cluster had not admitted yet, which measures
+        # nothing about a member's store.
+        runner = self.install(cluster_runner(torn_record=(2048, 49152), torn_before_election=True))
+        self.sql()
+        with self.assertRaises(fp.FaultPreconditionError) as caught:
+            tr.tear_a_page(target="follower", occurrence=tr.PAGE_TEAR_OCCURRENCE)
+        self.assertIn("fired before node2 had rejoined", str(caught.exception))
+        self.assertTrue(runner.matching("--force-recreate"))
 
     def test_a_tear_that_only_reaches_the_header_is_not_claimed_as_a_page(self) -> None:
         self.install(cluster_runner(torn_record=(160, 0)))

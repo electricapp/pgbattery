@@ -74,24 +74,26 @@ UNKNOWN_REFUSAL: Final[str] = "unknown"
 """The node is down and none of the store-damage markers explain why, so the
 refusal cannot be attributed to the tear."""
 
-PAGE_TEAR_OCCURRENCE: Final[int] = 1200
+PAGE_TEAR_OCCURRENCE: Final[int] = 150
 """Which write to `raft.db` the page tear aims at, counted from the restarted
 LazyFS's mount.
 
-An idle cluster writes the store at a steady 475-485 writes/min — control-plane
-appends on their own cadence, with no startup burst to clear, since the first
-minute after a mount measures the same 487. So this is about two and a half
-minutes in: long enough that the victim has rejoined and a tear lands on a node
-the cluster has admitted, short enough to leave most of the wait as margin.
+An idle cluster writes the store only when it proposes something, so the
+count past a rejoin is reached by driven elections (:func:`drive_elections`).
+Measured with per-operation logging, leader and follower alike: no writes in
+30 s idle, 3 for a rejoin, 24-36 per election. A leader victim's rejoin can
+cost two elections (its restart moves leadership, and it takes leadership
+back), so this clears about twice that and lands within a handful of driven
+elections. A tear that has already landed when the cluster settles is refused.
 
 Pages are 85% of redb's writes, so a given occurrence is far more often a page
 than a header, and the run reports which it hit rather than assuming."""
 
-PAGE_TEAR_TIMEOUT_S: Final[float] = 420.0
-"""How long to wait for the baked fault to reach its occurrence.
+ELECTION_SETTLE_S: Final[float] = 15.0
+"""How long one driven election gets to show a new leader before the next."""
 
-Two and a half times the measured time to reach :data:`PAGE_TEAR_OCCURRENCE`,
-so a runner writing at half the rate still lands the tear."""
+ELECTION_DRIVE_TIMEOUT_S: Final[float] = 300.0
+"""How long elections are driven for one tear before the run gives up on it."""
 
 PAGE_TEAR_BATCH: Final[int] = 100
 """Writes issued per attempt, so a run that needed several still reads back a
@@ -329,6 +331,62 @@ def await_leader(timeout_s: float) -> str:
         f"no single leader within {timeout_s:g}s (saw {leaders()}); the cluster "
         f"never converged, so nothing below would measure a torn write"
     )
+
+
+def next_election_target(victim: str, target: str, current: str | None) -> str:
+    """Where the next driven election hands leadership.
+
+    A follower victim stays one: leadership moves between the other two, and
+    it votes and appends in each. A leader victim is the node leadership moves
+    on and off, so every election rewrites its vote and its log.
+    """
+    others = [n for n in topology.NODES if n != victim]
+    if target == "leader":
+        return others[0] if current == victim else victim
+    return next((n for n in others if n != current), others[0])
+
+
+def request_transfer(to: str) -> None:
+    """Ask the current leader, once, to hand leadership to `to`."""
+    current = leaders()
+    if not current:
+        return
+    port = topology.MGMT_PORTS[current[0]]
+    fp.run(
+        f"curl -s -X POST --max-time 10 -H 'x-pgbattery-token: {mgmt_token()}' "
+        f"http://127.0.0.1:{port}/api/v1/cluster/transfer-leadership/{to.removeprefix('node')}"
+    )
+
+
+def tear_landed(victim: str) -> bool:
+    """Whether an armed tear has fired: LazyFS logged it, or the crash it
+    causes took the victim's container down."""
+    if not victim_is_running(victim):
+        return True
+    log = fp.exec_in(victim, fp.lazyfs_log_cmd(log=fp.LAZYFS_RAFT.log))
+    return log.ok and bool(fp.parse_lazyfs_torn_records(log.stdout, RAFT_DB))
+
+
+def drive_elections(victim: str, target: str, timeout_s: float) -> int:
+    """Hold elections the victim takes part in until its tear lands; the count.
+
+    An idle cluster writes nothing to `raft.db`: LSN reports are not log
+    entries, so the store is written only when the cluster proposes something,
+    and an election is the one write a caller can cause. Every voter persists
+    the new vote and appends the new leader's entries.
+    """
+    deadline = time.monotonic() + timeout_s
+    elections = 0
+    while time.monotonic() < deadline and not tear_landed(victim):
+        current = next(iter(leaders()), None)
+        request_transfer(next_election_target(victim, target, current))
+        elections += 1
+        settled = min(deadline, time.monotonic() + ELECTION_SETTLE_S)
+        while time.monotonic() < settled and not tear_landed(victim):
+            if leaders() not in ([], [current]):
+                break
+            time.sleep(1)
+    return elections
 
 
 def voter_views() -> dict[str, set[str]]:
@@ -641,25 +699,24 @@ def await_victim_settled(service: str, timeout_s: float) -> tuple[bool, bool]:
 
 
 def tear_once(victim: str, index: int, outcome: Outcome) -> TearReading:
-    """Arm one torn write on `victim`'s raft.db, drive traffic, report the tear.
+    """Arm one torn write on `victim`'s raft.db, drive elections, report the tear.
 
-    A tear that did not fire is a real possibility, because the fault is armed
-    for the *next* write to that path and a node that has caught up may not
-    write again promptly. So is a log that cannot be read: the tear kills the
-    Raft store's LazyFS, which takes the container holding the log down with
-    it. The two are returned distinctly.
+    The fault is armed for the *next* write to that path, and a caught-up node
+    writes nothing until the cluster proposes something, so elections are held
+    until it fires. A log that cannot be read is a real possibility too: the
+    tear kills the Raft store's LazyFS, which takes the container holding the
+    log down with it. The two are returned distinctly.
 
     The writes driven here go into `outcome.acked`. They are issued while a
     tear is armed on a live member of the cluster, which makes them the writes
     most exposed to it; counting only the ones from before the first tear would
     have measured the safest keys in the run.
-
     """
     fp.arm_torn_write(victim, RAFT_DB, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT)
     lead = await_leader(CONVERGE_TIMEOUT_S)
     base = 1000 * (index + 1)
     outcome.acked.extend(write_batch(lead, range(base, base + 50), under_fault=True))
-    time.sleep(3)
+    drive_elections(victim, outcome.target, ELECTION_DRIVE_TIMEOUT_S)
 
     return read_tear(
         fp.exec_when_deliverable(
@@ -704,23 +761,29 @@ def tear_until_page(
         fp.arm_config_torn_write(
             victim, RAFT_DB, occurrence=at, parts=2, persist=(1,), mount=fp.LAZYFS_RAFT
         )
-        # Re-settle before waiting on the fault. A tear that beat this would
-        # have hit a node the cluster had not admitted, which measures nothing.
+        # Re-settle before waiting on the fault. A tear that beat this hit a
+        # node the cluster had not admitted, which measures nothing.
         lead = await_writable_leader(CONVERGE_TIMEOUT_S)
         if target == "leader":
             make_leader(victim, CONVERGE_TIMEOUT_S)
             lead = victim
+        if tear_landed(victim):
+            raise fp.FaultPreconditionError(
+                f"the tear at occurrence {at} fired before {victim} had rejoined; "
+                f"raise PAGE_TEAR_OCCURRENCE past what a rejoin writes"
+            )
         first = BASELINE_WRITES + attempt * PAGE_TEAR_BATCH
         outcome.acked.extend(write_batch(lead, range(first, first + PAGE_TEAR_BATCH)))
 
+        elections = drive_elections(victim, target, ELECTION_DRIVE_TIMEOUT_S)
         record = fp.await_torn_record(
-            victim, RAFT_DB, mount=fp.LAZYFS_RAFT, timeout_s=PAGE_TEAR_TIMEOUT_S
+            victim, RAFT_DB, mount=fp.LAZYFS_RAFT, timeout_s=LOG_READ_TIMEOUT_S
         )
         if record is None:
             raise fp.FaultEffectNotObserved(
-                f"no torn write to {RAFT_DB} within {PAGE_TEAR_TIMEOUT_S:g}s at occurrence "
-                f"{at}. The store may not have reached that many writes; this run "
-                f"asserts nothing about torn pages."
+                f"no torn write to {RAFT_DB} at occurrence {at} after {elections} "
+                f"elections in {ELECTION_DRIVE_TIMEOUT_S:g}s; this run asserts "
+                f"nothing about torn pages."
             )
         persisted, offset = record
         outcome.observed.append(ObservedTear(bytes=persisted, offset=offset))
@@ -1033,9 +1096,9 @@ def unobserved_fault_message(outcome: Outcome, *, min_torn_bytes: int) -> str:
         )
     return (
         f"{head} The fault never fired -- it arms for the *next* write to raft.db, "
-        f"and a caught-up node may not write again promptly -- or redb writes "
-        f"nothing that large in this workload, which is worth recording rather "
-        f"than working around."
+        f"and the driven elections did not reach the victim's store in "
+        f"{ELECTION_DRIVE_TIMEOUT_S:g}s -- or redb writes nothing that large in "
+        f"this workload, which is worth recording rather than working around."
     )
 
 
