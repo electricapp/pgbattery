@@ -3952,6 +3952,10 @@ class CIRunner:
             self.failed = True
             joined = "\n".join(cleanup_failures)
             self._write_text(case_dir / "cleanup-error.txt", f"{joined}\n")
+            # The cluster that would not converge is torn down after the suite,
+            # so its state and logs are kept now or never.
+            self._collect_snapshot(f"{case_id}-cleanup-failed")
+            self._collect_failure_logs(case_id)
             self.log(
                 f"[cleanup-error] {case_id}: {len(cleanup_failures)} cleanup step(s) failed; "
                 f"cluster may hold residue"

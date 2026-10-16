@@ -54,6 +54,7 @@ class StubRunner(ci_runner.CIRunner):
         executed: ``(phase, index, step_type)`` for every dispatched step.
         fail_steps: ``(phase, index)`` pairs that should raise when dispatched.
         snapshots: Labels passed to :meth:`_collect_snapshot`.
+        failure_logs: Case ids passed to :meth:`_collect_failure_logs`.
         probe_handler: Optional canned-probe function keyed on the probe
             command; when unset, probing raises to catch unexpected probes.
     """
@@ -76,6 +77,7 @@ class StubRunner(ci_runner.CIRunner):
         self.executed: list[tuple[str, int, str]] = []
         self.fail_steps: set[tuple[str, int]] = set()
         self.snapshots: list[str] = []
+        self.failure_logs: list[str] = []
         self.probe_handler: Callable[[str], ci_runner.ProbeResult] | None = None
 
     def _execute_step(self, step: dict[str, Any], case_id: str, phase: str, index: int) -> None:
@@ -87,7 +89,7 @@ class StubRunner(ci_runner.CIRunner):
         self.snapshots.append(label)
 
     def _collect_failure_logs(self, case_id: str) -> None:
-        return None
+        self.failure_logs.append(case_id)
 
     def _probe(self, command: str, log_path: Path) -> ci_runner.ProbeResult:
         if self.probe_handler is None:
@@ -621,6 +623,26 @@ def test_case_with_failing_cleanup_is_errored_not_passed() -> None:
     assert len(entry.cleanup_failures) == 1
     cleanup_error = runner._case_dir(case.id) / "cleanup-error.txt"
     assert "cleanup step 00" in cleanup_error.read_text(encoding="utf-8")
+
+
+def test_a_failed_cleanup_keeps_the_cluster_evidence() -> None:
+    # The cluster that would not converge is torn down after the suite, so
+    # whatever explains the failure has to be captured while it still runs.
+    runner = make_runner()
+    case = ci_runner.CaseConfig.model_validate(
+        {
+            "id": "cleanup-stuck",
+            "assertions": [{"type": "cmd", "cmd": "true"}],
+            "cleanup": _cleanup_steps(),
+        }
+    )
+    runner.case_map[case.id] = case
+    runner.fail_steps = {("cleanup", 1)}
+
+    runner._run_case(case.id)
+
+    assert runner.failure_logs == [case.id], "no logs kept for the cluster that stuck"
+    assert f"{case.id}-cleanup-failed" in runner.snapshots
 
 
 def test_case_with_clean_cleanup_passes() -> None:
