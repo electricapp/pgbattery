@@ -222,11 +222,17 @@ impl std::fmt::Debug for Replicas {
 
 impl Replicas {
     /// Forget everything when leadership goes: a new term starts its own
-    /// observations, and its slots sweep at once.
+    /// observations, and its slots sweep at once. The published gauges go to
+    /// zero with it, or a node leading again would export the last term's.
     pub(super) fn reset(&mut self) {
         self.status.clear();
         self.last_slot_sweep = None;
         self.async_fallback = false;
+        for gauges in self.gauges.values() {
+            gauges.zero();
+        }
+        self.publish(&HashSet::new());
+        metrics::gauge!("pgbattery_rpo_degraded").set(0.0);
     }
 
     /// Fold one `pg_stat_replication` sample in and return how many voter
@@ -641,6 +647,43 @@ mod tests {
             !replicas.status.contains_key(&4),
             "a departed member was kept"
         );
+    }
+
+    #[test]
+    fn losing_leadership_zeroes_every_published_replica_gauge() {
+        // A node that leads again exports only what its own term observed: a
+        // previous term's `sync` read as a second sync standby.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut replicas = Replicas::default();
+            let voters: HashSet<NodeId> = [1, 2, 3].into();
+            let stats = [
+                stat(2, ReplicationState::Streaming, SyncState::Sync),
+                stat(3, ReplicationState::Streaming, SyncState::Potential),
+            ];
+            replicas.observe(
+                &stats,
+                &voters,
+                &voters,
+                Instant::now(),
+                Duration::from_secs(5),
+            );
+            replicas.record_rpo(true);
+            replicas.reset();
+        });
+        let text = handle.render();
+        for line in [
+            "pgbattery_replica_is_sync{node=\"2\"} 0",
+            "pgbattery_replica_is_sync{node=\"3\"} 0",
+            "pgbattery_replica_health{node=\"2\"} 0",
+            "pgbattery_healthy_replicas 0",
+            "pgbattery_sync_replicas 0",
+            "pgbattery_sync_quorum 0",
+            "pgbattery_rpo_degraded 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "no `{line}` in\n{text}");
+        }
     }
 
     #[test]

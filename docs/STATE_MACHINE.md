@@ -116,7 +116,7 @@ Transitions are driven by a definitive source of truth — not by a timer, sleep
 
 ### 4. Sync replication membership (node reconciler, leader)
 
-- **Per replica**: `ReplicaHealth` = `Healthy | Lagging | Unhealthy`. Disconnect timing via `ReplicaStatus.last_seen` (`Instant`); a replica PG stops listing loses `sync` at once and flips to `Unhealthy` when `now - last_seen >= disconnect_timeout`. Leadership loss forgets them all.
+- **Per replica**: `ReplicaHealth` = `Healthy | Lagging | Unhealthy`. Disconnect timing via `ReplicaStatus.last_seen` (`Instant`); a replica PG stops listing loses `sync` at once and flips to `Unhealthy` when `now - last_seen >= disconnect_timeout`. Leadership loss forgets them all and zeroes every gauge they published (`Replicas::reset`), so a node that leads again exports only its own term's observations.
 - **Aggregate**: `synchronous_standby_names` on the primary, derived each pass from the committed voter set (`sync_standby_list`), never from who is connected.
 - **SoT**: `pg_stat_replication` + live GUC; the committed mode is `ClusterState::sync_replication_active`.
 - **Trigger**: the reconciler's pass while this node leads a primary (PG has no event hook).
