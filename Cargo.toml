@@ -119,7 +119,7 @@ metrics-exporter-prometheus = "0.18"
 
 # Utilities
 anyhow = "1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 dashmap = "6"
 sha2 = "0.11"
 
