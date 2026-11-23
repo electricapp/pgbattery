@@ -4,7 +4,7 @@
 # the managed GUCs) through this default; CI can matrix it via --build-arg.
 ARG PG_MAJOR=18
 
-FROM rust:1.99 AS builder
+FROM rust:1.100 AS builder
 WORKDIR /app
 
 # Cargo profile for the binary. `ci` is release optimisation without the
@@ -157,7 +157,7 @@ USER postgres
 # glibc match exactly, and pinned to a release commit SHA rather than a tag —
 # tags move (see tla/Makefile for what that costs).
 # ─────────────────────────────────────────────────────────────────────────────
-FROM postgres:18 AS lazyfs-builder
+FROM postgres:19 AS lazyfs-builder
 
 ARG LAZYFS_COMMIT=045a0b3a1126725e693934e29d3ba15e08cc39ec
 
