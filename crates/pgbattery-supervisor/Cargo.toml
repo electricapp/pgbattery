@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 # query, SQLSTATE on every error, nothing to tear when a caller times out.
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 # Counts the statements in a query before it is sent: see `session::one_statement`.
-pg_query = "6"
+pg_query = "18"
 tracing = "0.1"
 metrics = "0.24"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
